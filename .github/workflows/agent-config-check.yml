@@ -1,0 +1,24 @@
+name: agent-config-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: ROADMAP.md is generated from roadmap/issues.json
+        run: node scripts/gen-roadmap.mjs --check
+      - name: Copilot agents are generated from .claude/agents
+        run: node scripts/sync-agents.mjs --check
+      - name: Skills have valid frontmatter
+        run: node scripts/check-skills.mjs

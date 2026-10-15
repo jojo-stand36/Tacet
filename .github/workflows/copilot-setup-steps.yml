@@ -1,0 +1,40 @@
+name: Copilot setup steps
+
+# Prepares the environment for GitHub Copilot cloud agent sessions.
+# The job MUST be named `copilot-setup-steps`. Only steps, permissions, runs-on,
+# services, snapshot and timeout-minutes are honored by Copilot.
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm via corepack
+        run: corepack enable
+
+      - name: Install dependencies (once the monorepo exists)
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "No pnpm-lock.yaml yet (planning stage); skipping install."
+          fi
+
+      - name: Check generated agent and roadmap files
+        run: |
+          node scripts/gen-roadmap.mjs --check
+          node scripts/sync-agents.mjs --check

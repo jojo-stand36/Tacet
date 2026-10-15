@@ -10,17 +10,17 @@
 
 Running one coding agent is easy. Running ten across five repos means you become the bottleneck: every question, approval and context reset lands on you.
 
-tacet adds a **hierarchy** so you only see what actually needs you:
+Tacet adds a **hierarchy** so you only see what actually needs you:
 
 - **Conductor** — runs locally (web UI or terminal). Your single inbox for decisions, plus cross-project goals, global settings and cost.
 - **Mini-conductors** — installed per repo (`npx tacet init`). They plan work, spin up cheap sub-agents in isolated worktrees, verify results, answer what they can, and escalate only real decisions.
 - **Workers** — Claude Code, Codex, Gemini CLI, OpenCode, Goose or any ACP/CLI agent, typically on cheaper, lower-effort models.
 
-And it manages **context as a budget**: when a session gets heavy, tacet has it write a structured handoff and continues in a fresh session, instead of letting quality decay through compaction.
+And it manages **context as a budget**: when a session gets heavy, Tacet has it write a structured handoff and continues in a fresh session, instead of letting quality decay through compaction.
 
 ## Why another orchestrator?
 
-Most tools in this space run many agents *side by side* and leave you to coordinate them. tacet's bets are:
+Most tools in this space run many agents *side by side* and leave you to coordinate them. Tacet's bets are:
 
 1. Two-tier hierarchy across many repos, with escalation as the core UX
 2. Harness-agnostic via native APIs, ACP, MCP and a PTY fallback
@@ -30,6 +30,10 @@ Most tools in this space run many agents *side by side* and leave you to coordin
 6. Local-first, configurable to how you work
 
 Details and prior art: [docs/RESEARCH.md](docs/RESEARCH.md). Proposed design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Contributing (humans and agents)
+
+Tacet is built by people working with Claude Code and the GitHub Copilot cloud agent. Start with [AGENTS.md](AGENTS.md), the canonical instructions for every agent and a good primer for humans too. Issues carry routing labels (`agent:copilot`, `agent:claude`, `agent:either`, `needs-human`). How the hybrid setup works: [docs/HYBRID_WORKFLOW.md](docs/HYBRID_WORKFLOW.md).
 
 ## Bootstrapping this repo's issues
 
