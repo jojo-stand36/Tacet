@@ -1,0 +1,20 @@
+name: Feature
+description: Propose a feature or roadmap item
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: summary
+    attributes: { label: Summary, description: What and why }
+    validations: { required: true }
+  - type: textarea
+    id: tasks
+    attributes: { label: Tasks, value: "- [ ] " }
+  - type: textarea
+    id: acceptance
+    attributes: { label: Acceptance criteria }
+    validations: { required: true }
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [core, conductor, mini, adapters, handoff, ui, tui, channels, config, cost, security]

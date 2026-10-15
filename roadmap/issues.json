@@ -1,0 +1,695 @@
+{
+  "labels": [
+    {
+      "name": "type:epic",
+      "color": "5319e7"
+    },
+    {
+      "name": "type:feature",
+      "color": "1d76db"
+    },
+    {
+      "name": "type:spike",
+      "color": "fbca04"
+    },
+    {
+      "name": "type:adr",
+      "color": "c5def5"
+    },
+    {
+      "name": "type:docs",
+      "color": "0075ca"
+    },
+    {
+      "name": "type:chore",
+      "color": "cfd3d7"
+    },
+    {
+      "name": "area:core",
+      "color": "0e8a16"
+    },
+    {
+      "name": "area:conductor",
+      "color": "b60205"
+    },
+    {
+      "name": "area:mini",
+      "color": "d93f0b"
+    },
+    {
+      "name": "area:adapters",
+      "color": "e99695"
+    },
+    {
+      "name": "area:handoff",
+      "color": "f9d0c4"
+    },
+    {
+      "name": "area:ui",
+      "color": "bfdadc"
+    },
+    {
+      "name": "area:tui",
+      "color": "bfd4f2"
+    },
+    {
+      "name": "area:channels",
+      "color": "d4c5f9"
+    },
+    {
+      "name": "area:security",
+      "color": "000000"
+    },
+    {
+      "name": "area:config",
+      "color": "c2e0c6"
+    },
+    {
+      "name": "area:cost",
+      "color": "fef2c0"
+    },
+    {
+      "name": "priority:p0",
+      "color": "b60205"
+    },
+    {
+      "name": "priority:p1",
+      "color": "d93f0b"
+    },
+    {
+      "name": "priority:p2",
+      "color": "fbca04"
+    },
+    {
+      "name": "good first issue",
+      "color": "7057ff"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "M0 \u00b7 Foundations",
+      "description": "Repo, decisions, schemas, spikes. Nothing runs agents yet."
+    },
+    {
+      "title": "M1 \u00b7 Mini-conductor MVP",
+      "description": "One repo, one mini-conductor, real workers via adapters, worktrees, verification. Usable standalone."
+    },
+    {
+      "title": "M2 \u00b7 Conductor & escalation",
+      "description": "Global conductor, multi-repo registry, decision inbox, summary packets."
+    },
+    {
+      "title": "M3 \u00b7 Context handoff & cost tiering",
+      "description": "Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost ledger."
+    },
+    {
+      "title": "M4 \u00b7 Visual & terminal UI",
+      "description": "Web app (board, inbox, live terminals, cost) and TUI mode."
+    },
+    {
+      "title": "M5 \u00b7 Channels & workflows",
+      "description": "Notifications, chat channels, phone access, non-code workflows and templates."
+    },
+    {
+      "title": "M6 \u00b7 Ecosystem & hardening",
+      "description": "Plugins, A2A/ACP exposure, sandboxing, evals, docs, release."
+    }
+  ],
+  "issues": [
+    {
+      "title": "Repo scaffold: pnpm monorepo, TS, lint, test, CI",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:chore",
+        "area:core",
+        "priority:p0"
+      ],
+      "body": "Set up the monorepo skeleton described in docs/ARCHITECTURE.md \u00a75.\n\n### Tasks\n- [ ] pnpm workspaces with packages: core, conductor, mini, adapters/*, web, tui, cli\n- [ ] TypeScript strict, shared tsconfig, ESLint + Prettier (or Biome)\n- [ ] Vitest, GitHub Actions CI on Linux + macOS (+ Windows smoke)\n- [ ] LICENSE (decide: Apache-2.0 vs MIT), CONTRIBUTING, CODE_OF_CONDUCT, SECURITY\n\n### Acceptance criteria\n- `pnpm i && pnpm test` passes in CI on a clean checkout\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "ADR-001: Build standalone vs extend Omnigent vs interop",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:adr",
+        "type:spike",
+        "priority:p0"
+      ],
+      "body": "Decide the build-vs-extend question in docs/RESEARCH.md \u00a79 before significant code is written.\n\n### Tasks\n- [ ] Run Omnigent locally; try modelling a mini-conductor as an Omnigent agent + policies\n- [ ] Run Gas Town on a toy repo; note what to borrow and what to avoid\n- [ ] Write ADR with decision, consequences and what we borrow\n\n### Acceptance criteria\n- ADR merged in docs/adr/\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "ADR-002: Language/runtime (TypeScript on Node vs Bun vs Python)",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:adr",
+        "priority:p0"
+      ],
+      "body": "Confirm runtime. Default recommendation: TypeScript on Node (all target SDKs are first-class in TS).\n\n### Tasks\n- [ ] Check SDK support matrix: Claude Agent SDK, Codex app-server TS schema, ACP SDK, OpenCode SDK, MCP SDK, AG-UI\n- [ ] Check node-pty / PTY support on macOS, Linux, Windows\n- [ ] Decide Node vs Bun\n\n### Acceptance criteria\n- ADR merged\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "ADR-003: Wire protocols (conductor\u2194mini, UI events, MCP surface)",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:adr",
+        "area:core",
+        "priority:p0"
+      ],
+      "body": "Ratify the protocol table in RESEARCH.md \u00a74: JSON-RPC over local WebSocket shaped like A2A tasks; AG-UI-style UI events; MCP tools for agents.\n\n### Tasks\n- [ ] Define message envelope, versioning and auth token handshake\n- [ ] Map our Task model onto A2A Task to keep a clean upgrade path\n- [ ] Pick AG-UI event subset for UI\n\n### Acceptance criteria\n- ADR merged; JSON Schema stubs in @tacet/core\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Core schemas: Task, AgentEvent, Decision, Escalation, HandoffPacket",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p0"
+      ],
+      "body": "Single source of truth for all shared types, with runtime validation (zod or JSON Schema).\n\n### Tasks\n- [ ] Task (id, goal, acceptance criteria, budget, priority, parent)\n- [ ] Normalized AgentEvent union (see ARCHITECTURE.md \u00a73)\n- [ ] Escalation + Decision (with precedent tags)\n- [ ] HandoffPacket (goal, acceptance_criteria, state_summary, decisions, files_touched, commands_run, open_questions, next_action, verification, parent_session)\n- [ ] Export JSON Schema for non-TS consumers\n\n### Acceptance criteria\n- Schemas published from @tacet/core with tests and examples\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Event log: append-only SQLite store with replay",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p0"
+      ],
+      "body": "Event-sourced storage used by both mini-conductor and conductor.\n\n### Tasks\n- [ ] SQLite (better-sqlite3 or libsql) schema for events + projections\n- [ ] Append, query by task/session, replay into projections\n- [ ] Retention/compaction policy for old events\n\n### Acceptance criteria\n- Replay of a recorded session reproduces task state exactly\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Config system: layered YAML (user \u2192 repo \u2192 local \u2192 task)",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:feature",
+        "area:config",
+        "priority:p0"
+      ],
+      "body": "Implement config layering from ARCHITECTURE.md \u00a74 with schema validation and helpful errors.\n\n### Tasks\n- [ ] ~/.tacet/config.yaml, <repo>/.tacet/tacet.yaml, <repo>/.tacet/local.yaml\n- [ ] Merge semantics documented; `tacet config explain` shows effective config + source of each value\n- [ ] Secrets referenced from env/keychain, never stored in repo config\n\n### Acceptance criteria\n- Effective config is deterministic and explainable\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Spike: adapter capability matrix across Claude, Codex, OpenCode, Gemini, ACP",
+      "milestone": "M0 \u00b7 Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p0"
+      ],
+      "body": "Empirically verify what each integration surface supports before designing the adapter interface in detail.\n\n### Tasks\n- [ ] For each: streaming, approvals, interrupt, resume/fork, token/context usage, model switch, cost reporting\n- [ ] Note auth modes and vendor terms (esp. Claude subscription restrictions)\n- [ ] Publish docs/adapters/capability-matrix.md\n\n### Acceptance criteria\n- Matrix committed; gaps flagged as issues\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Epic: Mini-conductor MVP (standalone, single repo)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:epic",
+        "area:mini",
+        "priority:p0"
+      ],
+      "body": "A developer can `tacet init` in a repo, give a task, and have the mini-conductor plan it, run cheap workers in worktrees, verify, and report back.\n\n### Tasks\n- [ ] All M1 issues\n\n### Acceptance criteria\n- Demo: a multi-file feature completed end-to-end with \u22652 parallel workers and passing verification\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "AgentAdapter interface + conformance test suite",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p0"
+      ],
+      "body": "Define the adapter contract and a shared test bench every adapter must pass (inspired by Omnigent's harness test bench).\n\n### Tasks\n- [ ] Interface per ARCHITECTURE.md \u00a73 with capability flags\n- [ ] Fake/mock adapter for tests\n- [ ] Conformance tests: start, stream, approval round-trip, interrupt, usage events, close\n\n### Acceptance criteria\n- Mock adapter passes the suite in CI\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Adapter: Claude Code (Agent SDK / stream-json)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p0"
+      ],
+      "body": "Drive Claude Code via the Agent SDK or `claude -p --input-format stream-json --output-format stream-json`.\n\n### Tasks\n- [ ] Multi-turn streaming input, canUseTool \u2192 approval events\n- [ ] Resume/fork by session id\n- [ ] Usage + context events\n- [ ] Auth: API key / cloud provider first; document subscription terms clearly\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Adapter: Codex app-server (JSON-RPC)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p0"
+      ],
+      "body": "Drive Codex via `codex app-server --stdio` using its generated TS schema.\n\n### Tasks\n- [ ] thread/start, turn/start, server-initiated approval requests\n- [ ] Map items \u2192 AgentEvent\n- [ ] Regenerate schema in CI against pinned Codex version\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Adapter: generic ACP client",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p1"
+      ],
+      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, Claude/Codex via adapters\u2026).\n\n### Tasks\n- [ ] Use official ACP TS SDK\n- [ ] Capability negotiation \u2192 capability flags\n- [ ] Configurable command per agent\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Adapter: OpenCode server (HTTP + SSE)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2"
+      ],
+      "body": "Drive OpenCode via `opencode serve` and its SDK.\n\n### Tasks\n- [ ] Session CRUD, message, SSE events \u2192 AgentEvent\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Adapter: PTY + hooks fallback (any CLI)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p1"
+      ],
+      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Worktree manager",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p0"
+      ],
+      "body": "Create/clean git worktrees per worker; branch naming; merge/rebase helpers; conflict detection.\n\n### Tasks\n- [ ] Create from base branch, setup script hook (install deps, copy .env)\n- [ ] GC of stale worktrees\n- [ ] Merge strategies: PR, squash-to-branch, manual\n\n### Acceptance criteria\n- 10 parallel workers without collisions on a sample repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Mini-conductor daemon: task queue, planner, worker pool",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p0"
+      ],
+      "body": "The core loop: accept task \u2192 plan sub-tasks \u2192 schedule onto workers (concurrency limits) \u2192 collect results.\n\n### Tasks\n- [ ] Planner uses the mini tier model\n- [ ] Dependency-aware scheduling\n- [ ] Max concurrency per repo/adapter\n- [ ] Restart-safe (rehydrate from event log)\n\n### Acceptance criteria\n- Daemon restart mid-task resumes without losing work\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision\u2026)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p0"
+      ],
+      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\n### Tasks\n- [ ] Tools: escalate, report_progress, request_handoff, read_task, record_decision, spawn_worker (gated)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Verification pipeline: commands + reviewer agent",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1"
+      ],
+      "body": "Run repo verify commands and an optional reviewer agent (cross-vendor by default) before a task is marked done.\n\n### Tasks\n- [ ] Run verify commands from config in worktree\n- [ ] Reviewer agent on a different vendor than author\n- [ ] Failure \u2192 feedback to worker, retry budget\n\n### Acceptance criteria\n- Failing tests block completion and loop back to the worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "`tacet init` installer for repos",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p0",
+        "good first issue"
+      ],
+      "body": "Scaffold `.tacet/` in a repo with sensible defaults and detect available agent CLIs.\n\n### Tasks\n- [ ] Detect installed CLIs (claude, codex, gemini, opencode, goose\u2026) and auth state\n- [ ] Write tacet.yaml + .gitignore entry for local.yaml\n- [ ] Idempotent re-run\n\n### Acceptance criteria\n- Works on a fresh clone in < 30s\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "CLI: tacet run / status / attach / logs (standalone mode)",
+      "milestone": "M1 \u00b7 Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1"
+      ],
+      "body": "Minimal CLI to use a mini-conductor without the Conductor.\n\n### Tasks\n- [ ] `tacet run \"task\"`\n- [ ] `tacet status`\n- [ ] `tacet attach <worker>` (live PTY or stream)\n- [ ] `tacet logs <task>`\n\n### Acceptance criteria\n- End-to-end demo scriptable from CLI only\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Epic: Conductor and escalation inbox",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:epic",
+        "area:conductor",
+        "priority:p0"
+      ],
+      "body": "One global place where the user sees only what needs them, across every repo.\n\n### Tasks\n- [ ] All M2 issues\n\n### Acceptance criteria\n- Demo: 3 repos running, user handles all decisions from one inbox\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Conductor daemon + mini-conductor registry",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p0"
+      ],
+      "body": "Global daemon (`tacet up`) that discovers/registers mini-conductors, tracks health, and routes tasks.\n\n### Tasks\n- [ ] Registration handshake with per-install token\n- [ ] Heartbeats/health, reconnect\n- [ ] Auto-start mini-conductors for registered repos\n\n### Acceptance criteria\n- Kill/restart of either side recovers cleanly\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Conductor\u2194mini protocol implementation",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "area:mini",
+        "priority:p0"
+      ],
+      "body": "Implement ADR-003 protocol: tasks down, summaries/escalations/events up.\n\n### Tasks\n- [ ] JSON-RPC over WS, versioned\n- [ ] Backpressure + batching of events\n- [ ] Contract tests\n\n### Acceptance criteria\n- Protocol tests pass both directions\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Escalation gate in mini-conductor",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p0"
+      ],
+      "body": "Resolve what can be resolved locally (policy, precedent decisions, own reasoning); escalate the rest.\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Decision inbox: dedupe, batch, rank, answer, propagate",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p0"
+      ],
+      "body": "The core UX. Ranks by urgency \u00d7 number of blocked workers; dedupes similar questions across repos.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer \u2192 Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Summary packets (no transcripts upward)",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "area:handoff",
+        "priority:p1"
+      ],
+      "body": "Mini-conductors report compact typed summaries to keep the Conductor's context small.\n\n### Tasks\n- [ ] Summary schema (shares fields with HandoffPacket)\n- [ ] Periodic + on-completion summaries\n- [ ] Drill-down links to full logs\n\n### Acceptance criteria\n- Conductor context stays bounded over a 3-hour multi-repo run\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Cross-project goals: split one goal into tasks across repos",
+      "milestone": "M2 \u00b7 Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p1"
+      ],
+      "body": "e.g. 'add field X to the API and the web client' \u2192 tasks in two repos with a dependency.\n\n### Tasks\n- [ ] Conductor planner (frontier tier)\n- [ ] Cross-repo dependencies\n- [ ] Aggregated completion\n\n### Acceptance criteria\n- Demo across two repos with a dependency\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Epic: Context handoff and cost tiering",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:epic",
+        "area:handoff",
+        "area:cost",
+        "priority:p0"
+      ],
+      "body": "Preserve tokens and quality with automatic fresh-session handoffs and role-based model tiers.\n\n### Tasks\n- [ ] All M3 issues\n\n### Acceptance criteria\n- Long task (> 2 context windows) completes with handoffs and no human intervention\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Context usage tracking per session",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:handoff",
+        "priority:p0"
+      ],
+      "body": "Normalize context used/max from every adapter (usage events, statusline/PreCompact hooks as fallback).\n\n### Tasks\n- [ ] Per-adapter extraction\n- [ ] Estimate when adapter lacks it\n- [ ] Expose in events + UI\n\n### Acceptance criteria\n- Usage within \u00b15% of vendor-reported for tier-1 adapters\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Automatic handoff: thresholds, packet generation, validation, reseed",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:handoff",
+        "priority:p0"
+      ],
+      "body": "Implement the handoff flow in ARCHITECTURE.md \u00a72.3.\n\n### Tasks\n- [ ] warn/handoff/hard bands from config\n- [ ] Disable vendor auto-compaction where possible\n- [ ] Prompt worker for HandoffPacket; validate (reject if next_action missing)\n- [ ] Store in .tacet/handoffs/, start fresh session seeded with it\n- [ ] Optional model change on handoff\n\n### Acceptance criteria\n- Handoff preserves task progress in \u2265 90% of eval runs\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Conductor & mini-conductor self-handoff",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:handoff",
+        "priority:p1"
+      ],
+      "body": "Coordinators also roll over their own sessions using the same packet mechanism.\n\n### Tasks\n- [ ] Self-monitoring of context\n- [ ] Durable state lives in event log, not chat\n\n### Acceptance criteria\n- Conductor runs for a full day without degradation\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Model tier policies and per-task overrides",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:config",
+        "area:cost",
+        "priority:p0"
+      ],
+      "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security \u2192 frontier)\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Escalation ladder: retry with stronger model before asking a human",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:cost",
+        "priority:p1"
+      ],
+      "body": "Worker fails verification N times \u2192 bump tier \u2192 then escalate to mini \u2192 then user.\n\n### Tasks\n- [ ] Configurable N and ladder\n- [ ] Record which tier finally succeeded (learning signal)\n\n### Acceptance criteria\n- Ladder behaviour covered by tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Cost ledger + budgets (per task/repo/day)",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:cost",
+        "priority:p1"
+      ],
+      "body": "Track spend from usage events; enforce soft/hard budget policies.\n\n### Tasks\n- [ ] Pricing table per model (config-driven, updatable)\n- [ ] Soft warn \u2192 escalate; hard cap \u2192 pause\n- [ ] Distinguish API-key spend vs subscription usage\n\n### Acceptance criteria\n- Budget caps enforced in tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Measure orchestration overhead",
+      "milestone": "M3 \u00b7 Context handoff & cost tiering",
+      "labels": [
+        "type:spike",
+        "area:cost",
+        "priority:p1"
+      ],
+      "body": "Quantify tokens spent on coordination vs work, so hierarchy pays for itself.\n\n### Tasks\n- [ ] Instrument per-tier token use\n- [ ] Compare against single-agent baseline on eval tasks\n\n### Acceptance criteria\n- Report in docs/benchmarks/\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Epic: Visual and terminal modes",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:epic",
+        "area:ui",
+        "area:tui",
+        "priority:p1"
+      ],
+      "body": "Web app on localhost and a TUI with the same capabilities, user picks per preference.\n\n### Tasks\n- [ ] All M4 issues\n\n### Acceptance criteria\n- Every M2/M3 capability usable from both\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Web app shell: React + routing + live event stream",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:feature",
+        "area:ui",
+        "priority:p1"
+      ],
+      "body": "Served by the Conductor on 127.0.0.1; subscribes to AG-UI-style events.\n\n### Tasks\n- [ ] Vite + React\n- [ ] WS/SSE client\n- [ ] Auth via local token\n\n### Acceptance criteria\n- Loads in < 1s locally\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "UI: decision inbox",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:feature",
+        "area:ui",
+        "priority:p0"
+      ],
+      "body": "Primary screen. Answer, batch-answer, delegate, snooze; show context and blocked workers.\n\n### Tasks\n- [ ] Keyboard-first\n- [ ] Desktop notifications\n\n### Acceptance criteria\n- All inbox actions available\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "UI: projects/tasks board and timelines",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:feature",
+        "area:ui",
+        "priority:p1"
+      ],
+      "body": "Board across repos; per-task timeline from event log; handoff history.\n\n### Tasks\n- [ ] Kanban + list views\n- [ ] Timeline with handoff markers\n\n### Acceptance criteria\n- Board reflects live state\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "UI: live terminals and diffs",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:feature",
+        "area:ui",
+        "priority:p1"
+      ],
+      "body": "xterm.js view into any worker; diff viewer per worktree; take over a session manually.\n\n### Tasks\n- [ ] Attach/detach\n- [ ] Diff + inline comment \u2192 feedback to worker\n\n### Acceptance criteria\n- Can take over and hand back a session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "UI: settings and personalization",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:feature",
+        "area:ui",
+        "area:config",
+        "priority:p2"
+      ],
+      "body": "Edit tiers, autonomy, budgets, channels; theme; layout presets.\n\n### Tasks\n- [ ] Writes to correct config layer\n- [ ] Shows effective config + source\n\n### Acceptance criteria\n- No hand-editing YAML required for common settings\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "TUI mode (Ink)",
+      "milestone": "M4 \u00b7 Visual & terminal UI",
+      "labels": [
+        "type:feature",
+        "area:tui",
+        "priority:p1"
+      ],
+      "body": "Terminal-first equivalent: inbox, board, attach to worker.\n\n### Tasks\n- [ ] `tacet tui`\n- [ ] Same API as web\n\n### Acceptance criteria\n- Feature parity for inbox + attach\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Epic: Channels and non-code workflows",
+      "milestone": "M5 \u00b7 Channels & workflows",
+      "labels": [
+        "type:epic",
+        "area:channels",
+        "priority:p2"
+      ],
+      "body": "Reach the user where they are; use the same engine for research and task workflows.\n\n### Tasks\n- [ ] All M5 issues\n\n### Acceptance criteria\n- Answer an escalation from phone\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Notification channels: OS, email, webhook",
+      "milestone": "M5 \u00b7 Channels & workflows",
+      "labels": [
+        "type:feature",
+        "area:channels",
+        "priority:p1"
+      ],
+      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Chat channels: Slack / Discord / Telegram (two-way)",
+      "milestone": "M5 \u00b7 Channels & workflows",
+      "labels": [
+        "type:feature",
+        "area:channels",
+        "priority:p2"
+      ],
+      "body": "Answer inbox items and issue tasks from chat.\n\n### Tasks\n- [ ] Two-way bot per platform\n- [ ] Signed callbacks\n- [ ] Rate limiting\n\n### Acceptance criteria\n- Round-trip answer from Slack unblocks a worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Remote/phone access (opt-in, Tailscale/tunnel guidance)",
+      "milestone": "M5 \u00b7 Channels & workflows",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "area:ui",
+        "priority:p2"
+      ],
+      "body": "Mobile-friendly UI with explicit opt-in remote access.\n\n### Tasks\n- [ ] Responsive inbox\n- [ ] Docs for Tailscale and tunnels\n- [ ] Stronger auth when non-local\n\n### Acceptance criteria\n- Security review passed\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Workflow templates (research, docs, triage, refactor)",
+      "milestone": "M5 \u00b7 Channels & workflows",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p2"
+      ],
+      "body": "Reusable multi-step workflows, including non-code folders as 'workspaces'.\n\n### Tasks\n- [ ] Template format (YAML)\n- [ ] Starter templates\n- [ ] Sequential + parallel steps\n\n### Acceptance criteria\n- 3 templates shipped and documented\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Scheduled and triggered tasks",
+      "milestone": "M5 \u00b7 Channels & workflows",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p2"
+      ],
+      "body": "Cron/webhook/GitHub-event triggered tasks (e.g. nightly dependency triage).\n\n### Tasks\n- [ ] Scheduler\n- [ ] GitHub webhook trigger\n\n### Acceptance criteria\n- Nightly job demo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Plugin system: adapters, channels, tools, workflows",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p2"
+      ],
+      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2"
+      ],
+      "body": "Let editors talk to a repo's mini-conductor as a single agent.\n\n### Tasks\n- [ ] ACP agent server\n- [ ] Map escalations to ACP permission requests\n\n### Acceptance criteria\n- Works from Zed\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Expose conductor via A2A",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p2"
+      ],
+      "body": "Interop with other A2A agents/orchestrators.\n\n### Tasks\n- [ ] Agent Card\n- [ ] Task mapping\n\n### Acceptance criteria\n- A2A conformance smoke test\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "OS sandboxing for workers (bubblewrap / seatbelt / containers)",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "priority:p2"
+      ],
+      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Evaluation harness: escalation quality, handoff fidelity, cost",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p1"
+      ],
+      "body": "Repeatable evals to tune thresholds and prevent regressions.\n\n### Tasks\n- [ ] Task suite\n- [ ] Metrics: success, escalations/hour, false escalations, tokens/task\n- [ ] CI nightly\n\n### Acceptance criteria\n- Dashboard of eval trends\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Threat model + security review",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:docs",
+        "area:security",
+        "priority:p1"
+      ],
+      "body": "Prompt injection via repo content, MCP tool abuse, local server exposure, secrets.\n\n### Tasks\n- [ ] STRIDE pass\n- [ ] Mitigations as issues\n\n### Acceptance criteria\n- SECURITY.md updated\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Docs site + quickstart + vendor auth/billing guide",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:docs",
+        "priority:p1"
+      ],
+      "body": "Quickstart in < 5 minutes; clear per-vendor auth/terms guidance (re-verify each release).\n\n### Tasks\n- [ ] Docs site\n- [ ] Auth guide per vendor\n- [ ] Architecture docs\n\n### Acceptance criteria\n- New user reaches first completed task from docs alone\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "v0.1 release: packaging (npm, Homebrew), installers, changelog",
+      "milestone": "M6 \u00b7 Ecosystem & hardening",
+      "labels": [
+        "type:chore",
+        "priority:p1"
+      ],
+      "body": "First public release.\n\n### Tasks\n- [ ] npm publish\n- [ ] Homebrew tap\n- [ ] Release automation\n\n### Acceptance criteria\n- `npx tacet init` works on macOS and Linux\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    }
+  ]
+}
