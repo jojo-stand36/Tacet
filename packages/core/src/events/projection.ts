@@ -4,7 +4,10 @@ import { Id, openEnum, Ulid } from '../schema/common.js';
 import { Decision } from '../schema/decision.js';
 import type { EventEnvelope } from '../schema/envelope.js';
 import { Escalation } from '../schema/escalation.js';
+import { TaskPlan } from '../schema/plan.js';
+import { type SummaryOutcome, SummaryPacket } from '../schema/summary.js';
 import { Task } from '../schema/task.js';
+import { WorkerEnded, WorkerStarted } from '../schema/worker.js';
 
 /**
  * A pure fold over event envelopes. `apply` must not read the clock, randomness or anything
@@ -43,6 +46,8 @@ export type TaskState = z.infer<typeof TaskState>;
 export const TaskEventData = {
   'task.created': Task,
   'task.status': z.object({ state: TaskState, message: z.string().optional() }),
+  'task.planned': TaskPlan,
+  'task.result': SummaryPacket,
   'escalation.raised': Escalation,
   'escalation.resolved': z.object({
     escalationId: Ulid,
@@ -51,8 +56,8 @@ export const TaskEventData = {
   }),
   'decision.recorded': Decision,
   'handoff.accepted': z.object({ handoffId: Ulid, sessionId: Id }),
-  'worker.started': z.object({ sessionId: Id }),
-  'worker.ended': z.object({ sessionId: Id }),
+  'worker.started': WorkerStarted,
+  'worker.ended': WorkerEnded,
   'agent.usage': Usage,
 } as const;
 
@@ -66,6 +71,10 @@ export interface TaskView {
   decisions: string[];
   handoffs: string[];
   activeWorkers: string[];
+  /** Sub-task ids and their dependencies, from the latest `task.planned`. */
+  plan?: { id: string; dependsOn: string[] }[];
+  /** Outcome of the latest `task.result`. */
+  result?: { outcome: SummaryOutcome; createdAt: string };
   usage: { inputTokens: number; outputTokens: number; costUsd: number };
   /** Id of the last event applied to this task. */
   lastEventId: string;
@@ -139,6 +148,18 @@ export const tasksProjection: Projection<TasksState> = {
             ...(r.decisionId !== undefined ? { decisionId: r.decisionId } : {}),
           },
         };
+        break;
+      }
+      case 'task.planned':
+        next.plan = (data as TaskPlan).subtasks.map((st) => ({
+          id: st.id,
+          dependsOn: [...st.dependsOn],
+        }));
+        break;
+      case 'task.result': {
+        const r = data as SummaryPacket;
+        if (r.taskId !== taskId) return { ...state, skipped: [...state.skipped, e.id] };
+        next.result = { outcome: r.outcome, createdAt: r.createdAt };
         break;
       }
       case 'decision.recorded':

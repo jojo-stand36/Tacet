@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:summary-packet:v1",
+  "title": "Tacet SummaryPacket (task.result)",
+  "type": "object",
+  "properties": {
+    "v": {
+      "type": "number",
+      "const": 1
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "sessionId": {
+      "description": "The Worker session that produced it, if one did",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+    },
+    "outcome": {
+      "enum": [
+        "completed",
+        "failed",
+        "partial",
+        "blocked"
+      ],
+      "x-tacet-fallback": "failed",
+      "type": "string"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "What was done, in a few sentences"
+    },
+    "filesTouched": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[^/]",
+        "description": "Repo-relative POSIX path, never an absolute worktree path"
+      }
+    },
+    "commits": {
+      "default": [],
+      "description": "Full lowercase commit ids; the Mini-conductor resolves them before writing",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+      }
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "partial",
+            "not_run"
+          ],
+          "x-tacet-fallback": "not_run",
+          "type": "string"
+        },
+        "commands": {
+          "default": [],
+          "description": "Commands that verify the work",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "openQuestions": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "required": [
+    "v",
+    "taskId",
+    "createdAt",
+    "outcome",
+    "summary",
+    "verification"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "v": 1,
+  "taskId": "task-42.1",
+  "sessionId": "sess-2",
+  "createdAt": "2026-11-09T12:30:00.000Z",
+  "outcome": "completed",
+  "summary": "Added src/middleware/rate-limit.ts with a Redis token bucket, 100 requests per minute per key.",
+  "filesTouched": ["src/middleware/rate-limit.ts"],
+  "commits": ["4b825dc642cb6eb9a060e54bf8d69288fbee4904"],
+  "verification": {
+    "status": "passed",
+    "commands": ["pnpm test rate-limit"]
+  },
+  "openQuestions": []
+}

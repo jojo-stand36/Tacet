@@ -1,0 +1,31 @@
+{
+  "subtasks": [
+    {
+      "id": "task-42.1",
+      "goal": "Add a Redis-backed rate-limit middleware",
+      "acceptanceCriteria": ["429 after 100 requests per minute per key"],
+      "kind": "implement",
+      "dependsOn": []
+    },
+    {
+      "id": "task-42.2",
+      "goal": "Wire the middleware into the public router and add tests",
+      "acceptanceCriteria": ["Tests cover the limiter, including a burst"],
+      "kind": "implement",
+      "dependsOn": ["task-42.1"]
+    },
+    {
+      "id": "task-42.3",
+      "goal": "Review the diff against the acceptance criteria",
+      "acceptanceCriteria": ["Every criterion checked; issues listed"],
+      "kind": "review",
+      "dependsOn": ["task-42.2"]
+    }
+  ],
+  "planner": {
+    "sessionId": "sess-plan-1",
+    "adapter": "claude-sdk",
+    "model": "sonnet"
+  },
+  "rationale": "The middleware is independent; wiring and tests need it; review comes last from another vendor."
+}
