@@ -264,7 +264,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Drive Codex via `codex app-server --stdio` using its generated TS schema.\n\n### Tasks\n- [ ] thread/start, turn/start, server-initiated approval requests\n- [ ] Map items → AgentEvent\n- [ ] Regenerate schema in CI against pinned Codex version\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Drive Codex via `codex app-server --stdio` using its generated TS schema.\n\n### Tasks\n- [ ] thread/start, turn/start, server-initiated approval requests\n- [ ] Map items → AgentEvent\n- [ ] Regenerate schema in CI against pinned Codex version\n- [ ] Use the #58 findings: `allow_always` defaults to session scope (`acceptForSession`), permissions requests take a granted subset, track `turnId` for `turn/steer`\n- [ ] Auth routing (owner policy, RESEARCH §7): API key for parallel or unattended Workers; the user's own Codex login only for interactive sessions. Never implement `chatgptAuthTokens`.\n\n### Acceptance criteria\n- Passes conformance suite\n- Auth mode selection follows the routing policy and is tested without real credentials\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: generic ACP client",
@@ -330,7 +330,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\nCompatibility: the server answers MCP 2026-07-28 and 2025-11-25 clients through SDK defaults. The core tools use no feature that exists only in 2026-07-28 (ADR-003, addendum 2026-11-09).\n\n### Tasks\n- [ ] Tools: escalate, report_progress, request_handoff, read_task, record_decision, spawn_worker (gated)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n- [ ] Three-client conformance test: a 2026-07-28 client, a 2025-11-25 client and a real vendor worker\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n- The three-client conformance test passes\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\nCompatibility (required, per #68: Codex, Gemini CLI and OpenCode default to 2025-era MCP): the server answers MCP 2026-07-28 and 2025-era (2025-06-18, 2025-11-25) clients through SDK defaults. The core tools use no feature that exists only in 2026-07-28 (ADR-003, addendum 2026-11-09).\n\n### Tasks\n- [ ] Tools (ADR-003 §6): read_task, report_progress, escalate (non-blocking, returns pending), get_decision, request_handoff, record_decision, search_decisions. No spawn_worker in v1\n- [ ] Return a fast 404 for `/.well-known/*` (Codex probes OAuth discovery, #68)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n- [ ] Three-client conformance test: an MCP SDK v2 client on 2026-07-28, an SDK v1 client on 2025-era, and Claude Code as a real vendor worker\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n- The three-client conformance test passes\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Verification pipeline: commands + reviewer agent",
