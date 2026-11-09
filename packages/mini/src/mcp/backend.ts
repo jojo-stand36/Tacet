@@ -167,7 +167,7 @@ export class EventLogBackend implements MiniBackend {
   #raise(
     b: WorkerBinding,
     i: ToolInput<'escalate'>,
-    extra: Record<string, unknown> = {},
+    extra: Pick<Escalation, 'category' | 'proposedDecision'> = {},
   ): Escalation {
     const now = this.#now();
     const escalation = Escalation.parse({
@@ -183,8 +183,9 @@ export class EventLogBackend implements MiniBackend {
       blockedWorkers: i.urgency === 'blocking' ? 1 : 0,
       status: 'pending',
       createdAt: now.toISOString(),
+      ...extra,
     });
-    this.#append(b, 'escalation.raised', { ...escalation, ...extra }, 'worker');
+    this.#append(b, 'escalation.raised', escalation, 'worker');
     return escalation;
   }
 

@@ -88,7 +88,7 @@ describe('a real Codex Worker calls escalate (#18 acceptance)', () => {
         const req = await tap
           .waitFor((e) => e.t === 'approval.request', 60_000, from)
           .catch(() => undefined);
-        if (!req || req.event.t !== 'approval.request') return;
+        if (req?.event.t !== 'approval.request') return;
         from = req.index + 1;
         await adapter
           .respond(h, req.event.id, { kind: 'allow_once', persist: false })

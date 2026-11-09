@@ -235,11 +235,22 @@ async function serve(
     }
     chunks.push(c as Buffer);
   }
-  const body = Buffer.concat(chunks);
-  if (wantsSubscription(body)) {
+  // Parse once and hand the SDK this same object, so the filter below and the SDK can never
+  // read the body differently (e.g. a leading BOM). Anything that is not JSON is refused here.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    return reply(res, 400, {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: 'parse error' },
+    });
+  }
+  if (wantsSubscription(parsed)) {
     return reply(res, 200, {
       jsonrpc: '2.0',
-      id: requestId(body),
+      id: requestId(parsed),
       error: { code: -32601, message: 'subscriptions are not offered by this server' },
     });
   }
@@ -250,9 +261,12 @@ async function serve(
     method: 'POST',
     headers: toHeaders(req.headers),
     signal: abort.signal,
-    body,
+    body: JSON.stringify(parsed),
   });
-  const response = await handler.fetch(request, { authInfo: toAuthInfo(binding) });
+  const response = await handler.fetch(request, {
+    authInfo: toAuthInfo(binding),
+    parsedBody: parsed,
+  });
   res.writeHead(response.status, Object.fromEntries(response.headers));
   if (!response.body) return void res.end();
   await pipeline(
@@ -277,16 +291,7 @@ function fromAuthInfo(
   return { workerSessionId: info.clientId, taskId: scope.slice(TASK_SCOPE.length) };
 }
 
-function parse(body: Buffer): unknown {
-  try {
-    return JSON.parse(body.toString('utf8'));
-  } catch {
-    return undefined;
-  }
-}
-
-function wantsSubscription(body: Buffer): boolean {
-  const msg = parse(body);
+function wantsSubscription(msg: unknown): boolean {
   const all = Array.isArray(msg) ? msg : [msg];
   return all.some(
     (m) =>
@@ -296,8 +301,7 @@ function wantsSubscription(body: Buffer): boolean {
   );
 }
 
-function requestId(body: Buffer): unknown {
-  const msg = parse(body);
+function requestId(msg: unknown): unknown {
   return typeof msg === 'object' && msg !== null && !Array.isArray(msg)
     ? ((msg as { id?: unknown }).id ?? null)
     : null;

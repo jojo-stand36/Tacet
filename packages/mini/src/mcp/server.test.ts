@@ -261,6 +261,18 @@ describe('Mini-conductor MCP server', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'subscriptions/listen', params: {} }),
     });
     expect(await res.json()).toMatchObject({ id: 7, error: { code: -32601 } });
+    // A body the SDK could read differently from the filter (here: a leading BOM) is refused.
+    const bom = await fetch(server.url, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: `\uFEFF${JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'subscriptions/listen', params: {} })}`,
+    });
+    expect(bom.status).toBe(400);
+    expect(await bom.json()).toMatchObject({ error: { code: -32700 } });
     const closed = server.close().then(() => 'closed');
     const timeout = new Promise((r) => setTimeout(() => r('timeout'), 3000));
     expect(await Promise.race([closed, timeout])).toBe('closed');
