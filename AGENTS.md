@@ -14,7 +14,7 @@ Read before non-trivial work:
 
 ## Current status
 
-Planning stage (milestone **M0 · Foundations**). There is no application code yet. The planned stack is a TypeScript pnpm monorepo (`packages/core`, `conductor`, `mini`, `adapters/*`, `web`, `tui`, `cli`), pending ADR-002. Do not scaffold packages outside the issue that asks for it.
+Planning stage (milestone **M0 · Foundations**). There is no application code yet. The stack is decided ([ADR-002](docs/adr/002-language-runtime.md)): TypeScript (`strict`, ESM) in a pnpm monorepo (`packages/core`, `conductor`, `mini`, `adapters/*`, `web`, `tui`, `cli`), on Node.js 24 or later. Bun is not supported. Targets are macOS and Linux (Ubuntu) only. Do not scaffold packages outside the issue that asks for it.
 
 ## Repo layout
 
@@ -61,6 +61,8 @@ Once packages exist, `pnpm install`, `pnpm test`, `pnpm lint` and `pnpm typechec
 ## Conventions
 
 - **Language:** TypeScript, `strict` mode, ESM. No `any` without a comment saying why.
+- **Runtime:** Node.js 24 or later (ADR-002). Do not use Bun-only APIs (`Bun.*`, `bun:*`). CI does not run Bun.
+- **Borrowed code:** borrow ideas freely. Port code only with attribution: keep the license header and add the entry to `NOTICE` (ADR-001).
 - **Commits:** Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`). Reference the issue: `feat(mini): worktree GC (#12)`.
 - **Naming:** use the project vocabulary exactly: Conductor, Mini-conductor, Worker, Adapter, Escalation, Decision, HandoffPacket, Task. Config lives in `.tacet/`; packages are `@tacet/*`.
 - **Dependencies:** prefer the platform and the official vendor SDKs. Justify every new runtime dependency in the PR.
