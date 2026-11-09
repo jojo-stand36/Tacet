@@ -38,6 +38,7 @@
     "check:schemas": "tsc -b && node scripts/gen-schemas.mjs --check"
   },
   "dependencies": {
+    "yaml": "2.9.1",
     "zod": "catalog:"
   },
   "devDependencies": {

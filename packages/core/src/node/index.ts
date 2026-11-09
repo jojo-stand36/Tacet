@@ -3,3 +3,4 @@
  * Never import this from browser code; use the `@tacet/core` entry instead.
  */
 export * from './auth/index.js';
+export * from './config/index.js';
