@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -9,7 +9,15 @@ import { WorktreeManager } from './worktree.js';
 const execFileAsync = promisify(execFile);
 
 async function git(repository: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync('git', ['-C', repository, ...args], { encoding: 'utf8' });
+  const { stdout } = await execFileAsync('git', ['-C', repository, ...args], {
+    encoding: 'utf8',
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME ?? '',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1',
+    },
+  });
   return stdout;
 }
 
@@ -60,6 +68,27 @@ describe('WorktreeManager', () => {
     );
   });
 
+  it('retries path discovery after the repository initially does not exist', async () => {
+    const lateRepository = path.join(temporaryDirectory, 'late-repo');
+    const lateManager = new WorktreeManager(
+      lateRepository,
+      path.join(temporaryDirectory, 'late-worktrees'),
+    );
+    await expect(lateManager.list()).rejects.toThrow();
+
+    await mkdir(lateRepository);
+    await git(lateRepository, ['init', '-b', 'main']);
+    await git(lateRepository, ['config', 'user.name', 'Tacet test']);
+    await git(lateRepository, ['config', 'user.email', 'tacet-test@example.invalid']);
+    await writeFile(path.join(lateRepository, 'file.txt'), 'base\n');
+    await git(lateRepository, ['add', '.']);
+    await git(lateRepository, ['commit', '-m', 'initial']);
+
+    expect(await lateManager.create('retry-worker')).toMatchObject({
+      branch: expect.any(String),
+    });
+  });
+
   it('handles worker IDs with long hyphen runs', async () => {
     const worktree = await manager.create(`${'-'.repeat(10_000)}worker${'-'.repeat(10_000)}`);
 
@@ -71,6 +100,7 @@ describe('WorktreeManager', () => {
     await writeFile(path.join(repository, 'base-only.txt'), 'from setup base\n');
     await git(repository, ['add', 'base-only.txt']);
     await git(repository, ['commit', '-m', 'base branch']);
+    await git(repository, ['tag', 'setup-base', 'main']);
     await git(repository, ['checkout', 'main']);
     await writeFile(path.join(repository, '.env'), 'test-value\n');
 
@@ -120,8 +150,108 @@ describe('WorktreeManager', () => {
     );
   });
 
+  it('refuses to remove dirty or ignored files unless forced', async () => {
+    const worktree = await manager.create('preserve-local-files');
+    await writeFile(path.join(worktree.path, '.env'), 'local\n');
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow(
+      'worktree contains local or ignored files',
+    );
+    expect(await readFile(path.join(worktree.path, '.env'), 'utf8')).toBe('local\n');
+
+    await manager.remove(worktree.id, { force: true });
+    await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps detached-head worktrees listed and uses their HEAD for merge checks', async () => {
+    const worktree = await manager.create('detached-worker');
+    await git(worktree.path, ['checkout', '--detach']);
+    await writeFile(path.join(worktree.path, 'detached.txt'), 'worker commit\n');
+    await git(worktree.path, ['add', 'detached.txt']);
+    await git(worktree.path, ['commit', '-m', 'detached worker commit']);
+
+    expect((await manager.list()).map(({ id }) => id)).toContain(worktree.id);
+    expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+    expect(await manager.merge(worktree.id, 'pr', 'main')).toMatchObject({ status: 'ready' });
+  });
+
+  it('does not execute repository hooks or fsmonitor during worktree creation', async () => {
+    const marker = path.join(temporaryDirectory, 'creation-command-ran');
+    const fsmonitor = path.join(temporaryDirectory, 'creation-fsmonitor');
+    const hooks = path.join(temporaryDirectory, 'creation-hooks');
+    await mkdir(hooks);
+    await writeFile(fsmonitor, `#!/bin/sh\nprintf ran >> '${marker}'\n`);
+    await chmod(fsmonitor, 0o700);
+    await writeFile(path.join(hooks, 'post-checkout'), `#!/bin/sh\nprintf ran >> '${marker}'\n`);
+    await chmod(path.join(hooks, 'post-checkout'), 0o700);
+    await git(repository, ['config', 'core.fsmonitor', fsmonitor]);
+    await git(repository, ['config', 'core.hooksPath', hooks]);
+
+    await manager.create('creation-hook-worker');
+
+    await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('does not execute fsmonitor or hooks from a hostile worktree gitdir', async () => {
+    await git(repository, ['config', 'extensions.worktreeConfig', 'true']);
+    const worktree = await manager.create('hostile-worker');
+    const marker = path.join(temporaryDirectory, 'hostile-command-ran');
+    const fsmonitor = path.join(temporaryDirectory, 'fsmonitor');
+    const hooks = path.join(temporaryDirectory, 'hooks');
+    await mkdir(hooks);
+    await writeFile(fsmonitor, `#!/bin/sh\nprintf ran >> '${marker}'\n`);
+    await chmod(fsmonitor, 0o700);
+    await writeFile(path.join(hooks, 'pre-rebase'), `#!/bin/sh\nprintf ran >> '${marker}'\n`);
+    await chmod(path.join(hooks, 'pre-rebase'), 0o700);
+    await git(worktree.path, ['config', '--worktree', 'core.fsmonitor', fsmonitor]);
+    await git(worktree.path, ['config', '--worktree', 'core.hooksPath', hooks]);
+
+    await writeFile(path.join(worktree.path, 'worker.txt'), 'worker\n');
+    await git(worktree.path, ['add', 'worker.txt']);
+    await git(worktree.path, ['commit', '-m', 'worker commit']);
+    await writeFile(path.join(repository, 'target.txt'), 'target\n');
+    await git(repository, ['add', 'target.txt']);
+    await git(repository, ['commit', '-m', 'advance target']);
+
+    const realGitDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    const commonDirectory = (
+      await git(repository, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+    ).trim();
+    const hostileGitDirectory = path.join(temporaryDirectory, 'hostile-gitdir');
+    await cp(realGitDirectory, hostileGitDirectory, { recursive: true });
+    await writeFile(path.join(hostileGitDirectory, 'commondir'), `${commonDirectory}\n`);
+    await writeFile(path.join(worktree.path, '.git'), `gitdir: ${hostileGitDirectory}\n`);
+    await writeFile(path.join(worktree.path, '.env'), 'ignored\n');
+    await rm(marker, { force: true });
+
+    const gc = await manager.gc({
+      olderThanMs: 0,
+      now: Date.now() + 1_000,
+    });
+    expect(gc.skipped).toContainEqual({
+      id: worktree.id,
+      reason: 'worktree contains local or ignored files',
+    });
+
+    await rm(path.join(worktree.path, '.env'));
+    expect(await manager.rebase(worktree.id, 'main')).toEqual([]);
+    await manager.remove(worktree.id);
+    await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(path.join(worktree.path, 'worker.txt'), 'utf8')).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  });
+
   it('detects conflicts without modifying the target and aborts a conflicted rebase', async () => {
     const worktree = await manager.create('conflicting-worker');
+    await git(repository, ['tag', 'main', 'HEAD']);
     await writeFile(path.join(worktree.path, 'file.txt'), 'worker change\n');
     await git(worktree.path, ['add', 'file.txt']);
     await git(worktree.path, ['commit', '-m', 'worker change']);
