@@ -1,0 +1,10 @@
+{
+  "role": "mini",
+  "protocolVersions": [1],
+  "clientInfo": { "name": "@tacet/mini", "version": "0.0.0" },
+  "capabilities": {},
+  "repoId": "api-service",
+  "repoPath": "/home/dev/src/api-service",
+  "adapters": ["claude-sdk", "codex-app-server"],
+  "miniVersion": "0.0.0"
+}

@@ -4,6 +4,7 @@ import { Decision, DecisionExt } from './decision.js';
 import { EventEnvelope } from './envelope.js';
 import { Escalation, EscalationExt } from './escalation.js';
 import { HandoffPacket } from './handoff.js';
+import { HelloParams, HelloResult } from './hello.js';
 import { Task, TaskExt } from './task.js';
 
 export * from './agent-event.js';
@@ -12,6 +13,7 @@ export * from './decision.js';
 export * from './envelope.js';
 export * from './escalation.js';
 export * from './handoff.js';
+export * from './hello.js';
 export * from './task.js';
 
 /** Schema major version; JSON Schemas live in `schema/v1/`. */
@@ -38,6 +40,8 @@ export const jsonSchemas = {
     title: 'Tacet A2A decision extension (urn:tacet:a2a-ext:decision:v1)',
   },
   'handoff-packet': { schema: HandoffPacket, title: 'Tacet HandoffPacket' },
+  'hello-params': { schema: HelloParams, title: 'Tacet tacet/hello request params' },
+  'hello-result': { schema: HelloResult, title: 'Tacet tacet/hello result' },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;
