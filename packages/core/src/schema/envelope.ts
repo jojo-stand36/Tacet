@@ -1,7 +1,8 @@
 import { z } from 'zod';
-import { Id, Timestamp, Ulid } from './common.js';
+import { Id, openEnum, Timestamp, Ulid } from './common.js';
 
-export const SourceKind = z.enum(['worker', 'mini', 'conductor', 'adapter']);
+/** Unknown values fall back to `worker`, the least trusted source. */
+export const SourceKind = openEnum(['worker', 'mini', 'conductor', 'adapter'], 'worker');
 export type SourceKind = z.infer<typeof SourceKind>;
 
 /** Event type namespaces known in protocol v1 (ADR-003 §1). Informational, not a whitelist. */

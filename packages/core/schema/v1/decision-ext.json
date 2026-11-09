@@ -16,11 +16,12 @@
       "type": "string"
     },
     "scope": {
-      "type": "string",
       "enum": [
         "task",
         "repo"
-      ]
+      ],
+      "x-tacet-fallback": "task",
+      "type": "string"
     }
   },
   "required": [

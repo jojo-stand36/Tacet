@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { Id, Timestamp, Ulid } from './common.js';
+import { Id, openEnum, Timestamp, Ulid } from './common.js';
 import { DecisionScope } from './decision.js';
 
 /** A decision made during the session, carried forward so the next session does not reopen it. */
@@ -18,7 +18,8 @@ export const CommandRun = z.object({
 });
 export type CommandRun = z.infer<typeof CommandRun>;
 
-export const VerificationStatus = z.enum(['passed', 'failed', 'partial', 'not_run']);
+/** Unknown values fall back to `not_run`, so nothing is assumed verified. */
+export const VerificationStatus = openEnum(['passed', 'failed', 'partial', 'not_run'], 'not_run');
 export type VerificationStatus = z.infer<typeof VerificationStatus>;
 
 export const Verification = z.object({

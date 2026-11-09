@@ -192,6 +192,10 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 - **Revisit:** when the MCP TypeScript SDK announces that it will remove legacy (`2025-11-25`) serving.
 - **Auth module:** follow-up 2 (local auth module) is now a roadmap entry in M1 (`agent:claude`, `priority:p0`, `area:security`, with a reviewer pass required).
 
+### Addendum (2026-11-09): enum evolution (§2)
+
+- **Owner decision:** adding a value to an enum is an additive, non-breaking change under §2. Receivers map an unknown value to that enum's documented fallback instead of rejecting the message. Discriminators (`AgentEvent.t`, the `tacet/hello` `role`) are not covered: an unknown `AgentEvent.t` is ignored, as §2 already says for unknown event types. In `@tacet/core` this is `openEnum()`; each JSON Schema enum carries its fallback as `x-tacet-fallback` (#5 follow-up).
+
 ## Consequences
 
 - `docs/ARCHITECTURE.md` needs, in the PR that accepts this ADR:

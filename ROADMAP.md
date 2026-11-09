@@ -61,6 +61,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Summary packets (no transcripts upward)** — `feature` `P1` `either`
 - [ ] **Cross-project goals: split one goal into tasks across repos** — `feature` `P1` `either`
 - [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
+- [ ] **UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)** — `feature` `P2` `either`
 
 ## M3 · Context handoff & cost tiering
 

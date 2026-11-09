@@ -1,8 +1,12 @@
 import { z } from 'zod';
-import { Id, TokenCount, Urgency, Usd } from './common.js';
+import { Id, openEnum, TokenCount, Urgency, Usd } from './common.js';
 
 /** One choice offered with an approval request (vendor-neutral, mapped by each adapter). */
-export const ApprovalOption = z.enum(['allow_once', 'allow_always', 'reject', 'cancel']);
+/** Unknown values fall back to `reject`, the safe answer. */
+export const ApprovalOption = openEnum(
+  ['allow_once', 'allow_always', 'reject', 'cancel'],
+  'reject',
+);
 export type ApprovalOption = z.infer<typeof ApprovalOption>;
 
 /** Streamed assistant text. */
@@ -74,19 +78,17 @@ export const Usage = z.object({
   contextMax: TokenCount.optional().describe('Context window size (gauge)'),
   costUsd: Usd.optional().describe('Cost of this call in US dollars (delta)'),
   model: z.string().min(1).optional(),
-  source: z.enum(['reported', 'estimated']),
+  source: openEnum(['reported', 'estimated'], 'estimated'),
 });
 
-/** `auth_required`: the vendor CLI needs the user to log in (maps to A2A AUTH_REQUIRED). */
-export const SessionState = z.enum([
+/**
+ * `auth_required`: the vendor CLI needs the user to log in (maps to A2A AUTH_REQUIRED).
+ * Unknown values fall back to `running`.
+ */
+export const SessionState = openEnum(
+  ['running', 'idle', 'waiting_input', 'auth_required', 'cancelled', 'error', 'done'],
   'running',
-  'idle',
-  'waiting_input',
-  'auth_required',
-  'cancelled',
-  'error',
-  'done',
-]);
+);
 export type SessionState = z.infer<typeof SessionState>;
 
 export const Status = z.object({

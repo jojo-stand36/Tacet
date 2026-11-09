@@ -35,21 +35,23 @@
       "type": "string"
     },
     "scope": {
-      "type": "string",
       "enum": [
         "task",
         "repo"
-      ]
+      ],
+      "x-tacet-fallback": "task",
+      "type": "string"
     },
     "source": {
-      "type": "string",
       "enum": [
         "policy",
         "precedent",
         "mini",
         "user",
         "worker"
-      ]
+      ],
+      "x-tacet-fallback": "mini",
+      "type": "string"
     },
     "tags": {
       "default": [],
