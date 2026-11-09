@@ -114,44 +114,37 @@ function toHeaders(raw: IncomingMessage['headers']): Headers {
   return h;
 }
 
-/** After a 413, drain at most this much more before dropping the connection. */
+/** Past the limit, read and discard at most this much more before dropping the connection. */
 const DRAIN_BYTES = 16 * 1024 * 1024;
-const DRAIN_MS = 2000;
 
 /**
- * The request body, or undefined once it exceeds `limit`. An oversize body is then drained (up
- * to `DRAIN_BYTES` or `DRAIN_MS`) instead of destroyed at once: closing a socket with unread
- * input sends a reset, which on macOS can reach the client before the 413 does.
+ * The request body, or undefined when it exceeds `limit`. An oversize body is still read to its
+ * end (and discarded) before the caller answers 413: a socket closed with unread input sends a
+ * reset, and on macOS that reset reaches the client before the 413 does. Only a body larger than
+ * `limit + DRAIN_BYTES` is cut off with a reset.
  */
 function readBody(req: IncomingMessage, limit: number): Promise<Buffer | undefined> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    let over = false;
+    let ended = false;
     req.on('data', (c: Buffer) => {
       size += c.length;
-      if (over) {
-        if (size > limit + DRAIN_BYTES) req.destroy();
+      if (size > limit + DRAIN_BYTES) {
+        req.destroy();
         return;
       }
-      if (size > limit) {
-        over = true;
-        chunks.length = 0;
-        setTimeout(() => req.destroy(), DRAIN_MS).unref();
-        resolve(undefined);
-        return;
-      }
-      chunks.push(c);
+      if (size <= limit) chunks.push(c);
+      else chunks.length = 0;
     });
-    let ended = false;
     req.once('end', () => {
       ended = true;
-      resolve(over ? undefined : Buffer.concat(chunks));
+      resolve(size > limit ? undefined : Buffer.concat(chunks));
     });
-    req.once('error', (err) => (over ? undefined : reject(err)));
-    // A client that goes away mid-body never sends 'end'.
+    req.once('error', reject);
+    // A client that goes away mid-body (or is cut off above) never sends 'end'.
     req.once('close', () => {
-      if (!ended && !over) reject(new Error('request aborted'));
+      if (!ended) reject(new Error('request aborted'));
     });
   });
 }
@@ -266,7 +259,8 @@ async function serve(
   const limit = opts.maxBodyBytes ?? 1024 * 1024;
   const body = await readBody(req, limit);
   if (body === undefined) {
-    // The rest of the body is drained, not read, so this connection cannot carry another request.
+    // The body was read to its end, so the answer reaches the client; still, nothing more is
+    // accepted on a connection that sent an oversize request.
     res.setHeader('connection', 'close');
     return reply(res, 413, { error: 'request too large' });
   }

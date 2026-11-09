@@ -358,15 +358,15 @@ function fetchStatus(
           ...headers,
         },
       },
+      // Settles only once the response has ended, so a refusal that never finishes fails here.
       (res) => {
         res.resume();
-        resolve(res.statusCode ?? 0);
+        res.once('end', () => resolve(res.statusCode ?? 0));
+        res.once('error', reject);
       },
     );
-    // The server may answer (413) and close before the whole body is sent.
-    req.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code !== 'EPIPE' && err.code !== 'ECONNRESET') reject(err);
-    });
+    // Any error before the response ends (e.g. a reset instead of an answer) fails the call.
+    req.on('error', reject);
     if (method === 'GET' || method === 'DELETE') req.end();
     else
       req.end(
