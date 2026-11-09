@@ -259,6 +259,21 @@ describe('loadConfig', () => {
     expect(bad.errors.some((e) => e.startsWith('secrets.x'))).toBe(true);
   });
 
+  it('refuses a subscription login for unattended Workers, allows it for interactive ones', () => {
+    write(join(userDir, 'config.yaml'), 'auth:\n  unattended: subscription\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(
+      /auth\.unattended must be "api_key".*#65/s,
+    );
+    write(
+      join(userDir, 'config.yaml'),
+      'auth:\n  unattended: api_key\n  interactive: subscription\n',
+    );
+    expect(loadConfig({ userDir, repoRoot }).config.auth).toEqual({
+      unattended: 'api_key',
+      interactive: 'subscription',
+    });
+  });
+
   it('validates task overrides like any other layer', () => {
     expect(() => loadConfig({ userDir, task: { budget: { per_task_usd: -1 } } })).toThrow(
       /task overrides/,
