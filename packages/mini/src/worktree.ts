@@ -119,13 +119,12 @@ function isWithin(parent: string, candidate: string): boolean {
 }
 
 function workerSlug(workerId: string): string {
-  return (
-    workerId
-      .toLowerCase()
-      .replace(/[^a-z0-9-]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 48) || 'worker'
-  );
+  const normalized = workerId.toLowerCase().replace(/[^a-z0-9-]+/g, '-');
+  let start = 0;
+  let end = normalized.length;
+  while (start < end && normalized.charCodeAt(start) === 45) start += 1;
+  while (end > start && normalized.charCodeAt(end - 1) === 45) end -= 1;
+  return normalized.slice(start, Math.min(end, start + 48)) || 'worker';
 }
 
 function parseWorktrees(output: string): GitWorktree[] {

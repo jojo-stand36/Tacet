@@ -59,6 +59,12 @@ describe('WorktreeManager', () => {
     );
   });
 
+  it('handles worker IDs with long hyphen runs', async () => {
+    const worktree = await manager.create(`${'-'.repeat(10_000)}worker${'-'.repeat(10_000)}`);
+
+    expect(worktree.branchName).toMatch(/^tacet\/workers\/worker-/);
+  });
+
   it('creates from an explicit base branch and runs an opt-in setup command', async () => {
     await git(repository, ['checkout', '-b', 'setup-base']);
     await writeFile(path.join(repository, 'base-only.txt'), 'from setup base\n');
