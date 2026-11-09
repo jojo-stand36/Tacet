@@ -4,5 +4,6 @@
  */
 export const packageName = '@tacet/core' as const;
 
+export * from './events/projection.js';
 export * from './schema/index.js';
 export { allJsonSchemas, type JsonSchemaDocument, toJsonSchema } from './schema/json-schema.js';
