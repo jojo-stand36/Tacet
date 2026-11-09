@@ -151,7 +151,7 @@ events:
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
 - Exception: `policies` and `escalation.always_ask` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
-- Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`.
+- Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
 - `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
 
 ## 5. Packages (monorepo)
