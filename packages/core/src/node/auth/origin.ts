@@ -21,10 +21,12 @@ export interface RequestHeaders {
 }
 
 /**
- * How the request authenticates. `cookie` (browser session) always requires a matching `Origin`.
- * `bearer` (CLI, Mini-conductor, worker MCP) may omit `Origin`, but a present one must match.
+ * Who is calling. `browser`: the web UI, i.e. the unauthenticated WebSocket upgrade and every
+ * HTTP call that carries a browser session token; it always requires a matching `Origin`.
+ * `bearer`: programmatic clients with a daemon or worker token (CLI, Mini-conductor, worker MCP);
+ * they may omit `Origin`, but a present one must match.
  */
-export type RequestAuth = 'cookie' | 'bearer';
+export type RequestAuth = 'browser' | 'bearer';
 
 const reject = (reason: string, httpStatus: 401 | 403 = 403): RequestCheck => ({
   ok: false,
@@ -37,7 +39,7 @@ const reject = (reason: string, httpStatus: 401 | 403 = 403): RequestCheck => ({
  * Host and Origin checks for every HTTP and WebSocket request (ADR-003 §3.5). The `Host` must be
  * exactly a loopback name with the server's port; anything else, including a DNS-rebinding
  * hostname that resolved to 127.0.0.1, is rejected. A present `Origin` must be a page this daemon
- * served. `auth` is required so a cookie route cannot forget the Origin requirement; it fails
+ * served. `auth` is required so a browser route cannot forget the Origin requirement; it fails
  * closed for anything other than `bearer`.
  */
 export function checkHostAndOrigin(

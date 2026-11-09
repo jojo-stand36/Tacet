@@ -101,19 +101,20 @@ export const SESSION_RESPONSE_HEADERS: Readonly<Record<string, string>> = Object
   'cache-control': 'no-store',
 });
 
-export type CodeExchange =
-  | {
-      ok: true;
-      /** The new browser session token, for the server's own bookkeeping. */
-      token: Secret;
-      /** JSON body to send: `{"sessionToken":"…"}`. The page keeps it in memory only. */
-      body: string;
-    }
-  | { ok: false; httpStatus: 401 };
+export type CodeExchange = { ok: true; token: Secret } | { ok: false; httpStatus: 401 };
+
+/**
+ * JSON body for a successful `POST /auth/session`: `{"sessionToken":"…"}`. Build it only at the
+ * point of sending, so the raw token never sits in a loggable object. The page keeps the token in
+ * memory only.
+ */
+export function sessionResponseBody(token: Secret): string {
+  return JSON.stringify({ sessionToken: token.reveal() });
+}
 
 /**
  * Handler logic for `POST /auth/session`: trade a valid one-time code for a browser session
- * token, returned in the JSON body. Send it with `SESSION_RESPONSE_HEADERS`.
+ * token. Respond with `SESSION_RESPONSE_HEADERS` and `sessionResponseBody(result.token)`.
  */
 export function exchangeCode(
   codes: OneTimeCodes,
@@ -121,6 +122,5 @@ export function exchangeCode(
   code: string | undefined | null,
 ): CodeExchange {
   if (!codes.redeem(code)) return { ok: false, httpStatus: 401 };
-  const token = sessions.create();
-  return { ok: true, token, body: JSON.stringify({ sessionToken: token.reveal() }) };
+  return { ok: true, token: sessions.create() };
 }

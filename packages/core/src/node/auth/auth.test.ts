@@ -31,6 +31,7 @@ import {
   removeRuntimeFile,
   SESSION_RESPONSE_HEADERS,
   Secret,
+  sessionResponseBody,
   WorkerTokens,
   writeRuntimeFile,
 } from '../index.js';
@@ -191,19 +192,19 @@ describe('Host and Origin checks', () => {
     ['other loopback port', 'http://127.0.0.1:4101'],
   ])('rejects Origin: %s', (_label, origin) => {
     expect(checkHostAndOrigin({ host, origin }, port, 'bearer').ok).toBe(false);
-    expect(checkHostAndOrigin({ host, origin }, port, 'cookie').ok).toBe(false);
+    expect(checkHostAndOrigin({ host, origin }, port, 'browser').ok).toBe(false);
   });
 
   it.each(['http://127.0.0.1:4100', 'http://[::1]:4100', 'HTTP://LOCALHOST:4100'])(
     'accepts Origin %s',
     (origin) => {
-      expect(checkHostAndOrigin({ host, origin }, port, 'cookie').ok).toBe(true);
+      expect(checkHostAndOrigin({ host, origin }, port, 'browser').ok).toBe(true);
     },
   );
 
-  it('requires an Origin on cookie requests, not on bearer requests', () => {
-    expect(checkHostAndOrigin({ host }, port, 'cookie').ok).toBe(false);
-    expect(checkHostAndOrigin({ host, origin: '' }, port, 'cookie').ok).toBe(false);
+  it('requires an Origin on browser requests, not on bearer requests', () => {
+    expect(checkHostAndOrigin({ host }, port, 'browser').ok).toBe(false);
+    expect(checkHostAndOrigin({ host, origin: '' }, port, 'browser').ok).toBe(false);
     expect(checkHostAndOrigin({ host }, port, 'bearer').ok).toBe(true);
   });
 
@@ -298,6 +299,7 @@ describe('tacet/hello gate', () => {
       versions: [1],
       serverInfo: { name: 'conductor', version: '0' },
       newSessionId: () => 's1',
+      upgradeAuth: 'bearer',
     });
   const hello = (versions: number[], extra: Record<string, unknown> = {}) =>
     JSON.stringify({
@@ -364,6 +366,7 @@ describe('tacet/hello gate', () => {
       versions: [1],
       serverInfo: { name: 'c', version: '0' },
       newSessionId: () => 's',
+      upgradeAuth: 'bearer',
       onHello: () => {
         throw new Error('unknown repo');
       },
@@ -382,6 +385,7 @@ describe('tacet/hello gate', () => {
         versions: [1],
         serverInfo: { name: 'c', version: '0' },
         newSessionId: () => 's',
+        upgradeAuth: 'none',
         verifyBrowserSession: (t) => sessions.validate(t),
         onHello: (p) => seen.push(p),
       });
@@ -407,6 +411,59 @@ describe('tacet/hello gate', () => {
     expect(uiGate().handle(uiHello(token))).toMatchObject({ kind: 'close', code: 4401 });
   });
 
+  it('on an unauthenticated upgrade, refuses every role except ui (no cli/mini spoofing)', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const noAuth = () =>
+      new HelloGate({
+        versions: [1],
+        serverInfo: { name: 'c', version: '0' },
+        newSessionId: () => 's',
+        upgradeAuth: 'none',
+        verifyBrowserSession: (t) => sessions.validate(t),
+      });
+    expect(noAuth().handle(hello([1]))).toMatchObject({ kind: 'close', code: 4401 });
+    const miniHello = hello([1], {
+      role: 'mini',
+      repoId: 'r',
+      repoPath: '/r',
+      adapters: [],
+      miniVersion: '0',
+    });
+    expect(noAuth().handle(miniHello)).toMatchObject({ kind: 'close', code: 4401 });
+    expect(noAuth().handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'reply',
+    });
+  });
+
+  it('checks the browser session before the protocol version, and fails closed if the verifier throws', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const make = (verify: (t: string) => boolean) =>
+      new HelloGate({
+        versions: [1],
+        serverInfo: { name: 'c', version: '0' },
+        newSessionId: () => 's',
+        upgradeAuth: 'none',
+        verifyBrowserSession: verify,
+      });
+    expect(make(() => false).handle(hello([9], { role: 'ui', sessionToken: token }))).toMatchObject(
+      {
+        code: 4401,
+      },
+    );
+    const throwing = make(() => {
+      throw new Error('db down');
+    });
+    expect(throwing.handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'close',
+      code: 4401,
+    });
+    expect(throwing.handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'close',
+    });
+  });
+
   it('refuses every UI hello when no browser-session verifier is configured', () => {
     const sessions = new BrowserSessions();
     const token = sessions.create().reveal();
@@ -421,6 +478,7 @@ describe('tacet/hello gate', () => {
       versions: [1, 2],
       serverInfo: { name: 'c', version: '0' },
       newSessionId: () => 's9',
+      upgradeAuth: 'bearer',
     });
     expect(g.handle(hello([1, 2, 3]))).toMatchObject({
       kind: 'reply',
@@ -443,7 +501,11 @@ describe('one-time code browser login', () => {
     expect(exchangeCode(codes, sessions, code.reveal())).toEqual({ ok: false, httpStatus: 401 });
     if (!first.ok) throw new Error('unreachable');
     expect(first).not.toHaveProperty('setCookie');
-    const { sessionToken } = JSON.parse(first.body) as { sessionToken: string };
+    expect(inspect(first)).not.toContain(first.token.reveal());
+    expect(JSON.stringify(first)).not.toContain(first.token.reveal());
+    const { sessionToken } = JSON.parse(sessionResponseBody(first.token)) as {
+      sessionToken: string;
+    };
     expect(first.token.equals(sessionToken)).toBe(true);
     expect(sessions.validate(sessionToken)).toBe(true);
     expect(sessions.validateHeader(`Bearer ${sessionToken}`)).toBe(true);
@@ -465,7 +527,9 @@ describe('one-time code browser login', () => {
         if (req.method === 'POST' && req.url === '/auth/session') {
           const r = exchangeCode(codes, sessions, req.headers['x-code'] as string | undefined);
           if (!r.ok) return void res.writeHead(r.httpStatus).end();
-          return void res.writeHead(200, SESSION_RESPONSE_HEADERS).end(r.body);
+          return void res
+            .writeHead(200, SESSION_RESPONSE_HEADERS)
+            .end(sessionResponseBody(r.token));
         }
         res.writeHead(sessions.validateHeader(req.headers.authorization) ? 200 : 401).end();
       }),
