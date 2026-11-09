@@ -1,4 +1,4 @@
-import { DEFAULT_CONFIG, type TacetConfig, validateEffective } from './schema.js';
+import { DEFAULT_CONFIG, TacetConfig, validateEffective } from './schema.js';
 
 /** Config layers, lowest precedence first (ARCHITECTURE.md §4). */
 export const LAYER_ORDER = ['default', 'user', 'repo', 'local', 'task'] as const;
@@ -16,6 +16,15 @@ export interface ConfigLayer {
  * safety rule set lower down. Every other array is replaced by the higher layer.
  */
 export const UNION_PATHS: ReadonlySet<string> = new Set(['policies', 'escalation.always_ask']);
+
+/**
+ * Objects that a higher layer replaces whole instead of merging key by key: secret references
+ * (`{ env }` or `{ keychain }`). Merging them would keep the lower layer's credential source next
+ * to the higher one's.
+ */
+export function isAtomicPath(path: string): boolean {
+  return /^secrets\.[^.]+$/.test(path) || /^agents\.[^.]+\.env\.[^.]+$/.test(path);
+}
 
 export interface ExplainEntry {
   path: string;
@@ -66,7 +75,7 @@ export function mergeConfig(
         if (added.length > 0 || !sources.has(path)) {
           sources.set(path, [...(sources.get(path) ?? []), src]);
         }
-      } else if (isPlain(v)) {
+      } else if (isPlain(v) && !isAtomicPath(path)) {
         if (!isPlain(target[key])) {
           target[key] = {};
           for (const p of [...sources.keys()])
@@ -84,7 +93,7 @@ export function mergeConfig(
 
   const explain: ExplainEntry[] = [];
   const walk = (value: unknown, path: string) => {
-    if (isPlain(value) && !UNION_PATHS.has(path)) {
+    if (isPlain(value) && !UNION_PATHS.has(path) && !isAtomicPath(path)) {
       const keys = Object.keys(value).sort();
       if (keys.length === 0 && path)
         explain.push({ path, value: {}, sources: sources.get(path) ?? [] });
@@ -96,7 +105,13 @@ export function mergeConfig(
   walk(merged, '');
 
   const config = merged as TacetConfig;
-  return { config, explain, errors: validateEffective(config) };
+  // Each layer was validated on its own; check the combination too, so a merge rule that
+  // produces a shape no layer could have written is reported instead of used.
+  const parsed = TacetConfig.safeParse(config);
+  const shapeErrors = parsed.success
+    ? []
+    : parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
+  return { config, explain, errors: [...shapeErrors, ...validateEffective(config)] };
 }
 
 /** Human-readable `tacet config explain` output: one line per value with its source. */

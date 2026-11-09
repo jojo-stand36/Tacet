@@ -178,6 +178,48 @@ describe('loadConfig', () => {
     expect(config.secrets?.webhook).toEqual({ keychain: 'tacet/webhook' });
   });
 
+  it('replaces a secret reference whole when a higher layer switches its kind', () => {
+    const layers = (lower: object, higher: object) =>
+      mergeConfig([
+        { name: 'user', origin: 'u', data: lower },
+        { name: 'local', origin: 'l', data: higher },
+      ]);
+    const toKeychain = layers(
+      { secrets: { webhook: { env: 'WEBHOOK_TOKEN' } } },
+      { secrets: { webhook: { keychain: 'tacet/webhook' } } },
+    );
+    expect(toKeychain.config.secrets).toEqual({ webhook: { keychain: 'tacet/webhook' } });
+    expect(toKeychain.errors).toEqual([]);
+    expect(toKeychain.explain.find((e) => e.path === 'secrets.webhook')?.sources).toEqual([
+      { layer: 'local', origin: 'l' },
+    ]);
+    const toEnv = layers(
+      { secrets: { webhook: { keychain: 'tacet/webhook' } } },
+      { secrets: { webhook: { env: 'WEBHOOK_TOKEN' } } },
+    );
+    expect(toEnv.config.secrets).toEqual({ webhook: { env: 'WEBHOOK_TOKEN' } });
+
+    const agent = (env: object) => ({
+      agents: { goose: { kind: 'acp', command: ['goose'], env } },
+    });
+    const agentEnv = layers(
+      agent({ KEY: { env: 'GOOSE_KEY' }, OTHER: { env: 'OTHER' } }),
+      agent({ KEY: { keychain: 'tacet/goose' } }),
+    );
+    expect(agentEnv.config.agents?.goose?.env).toEqual({
+      KEY: { keychain: 'tacet/goose' },
+      OTHER: { env: 'OTHER' },
+    });
+    expect(agentEnv.errors).toEqual([]);
+  });
+
+  it('reports a merged config that no longer matches the schema', () => {
+    const bad = mergeConfig([
+      { name: 'user', origin: 'u', data: { secrets: { x: { env: 'A', keychain: 'b' } } } as never },
+    ]);
+    expect(bad.errors.some((e) => e.startsWith('secrets.x'))).toBe(true);
+  });
+
   it('validates task overrides like any other layer', () => {
     expect(() => loadConfig({ userDir, task: { budget: { per_task_usd: -1 } } })).toThrow(
       /task overrides/,
