@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -7,6 +8,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,7 +16,7 @@ import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, gitRepoRoot, workerGitEnv, workerWorktree } from './adapter.js';
+import { CodexAppServerAdapter, SAFE_GIT_ARGS, workerGitEnv, workerWorktree } from './adapter.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
 /**
@@ -60,7 +62,10 @@ describe('Codex Worker isolation', () => {
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  const adapter = (extra: ConstructorParameters<typeof CodexAppServerAdapter>[0] = {}) =>
+  const adapter = (
+    extra: ConstructorParameters<typeof CodexAppServerAdapter>[0] = {},
+    withRepoRoot = true,
+  ) =>
     new CodexAppServerAdapter({
       authRoute: 'api_key',
       apiBaseUrl: api.url,
@@ -73,6 +78,7 @@ describe('Codex Worker isolation', () => {
         'sandbox_workspace_write.exclude_slash_tmp': true,
       },
       baseEnv: { ...gitEnv, OPENAI_API_KEY: 'placeholder-not-a-real-key' },
+      ...(withRepoRoot ? { repoRoot: repo } : {}),
       ...extra,
     });
 
@@ -103,16 +109,26 @@ describe('Codex Worker isolation', () => {
         })
       : [];
 
-  it('finds the repo and the linked worktree git dirs', () => {
-    expect(gitRepoRoot(worktree, gitEnv)).toBe(repo);
-    expect(gitRepoRoot(repo, gitEnv)).toBe(repo);
-    expect(workerWorktree(worktree, gitEnv)).toEqual({
+  /** A fresh worktree of `repo` on a new branch. */
+  const addWorktree = (name: string) => {
+    const dir = join(root, 'worktrees', name);
+    git(repo, 'worktree', 'add', '-q', dir, '-b', `tacet/${name}`);
+    return dir;
+  };
+
+  it('checks a linked worktree against the repo root', () => {
+    expect(workerWorktree(worktree, repo)).toEqual({
       gitDir: join(repo, '.git', 'worktrees', 'task-1'),
       commonDir: join(repo, '.git'),
     });
-    // The main worktree and a non-repo are not Worker worktrees.
-    expect(workerWorktree(repo, gitEnv)).toBeUndefined();
-    expect(workerWorktree(home, gitEnv)).toBeUndefined();
+    // The main worktree and a directory outside git are not Worker worktrees.
+    expect(workerWorktree(repo, repo)).toBeUndefined();
+    expect(workerWorktree(home, repo)).toBeUndefined();
+    // A worktree of another repo is refused.
+    const other = join(root, 'other');
+    mkdirSync(other);
+    git(other, 'init', '-q');
+    expect(() => workerWorktree(other, repo)).toThrow(/refusing worktree.*separate git repository/);
   });
 
   it('unattended: commits without approval, never writes the shared .git, integrates by push', async () => {
@@ -139,24 +155,27 @@ describe('Codex Worker isolation', () => {
     for (const leak of ['REF_MOVED', 'BRANCHED', 'OBJECTS_WRITABLE', 'SHARED_WRITABLE']) {
       expect(output).not.toContain(leak);
     }
-    // No approval was needed to commit.
+    // No approval was asked for. (Under `on-request` Codex does not ask on a sandbox denial, so
+    // COMMITTED above is what proves the commit worked inside the sandbox.)
     expect(events.some((e) => e.t === 'approval.request')).toBe(false);
     // The shared .git is exactly as it was: no refs moved, no objects added or removed.
     expect(git(repo, 'for-each-ref')).toBe(refsBefore);
     expect(files(join(shared, 'objects'))).toEqual(objectsBefore);
 
     // The Mini-conductor integrates outside the sandbox with the Worker's git environment.
-    const wt = workerWorktree(worktree, gitEnv);
+    // It checks the worktree again first: the Worker could have rewritten its git dir.
+    const wt = workerWorktree(worktree, repo);
     if (!wt) throw new Error('not a worktree');
     const env = { ...gitEnv, ...workerGitEnv(wt) };
     const sha = execFileSync('git', ['-C', worktree, 'rev-parse', 'HEAD'], {
       env,
       encoding: 'utf8',
     }).trim();
-    execFileSync('git', ['-C', worktree, 'push', '-q', repo, 'HEAD:refs/heads/tacet/task-1'], {
-      env,
-      stdio: 'ignore',
-    });
+    execFileSync(
+      'git',
+      ['-C', worktree, ...SAFE_GIT_ARGS, 'push', '-q', repo, 'HEAD:refs/heads/tacet/task-1'],
+      { env, stdio: 'ignore' },
+    );
     expect(git(repo, 'rev-parse', 'tacet/task-1')).toBe(sha);
     expect(git(repo, 'log', '-1', '--format=%s', 'tacet/task-1')).toBe('work');
     expect(git(repo, 'rev-parse', 'main')).not.toBe(sha);
@@ -190,22 +209,102 @@ describe('Codex Worker isolation', () => {
       mode: 'interactive',
       baseEnv: { ...gitEnv, OPENAI_API_KEY: 'placeholder-not-a-real-key', CODEX_HOME: userHome },
     });
-    const own = join(root, 'worktrees', 'own');
-    git(repo, 'worktree', 'add', '-q', own, '-b', 'user/own');
+    const own = addWorktree('own');
     const h = await a.start({ cwd: own });
     const { output } = await run(a, h, 'echo "objects=$GIT_OBJECT_DIRECTORY"');
     await a.close(h);
     expect(files(join(userHome, 'sessions')).some((f) => f.endsWith('.jsonl'))).toBe(true);
     // The user's own session keeps its branch and git environment.
-    expect(git(own, 'symbolic-ref', 'HEAD')).toBe('refs/heads/user/own');
+    expect(git(own, 'symbolic-ref', 'HEAD')).toBe('refs/heads/tacet/own');
     expect(output).toContain('objects=\n');
   });
 
-  it('keys the state dir by an explicit repoRoot and stateDir', async () => {
+  it('keys the state dir by the repo root and stateDir; outside git, by the cwd', async () => {
     const stateDir = join(root, 'state');
-    const a = adapter({ repoRoot: repo, stateDir });
+    const a = adapter({ stateDir });
     const h = await a.start({ cwd: worktree });
     await a.close(h);
     expect(existsSync(join(repoStateDir(repo, stateDir), 'codex'))).toBe(true);
+    const plain = join(root, 'plain');
+    mkdirSync(plain);
+    const b = adapter({ stateDir }, false);
+    const h2 = await b.start({ cwd: plain });
+    await b.close(h2);
+    expect(existsSync(join(repoStateDir(plain, stateDir), 'codex'))).toBe(true);
+    // A git checkout without a trusted repo root is refused.
+    await expect(adapter({}, false).start({ cwd: worktree })).rejects.toThrow(/repoRoot/);
+  });
+
+  it('leaves the main worktree attached, and runs none of the repo hooks on start', async () => {
+    const wt = addWorktree('hooks');
+    const marker = join(root, 'hook-ran');
+    const hooks = ['post-checkout', 'reference-transaction'].map((n) =>
+      join(repo, '.git', 'hooks', n),
+    );
+    for (const hook of hooks) {
+      writeFileSync(hook, `#!/bin/sh\ntouch ${marker}\n`);
+      chmodSync(hook, 0o755);
+    }
+    const a = adapter();
+    const h = await a.start({ cwd: wt });
+    await a.close(h);
+    const m = await a.start({ cwd: repo });
+    await a.close(m);
+    for (const hook of hooks) rmSync(hook);
+    expect(existsSync(marker)).toBe(false);
+    expect(() => git(wt, 'symbolic-ref', '-q', 'HEAD')).toThrow();
+    expect(git(repo, 'symbolic-ref', 'HEAD')).toBe('refs/heads/main');
+  });
+
+  it('refuses a worktree whose git metadata the Worker rewrote, before running git', async () => {
+    const marker = join(root, 'escaped');
+    const forge = (name: string, tamper: (wt: string, gitDir: string) => void) => {
+      const wt = addWorktree(name);
+      const gitDir = join(repo, '.git', 'worktrees', name);
+      // What a Worker could write: a fake common dir in the worktree whose hooks touch a marker.
+      const evil = join(wt, 'evil');
+      mkdirSync(join(evil, 'hooks'), { recursive: true });
+      writeFileSync(join(evil, 'config'), `[core]\n\thooksPath = ${join(evil, 'hooks')}\n`);
+      for (const h of ['post-checkout', 'reference-transaction', 'pre-push']) {
+        writeFileSync(join(evil, 'hooks', h), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+      }
+      tamper(wt, gitDir);
+      return wt;
+    };
+    const cases = [
+      forge('t-commondir', (wt, gd) => writeFileSync(join(gd, 'commondir'), join(wt, 'evil'))),
+      forge('t-gitfile', (wt) => writeFileSync(join(wt, '.git'), `gitdir: ${join(wt, 'evil')}\n`)),
+      forge('t-backlink', (wt, gd) => writeFileSync(join(gd, 'gitdir'), join(wt, 'evil', '.git'))),
+      forge('t-wtconfig', (_wt, gd) => writeFileSync(join(gd, 'config.worktree'), '')),
+    ];
+    for (const wt of cases) {
+      await expect(adapter().start({ cwd: wt })).rejects.toThrow(/refusing worktree/);
+      expect(() => workerWorktree(wt, repo)).toThrow(/refusing worktree/);
+    }
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('refuses a worktree with no commit to start from', async () => {
+    const wt = addWorktree('unborn');
+    writeFileSync(join(repo, '.git', 'worktrees', 'unborn', 'HEAD'), 'ref: refs/heads/nothing\n');
+    await expect(adapter().start({ cwd: wt })).rejects.toThrow(/no commit/);
+  });
+
+  it('keeps the git dir writable for a resumed thread', async () => {
+    const wt = addWorktree('resume');
+    const a = adapter();
+    const h = await a.start({ cwd: wt });
+    await run(a, h, 'echo one > a.txt && git add a.txt && git commit -qm one && echo FIRST');
+    await a.close(h);
+    const id = h.vendorSessionId;
+    if (!id) throw new Error('no thread id');
+    const r = await a.start({ cwd: wt, resume: { vendorSessionId: id } });
+    const { output } = await run(
+      a,
+      r,
+      'echo two > b.txt && git add b.txt && git commit -qm two && echo SECOND',
+    );
+    await a.close(r);
+    expect(output).toContain('SECOND');
   });
 });

@@ -1,9 +1,9 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -82,8 +82,9 @@ export interface CodexAdapterOptions {
    */
   mode?: 'unattended' | 'interactive';
   /**
-   * The repo the Worker belongs to, which keys its state directory like the event log does.
-   * Default: the main worktree of the git repo at `cwd`, else `cwd`.
+   * The repo (main worktree) the Worker belongs to. It keys the Worker's state directory like the
+   * event log does, and is the trusted anchor its worktree is checked against. Required for an
+   * unattended Worker in a git checkout; a directory outside git is keyed by itself.
    */
   repoRoot?: string;
   /** Tacet state directory (config `events.state_dir`). Default `<HOME>/.tacet/state`. */
@@ -179,7 +180,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       // the user's ~/.codex, and the user's config.toml cannot change a Worker (#116).
       codexHome = join(
         repoStateDir(
-          this.#opts.repoRoot ?? gitRepoRoot(opts.cwd, launch.env) ?? opts.cwd,
+          workerRepoRoot(opts.cwd, this.#opts.repoRoot),
           this.#opts.stateDir ?? defaultStateDir(home),
         ),
         'codex',
@@ -201,14 +202,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // Unattended Worker in a linked worktree (#116, option B): it commits on a detached HEAD into
     // its own object store, and the only writable git path is its own worktree git dir. The
     // Mini-conductor integrates the commits outside the sandbox (see `workerGitEnv`).
-    const wt = unattended ? workerWorktree(opts.cwd, launch.env) : undefined;
+    // A Worker can write its worktree git dir, so everything in it is untrusted: it is checked
+    // against the repo root before any git command runs outside the sandbox.
+    const wt =
+      unattended && this.#opts.repoRoot !== undefined
+        ? workerWorktree(opts.cwd, this.#opts.repoRoot)
+        : undefined;
     if (wt) {
       mkdirSync(join(wt.gitDir, 'objects'), { recursive: true });
       Object.assign(launch.env, workerGitEnv(wt));
-      execFileSync('git', ['-C', opts.cwd, 'checkout', '-q', '--detach'], {
-        env: launch.env,
-        stdio: 'ignore',
-      });
+      detachHead(opts.cwd, wt, launch.env);
     }
     const gitDir = wt?.gitDir;
     const secrets = [
@@ -793,53 +796,125 @@ function privateDir(dir: string): void {
   chmodSync(dir, 0o700);
 }
 
-function git(cwd: string, env: Record<string, string>, args: string[]): string | undefined {
-  try {
-    return execFileSync('git', ['-C', cwd, 'rev-parse', '--path-format=absolute', ...args], {
-      env,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return undefined;
+/**
+ * The repo an unattended Worker belongs to. A git checkout needs the caller's `repoRoot` (the
+ * Mini-conductor knows it): what `cwd` says about its repo is writable by the Worker and so not
+ * trusted. A directory that is not a git checkout is keyed by itself.
+ */
+function workerRepoRoot(cwd: string, repoRoot: string | undefined): string {
+  if (repoRoot !== undefined) return repoRoot;
+  if (existsSync(join(cwd, '.git'))) {
+    throw new Error('unattended Codex Workers in a git checkout need the repoRoot option (#116)');
   }
+  return cwd;
 }
 
-/** The repo's main worktree for a checkout at `cwd` (any linked worktree maps to it). */
-export function gitRepoRoot(cwd: string, env: Record<string, string>): string | undefined {
-  const common = git(cwd, env, ['--git-common-dir']);
-  if (common === undefined || !isAbsolute(common)) return undefined;
-  return basename(common) === '.git' ? dirname(common) : resolve(common);
-}
-
-/** A linked worktree's own git dir and the repo's shared one. */
+/** A linked worktree's own git dir and the repo's shared one, both canonical. */
 export interface WorkerWorktree {
   gitDir: string;
   commonDir: string;
 }
 
-/** The linked worktree at `cwd`; undefined for a main worktree or no repo. */
-export function workerWorktree(
-  cwd: string,
-  env: Record<string, string>,
-): WorkerWorktree | undefined {
-  const out = git(cwd, env, ['--git-dir', '--git-common-dir']);
-  const [gitDir, commonDir] = out?.split('\n') ?? [];
-  if (!gitDir || !commonDir || !isAbsolute(gitDir) || gitDir === commonDir) return undefined;
+const real = (p: string): string => realpathSync.native(p);
+
+function readPointer(file: string, prefix: string): string {
+  if (!lstatSync(file).isFile()) throw new Error(`${file} is not a regular file`);
+  const text = readFileSync(file, 'utf8').trim();
+  return text.startsWith(prefix) ? text.slice(prefix.length).trim() : text;
+}
+
+/**
+ * The linked worktree of `repoRoot` checked out at `cwd`, or undefined when `cwd` is the main
+ * worktree or not a git checkout. The Worker can rewrite `<cwd>/.git` and its git dir (#116
+ * review): a forged `commondir` would make a later git command outside the sandbox load config
+ * and hooks the Worker wrote. So nothing is taken from git; the pointer files are read and must
+ * agree with the trusted repo root, and a `config.worktree` is refused. Throws when they do not.
+ */
+export function workerWorktree(cwd: string, repoRoot: string): WorkerWorktree | undefined {
+  try {
+    return checkWorktree(cwd, repoRoot);
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('refusing worktree')) throw err;
+    throw new Error(`refusing worktree ${cwd}: ${errorMessage(err)}`);
+  }
+}
+
+function checkWorktree(cwd: string, repoRoot: string): WorkerWorktree | undefined {
+  const dotGit = join(cwd, '.git');
+  if (!existsSync(dotGit)) return undefined;
+  const commonDir = real(join(repoRoot, '.git'));
+  const fail = (why: string): never => {
+    throw new Error(`refusing worktree ${cwd}: ${why}`);
+  };
+  if (!lstatSync(commonDir).isDirectory()) fail(`${commonDir} is not a git directory`);
+  if (lstatSync(dotGit).isDirectory()) {
+    if (real(cwd) === real(repoRoot)) return undefined;
+    fail(`it is a separate git repository, not a worktree of ${repoRoot}`);
+  }
+  const gitDir = real(resolve(cwd, readPointer(dotGit, 'gitdir:')));
+  if (dirname(gitDir) !== join(commonDir, 'worktrees')) fail('its git dir is outside the repo');
+  if (lstatSync(gitDir).isSymbolicLink() || !lstatSync(gitDir).isDirectory()) {
+    fail('its git dir is not a directory');
+  }
+  if (real(resolve(gitDir, readPointer(join(gitDir, 'commondir'), ''))) !== commonDir) {
+    fail('its commondir does not point at the repo');
+  }
+  if (real(resolve(gitDir, readPointer(join(gitDir, 'gitdir'), ''))) !== real(dotGit)) {
+    fail('its git dir does not point back at it');
+  }
+  if (existsSync(join(gitDir, 'config.worktree'))) fail('it has a config.worktree');
   return { gitDir, commonDir };
 }
 
 /**
  * Git environment of an unattended Worker in `wt` (#116): new objects go to the worktree's own
- * git dir, existing ones are read from the repo's shared store. The Mini-conductor uses the same
- * environment outside the sandbox to integrate, e.g.
- * `git push <repo> HEAD:refs/heads/tacet/<task>`.
+ * git dir, existing ones are read from the repo's shared store. The Mini-conductor integrates
+ * outside the sandbox with this environment after checking the worktree again with
+ * `workerWorktree`, and with `SAFE_GIT_ARGS`, e.g.
+ * `git <SAFE_GIT_ARGS> push <repo> HEAD:refs/heads/tacet/<task>`.
  */
 export function workerGitEnv(wt: WorkerWorktree): Record<string, string> {
   return {
     GIT_OBJECT_DIRECTORY: join(wt.gitDir, 'objects'),
     GIT_ALTERNATE_OBJECT_DIRECTORIES: join(wt.commonDir, 'objects'),
   };
+}
+
+/** For git commands run outside the sandbox on a Worker's worktree: no hooks, no fsmonitor. */
+export const SAFE_GIT_ARGS = [
+  '-c',
+  'core.hooksPath=/dev/null',
+  '-c',
+  'core.fsmonitor=false',
+] as const;
+
+/**
+ * Detach the worktree's HEAD at its current commit without a checkout: only `<git dir>/HEAD`
+ * changes, so no hooks, filters or index updates run. Git sees only PATH and HOME (never the
+ * API key). Throws when HEAD has no commit yet.
+ */
+function detachHead(cwd: string, wt: WorkerWorktree, env: Record<string, string>): void {
+  const gitEnv: Record<string, string> = {
+    ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+    ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+    ...workerGitEnv(wt),
+    GIT_DIR: wt.gitDir,
+    GIT_WORK_TREE: cwd,
+  };
+  const run = (args: string[]) =>
+    execFileSync('git', [...SAFE_GIT_ARGS, ...args], {
+      cwd,
+      env: gitEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  let sha: string;
+  try {
+    sha = run(['rev-parse', '--verify', '-q', 'HEAD^{commit}']);
+  } catch {
+    throw new Error(`worktree ${cwd} has no commit to start a Worker from`);
+  }
+  run(['update-ref', '--no-deref', 'HEAD', sha]);
 }
 
 /** Signal the process group `proc` leads (POSIX), or just `proc`. Already-gone is fine. */
