@@ -11,9 +11,9 @@ describe('chooseAuthRoute', () => {
   });
   it('follows config', () => {
     expect(chooseAuthRoute({ interactive: true }, { interactive: 'api_key' })).toBe('api_key');
-    expect(chooseAuthRoute({ interactive: false }, { unattended: 'subscription' })).toBe(
-      'subscription',
-    );
+    // Unattended sessions always use the API key (#65), whatever is passed.
+    const unchecked = { unattended: 'subscription' } as unknown as { unattended: 'api_key' };
+    expect(chooseAuthRoute({ interactive: false }, unchecked)).toBe('api_key');
   });
 });
 

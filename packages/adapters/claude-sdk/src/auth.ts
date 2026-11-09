@@ -21,14 +21,16 @@ export class AuthRoutingError extends Error {
   override name = 'AuthRoutingError';
 }
 
-/** Pick the route from config (`auth.unattended` / `auth.interactive`) and the session kind. */
+/**
+ * Pick the route from config (`auth.interactive`) and the session kind. Parallel or unattended
+ * sessions always use the API key (owner decision on #65); the config schema rejects anything
+ * else for `auth.unattended`.
+ */
 export function chooseAuthRoute(
   session: { interactive: boolean },
-  config: { unattended?: ClaudeAuthRoute; interactive?: ClaudeAuthRoute } = {},
+  config: { unattended?: 'api_key'; interactive?: ClaudeAuthRoute } = {},
 ): ClaudeAuthRoute {
-  return session.interactive
-    ? (config.interactive ?? 'subscription')
-    : (config.unattended ?? 'api_key');
+  return session.interactive ? (config.interactive ?? 'subscription') : 'api_key';
 }
 
 /**

@@ -189,7 +189,7 @@ The building blocks live in `@tacet/core/node` (`packages/core/src/node/auth/`, 
 Vendor auth and billing:
 
 - Never store, log, proxy or copy vendor OAuth or subscription tokens. Launch vendor CLIs and SDKs under the user's own login or API key.
-- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. The owner can override this in config. The same policy applies to Codex (#12): an API key for unattended or parallel Workers, and the user's own Codex login only for interactive use. Tacet never implements `chatgptAuthTokens`. Many parallel Workers on one subscription is an open risk; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
+- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. Only the interactive route is configurable: `auth.unattended` accepts only `api_key` (owner decision on #65). The same policy applies to Codex (#12): an API key for unattended or parallel Workers, and the user's own Codex login only for interactive use. Tacet never implements `chatgptAuthTokens`. Tacet never runs parallel Workers on one subscription; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
 
 Accepted residual risks (owner decision, 2026-11-09):
 
