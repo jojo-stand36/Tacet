@@ -25,14 +25,15 @@ export class AuthRoutingError extends Error {
   override name = 'AuthRoutingError';
 }
 
-/** Pick the route from config (`auth.unattended` / `auth.interactive`) and the session kind. */
+/**
+ * Pick the route from config (`auth.interactive`) and the session kind. Parallel or unattended
+ * sessions always use the API key (owner decision on #65).
+ */
 export function chooseAuthRoute(
   session: { interactive: boolean },
-  config: { unattended?: CodexAuthRoute; interactive?: CodexAuthRoute } = {},
+  config: { unattended?: 'api_key'; interactive?: CodexAuthRoute } = {},
 ): CodexAuthRoute {
-  return session.interactive
-    ? (config.interactive ?? 'subscription')
-    : (config.unattended ?? 'api_key');
+  return session.interactive ? (config.interactive ?? 'subscription') : 'api_key';
 }
 
 export interface CodexLaunch {

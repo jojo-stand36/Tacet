@@ -18,6 +18,8 @@ describe('auth routing', () => {
     expect(chooseAuthRoute({ interactive: false })).toBe('api_key');
     expect(chooseAuthRoute({ interactive: true })).toBe('subscription');
     expect(chooseAuthRoute({ interactive: true }, { interactive: 'api_key' })).toBe('api_key');
+    const unchecked = { unattended: 'subscription' } as unknown as { unattended: 'api_key' };
+    expect(chooseAuthRoute({ interactive: false }, unchecked)).toBe('api_key');
   });
 
   it('api_key names the key variable in a provider; the value never reaches argv', () => {
