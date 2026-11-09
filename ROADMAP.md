@@ -53,7 +53,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Sweep stale Worker MCP config files at startup** — `feature` `P2` `either`
 - [ ] **Scrub Worker tokens split across streamed message deltas** — `feature` `P2` `either`
 - [ ] **Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off** — `feature` `P1` `claude`
-- [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude + human`
+- [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude`
 - [ ] **Submodules and nested repos for unattended Codex Workers** — `feature` `P2` `claude + human`
 - [ ] **Rate-limit escalate and record_decision in the Mini-conductor MCP server** — `feature` `P2` `either`
 - [ ] **Prune per-Worker progress state when a Worker token is revoked** — `chore` `P2` `either`
