@@ -160,7 +160,7 @@ events:
 |---|---|
 | `@tacet/core` | Types, zod 4 protocol and event schemas ([ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)), HandoffPacket schema, config loader |
 | `@tacet/conductor` | Global daemon: registry, inbox, workflows, API for UI |
-| `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package |
+| `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package. The Worker MCP server (#18, `MiniMcpServer`) serves the ADR-003 §6 tools over Streamable HTTP at `http://127.0.0.1:<port>/mcp` to 2026-07-28 and 2025-era clients, takes identity only from the per-worker bearer token, and records every tool effect in the event log (`EventLogBackend`). `workerConfig()` mints the MCP config an adapter injects into a Worker session. |
 | `@tacet/adapter-*` | `claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty` |
 | `@tacet/web` | React UI: board, inbox, live terminals (xterm.js), cost |
 | `@tacet/tui` | Ink-based terminal mode |
