@@ -192,6 +192,10 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 - **Revisit:** when the MCP TypeScript SDK announces that it will remove legacy (`2025-11-25`) serving.
 - **Auth module:** follow-up 2 (local auth module) is now a roadmap entry in M1 (`agent:claude`, `priority:p0`, `area:security`, with a reviewer pass required).
 
+### Addendum (2026-11-09): browser session without cookies (§3.4)
+
+- **Owner decision (accepted 2026-11-09):** browser auth does not use cookies. A cookie on `127.0.0.1` is sent to every local server on that host, on any port, including dev servers a Worker starts from repo code, which could replay it. §3.4 changes as follows: `POST /auth/session` exchanges the one-time code for a **browser session token** (no `Set-Cookie`). The page keeps the token in memory only (not `localStorage`), presents it in the `tacet/hello` params on the WebSocket and as `Authorization: Bearer` on HTTP calls. The Host and Origin checks in §3.5 are unchanged. Tracked as a new M1 security issue; it replaces the cookie in the #77 auth module.
+
 ### Addendum (2026-11-09): enum evolution (§2)
 
 - **Owner decision:** adding a value to an enum is an additive, non-breaking change under §2. Receivers map an unknown value to that enum's documented fallback instead of rejecting the message. Discriminators (`AgentEvent.t`, the `tacet/hello` `role`) are not covered: an unknown `AgentEvent.t` is ignored, as §2 already says for unknown event types. In `@tacet/core` this is `openEnum()`; each JSON Schema enum carries its fallback as `x-tacet-fallback` (#5 follow-up).
