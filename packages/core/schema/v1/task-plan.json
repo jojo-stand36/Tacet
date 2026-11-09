@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:task-plan:v1",
+  "title": "Tacet task.planned payload",
+  "type": "object",
+  "properties": {
+    "subtasks": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Task id of the sub-task"
+          },
+          "goal": {
+            "type": "string",
+            "minLength": 1
+          },
+          "acceptanceCriteria": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "kind": {
+            "default": "implement",
+            "enum": [
+              "implement",
+              "review",
+              "explore"
+            ],
+            "x-tacet-fallback": "explore",
+            "type": "string"
+          },
+          "dependsOn": {
+            "default": [],
+            "description": "Ids of sub-tasks in the same plan that must complete first",
+            "uniqueItems": true,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            }
+          }
+        },
+        "required": [
+          "id",
+          "goal",
+          "acceptanceCriteria"
+        ]
+      }
+    },
+    "planner": {
+      "description": "The planner session, for audit",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "adapter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "rationale": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "subtasks"
+  ],
+  "description": "A task's plan. Invariants (checked by Tacet, not by this schema): sub-task ids are unique; dependsOn names only sub-tasks of the same plan, never the sub-task itself, and has no duplicates; the dependency graph has no cycles; each task.planned is the full current plan: a replan lists every sub-task again, completed ones included.",
+  "x-tacet-invariants": [
+    "sub-task ids are unique",
+    "dependsOn names only sub-tasks of the same plan, never the sub-task itself, and has no duplicates",
+    "the dependency graph has no cycles",
+    "each task.planned is the full current plan: a replan lists every sub-task again, completed ones included"
+  ]
+}

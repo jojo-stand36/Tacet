@@ -7,10 +7,16 @@ import type { AddressInfo } from 'node:net';
  * text, like the Claude adapter's mock:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: calls the shell tool Codex offers (`exec_command`) with `touch tool-ran.txt`.
+ * - `RUN_CMD <shell command>`: calls the same tool with the rest of the line.
+ * - `ESCALATE`: calls the Tacet MCP `escalate` tool. Codex 0.167.0 offers each MCP server as a
+ *   `namespace` tool (`mcp__<server>`) holding plain functions, and the model calls one with a
+ *   `function_call` carrying `namespace` and `name`. `requests[].tools` lists nested tools as
+ *   `namespace/name`.
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the requested model id.
  * Each request is recorded (model, effort, last user text, whether it carried a tool result and
- * whether an Authorization header was present) for assertions; header values are not kept.
+ * whether an Authorization header was present) for assertions; header values are not kept. A
+ * request carrying a tool result also records that result's text as `toolOutput`.
  */
 export interface MockResponsesApi {
   url: string;
@@ -19,7 +25,9 @@ export interface MockResponsesApi {
     effort: string | undefined;
     text: string;
     toolResult: boolean;
+    toolOutput?: string;
     authorized: boolean;
+    tools: string[];
   }[];
   close(): Promise<void>;
 }
@@ -28,26 +36,28 @@ interface InputItem {
   type?: string;
   role?: string;
   content?: string | { text?: string }[];
+  output?: string | { text?: string }[];
 }
+
+const joinText = (c: InputItem['content']): string =>
+  typeof c === 'string' ? c : (c ?? []).map((x) => x.text ?? '').join('\n');
 
 interface Body {
   model?: string;
   reasoning?: { effort?: string };
   input?: InputItem[];
-  tools?: { name?: string; type?: string }[];
+  tools?: { name?: string; type?: string; tools?: { name?: string }[] }[];
 }
 
-function lastUser(body: Body): { text: string; toolResult: boolean } {
+function lastUser(body: Body): { text: string; toolResult: boolean; toolOutput?: string } {
   const items = body.input ?? [];
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
     if (!it) continue;
-    if (it.type === 'function_call_output') return { text: '', toolResult: true };
-    if (it.role === 'user') {
-      const c = it.content;
-      const text = typeof c === 'string' ? c : (c ?? []).map((x) => x.text ?? '').join('\n');
-      return { text, toolResult: false };
+    if (it.type === 'function_call_output') {
+      return { text: '', toolResult: true, toolOutput: joinText(it.output) };
     }
+    if (it.role === 'user') return { text: joinText(it.content), toolResult: false };
   }
   return { text: '', toolResult: false };
 }
@@ -76,7 +86,13 @@ async function handle(
     effort: body.reasoning?.effort,
     text: last.text,
     toolResult: last.toolResult,
+    ...(last.toolOutput !== undefined ? { toolOutput: last.toolOutput } : {}),
     authorized: /^Bearer \S+/.test(req.headers.authorization ?? ''),
+    tools: (body.tools ?? []).flatMap((t) =>
+      t.type === 'namespace'
+        ? (t.tools ?? []).map((x) => `${t.name}/${x.name ?? ''}`)
+        : [t.name ?? t.type ?? ''],
+    ),
   });
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
   const sse = (event: Record<string, unknown> & { type: string }) =>
@@ -84,13 +100,33 @@ async function handle(
   const id = `resp_mock_${++n}`;
   sse({ type: 'response.created', response: { id } });
 
-  if (!last.toolResult && /RUN_TOOL/.test(last.text)) {
+  const runCmd = last.text.match(/RUN_CMD (.+)/)?.[1];
+  const ns = (body.tools ?? []).find(
+    (t) =>
+      t.type === 'namespace' &&
+      /tacet/.test(t.name ?? '') &&
+      (t.tools ?? []).some((x) => x.name === 'escalate'),
+  );
+  if (!last.toolResult && /ESCALATE/.test(last.text) && ns?.name) {
+    const item = {
+      type: 'function_call',
+      id: `fc_mock_${n}`,
+      call_id: `call_mock_${n}`,
+      namespace: ns.name,
+      name: 'escalate',
+      arguments: JSON.stringify({
+        question: 'Which database should the cache use?',
+        urgency: 'normal',
+      }),
+    };
+    sse({ type: 'response.output_item.added', output_index: 0, item });
+    sse({ type: 'response.output_item.done', output_index: 0, item });
+  } else if (!last.toolResult && (runCmd !== undefined || /RUN_TOOL/.test(last.text))) {
     const tools = (body.tools ?? []).map((t) => t.name ?? '');
     const name = tools.find((t) => t === 'exec_command') ?? tools.find((t) => /shell/.test(t));
-    const args =
-      name === 'exec_command'
-        ? { cmd: 'touch tool-ran.txt' }
-        : { command: ['touch', 'tool-ran.txt'] };
+    const cmd = runCmd ?? 'touch tool-ran.txt';
+    // Codex's default tool is `exec_command` ({ cmd }); older models get a `shell` tool instead.
+    const args = name && name !== 'exec_command' ? { command: ['sh', '-c', cmd] } : { cmd };
     const item = {
       type: 'function_call',
       id: `fc_mock_${n}`,

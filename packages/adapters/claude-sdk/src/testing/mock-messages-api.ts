@@ -7,10 +7,13 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `ESCALATE`: calls the Tacet MCP `escalate` tool with a fixed question: the offered tool whose
+ *   name ends in `escalate`, else `mcp__tacet__escalate` (Claude Code defers MCP tools behind
+ *   ToolSearch, so they are usually not offered by name).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the requested model id.
- * Requests are recorded (model, last user text, and the effort and beta settings the
- * binary sent; never headers that carry credentials) for assertions.
+ * Requests are recorded (model, last user text, offered tool names, and the effort and beta
+ * settings the binary sent; never headers that carry credentials) for assertions.
  */
 export interface MockRequest {
   model: string | undefined;
@@ -20,6 +23,8 @@ export interface MockRequest {
   effort?: unknown;
   /** The `anthropic-beta` header values. */
   betas: string[];
+  /** Names of the tools offered. */
+  tools: string[];
 }
 
 export interface MockMessagesApi {
@@ -37,6 +42,7 @@ interface Body {
   output_config?: { effort?: unknown };
   stream?: boolean;
   messages?: { role: string; content: string | { type: string; text?: string }[] }[];
+  tools?: { name?: string }[];
 }
 
 function lastUser(body: Body): { text: string; toolResult: boolean } {
@@ -64,6 +70,17 @@ function plan(body: Body): Block[] {
         id: `toolu_mock_${++n}`,
         name: 'Bash',
         input: { command: 'touch tool-ran.txt', description: 'create a file' },
+      },
+    ];
+  }
+  if (/ESCALATE/.test(text)) {
+    const offered = (body.tools ?? []).map((t) => t.name ?? '');
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: offered.find((t) => /tacet.*escalate$/.test(t)) ?? 'mcp__tacet__escalate',
+        input: { question: 'Which database should the cache use?', urgency: 'normal' },
       },
     ];
   }
@@ -106,6 +123,7 @@ async function handle(
       .split(',')
       .map((b) => b.trim())
       .filter(Boolean),
+    tools: (body.tools ?? []).map((t) => t.name ?? ''),
   });
   const blocks = plan(body);
   const id = `msg_mock_${++n}`;

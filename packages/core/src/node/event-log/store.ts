@@ -1,10 +1,9 @@
 import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { type Projection, project } from '../../events/projection.js';
 import { EventEnvelope } from '../../schema/envelope.js';
-import { tokenKey } from '../auth/secret.js';
+import { defaultStateDir, repoStateDir } from '../state-dir.js';
 
 /**
  * Append-only event log (ARCHITECTURE.md §3, ADR-003 §1). Driver: better-sqlite3, chosen under
@@ -53,10 +52,11 @@ export interface StoredEvent {
 
 /**
  * Retention: events older than `before` whose type starts with one of `dropTypes` are deleted.
- * The default keeps every summary-grade event (task, escalation, decision, handoff, budget and
- * `agent.usage`) forever, and drops transcript-grade events (`agent.message`, `agent.tool`,
- * `agent.approval`, `agent.status`, `agent.escalation`, `worker`) once they are old. Task state
- * replays exactly after compaction because the task projection only reads kept types.
+ * The default keeps every summary-grade event (task, escalation, decision, handoff, worker,
+ * budget and `agent.usage`) forever, and drops transcript-grade events (`agent.message`,
+ * `agent.tool`, `agent.approval`, `agent.status`, `agent.escalation`) once they are old. Task
+ * state replays exactly after compaction because the task projection only reads kept types, and
+ * a restarted Mini-conductor rebuilds its Worker pool from the kept `worker.*` events.
  */
 export interface RetentionPolicy {
   before: string;
@@ -106,11 +106,8 @@ interface Row {
  * Default event DB for a repo: `<stateDir>/<repo-hash>/events.db`, outside the repo so it is never
  * committed (`stateDir` defaults to `~/.tacet/state`, config `events.state_dir`).
  */
-export function defaultEventDbPath(
-  repoPath: string,
-  stateDir = join(homedir(), '.tacet', 'state'),
-): string {
-  return join(stateDir, tokenKey(resolve(repoPath)).slice(0, 16), 'events.db');
+export function defaultEventDbPath(repoPath: string, stateDir = defaultStateDir()): string {
+  return join(repoStateDir(repoPath, stateDir), 'events.db');
 }
 
 /**

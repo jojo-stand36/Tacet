@@ -45,8 +45,13 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 ### 2.1 Task flow
 1. User (or a workflow) gives the Conductor a goal; Conductor routes it to one or more mini-conductors as **tasks** (A2A-shaped: id, goal, acceptance criteria, budget, priority).
 2. Mini-conductor plans → sub-tasks → picks adapter+model per its tier policy → spawns workers in worktrees.
+   - The plan is one `task.planned` event (`TaskPlan`: sub-tasks with `dependsOn`), written in the same batch as one `task.created` per sub-task with `parentId`. Each `task.planned` is the full current plan: a replan lists every sub-task again, completed ones included. A sub-task's own `task.created` is authoritative for its goal and criteria. A sub-task kind a receiver does not know reads as `explore`, the read-only kind (owner decision, 2026-11-09). Dependencies live in the plan, not on `Task`, because `Task.parentId` is A2A `referenceTaskIds` and sub-tasks stay internal to the Mini-conductor ([ADR-003 §4](adr/003-wire-protocols.md#4-conductor--mini-conductor-a2a-shapes-over-a-json-rpc-websocket)).
+   - A sub-task is scheduled once every sub-task it depends on is `completed`, within the `workers` capacity limits (§4).
 3. Workers report via events and MCP tools; mini-conductor verifies (tests, lint, reviewer agent).
-4. Results roll up as **summary packets**, never transcripts.
+   - A Worker turn that ends idle with no pending escalation or approval is *finished*, not completed: it goes through verification first. One that ends with an escalation pending with the user is `input_required`. The parent task mirrors `input_required` (and `auth_required`) while a sub-task waits.
+   - An escalation answer reaches the Worker that asked as its next message, sent only between turns and recorded as `escalation.delivered` once sent. An answer the gate gives in time comes back in the tool result itself and is recorded as delivered (`inline`). An answer that arrives while no session is open (after a restart or a failed run) goes into the first message of the next session.
+   - The Worker pool is the Mini-conductor daemon in `@tacet/mini` (`MiniConductor`, #17). It runs one instance per repo (a lock file), Workers only on the API-key route, and allows a Worker's approval requests only for the exact names of its own MCP tools until policies exist (#25). `completed` keeps its A2A meaning, "done and verified", and its `task.result` has `verification.status: passed`.
+4. Results roll up as **summary packets**, never transcripts: each verified (sub-)task gets a `task.result` (`SummaryPacket`), which goes up to the Conductor as an A2A Artifact with media type `application/vnd.tacet.summary+json`.
 
 ### 2.2 Escalation flow
 - Workers call MCP `escalate({question, options?, urgency, contextRef?})`. The call does not block on a human: if the gate does not resolve it within a few seconds, it returns `pending`, and the answer arrives as the worker's next message ([ADR-003 §6](adr/003-wire-protocols.md#6-workers--mini-conductor-mcp-tool-surface)). Adapters can also surface a permission or approval request.
@@ -101,7 +106,7 @@ All events go to an append-only **event log** (SQLite) → UI timelines, replay,
 
 The log is `openEventStore()` in `@tacet/core/node` (#6). It stores each envelope verbatim, is idempotent on the envelope id, and blocks `UPDATE`/`DELETE` with triggers. State is rebuilt with pure projections (`tasksProjection` in `@tacet/core`). Retention deletes old transcript-grade events (`agent.message`, `agent.tool`, `agent.approval`, `agent.status`, `agent.escalation`) and keeps every summary-grade event, so task state replays exactly after compaction. Driver: `better-sqlite3`, chosen under [ADR-002](adr/002-language-runtime.md) decision 5 because `node:sqlite` is still a release candidate (Stability 1.2) in Node 24 and 26 as of 2026-11-09; callers use the `EventStore` interface, so moving to `node:sqlite` once it is Stable touches one file.
 
-Every state change is wrapped in an **event envelope** before it is stored or forwarded: `{v, id (ULID), ts, source, repo?, taskId?, sessionId?, correlationId?, causationId?, type, data}`. `AgentEvent` above is the payload of the `agent.*` envelope types (for example `agent.message.delta` and `agent.usage`). The other namespaces are `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `worker.*` and `budget.*`. Receivers ignore unknown fields and unknown event types. The full envelope is in [ADR-003 §1](adr/003-wire-protocols.md#1-one-transport-envelope-and-one-event-envelope).
+Every state change is wrapped in an **event envelope** before it is stored or forwarded: `{v, id (ULID), ts, source, repo?, taskId?, sessionId?, correlationId?, causationId?, type, data}`. `AgentEvent` above is the payload of the `agent.*` envelope types (for example `agent.message.delta` and `agent.usage`). The other namespaces are `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `worker.*` and `budget.*`. Worker lifecycle events are summary-grade and kept by retention: `worker.started` (`WorkerStarted`: adapter, model, `workspaceId`, `attempt`, `previousSessionId` for a replacement session), `worker.vendor_session` (the vendor's session id, once known), `worker.nudged` and `worker.ended` (`reason`: `finished`, `failed`, `stuck`, `restart`, `canceled`, `handoff`; unknown reads as `failed`; `failed` and `stuck` count against `workers.max_attempts`, the others do not). A Mini-conductor writes `worker.started` before it starts the vendor session, so a crash in between still leaves a record, and rebuilds its Worker pool from these events on restart. They name workspaces by id, never by path, because they are forwarded to the Conductor. Receivers ignore unknown fields and unknown event types. The full envelope is in [ADR-003 §1](adr/003-wire-protocols.md#1-one-transport-envelope-and-one-event-envelope).
 
 ## 4. Configuration layers
 
@@ -140,6 +145,12 @@ agents:                     # acp:<slug> agents and PTY presets
   goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
 policies:
   - { tool: Bash, match: "rm -rf *", decision: deny }
+workers:                    # Worker pool (#17); defaults shown
+  max: 4                    # running Workers per repo, all adapters (capacity governor)
+  # per_adapter: { codex-app-server: 2 }
+  stuck_after_s: 300        # silent this long: nudge
+  nudge_grace_s: 900        # still silent this much later: replace the session
+  max_attempts: 3           # failed or stuck runs (or an unknown end reason) before a sub-task fails; restarts, handoffs and cancels do not count (owner decision)
 events:
   # state_dir: ~/.tacet/state   # DB at <state_dir>/<repo-hash>/events.db, outside the repo
   retention:
@@ -149,6 +160,7 @@ events:
 **Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
 
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
+- The task layer may only **lower** `workers.*`, never raise it, because the Worker pool is repo-wide (owner decision, 2026-11-09): a raise is a config error.
 - Exception: `policies` and `escalation.always_ask` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
 - Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
@@ -160,7 +172,7 @@ events:
 |---|---|
 | `@tacet/core` | Types, zod 4 protocol and event schemas ([ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)), HandoffPacket schema, config loader |
 | `@tacet/conductor` | Global daemon: registry, inbox, workflows, API for UI |
-| `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package |
+| `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package. The Worker MCP server (#18, `MiniMcpServer`) serves the ADR-003 §6 tools over Streamable HTTP at `http://127.0.0.1:<port>/mcp` to 2026-07-28 and 2025-era clients, takes identity only from the per-worker bearer token, and records every tool effect in the event log (`EventLogBackend`). `workerConfig()` mints the MCP config an adapter injects into a Worker session. |
 | `@tacet/adapter-*` | `claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty` |
 | `@tacet/web` | React UI: board, inbox, live terminals (xterm.js), cost |
 | `@tacet/tui` | Ink-based terminal mode |
@@ -201,7 +213,11 @@ Other:
 
 - Worktree isolation by default; optional OS sandbox later.
 - **Codex Worker isolation** (owner decision, 2026-11-09; #116):
-  - The Codex sandbox's writable roots gain the Worker's *own* worktree git directory (the one `git rev-parse --git-dir` names for that worktree), and no other, so `git commit` works without an escalation each time.
+  - The Codex sandbox's writable roots gain the Worker's *own* worktree git directory (the one `git rev-parse --git-dir` names for that worktree), and no other, so `git commit` works without an escalation each time. A commit also writes objects and a branch ref to the repo's shared `.git`, so (owner decision, option B) the Worker commits on a **detached HEAD** (HEAD is per-worktree) into its **own object store**: the adapter sets `GIT_OBJECT_DIRECTORY=<worktree git dir>/objects` and `GIT_ALTERNATE_OBJECT_DIRECTORIES=<repo>/.git/objects`. The shared `.git` (refs, objects, config, hooks) stays read-only to the Worker. The Mini-conductor integrates the commits outside the sandbox (owner decision, 2026-11-09; #119): after every Worker turn that committed, it copies the Worker's new objects into the shared store, fscks them, then runs `update-ref refs/heads/tacet/<task>`, under the rules below.
+    - **Everything in the Worker's worktree and its git dir is untrusted** once the Worker has run, and a running Worker can change it at any moment (background processes outlive turns). A rewritten `commondir`, `.git` pointer file or `config.worktree` would make git, run later *outside* the sandbox, load config and hooks the Worker wrote; a `logs/HEAD` symlink would make a ref update append to any file. So, before and during any git command outside the sandbox (the adapter's detach at start, the Mini-conductor's integration): the worktree is checked against the trusted repo root by reading its pointer files (`workerWorktree`); git runs with `GIT_DIR`, `GIT_COMMON_DIR` and `GIT_WORK_TREE` set explicitly, so a later forged `commondir` is ignored, with only PATH and HOME besides (`trustedGitEnv`), and with hooks, fsmonitor, reflogs and the commit-graph off (`SAFE_GIT_ARGS`). The adapter writes the detached `HEAD` itself (temp file and rename) instead of running a checkout or `update-ref`. A repo with `extensions.worktreeConfig` (e.g. after `git sparse-checkout`) is refused: git would read `config.worktree` from the Worker-writable git dir.
+    - Worker-side commands that write shared refs (`git checkout -b`, `git branch`, `git stash`) fail in the sandbox; whether that becomes an escalation depends on the approval policy. `git checkout <existing branch>` works (HEAD is per-worktree), but the next commit then fails on the shared ref.
+    - Until a Worker's commits are integrated, the main repo's `git gc`, `git prune` and `git fsck` fail on that worktree's HEAD (`bad object worktrees/<wt>/HEAD`), and so does a `git push` *into* the repo (its connectivity check walks every worktree HEAD): one unintegrated Worker blocks pushing any other Worker's commits. Nothing is lost. That is why integration copies objects and runs `update-ref` from the main repo instead of pushing into it (#119).
+    - The object-dir variables apply to every repo the Worker touches, so a submodule, a `git clone` or a nested repo inside the worktree does not work for unattended Codex Workers yet.
   - Unattended Codex Workers get their own `CODEX_HOME` at `~/.tacet/state/<repo>/codex`; interactive sessions keep the user's `~/.codex`. The user's `config.toml` customisations (including their MCP servers) therefore do not apply to unattended Workers.
   - Codex `features.plugins` is off for unattended Workers, so a Worker start never syncs plugins from GitHub.
 - All approvals and decisions are logged and attributable.
