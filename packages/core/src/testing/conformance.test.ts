@@ -87,6 +87,15 @@ describe('conformance bench with the mock adapter', () => {
     expect(verdict(results, 'effort'), formatResults(results)).toBe('skip');
   });
 
+  it('reports drift when a listed context window is accepted but not used', async () => {
+    const adapter = new MockAdapter();
+    const results = await runConformance(adapter, {
+      ...scenario,
+      contextWindow: { applied: () => false },
+    });
+    expect(verdict(results, 'context-sizes'), formatResults(results)).toBe('drift');
+  });
+
   it('reports drift when a per-session adapter accepts a turn-level effort', async () => {
     class Lax extends MockAdapter {
       override capabilities() {

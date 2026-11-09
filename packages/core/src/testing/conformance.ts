@@ -6,6 +6,7 @@ import type {
   SessionOptions,
 } from '../adapter/types.js';
 import { AgentEvent, type SessionState } from '../schema/agent-event.js';
+import { KNOWN_EFFORTS } from '../schema/profile.js';
 
 /**
  * Conformance bench for `AgentAdapter` implementations, after Omnigent's harness test bench
@@ -442,7 +443,8 @@ const PROBES: Probe[] = [
             await turn(ctx, h, tap, prompt);
             if (sent() !== effort) return drift(`vendor got ${JSON.stringify(sent())} at launch`);
             try {
-              await ctx.adapter.send(h, { text: prompt }, { effort: String(before ?? 'low') });
+              const other = KNOWN_EFFORTS.find((e) => e !== effort) ?? 'low';
+              await ctx.adapter.send(h, { text: prompt }, { effort: other });
               return drift('per-session adapter accepted a turn-level effort');
             } catch (err) {
               return isProfileRefusal(err)
