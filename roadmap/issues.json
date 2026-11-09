@@ -1075,6 +1075,52 @@
         "agent:either"
       ],
       "body": "Follow-up from #18. The Mini-conductor MCP backend keeps per-Worker state (latest progress, the one-handoff-per-session flag) in memory keyed by Worker session. Nothing removes it when the Worker ends and its token is revoked, so a long-running Mini-conductor grows without bound.\n\n### Tasks\n- [ ] Drop a Worker's in-memory state when its token is revoked or its session ends\n- [ ] Keep anything needed later in the event log, not in memory\n\n### Acceptance criteria\n- After a Worker's token is revoked, the backend holds no state for that Worker (test)\n- A new Worker with a new session id starts with clean state (test)\n\n_See docs/ARCHITECTURE.md and ADR-003 §6 for context._"
+    },
+    {
+      "title": "Worktree manager state into the event log",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from the #16 review (PR #103). The worktree manager keeps per-worktree state in `.tacet-<id>.json` sidecar files that `touch()` mutates. AGENTS.md says state changes go through the append-only event log. Move worktree lifecycle (created, touched, merged, removed) to events, keyed by workspace id, and rebuild the registry from the log.\n\n### Tasks\n- [ ] `workspace.*` events (created, used, removed) with ids, never paths in forwarded events\n- [ ] Registry rebuilt by a projection; no sidecar files\n- [ ] Migrate or ignore existing sidecar files\n\n### Acceptance criteria\n- No mutable state files remain for worktrees (test)\n- A restarted Mini-conductor finds every live worktree from the event log (test)\n\n_See docs/ARCHITECTURE.md and AGENTS.md (Events) for context._"
+    },
+    {
+      "title": "Clean up orphaned Worker processes after a Mini-conductor crash",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #17 (architect review). If the Mini-conductor dies without closing its Workers, their vendor processes (Claude Code, `codex app-server` and their children) can keep running and writing to the worktree, and race the resumed session after a restart. The daemon cannot see them today: adapters own the processes and `AgentAdapter` exposes no process id.\n\n### Tasks\n- [ ] Let adapters report the process group of a session (e.g. an optional field on `SessionHandle`, recorded in a 0600 runtime file under `~/.tacet/run/minis/`, not in forwarded events)\n- [ ] On `start()`, signal stale process groups that belonged to this repo's previous daemon before resuming, guarding against pid reuse\n\n### Acceptance criteria\n- After a simulated crash, no Worker process from the previous run is alive when the resumed session starts (test with a real adapter against its mock API)\n\n_See docs/ARCHITECTURE.md §6 and ADR-003 §3.2._"
+    },
+    {
+      "title": "Verify that resumed Worker sessions pick up a new MCP URL and token",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #17. After a restart the Mini-conductor's MCP port and every Worker token change, and the daemon passes the new `mcpServers` together with `resume`. Whether each vendor honours a changed MCP server config on a resumed session is a vendor fact that is not verified yet (Claude Agent SDK `resume`, Codex `thread/resume` with `config.mcp_servers`).\n\n### Tasks\n- [ ] Verify per vendor at the pinned versions (`verify-vendor-facts`), live against the mocks, and record in the capability matrix\n- [ ] Where it does not work, fall back to a fresh session seeded with the last `worker.progress` (and the sub-task prompt)\n\n### Acceptance criteria\n- A resumed Worker can call an MCP tool on the restarted Mini-conductor, for each adapter (tests)\n\n_See docs/adapters/capability-matrix.md._"
+    },
+    {
+      "title": "Resume in-flight handoffs after a Mini-conductor restart",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:handoff",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #17 (architect review). A `handoff.requested` with no later `worker.started` for that sub-task means the daemon stopped between accepting a HandoffPacket and starting the successor session. On restart the successor must start from the packet instead of resuming the old vendor session.\n\n### Tasks\n- [ ] Detect pending handoffs when rebuilding state\n- [ ] Start the successor seeded from the packet (`read_task` already returns the latest packet), with `previousSessionId` and `worker.ended {reason: handoff}` for the old one\n\n### Acceptance criteria\n- Crash after `handoff.requested`, restart: the successor session starts from the packet and the old session is not resumed (test)\n\n_See docs/ARCHITECTURE.md §2.3._"
     }
   ]
 }

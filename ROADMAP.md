@@ -57,6 +57,10 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Submodules and nested repos for unattended Codex Workers** — `feature` `P2` `claude + human`
 - [ ] **Rate-limit escalate and record_decision in the Mini-conductor MCP server** — `feature` `P2` `either`
 - [ ] **Prune per-Worker progress state when a Worker token is revoked** — `chore` `P2` `either`
+- [ ] **Worktree manager state into the event log** — `chore` `P2` `either`
+- [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
+- [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
+- [ ] **Resume in-flight handoffs after a Mini-conductor restart** — `feature` `P2` `either`
 
 ## M2 · Conductor & escalation
 
