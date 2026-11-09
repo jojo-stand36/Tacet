@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -20,7 +21,7 @@ const servers = [
 describe('writeMcpConfig', () => {
   let root: string;
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'tacet-mcp-'));
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-mcp-')));
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 

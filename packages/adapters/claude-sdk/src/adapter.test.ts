@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -91,7 +91,7 @@ const result = (cost: number, extra: object = {}) => ({
 describe('ClaudeSdkAdapter (stubbed SDK)', () => {
   let root: string;
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'tacet-claude-unit-'));
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-claude-unit-')));
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
