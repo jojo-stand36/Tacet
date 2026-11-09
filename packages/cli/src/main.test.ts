@@ -14,14 +14,14 @@ import { main } from './main.js';
 
 let root: string;
 let homeDir: string;
-const run = (argv: string[], env?: NodeJS.ProcessEnv) => {
+const run = (argv: string[], pathValue?: string) => {
   const out: string[] = [];
   const err: string[] = [];
   const code = main(argv, {
     out: (t) => out.push(t),
     err: (t) => err.push(t),
     cwd: root,
-    ...(env ? { env } : {}),
+    ...(pathValue ? { path: pathValue } : {}),
     homeDir,
   });
   return { code, out: out.join('\n'), err: err.join('\n') };
@@ -64,14 +64,13 @@ describe('tacet init', () => {
     mkdirSync(bin);
     writeFileSync(join(bin, 'claude'), '#!/bin/sh\n');
     chmodSync(join(bin, 'claude'), 0o755);
-    const credential = 'not-a-real-api-key';
-    const r = run(['init'], { PATH: bin, ANTHROPIC_API_KEY: credential });
+    const r = run(['init'], bin);
     expect(r.code).toBe(0);
     expect(readFileSync(join(root, '.tacet', 'tacet.yaml'), 'utf8')).toContain('autonomy: medium');
     expect(readFileSync(join(root, '.gitignore'), 'utf8')).toBe('.tacet/local.yaml\n');
-    expect(r.out).toContain('claude: API-key environment configured; login status unknown');
-    expect(r.out).toContain('Login status is not verified');
-    expect(r.out).not.toContain(credential);
+    expect(r.out).toContain('claude: login status unknown');
+    expect(r.out).toContain('Tacet does not inspect vendor login stores or credentials');
+    expect(run(['config', 'explain', '--user-dir', homeDir]).code).toBe(0);
   });
 
   it('is idempotent and preserves customized config', () => {

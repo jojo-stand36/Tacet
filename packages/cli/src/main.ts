@@ -7,7 +7,7 @@ export interface Io {
   out: (text: string) => void;
   err: (text: string) => void;
   cwd: string;
-  env?: NodeJS.ProcessEnv;
+  path?: string;
   homeDir?: string;
 }
 
@@ -31,7 +31,7 @@ function initCommand(args: string[], io: Io): number {
       options: { repo: { type: 'string' } },
       strict: true,
     });
-    const result = initRepo(values.repo ?? io.cwd, io.env ? { env: io.env } : {});
+    const result = initRepo(values.repo ?? io.cwd, io.path ? { path: io.path } : {});
     io.out(
       result.configCreated ? 'Created .tacet/tacet.yaml.' : 'Kept existing .tacet/tacet.yaml.',
     );
@@ -44,10 +44,7 @@ function initCommand(args: string[], io: Io): number {
     io.out(
       agents.length > 0
         ? `Available agent CLIs:\n${agents
-            .map(
-              (agent) =>
-                `  ${agent.command}: API-key environment ${agent.credentialEnvConfigured ? 'configured' : 'not detected'}; login status unknown`,
-            )
+            .map((agent) => `  ${agent.command}: login status unknown`)
             .join('\n')}`
         : 'No supported agent CLIs found on PATH.',
     );

@@ -25,18 +25,11 @@ handoff:
 `;
 const LOCAL_IGNORE = '.tacet/local.yaml';
 
-const AGENT_CLIS = [
-  { command: 'claude', credentialEnv: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'] },
-  { command: 'codex', credentialEnv: ['CODEX_API_KEY', 'OPENAI_API_KEY'] },
-  { command: 'gemini', credentialEnv: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'] },
-  { command: 'opencode', credentialEnv: [] },
-  { command: 'goose', credentialEnv: ['GOOSE_API_KEY'] },
-] as const;
+const AGENT_CLIS = ['claude', 'codex', 'gemini', 'opencode', 'goose'] as const;
 
 export interface AgentCli {
   command: string;
   installed: boolean;
-  credentialEnvConfigured: boolean;
 }
 
 function requireRepoDirectory(path: string): void {
@@ -102,22 +95,15 @@ function isExecutable(path: string): boolean {
   }
 }
 
-export function detectAgentClis(
-  pathValue = process.env.PATH ?? '',
-  env: NodeJS.ProcessEnv = process.env,
-): AgentCli[] {
+export function detectAgentClis(pathValue = process.env.PATH ?? ''): AgentCli[] {
   const directories = pathValue.split(delimiter).filter(Boolean);
-  return AGENT_CLIS.map(({ command, credentialEnv }) => ({
+  return AGENT_CLIS.map((command) => ({
     command,
     installed: directories.some((directory) => isExecutable(join(directory, command))),
-    credentialEnvConfigured: credentialEnv.some((name) => Boolean(env[name])),
   }));
 }
 
-export function initRepo(
-  repoRoot: string,
-  options: { path?: string; env?: NodeJS.ProcessEnv } = {},
-): InitResult {
+export function initRepo(repoRoot: string, options: { path?: string } = {}): InitResult {
   const root = resolve(repoRoot);
   requireRepoDirectory(root);
 
@@ -154,7 +140,7 @@ export function initRepo(
   return {
     configCreated,
     gitignoreUpdated,
-    agents: detectAgentClis(options.path ?? options.env?.PATH, options.env),
+    agents: detectAgentClis(options.path),
   };
 }
 
@@ -171,7 +157,6 @@ function backupLocation(repoRoot: string, homeDir: string, now: Date): string {
 }
 
 function inspectUninstall(opts: UninstallOptions): {
-  root: string;
   tacetDir: string;
   removals: string[];
   backupPath?: string;
@@ -179,12 +164,11 @@ function inspectUninstall(opts: UninstallOptions): {
   const root = resolve(opts.repoRoot);
   requireRepoDirectory(root);
   const tacetDir = join(root, '.tacet');
-  if (!pathExists(tacetDir)) return { root, tacetDir, removals: [] };
+  if (!pathExists(tacetDir)) return { tacetDir, removals: [] };
   requireDirectory(tacetDir, '.tacet');
 
   if (opts.purge) {
     return {
-      root,
       tacetDir,
       removals: [tacetDir],
       backupPath: backupLocation(root, opts.homeDir ?? homedir(), opts.now ?? new Date()),
@@ -192,14 +176,14 @@ function inspectUninstall(opts: UninstallOptions): {
   }
 
   const configPath = join(tacetDir, 'tacet.yaml');
-  if (!pathExists(configPath)) return { root, tacetDir, removals: [] };
+  if (!pathExists(configPath)) return { tacetDir, removals: [] };
   requireRegularFile(configPath, 'Config file');
   if (readFileSync(configPath, 'utf8') !== CONFIG_CONTENT) {
-    return { root, tacetDir, removals: [] };
+    return { tacetDir, removals: [] };
   }
   const removals = [configPath];
   if (readdirSync(tacetDir).length === 1) removals.push(tacetDir);
-  return { root, tacetDir, removals };
+  return { tacetDir, removals };
 }
 
 function ensureBackupDirectories(homeDir: string, backupPath: string): void {

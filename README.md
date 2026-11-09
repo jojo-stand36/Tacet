@@ -13,7 +13,7 @@ Running one coding agent is easy. Running ten across five repos means you become
 Tacet adds a **hierarchy** so you only see what actually needs you:
 
 - **Conductor** — runs locally (web UI or terminal). Your single inbox for decisions, plus cross-project goals, global settings and cost.
-- **Mini-conductors** — installed per repo (`npx tacet init`). They plan work, spin up cheap sub-agents in isolated worktrees, verify results, answer what they can, and escalate only real decisions.
+- **Mini-conductors** — designed to run per repo. `tacet init` scaffolds repo config; it does not install or start the Mini-conductor runtime yet.
 - **Workers** — Claude Code, Codex, Gemini CLI, OpenCode, Goose or any ACP/CLI agent, typically on cheaper, lower-effort models.
 
 And it manages **context as a budget**: when a session gets heavy, Tacet has it write a structured handoff and continues in a fresh session, instead of letting quality decay through compaction.
@@ -29,7 +29,7 @@ Most tools in this space run many agents *side by side* and leave you to coordin
 5. Repo-local config you commit, like `AGENTS.md`
 6. Local-first, configurable to how you work
 
-Details and prior art: [docs/RESEARCH.md](docs/RESEARCH.md). Proposed design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Details and prior art: [docs/RESEARCH.md](docs/RESEARCH.md). Proposed design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CLI setup: [docs/CLI.md](docs/CLI.md).
 
 ## Contributing (humans and agents)
 
