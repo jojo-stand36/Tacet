@@ -21,16 +21,16 @@ import {
   type VerificationStatus,
 } from '@tacet/core';
 import type { EventStore } from '@tacet/core/node';
-import { WorktreeRefusedError } from '../git/integrate.js';
 import { TOOL_NAMES } from '../mcp/tools.js';
-import type {
-  Integrator,
-  Planner,
-  Verifier,
-  WorkerAdapter,
-  WorkerMcp,
-  Workspace,
-  Workspaces,
+import {
+  type Integrator,
+  type Planner,
+  type Verifier,
+  type WorkerAdapter,
+  type WorkerMcp,
+  type Workspace,
+  type Workspaces,
+  WorktreeRefusedError,
 } from './ports.js';
 import { RESUME_PROMPT, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
@@ -66,6 +66,8 @@ interface SessionRecord {
   workspaceId?: string;
   vendorSessionId?: string;
   ended?: string;
+  /** Its checkout failed the integrity checks: never reuse it. */
+  refused?: boolean;
 }
 
 interface EscalationRecord {
@@ -555,8 +557,15 @@ export class MiniConductor {
     const worker = this.#o.adapters[tier.adapter] as WorkerAdapter;
     const last = history.at(-1);
     // Reuse the checkout of an earlier run: a restart or a retry continues the same work.
-    const existing = last?.workspaceId ? await this.#o.workspaces.get(last.workspaceId) : undefined;
-    const workspace = existing ?? (await this.#o.workspaces.create(subtaskId));
+    // Never one whose checkout failed the integrity checks: that run gets a fresh checkout.
+    const existing =
+      last?.workspaceId && !last.refused
+        ? await this.#o.workspaces.get(last.workspaceId)
+        : undefined;
+    const sessionId = randomUUID();
+    // A new checkout is named after the session that first uses it, so a sub-task that needs a
+    // fresh one (its last failed the integrity checks) never collides with its old one.
+    const workspace = existing ?? (await this.#o.workspaces.create(sessionId));
     if (!this.#live(gen)) return;
     const resume =
       last?.ended === 'restart' &&
@@ -566,7 +575,6 @@ export class MiniConductor {
       worker.adapter.capabilities().resume
         ? { vendorSessionId: last.vendorSessionId }
         : undefined;
-    const sessionId = randomUUID();
     // Intent first: a crash after this leaves a record of the session and its checkout.
     this.#o.store.append([
       this.#env(
@@ -771,6 +779,12 @@ export class MiniConductor {
         (x) => x.taskId === run.subtaskId && !x.resolved,
       );
       if (open.length > 0) {
+        // Waiting on a person can take long: bring the commits in now, so the repo's gc and fsck
+        // keep working meanwhile. A failure here is logged, not counted.
+        if (!(await this.#integrate(run, { bestEffort: true }))) {
+          ended = true;
+          return;
+        }
         this.#o.store.append(this.#env(run.subtaskId, 'task.status', { state: 'input_required' }));
         return;
       }
@@ -830,12 +844,12 @@ export class MiniConductor {
    * integrity checks (the user is asked; nothing ran in it) or integration failed (a failed
    * attempt).
    */
-  async #integrate(run: Run): Promise<boolean> {
+  async #integrate(run: Run, opts: { bestEffort?: boolean } = {}): Promise<boolean> {
     const integrator = this.#o.integrator;
     if (!integrator) return true;
     try {
       const result = await integrator.integrate(run.subtaskId, run.workspace);
-      if (result && this.#runs.get(run.subtaskId) === run) {
+      if (result && this.#runs.get(run.subtaskId) === run && run.commit !== result.commit) {
         run.commit = result.commit;
         this.#o.store.append(
           this.#env(
@@ -849,23 +863,25 @@ export class MiniConductor {
       return true;
     } catch (err) {
       this.#errors.push(err);
-      const message = redactSecrets((err as Error).message);
       if (err instanceof WorktreeRefusedError) {
-        const now = this.#now().toISOString();
+        // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
         this.#o.store.append([
           this.#env(run.subtaskId, 'escalation.raised', {
             id: newUlid(this.#now().getTime()),
             taskId: run.subtaskId,
-            question: `The Worker's checkout for ${run.subtaskId} failed its integrity checks (${message}). Nothing was run in it. Inspect it, then answer to let the sub-task run again.`,
+            question: `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
             urgency: 'high',
-            createdAt: now,
+            createdAt: this.#now().toISOString(),
             status: 'pending',
           }),
           this.#env(run.subtaskId, 'task.status', { state: 'input_required' }),
         ]);
-        await this.#end(run, 'failed', 'checkout failed its integrity checks');
+        await this.#end(run, 'canceled', 'checkout failed its integrity checks', {
+          workspaceRefused: true,
+        });
         return false;
       }
+      if (opts.bestEffort) return true;
       this.#o.store.append(
         this.#env(
           run.subtaskId,
@@ -873,7 +889,7 @@ export class MiniConductor {
           this.#summary(run, 'failed', {
             status: 'failed',
             commands: [],
-            notes: `integrating the Worker's commits failed: ${message}`,
+            notes: `integrating the Worker's commits failed: ${redactSecrets((err as Error).message)}`,
           }),
         ),
       );
@@ -921,6 +937,7 @@ export class MiniConductor {
     run: Run,
     reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled',
     message?: string,
+    extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
     if (this.#runs.get(run.subtaskId) !== run) return;
     this.#runs.delete(run.subtaskId);
@@ -929,7 +946,7 @@ export class MiniConductor {
       this.#env(
         run.subtaskId,
         'worker.ended',
-        { sessionId: run.sessionId, reason, ...(message ? { message } : {}) },
+        { sessionId: run.sessionId, reason, ...(message ? { message } : {}), ...extra },
         run.sessionId,
       ),
     );
@@ -1016,8 +1033,10 @@ export class MiniConductor {
           if (!s) continue;
           const vendor = str('vendorSessionId');
           if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
-          else if (e.type === 'worker.ended') s.ended = str('reason') ?? 'failed';
-          else if (e.type === 'worker.progress') {
+          else if (e.type === 'worker.ended') {
+            s.ended = str('reason') ?? 'failed';
+            if (d.workspaceRefused === true) s.refused = true;
+          } else if (e.type === 'worker.progress') {
             const summary = str('summary') ?? str('message');
             if (summary) progress.set(e.taskId, summary);
           }

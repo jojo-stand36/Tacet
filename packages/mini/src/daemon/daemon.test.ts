@@ -391,7 +391,10 @@ describe('MiniConductor', () => {
     // It resumed the same vendor session in the same checkout, told that it restarted.
     const resumed = fake.sessions.find((s) => s.opts.resume);
     expect(resumed?.opts.resume?.vendorSessionId).toBe(vendor);
-    expect(resumed?.opts.cwd).toBe(join(ws.root, `ws-${id}_2`));
+    const firstWs = ofType('worker.started', `${id}/2`)[0]?.data as
+      | { workspaceId: string }
+      | undefined;
+    expect(resumed?.opts.cwd).toBe(join(ws.root, firstWs?.workspaceId ?? '?'));
     expect(ofType('worker.started', `${id}/2`).map((e) => e.data)).toEqual([
       expect.objectContaining({ attempt: 1 }),
       expect.objectContaining({ attempt: 1, previousSessionId: crashed }),
@@ -399,7 +402,14 @@ describe('MiniConductor', () => {
     // Finished work was not redone, and the plan was not made again.
     expect(ofType('worker.started', `${id}/1`)).toHaveLength(1);
     expect(ofType('task.planned', id)).toHaveLength(1);
-    expect(ws.created.filter((w) => w === `ws-${id}_2`)).toHaveLength(1);
+    // One checkout for that sub-task, reused by the resumed session.
+    expect(
+      new Set(
+        ofType('worker.started', `${id}/2`).map(
+          (e) => (e.data as { workspaceId: string }).workspaceId,
+        ),
+      ).size,
+    ).toBe(1);
   });
 
   it('re-plans a task whose plan was never written', async () => {
@@ -697,8 +707,11 @@ describe('MiniConductor review fixes', () => {
 
   it('fails a sub-task whose checkout cannot be made, and runs the others', async () => {
     const create = ws.create.bind(ws);
+    let calls = 0;
+    // The first checkout (sub-task 1, scheduled first) cannot be made.
     ws.create = async (workerId: string) => {
-      if (workerId.endsWith('/1')) throw new Error('disk full');
+      calls += 1;
+      if (calls === 1) throw new Error('disk full');
       return create(workerId);
     };
     const d = make({

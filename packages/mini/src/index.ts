@@ -18,6 +18,7 @@ export type {
   Workspace,
   Workspaces,
 } from './daemon/ports.js';
+export { WorktreeRefusedError } from './daemon/ports.js';
 export {
   blockedByFailure,
   type CapacityLimits,
@@ -29,7 +30,6 @@ export {
   type Integration,
   integrateWorktree,
   taskBranch,
-  WorktreeRefusedError,
 } from './git/integrate.js';
 export {
   type EscalationGate,

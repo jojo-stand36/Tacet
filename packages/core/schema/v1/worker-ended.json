@@ -23,6 +23,10 @@
     },
     "message": {
       "type": "string"
+    },
+    "workspaceRefused": {
+      "description": "Its checkout failed the integrity checks; the next run gets a fresh one (#119)",
+      "type": "boolean"
     }
   },
   "required": [

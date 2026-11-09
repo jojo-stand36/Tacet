@@ -12,11 +12,16 @@ export interface Workspace {
 }
 
 export interface Workspaces {
-  /** A fresh checkout for `workerId` (the sub-task id). */
+  /** A fresh checkout for the Worker session `workerId`; never an existing one. */
   create(workerId: string): Promise<Workspace>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   remove(id: string): Promise<void>;
+}
+
+/** The Worker's checkout failed its integrity checks: nothing was run in it. */
+export class WorktreeRefusedError extends Error {
+  override name = 'WorktreeRefusedError';
 }
 
 /**

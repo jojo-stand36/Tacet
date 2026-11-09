@@ -55,6 +55,10 @@ export const WorkerEnded = z.object({
   sessionId: Id,
   reason: WorkerEndReason.optional(),
   message: z.string().optional(),
+  workspaceRefused: z
+    .boolean()
+    .optional()
+    .describe('Its checkout failed the integrity checks; the next run gets a fresh one (#119)'),
 });
 export type WorkerEnded = z.infer<typeof WorkerEnded>;
 

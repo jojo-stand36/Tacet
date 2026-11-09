@@ -1,5 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
 /**
@@ -21,9 +30,27 @@ export interface WorkerWorktree {
 
 const real = (p: string): string => realpathSync.native(p);
 
+/**
+ * Read a small file the Worker may have written, safely: never through a symlink, never blocking
+ * (a FIFO), only a regular file (checked on the open descriptor, so it cannot be swapped between
+ * the check and the read), and at most `maxBytes`.
+ */
+export function readWorkerFile(file: string, maxBytes = 4096): string {
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${file} is not a regular file`);
+    if (st.size > maxBytes) throw new Error(`${file} is larger than ${maxBytes} bytes`);
+    const buf = Buffer.alloc(maxBytes);
+    const n = readSync(fd, buf, 0, maxBytes, 0);
+    return buf.subarray(0, n).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
 function readPointer(file: string, prefix: string): string {
-  if (!lstatSync(file).isFile()) throw new Error(`${file} is not a regular file`);
-  const text = readFileSync(file, 'utf8').trim();
+  const text = readWorkerFile(file).trim();
   return text.startsWith(prefix) ? text.slice(prefix.length).trim() : text;
 }
 

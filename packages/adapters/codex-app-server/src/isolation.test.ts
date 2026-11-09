@@ -172,7 +172,7 @@ describe('Codex Worker isolation', () => {
 
   // Several real Codex turns: each has its own deadline in `run`, so a hang still fails with a
   // dump; the test as a whole needs more than the 5 s default.
-  it('unattended: commits without approval, never writes the shared .git, integrates by push', {
+  it('unattended: commits without approval into its own store, never writes the shared .git', {
     timeout: 30_000,
   }, async () => {
     const shared = join(repo, '.git');
@@ -217,24 +217,19 @@ describe('Codex Worker isolation', () => {
     expect(git(repo, 'for-each-ref')).toBe(refsBefore);
     expect(files(join(shared, 'objects'))).toEqual(objectsBefore);
 
-    // The Mini-conductor integrates outside the sandbox with the Worker's git environment.
-    // It checks the worktree again first: the Worker could have rewritten its git dir.
+    // The commit is in the Worker's own store, read with the trusted environment after checking
+    // the worktree again. Bringing it into the repo is the Mini-conductor's job (#119,
+    // `integrateWorktree` in @tacet/mini, tested there).
     const wt = workerWorktree(worktree, repo);
     if (!wt) throw new Error('not a worktree');
     const env = trustedGitEnv(worktree, wt, gitEnv);
-    const sha = execFileSync('git', [...SAFE_GIT_ARGS, 'rev-parse', 'HEAD'], {
-      cwd: worktree,
-      env,
-      encoding: 'utf8',
-    }).trim();
-    execFileSync('git', [...SAFE_GIT_ARGS, 'push', '-q', repo, 'HEAD:refs/heads/tacet/task-1'], {
-      cwd: worktree,
-      env,
-      stdio: 'ignore',
-    });
-    expect(git(repo, 'rev-parse', 'tacet/task-1')).toBe(sha);
-    expect(git(repo, 'log', '-1', '--format=%s', 'tacet/task-1')).toBe('work');
-    expect(git(repo, 'rev-parse', 'main')).not.toBe(sha);
+    expect(
+      execFileSync('git', [...SAFE_GIT_ARGS, 'log', '-1', '--format=%s', 'HEAD'], {
+        cwd: worktree,
+        env,
+        encoding: 'utf8',
+      }).trim(),
+    ).toBe('work');
 
     const codexHome = join(repoStateDir(repo, join(home, '.tacet', 'state')), 'codex');
     expect(statSync(codexHome).mode & 0o777).toBe(0o700);

@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { tasksProjection } from '@tacet/core';
+import { newUlid, tasksProjection } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GitIntegrator, taskBranch } from '../git/integrate.js';
@@ -144,5 +144,86 @@ describe('MiniConductor with git worktrees', () => {
     );
     expect(store.query({ taskId: sub, typePrefix: 'worker.integrated' })).toHaveLength(0);
     expect(() => git(repo, ['rev-parse', '--verify', '-q', taskBranch(sub)])).toThrow();
+  });
+
+  it('spends no attempt on a refused checkout and runs again in a fresh one after the answer', async () => {
+    let first = true;
+    const d = start((cwd) => {
+      commitAsWorker(cwd);
+      if (first) {
+        first = false;
+        const wt = workerWorktree(cwd, repo);
+        if (wt) writeFileSync(join(wt.gitDir, 'commondir'), join(cwd, 'evil'));
+      }
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    const state = () => store.replay(tasksProjection).tasks[sub]?.state;
+    await expect.poll(state, { timeout: 5000 }).toBe('input_required');
+    const ended = store.query({ taskId: sub, typePrefix: 'worker.ended' })[0]?.envelope.data;
+    expect(ended).toMatchObject({ reason: 'canceled', workspaceRefused: true });
+    const escalationId = (
+      store.query({ taskId: sub, typePrefix: 'escalation.raised' })[0]?.envelope.data as
+        | { id: string }
+        | undefined
+    )?.id;
+    // The question names the checkout by id, never by path.
+    const question = (
+      store.query({ taskId: sub, typePrefix: 'escalation.raised' })[0]?.envelope.data as
+        | { question: string }
+        | undefined
+    )?.question;
+    expect(question).not.toContain(root);
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'conductor', id: 'test' },
+      taskId: sub,
+      type: 'escalation.resolved',
+      data: { escalationId, answer: 'checked; go ahead' },
+    });
+    await d.settled();
+    expect(state()).toBe('completed');
+    const started = store
+      .query({ taskId: sub, typePrefix: 'worker.started' })
+      .map((e) => e.envelope.data as { workspaceId: string; attempt: number });
+    expect(started).toHaveLength(2);
+    expect(started[1]?.workspaceId).not.toBe(started[0]?.workspaceId);
+    expect(started[1]?.attempt).toBe(1);
+  });
+
+  it('integrates while the sub-task waits on the user, so the repo stays healthy', async () => {
+    const d = start((cwd) => {
+      commitAsWorker(cwd);
+      const sub = store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope;
+      if (!sub?.taskId) return;
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'worker', id: 'w' },
+        taskId: sub.taskId,
+        sessionId: (sub.data as { sessionId: string }).sessionId,
+        type: 'escalation.raised',
+        data: {
+          id: newUlid(),
+          taskId: sub.taskId,
+          question: 'Which database?',
+          urgency: 'normal',
+          createdAt: new Date().toISOString(),
+          status: 'pending',
+        },
+      });
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect
+      .poll(() => store.replay(tasksProjection).tasks[sub]?.state, { timeout: 5000 })
+      .toBe('input_required');
+    expect(store.query({ taskId: sub, typePrefix: 'worker.integrated' })).toHaveLength(1);
+    git(repo, ['gc', '-q']);
   });
 });
