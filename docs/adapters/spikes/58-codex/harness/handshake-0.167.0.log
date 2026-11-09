@@ -1,0 +1,12 @@
+>> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"tacet-spike","title":"Tacet spike","version":"0.0.0"},"capabilities":{"experimentalApi":false}}}
+<< {"id":1,"result":{"userAgent":"tacet-spike/0.167.0 (Ubuntu 24.4.0; x86_64) unknown (tacet-spike; 0.0.0)","codexHome":"/spike/chome","platformFamily":"unix","platformOs":"linux"}}
+>> {"jsonrpc":"2.0","method":"initialized","params":{}}
+>> {"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":"/spike/wk","approvalPolicy":"on-request"}}
+<< {"method":"configWarning","params":{"summary":"Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.","details":null},"emittedAtMs":1794249857167}
+<< {"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"vm","installationId":"<redacted>","environmentId":null},"emittedAtMs":1794249857167}
+<< {"id":2,"result":{"thread":{"id":"01a1c1a0-1896-7273-b86f-14222e015708","environments":[{"environmentId":"local","cwd":"/spike/wk","runtimeWorkspaceRoots":["/spike/wk"]}],"extra":null,"sessionId":"01a1c1a0-1896-7273-b86f-14222e01570
+>> {"jsonrpc":"2.0","id":3,"method":"turn/interrupt","params":{"threadId":"01a1c1a0-1896-7273-b86f-14222e015708","turnId":"not-a-real-turn"}}
+<< {"method":"thread/started","params":{"thread":{"id":"01a1c1a0-1896-7273-b86f-14222e015708","environments":[{"environmentId":"local","cwd":"/spike/wk","runtimeWorkspaceRoots":["/spike/wk"]}],"extra":null,"sessionId":"01a1c1a0-1896-72
+<< {"error":{"code":-32600,"message":"no active turn to interrupt"},"id":3}
+>> {"jsonrpc":"2.0","id":4,"method":"turn/steer","params":{"threadId":"01a1c1a0-1896-7273-b86f-14222e015708","input":[{"type":"text","text":"hi"}],"expectedTurnId":"not-a-real-turn"}}
+<< {"error":{"code":-32600,"message":"no active turn to steer"},"id":4}
