@@ -304,9 +304,12 @@ describe('integrateWorktree', () => {
   it('keeps its working copies inside the repo .git and leaves none behind', async () => {
     const w = worker('clean');
     commitIn(w, 'k.txt', 'k\n');
-    const tmpBefore = readdirSync(tmpdir()).filter((f) => f.startsWith('tacet-'));
+    // Only the integrator's own prefixes: other test files create and remove `tacet-*` temp
+    // dirs in parallel.
+    const own = () => readdirSync(tmpdir()).filter((f) => /^tacet-(snapshot|incoming)-/.test(f));
+    const tmpBefore = own();
     await integrate(w, 'clean');
-    expect(readdirSync(tmpdir()).filter((f) => f.startsWith('tacet-'))).toEqual(tmpBefore);
+    expect(own()).toEqual(tmpBefore);
     expect(readdirSync(join(repo, '.git')).filter((f) => f.startsWith('tacet-'))).toEqual([]);
   });
 
