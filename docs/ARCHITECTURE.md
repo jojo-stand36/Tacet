@@ -193,7 +193,7 @@ Vendor auth and billing:
 
 Accepted residual risks (owner decision, 2026-11-09):
 
-- **Workers can read `~/.tacet/run`.** Workers run as the same OS user, so file modes alone cannot keep the daemon tokens in `~/.tacet/run/*.json` from them. Until the worker sandbox (#53) denies that path, a worker that reads the file can act as the Mini-conductor or Conductor. The sandbox profile closes this.
+- **Workers can read `~/.tacet/run`.** Workers run as the same OS user, so file modes alone cannot keep the daemon tokens in `~/.tacet/run/*.json` from them. Until the worker sandbox (#53) denies that path, a worker that reads the file can act as the Mini-conductor or Conductor. The sandbox profile closes this. The same holds for sibling Workers' MCP tokens in `~/.tacet/run/mcp/` (accepted interim risk, ADR-003 addendum): a Worker that reads one can act as that Worker until #53 denies the path; each file is deleted when its session closes, and the Mini-conductor revokes the token when the Worker ends.
 - **The one-time code is visible in the process list.** `tacet open` passes the URL (code in the fragment) to the browser launcher, so `ps` shows it to processes of the same user. Accepted: the code is single use, expires after 60 s, and only same-user processes can see it.
 - **Worker MCP config files** hold the worker's token. Adapters write them outside the worktree at mode 0600 and delete them when the session closes, so they cannot be committed (#11–#15).
 
