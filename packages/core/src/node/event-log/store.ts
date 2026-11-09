@@ -1,6 +1,10 @@
+import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import Database from 'better-sqlite3';
 import { type Projection, project } from '../../events/projection.js';
 import { EventEnvelope } from '../../schema/envelope.js';
+import { tokenKey } from '../auth/secret.js';
 
 /**
  * Append-only event log (ARCHITECTURE.md §3, ADR-003 §1). Driver: better-sqlite3, chosen under
@@ -98,7 +102,29 @@ interface Row {
   envelope: string;
 }
 
+/**
+ * Default event DB for a repo: `<stateDir>/<repo-hash>/events.db`, outside the repo so it is never
+ * committed (`stateDir` defaults to `~/.tacet/state`, config `events.state_dir`).
+ */
+export function defaultEventDbPath(
+  repoPath: string,
+  stateDir = join(homedir(), '.tacet', 'state'),
+): string {
+  return join(stateDir, tokenKey(resolve(repoPath)).slice(0, 16), 'events.db');
+}
+
+/**
+ * Open (creating if needed) the event log at `path`. The containing directory is created with
+ * mode 0700 and must be a real directory, not a symlink.
+ */
 export function openEventStore(path: string): EventStore {
+  if (path !== ':memory:') {
+    const dir = dirname(path);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const st = lstatSync(dir);
+    if (!st.isDirectory()) throw new Error(`event log directory ${dir} is not a directory`);
+    chmodSync(dir, 0o700);
+  }
   const db = new Database(path);
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');

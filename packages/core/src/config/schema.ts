@@ -89,7 +89,18 @@ export const TacetConfig = z.strictObject({
     )
     .optional(),
   policies: z.array(PolicyRule).optional(),
-  retention: z.strictObject({ transcript_days: z.number().int().positive() }).partial().optional(),
+  /** Event log (#6): where it lives and how long transcript-grade events are kept. */
+  events: z
+    .strictObject({
+      state_dir: NonEmpty.optional().describe(
+        'Defaults to ~/.tacet/state; the DB is <state_dir>/<repo-hash>/events.db',
+      ),
+      retention: z
+        .strictObject({ transcript_days: z.number().int().positive() })
+        .partial()
+        .optional(),
+    })
+    .optional(),
   secrets: z.record(NonEmpty, SecretRef).optional(),
 });
 /** One config file as written: every key is optional. */
@@ -103,7 +114,7 @@ export const DEFAULT_CONFIG = {
   budget: { api_key_per_month_usd: 200 },
   auth: { unattended: 'api_key', interactive: 'subscription' },
   policies: [],
-  retention: { transcript_days: 30 },
+  events: { retention: { transcript_days: 30 } },
 } satisfies TacetConfig;
 
 /** Checks that only make sense on the merged result. */

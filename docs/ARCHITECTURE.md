@@ -140,8 +140,10 @@ agents:                     # acp:<slug> agents and PTY presets
   goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
 policies:
   - { tool: Bash, match: "rm -rf *", decision: deny }
-retention:
-  transcript_days: 30
+events:
+  # state_dir: ~/.tacet/state   # DB at <state_dir>/<repo-hash>/events.db, outside the repo
+  retention:
+    transcript_days: 30     # summary events are kept forever
 ```
 
 **Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
