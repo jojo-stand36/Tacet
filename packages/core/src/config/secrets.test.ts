@@ -28,6 +28,10 @@ describe('redactSecrets', () => {
       'curl -H "Authorization: [redacted]" x',
     );
     expect(redactSecrets('Bearer short')).toBe('Bearer short');
+    for (const scheme of ['bearer', 'BEARER', 'bEaReR']) {
+      expect(redactSecrets(`${scheme} ${'Z9_-'.repeat(8)}`)).toBe('[redacted]');
+      expect(findSecrets({ h: `${scheme} ${'Z9_-'.repeat(8)}` })).toHaveLength(1);
+    }
   });
   it('does not flag an environment reference after Bearer in config', () => {
     // biome-ignore lint/suspicious/noTemplateCurlyInString: a literal ${VAR} reference is the input under test

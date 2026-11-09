@@ -205,12 +205,85 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(JSON.stringify(call)).not.toContain(LEAKY);
     const usage = tap.events.filter((e) => e.t === 'usage');
     expect(usage.map((u) => (u.t === 'usage' ? u.costUsd : 0))).toEqual([0.5, 0.25]);
-    expect(usage[0]).toMatchObject({
-      inputTokens: 6,
-      outputTokens: 2,
-      contextUsed: 10,
-      contextMax: 100,
-    });
+    // Result events carry cost only; tokens come per model call.
+    expect(usage[0]).toMatchObject({ inputTokens: 0, outputTokens: 0, source: 'estimated' });
+  });
+
+  it('reports tokens, model and context per top-level model call', async () => {
+    const stub = stubQuery();
+    const { adapter, h, tap } = await session(stub, { model: 'requested-model' });
+    const ev = (event: object, parent: string | null = null) =>
+      stub.out.push({ type: 'stream_event', parent_tool_use_id: parent, event });
+    const start = (model: string) =>
+      ev({
+        type: 'message_start',
+        message: {
+          model,
+          usage: { input_tokens: 7, cache_read_input_tokens: 3, cache_creation_input_tokens: 0 },
+        },
+      });
+    start('served-model-a');
+    ev({ type: 'message_delta', usage: { output_tokens: 4 } });
+    // A subagent's call is not counted here (result.usage excludes subagents too).
+    ev(
+      { type: 'message_start', message: { model: 'sub', usage: { input_tokens: 99 } } },
+      'toolu_x',
+    );
+    ev({ type: 'message_delta', usage: { output_tokens: 99 } }, 'toolu_x');
+    start('served-model-b');
+    ev({ type: 'message_delta', usage: { output_tokens: 5 } });
+    stub.out.push(result(0.25));
+    await usages(tap, 3);
+    const usage = tap.events.filter((e) => e.t === 'usage');
+    expect(usage).toEqual([
+      {
+        t: 'usage',
+        inputTokens: 10,
+        outputTokens: 4,
+        contextUsed: 14,
+        contextMax: 100,
+        model: 'served-model-a',
+        source: 'reported',
+      },
+      {
+        t: 'usage',
+        inputTokens: 10,
+        outputTokens: 5,
+        contextUsed: 15,
+        contextMax: 100,
+        model: 'served-model-b',
+        source: 'reported',
+      },
+      {
+        t: 'usage',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0.25,
+        contextUsed: 15,
+        contextMax: 100,
+        model: 'requested-model',
+        source: 'estimated',
+      },
+    ]);
+    await adapter.close(h);
+  });
+
+  it('a late interrupt cannot relabel a finished turn', async () => {
+    const stub = stubQuery(() => ({ still_queued: [] }));
+    const { adapter, h, tap } = await session(stub);
+    await adapter.send(h, { text: 'one' });
+    stub.out.push(result(0.1));
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 2);
+    await adapter.interrupt(h); // lands after the result was handled
+    await adapter.send(h, { text: 'two' });
+    stub.out.push(result(0.2));
+    const second = await tap.waitFor(
+      (e) => e.t === 'status' && e.state !== 'running',
+      5000,
+      tap.events.findLastIndex((e) => e.t === 'status' && e.state === 'running') + 1,
+    );
+    expect(second.event).toMatchObject({ state: 'idle' });
+    await adapter.close(h);
   });
 
   it('scrubs the Worker token from every event, even without a known prefix', async () => {
@@ -361,9 +434,12 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     const tap3 = new EventTap(other.events(cold));
     stub.out.push(result(0.9));
     stub.out.push(result(1.0));
-    await usages(tap3, 2);
+    await tap3.waitFor(
+      () => tap3.events.filter((e) => e.t === 'status' && e.state === 'idle').length >= 3,
+      5000,
+    );
     const costs = tap3.events.flatMap((e) => (e.t === 'usage' ? [e.costUsd] : []));
-    expect(costs).toEqual([undefined, 0.1]);
+    expect(costs).toEqual([0.1]);
     await other.close(cold);
   });
 });

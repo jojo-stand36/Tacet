@@ -6,7 +6,8 @@ const SECRET_PATTERNS: [string, RegExp][] = [
   ['AWS access key id', /\bAKIA[0-9A-Z]{16}\b/],
   ['Google API key', /\bAIza[0-9A-Za-z_-]{30,}/],
   ['Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
-  ['bearer token', /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/],
+  // The auth scheme is case-insensitive (RFC 9110 §11.1), as is `parseBearer`.
+  ['bearer token', /\bbearer\s+[A-Za-z0-9._~+/-]{20,}=*/i],
   ['private key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
 ];
 
@@ -31,7 +32,7 @@ export function findSecrets(value: unknown, path = ''): SecretFinding[] {
   return [];
 }
 
-const GLOBAL_PATTERNS = SECRET_PATTERNS.map(([, re]) => new RegExp(re.source, 'g'));
+const GLOBAL_PATTERNS = SECRET_PATTERNS.map(([, re]) => new RegExp(re.source, `${re.flags}g`));
 
 /**
  * Copy of `value` with every substring that looks like a credential replaced by `[redacted]`.

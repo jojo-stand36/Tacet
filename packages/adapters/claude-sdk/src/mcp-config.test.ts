@@ -9,9 +9,9 @@ import {
   symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { removeMcpConfig, writeMcpConfig } from './mcp-config.js';
+import { realish, removeMcpConfig, writeMcpConfig } from './mcp-config.js';
 
 const servers = [
   { name: 'tacet', url: 'http://127.0.0.1:1/mcp', headers: { authorization: 'Bearer t' } },
@@ -70,16 +70,41 @@ describe('writeMcpConfig', () => {
     expect(readdirSync(wt)).toEqual([]);
   });
 
-  it('refuses a directory that is a symlink', () => {
-    mkdirSync(join(root, 'real'));
-    symlinkSync(join(root, 'real'), join(root, 'mcp'));
+  it('follows symlinks before `..`, and writes to an absolute real path', () => {
+    const wt = join(root, 'wt');
+    mkdirSync(join(wt, 'sub'), { recursive: true });
+    mkdirSync(join(root, 'outside'));
+    // `outside/link/..` is `wt` once the link is followed; lexically it would be `outside`.
+    symlinkSync(join(wt, 'sub'), join(root, 'outside', 'link'));
+    expect(realish(`${join(root, 'outside', 'link')}/..`)).toBe(realish(wt));
     expect(() =>
       writeMcpConfig(servers, {
         sessionId: 's1',
-        worktree: join(root, 'wt'),
-        dir: join(root, 'mcp'),
+        worktree: wt,
+        dir: `${join(root, 'outside', 'link')}/../mcp`,
       }),
-    ).toThrow(/not a directory/);
+    ).toThrow(/outside the worktree/);
+    // A symlinked directory pointing outside the worktree is used through its real path.
+    mkdirSync(join(root, 'real'));
+    symlinkSync(join(root, 'real'), join(root, 'mcp'));
+    const path = writeMcpConfig(servers, { sessionId: 's2', worktree: wt, dir: join(root, 'mcp') });
+    expect(path).toBe(join(realish(join(root, 'real')), 's2.json'));
+  });
+
+  it('resolves a relative directory to an absolute path', () => {
+    const cwd = process.cwd();
+    process.chdir(root);
+    try {
+      const path = writeMcpConfig(servers, {
+        sessionId: 's3',
+        worktree: join(root, 'wt'),
+        dir: 'rel/mcp',
+      });
+      expect(isAbsolute(path)).toBe(true);
+      expect(path).toBe(join(realish(root), 'rel', 'mcp', 's3.json'));
+    } finally {
+      process.chdir(cwd);
+    }
   });
 
   it('refuses to overwrite an existing file and rejects path-like session ids', () => {

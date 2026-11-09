@@ -89,6 +89,13 @@ interface Session {
    * and reports no cost, because its total includes the whole earlier session.
    */
   costSoFar: number | undefined;
+  /** The top-level model call in progress: prompt tokens and model from `message_start`. */
+  call: { inputTokens: number; model: string | undefined } | undefined;
+  /** Context window of `contextMaxModel`, from `getContextUsage`. */
+  contextMax: number | undefined;
+  contextMaxModel: string | undefined;
+  /** Context size after the last model call (prompt plus output). */
+  contextUsed: number | undefined;
   mcpConfigPath: string | undefined;
   loop: Promise<void>;
 }
@@ -206,6 +213,10 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       secrets: secretsOf(opts),
       model: opts.model,
       costSoFar: opts.resume ? this.#costTotals.get(opts.resume.vendorSessionId) : 0,
+      call: undefined,
+      contextMax: undefined,
+      contextMaxModel: undefined,
+      contextUsed: undefined,
       mcpConfigPath,
       loop: Promise.resolve(),
     };
@@ -359,14 +370,23 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         }
         return;
       case 'stream_event': {
-        // Top-level text only: subagent output arrives through their tool results.
+        // Top level only: subagent output and usage arrive through their tool results and the
+        // turn's cost (`result.usage` also excludes subagents).
+        if (m.parent_tool_use_id !== null) return;
         const ev = m.event;
-        if (
-          m.parent_tool_use_id === null &&
-          ev.type === 'content_block_delta' &&
-          ev.delta.type === 'text_delta'
-        ) {
+        if (ev.type === 'content_block_delta' && ev.delta.type === 'text_delta') {
           this.#emit(s, { t: 'message.delta', text: ev.delta.text });
+        } else if (ev.type === 'message_start') {
+          const u = ev.message.usage;
+          s.call = {
+            inputTokens:
+              u.input_tokens +
+              (u.cache_creation_input_tokens ?? 0) +
+              (u.cache_read_input_tokens ?? 0),
+            model: ev.message.model || s.model,
+          };
+        } else if (ev.type === 'message_delta' && s.call) {
+          await this.#onCallEnd(s, s.call, ev.usage.output_tokens);
         }
         return;
       }
@@ -393,14 +413,46 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         return;
       }
       case 'result':
-        await this.#onResult(s, m);
+        this.#onResult(s, m);
         return;
       default:
         return;
     }
   }
 
-  async #onResult(s: Session, m: Extract<SDKMessage, { type: 'result' }>): Promise<void> {
+  /** One top-level model call finished: emit its tokens, model and the context gauge. */
+  async #onCallEnd(
+    s: Session,
+    call: NonNullable<Session['call']>,
+    outputTokens: number,
+  ): Promise<void> {
+    s.call = undefined;
+    s.contextUsed = call.inputTokens + outputTokens;
+    if (s.contextMax === undefined || s.contextMaxModel !== call.model) {
+      // The window depends on the model; ask once per model. `summary` makes no API calls.
+      const ctx = await s.q.getContextUsage({ detail: 'summary' }).catch(() => undefined);
+      if (ctx) {
+        s.contextMax = ctx.maxTokens;
+        s.contextMaxModel = call.model;
+      }
+    }
+    this.#emit(s, {
+      t: 'usage',
+      inputTokens: call.inputTokens,
+      outputTokens,
+      ...this.#contextFields(s),
+      ...(call.model ? { model: call.model } : {}),
+      source: 'reported',
+    });
+  }
+
+  #contextFields(s: Session): { contextUsed?: number; contextMax?: number } {
+    return s.contextUsed !== undefined && s.contextMax !== undefined
+      ? { contextUsed: s.contextUsed, contextMax: s.contextMax }
+      : {};
+  }
+
+  #onResult(s: Session, m: Extract<SDKMessage, { type: 'result' }>): void {
     const answered = m.user_message_uuids ?? (m.user_message_uuid ? [m.user_message_uuid] : []);
     if (answered.length > 0) for (const u of answered) s.pending.delete(u);
     else {
@@ -424,19 +476,20 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         if (!oldest.done) this.#costTotals.delete(oldest.value);
       }
     }
-    const context = await s.q.getContextUsage({ detail: 'summary' }).catch(() => undefined);
-    this.#emit(s, {
-      t: 'usage',
-      inputTokens:
-        m.usage.input_tokens +
-        (m.usage.cache_creation_input_tokens ?? 0) +
-        (m.usage.cache_read_input_tokens ?? 0),
-      outputTokens: m.usage.output_tokens,
-      ...(cost !== undefined ? { costUsd: cost } : {}),
-      ...(context ? { contextUsed: context.totalTokens, contextMax: context.maxTokens } : {}),
-      ...(s.model ? { model: s.model } : {}),
-      source: 'estimated',
-    });
+    // Tokens were reported per model call; this event carries the turn's cost only, so the
+    // ledger never counts tokens twice. No awaits here: the turn's end state is decided on the
+    // same tick as its result, so a late interrupt() cannot relabel it.
+    if (cost !== undefined) {
+      this.#emit(s, {
+        t: 'usage',
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: cost,
+        ...this.#contextFields(s),
+        ...(s.model ? { model: s.model } : {}),
+        source: 'estimated',
+      });
+    }
 
     if (s.interrupting) {
       s.interrupting = false;
