@@ -63,6 +63,21 @@ describe('Codex Worker isolation', () => {
     git(repo, 'init', '-q', '-b', 'main');
     git(repo, 'commit', '-q', '--allow-empty', '-m', 'init');
     git(repo, 'worktree', 'add', '-q', worktree, '-b', 'tacet/task-1');
+    // macOS: the first run of the Xcode `git` shim on a fresh machine builds xcrun's cache, which
+    // can outlast a turn deadline inside the sandbox. The Mini-conductor runs git outside the
+    // sandbox before any Worker starts, so warm it the same way.
+    if (process.platform === 'darwin') {
+      for (const cmd of [
+        ['git', '--version'],
+        ['xcrun', '-f', 'git'],
+      ]) {
+        try {
+          execFileSync(cmd[0] as string, cmd.slice(1), { env: gitEnv, stdio: 'ignore' });
+        } catch {
+          // Not every macOS machine has xcrun; the commit probe reports what happens.
+        }
+      }
+    }
   });
 
   afterAll(async () => {
