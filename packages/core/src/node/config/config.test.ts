@@ -144,6 +144,26 @@ describe('loadConfig', () => {
     });
     write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max: 0, maximum: 3 }\n');
     expect(() => loadConfig({ userDir, repoRoot })).toThrow(ConfigError);
+    // A typo in an adapter id is an error, not a silent no-op.
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'workers: { per_adapter: { codex-app-sever: 1 } }\n',
+    );
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/per_adapter/);
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max: 2, per_adapter: { pty: 3 } }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/more than workers.max/);
+  });
+
+  it('merges workers.per_adapter key by key across layers', () => {
+    write(
+      join(userDir, 'config.yaml'),
+      'workers: { per_adapter: { claude-sdk: 2, acp:goose: 1 } }\n',
+    );
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { per_adapter: { claude-sdk: 1 } }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.workers?.per_adapter).toEqual({
+      'claude-sdk': 1,
+      'acp:goose': 1,
+    });
   });
 
   it('reports every problem with file, line and column', () => {

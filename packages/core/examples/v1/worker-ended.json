@@ -1,5 +1,5 @@
 {
   "sessionId": "sess-2",
   "reason": "stuck",
-  "message": "No activity for 20 minutes after a nudge"
+  "message": "Silent for 20 minutes, 15 of them after a nudge"
 }

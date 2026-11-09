@@ -34,12 +34,13 @@
               "review",
               "explore"
             ],
-            "x-tacet-fallback": "implement",
+            "x-tacet-fallback": "explore",
             "type": "string"
           },
           "dependsOn": {
             "default": [],
             "description": "Ids of sub-tasks in the same plan that must complete first",
+            "uniqueItems": true,
             "type": "array",
             "items": {
               "type": "string",
@@ -80,5 +81,12 @@
   },
   "required": [
     "subtasks"
+  ],
+  "description": "A task's plan. Invariants (checked by Tacet, not by this schema): sub-task ids are unique; dependsOn names only sub-tasks of the same plan, never the sub-task itself, and has no duplicates; the dependency graph has no cycles; each task.planned is the full current plan: a replan lists every sub-task again, completed ones included.",
+  "x-tacet-invariants": [
+    "sub-task ids are unique",
+    "dependsOn names only sub-tasks of the same plan, never the sub-task itself, and has no duplicates",
+    "the dependency graph has no cycles",
+    "each task.planned is the full current plan: a replan lists every sub-task again, completed ones included"
   ]
 }

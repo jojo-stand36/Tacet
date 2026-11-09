@@ -110,16 +110,26 @@ export const TacetConfig = z.strictObject({
     .optional(),
   secrets: z.record(NonEmpty, SecretRef).optional(),
   /**
-   * Worker pool (#17). Capacity governor after Gas Town's `max_polecats` (ADR-001): `max` counts
-   * every running Worker of the repo, `per_adapter` caps one adapter further. Health thresholds
-   * after Gas Town's stale / very-stale heartbeats: a silent Worker is nudged after
-   * `stuck_after_s` and replaced after `nudge_grace_s` more. A sub-task fails for good after
-   * `max_attempts` failed runs (a Mini-conductor restart does not count).
+   * Worker pool (#17). Capacity governor after Gas Town's scheduler `max_polecats`
+   * (`docs/design/scheduler.md`, ADR-001): `max` counts every running Worker of the repo,
+   * `per_adapter` caps one adapter further. Health defaults after Gas Town's Deacon heartbeat
+   * thresholds (5 min stale, 20 min very stale; `docs/concepts/heartbeats.md` @ 466aa41): a
+   * silent Worker is nudged after `stuck_after_s` and, unlike Gas Town's poke, replaced after
+   * `nudge_grace_s` more. A sub-task fails for good after `max_attempts` failed attempts (see
+   * `WorkerEndReason` for what counts).
    */
   workers: z
     .strictObject({
       max: z.number().int().positive(),
-      per_adapter: z.record(NonEmpty, z.number().int().positive()),
+      per_adapter: z.record(
+        z
+          .string()
+          .regex(
+            /^(claude-sdk|codex-app-server|opencode|acp|pty|acp:[a-z0-9][a-z0-9-]*)$/,
+            'expected an adapter id: claude-sdk, codex-app-server, opencode, acp, pty or acp:<agent>',
+          ),
+        z.number().int().positive(),
+      ),
       stuck_after_s: z.number().int().positive(),
       nudge_grace_s: z.number().int().positive(),
       max_attempts: z.number().int().positive(),
@@ -149,6 +159,12 @@ export function validateEffective(config: TacetConfig): string[] {
   if (h?.warn !== undefined && h.handoff !== undefined && h.hard !== undefined) {
     if (!(h.warn < h.handoff && h.handoff < h.hard)) {
       errors.push('handoff: expected warn < handoff < hard');
+    }
+  }
+  const w = config.workers;
+  for (const [id, cap] of Object.entries(w?.per_adapter ?? {})) {
+    if (w?.max !== undefined && cap > w.max) {
+      errors.push(`workers.per_adapter.${id}: ${cap} is more than workers.max (${w.max})`);
     }
   }
   return errors;

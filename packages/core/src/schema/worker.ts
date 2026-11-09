@@ -14,7 +14,12 @@ export const WorkerStarted = z.object({
   adapter: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
   workspaceId: Id.optional().describe('Worktree id in the worktree registry'),
-  attempt: z.number().int().positive().optional().describe('1 for the first run of a sub-task'),
+  attempt: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe('Failed attempts so far plus one (see WorkerEndReason); 1 for the first run'),
   previousSessionId: Id.optional().describe(
     'The session this one replaces (restart, handoff or retry), like AG-UI parentRunId',
   ),
@@ -29,12 +34,18 @@ export const WorkerVendorSession = z.object({
 export type WorkerVendorSession = z.infer<typeof WorkerVendorSession>;
 
 /**
- * Why a Worker session ended. `restart`: the Mini-conductor stopped while it ran (does not count
- * as a failed attempt). `stuck`: health checks gave up on it. `handoff`: replaced by a fresh
- * session with a HandoffPacket. Unknown values fall back to `failed`.
+ * Why a Worker session ended.
+ * - `finished`: its turn ended normally. That is not "completed": the sub-task completes only
+ *   once verified (`task.status completed`, ADR-003 §4).
+ * - `failed`: it errored or its work failed verification. Counts as a failed attempt.
+ * - `stuck`: health checks gave up on it. Counts as a failed attempt.
+ * - `restart`: the Mini-conductor stopped while it ran. Does not count.
+ * - `handoff`: replaced by a fresh session with a HandoffPacket. Does not count.
+ * - `canceled`: the task was canceled. Does not count.
+ * Unknown values fall back to `failed`, and so count.
  */
 export const WorkerEndReason = openEnum(
-  ['completed', 'failed', 'stuck', 'restart', 'canceled', 'handoff'],
+  ['finished', 'failed', 'stuck', 'restart', 'canceled', 'handoff'],
   'failed',
 );
 export type WorkerEndReason = z.infer<typeof WorkerEndReason>;

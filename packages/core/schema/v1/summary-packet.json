@@ -44,11 +44,14 @@
       "type": "array",
       "items": {
         "type": "string",
-        "minLength": 1
+        "minLength": 1,
+        "pattern": "^[^/]",
+        "description": "Repo-relative POSIX path, never an absolute worktree path"
       }
     },
     "commits": {
       "default": [],
+      "description": "Full lowercase commit ids; the Mini-conductor resolves them before writing",
       "type": "array",
       "items": {
         "type": "string",

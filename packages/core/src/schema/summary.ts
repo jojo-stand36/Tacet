@@ -2,7 +2,12 @@ import { z } from 'zod';
 import { Id, openEnum, Timestamp } from './common.js';
 import { Verification } from './handoff.js';
 
-/** How a (sub-)task ended. Unknown values fall back to `failed`, so nothing reads as done. */
+/**
+ * How a (sub-)task ended. `completed` is written only with `verification.status: passed` (the
+ * Mini-conductor enforces it). `partial` and `blocked` describe the work, not the task state:
+ * `task.status` stays authoritative (`partial` goes with `failed`, `blocked` with
+ * `input_required`). Unknown values fall back to `failed`, so nothing reads as done.
+ */
 export const SummaryOutcome = openEnum(['completed', 'failed', 'partial', 'blocked'], 'failed');
 export type SummaryOutcome = z.infer<typeof SummaryOutcome>;
 
@@ -18,10 +23,19 @@ export const SummaryPacket = z.object({
   createdAt: Timestamp,
   outcome: SummaryOutcome,
   summary: z.string().min(1).describe('What was done, in a few sentences'),
-  filesTouched: z.array(z.string().min(1)).default([]),
+  filesTouched: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .regex(/^[^/]/, 'expected a repo-relative path')
+        .describe('Repo-relative POSIX path, never an absolute worktree path'),
+    )
+    .default([]),
   commits: z
     .array(z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id'))
-    .default([]),
+    .default([])
+    .describe('Full lowercase commit ids; the Mini-conductor resolves them before writing'),
   verification: Verification,
   openQuestions: z.array(z.string().min(1)).default([]),
 });

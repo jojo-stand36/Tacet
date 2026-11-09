@@ -11,7 +11,7 @@
     },
     "reason": {
       "enum": [
-        "completed",
+        "finished",
         "failed",
         "stuck",
         "restart",
