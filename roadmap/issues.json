@@ -1027,6 +1027,53 @@
         "agent:claude"
       ],
       "body": "Owner decision (2026-11-09), from the #12 review (PR #115). Builds on the Codex adapter once #115 is merged. One issue because all three change how the adapter launches Codex for a Worker.\n\n### Tasks\n- [ ] Verify the 0.167.0 config keys first (`verify-vendor-facts`): sandbox writable roots for `workspace-write` (e.g. `sandbox_workspace_write.writable_roots`) and how `thread/start` `config` or `-c` sets them; record in the capability matrix\n- [ ] Writable git dir: add the Worker's own worktree git dir (`git rev-parse --git-dir` in the worktree) to the writable roots, and nothing else; never the main repo's whole `.git`\n- [ ] Own `CODEX_HOME` for unattended Workers at `~/.tacet/state/<repo>/codex` (dir 0700, created on demand, `<repo>` as in the event log path); interactive sessions keep the user's `~/.codex`\n- [ ] `features.plugins = false` for unattended Workers (no GitHub plugin sync on start)\n- [ ] Document in the adapter README / capability matrix that the user's `config.toml` customisations do not apply to unattended Workers\n\n### Acceptance criteria\n- A Codex Worker in a git worktree can `git commit` without an approval request (test against the mock Responses API)\n- An unattended Worker's thread state lands under `~/.tacet/state/<repo>/codex`, never in `~/.codex` (test with an isolated HOME)\n- No `plugins-clone-*` directory is created for an unattended Worker\n- An interactive session still uses the user's `CODEX_HOME`\n\n_See docs/ARCHITECTURE.md §6 (Codex Worker isolation) and docs/adapters/capability-matrix.md §2._"
+    },
+    {
+      "title": "Integrate unattended Codex Worker commits from the Mini-conductor",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #116 (option B). Unattended Codex Workers commit on a detached HEAD into their worktree's own object store (`GIT_OBJECT_DIRECTORY=<wt git dir>/objects`), so their commits are not in the repo until the Mini-conductor integrates them. Until then the main repo's `git gc`, `git prune` and `git fsck` fail on that worktree's HEAD. Everything in the Worker's worktree and git dir is untrusted: git run outside the sandbox must not load config or hooks the Worker wrote.\n\n### Tasks\n- [ ] After each Worker turn that committed, and before a worktree is left idle or removed, re-check the worktree with `workerWorktree(cwd, repoRoot)` from `@tacet/adapter-codex-app-server`\n- [ ] Push with the Worker's git environment and `SAFE_GIT_ARGS`, with only PATH and HOME besides: `git <SAFE_GIT_ARGS> push <repo> HEAD:refs/heads/tacet/<task>`\n- [ ] Record the integration (commit id, ref) in the event log\n- [ ] On a refused worktree, stop the Worker and escalate; never run git there\n\n### Acceptance criteria\n- After a Worker commits, `refs/heads/tacet/<task>` in the repo points at the Worker's HEAD and `git gc` in the repo succeeds\n- A Worker that rewrote `commondir`, its `.git` file or added `config.worktree` gets no git command run on its worktree outside the sandbox, and no hook in the worktree runs (test)\n- Integration runs no repo hook (test with a `pre-push` hook)\n\n_See docs/ARCHITECTURE.md §6 (Codex Worker isolation) and docs/adapters/capability-matrix.md §2._"
+    },
+    {
+      "title": "Submodules and nested repos for unattended Codex Workers",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Follow-up from #116. Unattended Codex Workers run with `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` set, which apply to every repo the Worker touches: a submodule, a `git clone` or a nested repo inside the worktree writes its objects to the Worker's object dir and is unreadable without that environment. Decide how such repos should work (e.g. per-repo object dirs, or scoping the variables to the worktree with a git wrapper) without widening the sandbox.\n\n### Tasks\n- [ ] Reproduce with a submodule and a nested `git init` in a Worker worktree\n- [ ] Propose an approach that keeps the shared `.git` read-only; get a human decision\n- [ ] Implement and test it\n\n### Acceptance criteria\n- A Worker can commit in a submodule of its worktree without writing the parent repo's shared `.git`\n- A repo the Worker creates inside its worktree is readable without the Worker's git environment\n\n_See docs/ARCHITECTURE.md §6 (Codex Worker isolation) and docs/adapters/capability-matrix.md §2._"
+    },
+    {
+      "title": "Rate-limit escalate and record_decision in the Mini-conductor MCP server",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:security",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #18. A Worker can call `escalate` or `record_decision` in a loop, flooding the user's queue and the event log. Each call is attributed to its Worker, but nothing limits the rate.\n\n### Tasks\n- [ ] Per-Worker limits on `escalate` and `record_decision` (configurable, sane defaults), counted in the backend\n- [ ] Over the limit, answer with a tool error the model can read; append one event noting the throttling\n\n### Acceptance criteria\n- A Worker calling `escalate` past the limit gets tool errors and no new escalations are created (test)\n- Other Workers are not affected by one Worker's limit (test)\n\n_See docs/ARCHITECTURE.md and ADR-003 §6 for context._"
+    },
+    {
+      "title": "Prune per-Worker progress state when a Worker token is revoked",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #18. The Mini-conductor MCP backend keeps per-Worker state (latest progress, the one-handoff-per-session flag) in memory keyed by Worker session. Nothing removes it when the Worker ends and its token is revoked, so a long-running Mini-conductor grows without bound.\n\n### Tasks\n- [ ] Drop a Worker's in-memory state when its token is revoked or its session ends\n- [ ] Keep anything needed later in the event log, not in memory\n\n### Acceptance criteria\n- After a Worker's token is revoked, the backend holds no state for that Worker (test)\n- A new Worker with a new session id starts with clean state (test)\n\n_See docs/ARCHITECTURE.md and ADR-003 §6 for context._"
     }
   ]
 }
