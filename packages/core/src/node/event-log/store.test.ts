@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { project, type TasksState, tasksProjection } from '../../events/projection.js';
 import { EventEnvelope } from '../../schema/envelope.js';
+import { repoStateDir } from '../state-dir.js';
 import { defaultEventDbPath, type EventStore, openEventStore } from './store.js';
 
 const fixture: Record<string, unknown>[] = readFileSync(
@@ -181,6 +182,7 @@ describe('event log', () => {
     s2.close();
     expect(statSync(join(dir, 'state', 'abc')).mode & 0o777).toBe(0o700);
     const p = defaultEventDbPath('/src/api', join(dir, 'state'));
+    expect(p).toBe(join(repoStateDir('/src/api', join(dir, 'state')), 'events.db'));
     expect(p).toBe(defaultEventDbPath('/src/api/', join(dir, 'state')));
     expect(p).not.toBe(defaultEventDbPath('/src/web', join(dir, 'state')));
     expect(p.startsWith(join(dir, 'state'))).toBe(true);

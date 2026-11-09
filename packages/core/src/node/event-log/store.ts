@@ -1,10 +1,9 @@
 import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
 import { type Projection, project } from '../../events/projection.js';
 import { EventEnvelope } from '../../schema/envelope.js';
-import { tokenKey } from '../auth/secret.js';
+import { defaultStateDir, repoStateDir } from '../state-dir.js';
 
 /**
  * Append-only event log (ARCHITECTURE.md §3, ADR-003 §1). Driver: better-sqlite3, chosen under
@@ -106,11 +105,8 @@ interface Row {
  * Default event DB for a repo: `<stateDir>/<repo-hash>/events.db`, outside the repo so it is never
  * committed (`stateDir` defaults to `~/.tacet/state`, config `events.state_dir`).
  */
-export function defaultEventDbPath(
-  repoPath: string,
-  stateDir = join(homedir(), '.tacet', 'state'),
-): string {
-  return join(stateDir, tokenKey(resolve(repoPath)).slice(0, 16), 'events.db');
+export function defaultEventDbPath(repoPath: string, stateDir = defaultStateDir()): string {
+  return join(repoStateDir(repoPath, stateDir), 'events.db');
 }
 
 /**

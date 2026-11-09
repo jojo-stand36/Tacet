@@ -8,7 +8,12 @@ export {
   CodexAppServerAdapter,
   configArgs,
   grantSubset,
+  SAFE_GIT_ARGS,
   toCodexDecision,
+  trustedGitEnv,
+  type WorkerWorktree,
+  workerGitEnv,
+  workerWorktree,
 } from './adapter.js';
 export {
   API_KEY_PROVIDER_ID,
