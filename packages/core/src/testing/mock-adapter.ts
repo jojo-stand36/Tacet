@@ -1,3 +1,4 @@
+import { ProfileRefusedError } from '../adapter/errors.js';
 import type {
   AdapterCapabilities,
   AgentAdapter,
@@ -21,6 +22,8 @@ export const MOCK_CAPABILITIES: AdapterCapabilities = {
   usage: { live: true, context: true, cost: 'estimated' },
   modelSwitch: 'mid-session',
   injectContext: true,
+  effortSwitch: 'per-turn',
+  contextSizes: [1_000_000],
 };
 
 /** Behaviours the mock can silently drop while still declaring them, to test drift detection. */
@@ -29,10 +32,15 @@ export interface MockLies {
   usage?: boolean;
   approvals?: boolean;
   interrupt?: boolean;
+  /** Accepts `effort` but never applies it. */
+  effort?: boolean;
+  /** Starts with any `contextWindow`, even one it does not list. */
+  contextWindow?: boolean;
 }
 
 export interface MockAdapterOptions {
-  capabilities?: Partial<AdapterCapabilities>;
+  /** Overrides of the default capabilities; `undefined` removes an optional one. */
+  capabilities?: { [K in keyof AdapterCapabilities]?: AdapterCapabilities[K] | undefined };
   lie?: MockLies;
   /** Delay between streamed chunks, in ms. */
   tickMs?: number;
@@ -47,6 +55,7 @@ interface MockSession {
   busy: boolean;
   interrupted: boolean;
   model: string;
+  effort: string | undefined;
   context: string[];
   approvals: Map<string, (d: ApprovalDecision) => void>;
 }
@@ -66,13 +75,17 @@ export class MockAdapter implements AgentAdapter {
   readonly #lie: MockLies;
   readonly #tick: number;
   readonly #sessions = new Map<string, MockSession>();
+  /** The effort in force for the last turn any session ran (what a vendor would have got). */
+  lastEffort: string | undefined;
 
   constructor(opts: MockAdapterOptions = {}) {
-    this.#caps = {
+    const caps: Record<string, unknown> = {
       ...MOCK_CAPABILITIES,
       ...opts.capabilities,
       usage: { ...MOCK_CAPABILITIES.usage, ...opts.capabilities?.usage },
     };
+    for (const k of Object.keys(caps)) if (caps[k] === undefined) delete caps[k];
+    this.#caps = caps as unknown as AdapterCapabilities;
     this.#lie = opts.lie ?? {};
     this.#tick = opts.tickMs ?? 2;
   }
@@ -83,6 +96,16 @@ export class MockAdapter implements AgentAdapter {
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
     if (opts.resume && !this.#caps.resume) throw new Error('resume not supported');
+    if (
+      opts.contextWindow !== undefined &&
+      !this.#lie.contextWindow &&
+      !(this.#caps.contextSizes ?? []).includes(opts.contextWindow)
+    ) {
+      throw new ProfileRefusedError('contextWindow', `no ${opts.contextWindow}-token window`);
+    }
+    if (opts.effort !== undefined && !this.#caps.effortSwitch) {
+      throw new ProfileRefusedError('effort', 'effort not supported');
+    }
     const id = `mock-${++sessionCounter}`;
     const vendorSessionId =
       opts.resume && !opts.resume.fork ? opts.resume.vendorSessionId : `vendor-${id}`;
@@ -95,6 +118,7 @@ export class MockAdapter implements AgentAdapter {
       busy: false,
       interrupted: false,
       model: opts.model ?? 'mock-model',
+      effort: opts.effort,
       context: [],
       approvals: new Map(),
     };
@@ -109,6 +133,12 @@ export class MockAdapter implements AgentAdapter {
     if (opts?.model) {
       if (this.#caps.modelSwitch === 'launch-only') throw new Error('model is fixed at launch');
       s.model = opts.model;
+    }
+    if (opts?.effort !== undefined) {
+      if (this.#caps.effortSwitch !== 'per-turn') {
+        throw new ProfileRefusedError('effort', 'effort is fixed at launch');
+      }
+      if (!this.#lie.effort) s.effort = opts.effort;
     }
     s.queue.push(input.text);
     if (!s.busy) void this.#drain(s);
@@ -168,6 +198,7 @@ export class MockAdapter implements AgentAdapter {
     while (s.queue.length > 0 && this.#sessions.has(s.handle.id)) {
       const text = s.queue.shift() ?? '';
       s.interrupted = false;
+      this.lastEffort = s.effort;
       this.#emit(s, { t: 'status', state: 'running' });
       const outcome = await this.#turn(s, text);
       if (!this.#sessions.has(s.handle.id)) break;

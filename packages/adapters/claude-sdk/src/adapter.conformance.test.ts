@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionHandle } from '@tacet/core';
+import { ProfileRefusedError, type SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ClaudeSdkAdapter } from './adapter.js';
@@ -143,6 +143,8 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
       slowPrompt: 'SLOW',
       echoPrompt: 'WHO',
       altModel: 'claude-opus-5-5',
+      altEffort: 'high',
+      sentEffort: () => api.requests.at(-1)?.effort,
       timeoutMs: 60_000,
     });
     console.log(formatResults(results));
@@ -151,10 +153,63 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     const p1 = Object.fromEntries(
       results.filter((r) => r.priority === 'P1').map((r) => [r.id, r.verdict]),
     );
-    expect(p1).toMatchObject({ 'live-input': 'pass', resume: 'pass', 'model-switch': 'pass' });
+    expect(p1).toMatchObject({
+      'live-input': 'pass',
+      resume: 'pass',
+      'model-switch': 'pass',
+      effort: 'pass',
+      'context-sizes': 'pass',
+    });
     // Every session removed its MCP config file on close, and none was written in the worktree.
     expect(readdirSync(join(root, 'run', 'mcp'))).toEqual([]);
     expect(existsSync(join(worktree, '.mcp.json'))).toBe(false);
     expect(api.requests.some((r) => r.model === 'claude-opus-5-5')).toBe(true);
+  });
+
+  it('sends launch effort and the 1M beta, and refuses what the model lacks', {
+    timeout: 180_000,
+  }, async () => {
+    // Launch effort reaches the API as output_config.effort.
+    const h = await adapter.start({ cwd: worktree, model: 'claude-sonnet-4-6', effort: 'low' });
+    expect(await turn(h, new EventTap(adapter.events(h)), 'SAY low')).toBe('You said low.');
+    expect(api.requests.findLast((r) => r.text.endsWith('SAY low'))?.effort).toBe('low');
+    // claude-sonnet-4-6 lists no xhigh: refused, not silently lowered.
+    await expect(adapter.send(h, { text: 'SAY x' }, { effort: 'xhigh' })).rejects.toThrow(
+      ProfileRefusedError,
+    );
+    // A switch to a model without effort support would drop the session's effort: refused.
+    await expect(
+      adapter.send(h, { text: 'SAY x' }, { model: 'claude-sonnet-4-5' }),
+    ).rejects.toThrow(ProfileRefusedError);
+    await adapter.close(h);
+
+    // claude-sonnet-4-5 has no effort support; the SDK would drop it silently.
+    await expect(
+      adapter.start({ cwd: worktree, model: 'claude-sonnet-4-5', effort: 'high' }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError', field: 'effort' });
+    // Names Claude does not have are refused before any process starts.
+    await expect(
+      adapter.start({ cwd: worktree, model: 'claude-sonnet-4-6', effort: 'minimal' }),
+    ).rejects.toMatchObject({ field: 'effort' });
+
+    // The 1M window is an opt-in beta for Sonnet 4 and 4.5 only.
+    const big = await adapter.start({
+      cwd: worktree,
+      model: 'claude-sonnet-4-5',
+      contextWindow: 1_000_000,
+    });
+    expect(await turn(big, new EventTap(adapter.events(big)), 'SAY big')).toBe('You said big.');
+    expect(api.requests.findLast((r) => r.text.endsWith('SAY big'))?.betas).toContain(
+      'context-1m-2025-08-07',
+    );
+    await adapter.close(big);
+    await expect(
+      adapter.start({ cwd: worktree, model: 'claude-sonnet-5-5', contextWindow: 1_000_000 }),
+    ).rejects.toMatchObject({ field: 'contextWindow' });
+    await expect(
+      adapter.start({ cwd: worktree, model: 'claude-sonnet-4-5', contextWindow: 2_000_000 }),
+    ).rejects.toMatchObject({ field: 'contextWindow' });
+    // No session was left behind by a refusal.
+    expect(readdirSync(join(root, 'run', 'mcp'))).toEqual([]);
   });
 });

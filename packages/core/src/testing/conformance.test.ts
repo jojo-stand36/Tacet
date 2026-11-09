@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import type { AdapterCapabilities } from '../adapter/types.js';
 import {
   assertConformance,
   type ConformanceScenario,
@@ -20,7 +19,14 @@ const scenario: ConformanceScenario = {
   timeoutMs: 2000,
 };
 
-const run = (opts?: MockAdapterOptions) => runConformance(new MockAdapter(opts), scenario);
+const run = (opts?: MockAdapterOptions) => {
+  const adapter = new MockAdapter(opts);
+  return runConformance(adapter, {
+    ...scenario,
+    altEffort: 'high',
+    sentEffort: () => adapter.lastEffort,
+  });
+};
 const verdict = (results: ProbeResult[], id: string) => results.find((r) => r.id === id)?.verdict;
 
 describe('conformance bench with the mock adapter', () => {
@@ -34,7 +40,7 @@ describe('conformance bench with the mock adapter', () => {
   });
 
   it('a mock with fewer capabilities passes, skipping what it does not declare', async () => {
-    const capabilities: Partial<AdapterCapabilities> = {
+    const capabilities: MockAdapterOptions['capabilities'] = {
       streaming: false,
       liveInput: false,
       approvals: 'predecided',
@@ -44,6 +50,8 @@ describe('conformance bench with the mock adapter', () => {
       usage: { live: true, context: false, cost: 'none' },
       modelSwitch: 'launch-only',
       injectContext: false,
+      effortSwitch: undefined,
+      contextSizes: [],
     };
     const results = await run({ capabilities });
     expect(() => assertConformance(results)).not.toThrow();
@@ -54,10 +62,17 @@ describe('conformance bench with the mock adapter', () => {
       'resume',
       'inject-context',
       'model-switch',
+      'effort',
     ]) {
       expect(verdict(results, id), id).toBe('skip');
     }
     expect(verdict(results, 'stream')).toBe('pass');
+    expect(verdict(results, 'context-sizes')).toBe('pass'); // refuses what it does not list
+  });
+
+  it('checks effort at launch for a per-session adapter', async () => {
+    const results = await run({ capabilities: { effortSwitch: 'per-session' } });
+    expect(verdict(results, 'effort'), formatResults(results)).toBe('pass');
   });
 });
 
@@ -75,6 +90,15 @@ describe('drift detection (declared vs observed)', () => {
       expect(() => assertConformance(results)).toThrow(new RegExp(`${probe}: drift`));
     },
   );
+
+  it.each([
+    ['effort', 'effort'],
+    ['contextWindow', 'context-sizes'],
+  ] as const)('reports P1 drift (not gating) when the adapter fakes %s', async (lie, probe) => {
+    const results = await run({ lie: { [lie]: true } });
+    expect(verdict(results, probe), formatResults(results)).toBe('drift');
+    expect(() => assertConformance(results)).not.toThrow(); // P1 probes report, never gate
+  });
 
   it('reports drift when an adapter streams but declares that it does not', async () => {
     // Declared non-streaming, but the bench sees several deltas: the declaration is wrong.

@@ -36,6 +36,13 @@ export interface ConformanceScenario {
   echoPrompt?: string;
   /** A model to switch to in the model-switch probe. */
   altModel?: string;
+  /** An effort the scenario's model accepts, for the effort probe (#110). */
+  altEffort?: string;
+  /**
+   * The effort the vendor received in its most recent model request, e.g. read from a mock
+   * API's request log. Without it the effort probe is skipped: adapter events do not carry it.
+   */
+  sentEffort?: () => unknown;
   minDeltas?: number;
   timeoutMs?: number;
 }
@@ -398,6 +405,57 @@ const PROBES: Probe[] = [
           ? pass('switched model')
           : drift('model did not change');
       });
+    },
+  },
+  {
+    id: 'effort',
+    priority: 'P1',
+    run: async (ctx) => {
+      const mode = ctx.caps.effortSwitch;
+      if (!mode) return skip('no effortSwitch declared');
+      const effort = ctx.sc.altEffort;
+      const sent = ctx.sc.sentEffort;
+      if (!effort || !sent) return skip('no altEffort/sentEffort in scenario');
+      if (mode === 'per-session') {
+        // Applied at launch: start a session with it and check the first request.
+        return withSession(
+          ctx,
+          async (h, tap) => {
+            await turn(ctx, h, tap, ctx.sc.replyPrompt);
+            return sent() === effort ? pass('effort applied at launch') : drift('effort not sent');
+          },
+          { ...ctx.sc.session, effort },
+        );
+      }
+      // per-turn: a turn-level change must reach the vendor on that turn.
+      return withSession(ctx, async (h, tap) => {
+        const from = tap.events.length;
+        await ctx.adapter.send(h, { text: ctx.sc.replyPrompt }, { effort });
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'running', ctx.timeout, from);
+        await tap.waitFor((e) => e.t === 'status' && TURN_END.has(e.state), ctx.timeout, from + 1);
+        return sent() === effort
+          ? pass('effort applied on the turn')
+          : drift(`vendor got effort ${JSON.stringify(sent())}, not ${effort}`);
+      });
+    },
+  },
+  {
+    id: 'context-sizes',
+    priority: 'P1',
+    run: async (ctx) => {
+      // An adapter refuses a window it does not list instead of silently using the default.
+      const listed = new Set(ctx.caps.contextSizes ?? []);
+      let unlisted = 1_234_567;
+      while (listed.has(unlisted)) unlisted += 1;
+      try {
+        const h = await ctx.adapter.start({ ...ctx.sc.session, contextWindow: unlisted });
+        await ctx.adapter.close(h).catch(() => {});
+        return drift(`started with unlisted contextWindow ${unlisted}`);
+      } catch (err) {
+        return err instanceof Error && err.name === 'ProfileRefusedError'
+          ? pass('unlisted context window refused')
+          : drift(`expected ProfileRefusedError, got ${String(err)}`);
+      }
     },
   },
 ];

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:session-profile:v1",
+  "title": "Tacet SessionProfile",
+  "type": "object",
+  "properties": {
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "effort": {
+      "enum": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "x-tacet-fallback": "medium",
+      "type": "string"
+    },
+    "contextWindow": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    }
+  },
+  "required": [
+    "model"
+  ]
+}
