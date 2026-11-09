@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # ADR-002: macOS and Ubuntu Linux only; Node 24 minimum, also tested on 26.
+        os: [ubuntu-latest, macos-latest]
+        node: [24, 26]
+    steps:
+      - uses: actions/checkout@v6
+
+      # Reads the pnpm version from package.json "packageManager".
+      # Node 25+ no longer bundles Corepack, so pnpm is installed by this action.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
