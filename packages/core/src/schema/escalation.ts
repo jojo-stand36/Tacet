@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Id, openEnum, Timestamp, Ulid, Urgency } from './common.js';
+import { DecisionScope } from './decision.js';
 
 /** Optional routing category (Gas Town, ADR-001). Unknown values fall back to `help`. */
 export const EscalationCategory = openEnum(
@@ -38,6 +39,18 @@ export const Escalation = z.object({
     .describe('Re-escalate if still pending after this many seconds'),
   maxReescalations: z.number().int().nonnegative().optional(),
   reescalations: z.number().int().nonnegative().default(0),
+  proposedDecision: z
+    .object({
+      decisionId: Ulid,
+      topic: z.string().min(1),
+      decision: z.string().min(1),
+      rationale: z.string().optional(),
+      scope: DecisionScope,
+    })
+    .optional()
+    .describe(
+      'For an approval request (category "decision"): the decision to record under decisionId if approved',
+    ),
 });
 export type Escalation = z.infer<typeof Escalation>;
 

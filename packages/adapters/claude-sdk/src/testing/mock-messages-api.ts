@@ -7,13 +7,16 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `ESCALATE`: calls the Tacet MCP `escalate` tool with a fixed question: the offered tool whose
+ *   name ends in `escalate`, else `mcp__tacet__escalate` (Claude Code defers MCP tools behind
+ *   ToolSearch, so they are usually not offered by name).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the requested model id.
  * Requests are recorded (model and last user text only) for assertions.
  */
 export interface MockMessagesApi {
   url: string;
-  requests: { model: string | undefined; text: string; messages: number }[];
+  requests: { model: string | undefined; text: string; messages: number; tools: string[] }[];
   close(): Promise<void>;
 }
 
@@ -25,6 +28,7 @@ interface Body {
   model?: string;
   stream?: boolean;
   messages?: { role: string; content: string | { type: string; text?: string }[] }[];
+  tools?: { name?: string }[];
 }
 
 function lastUser(body: Body): { text: string; toolResult: boolean } {
@@ -52,6 +56,17 @@ function plan(body: Body): Block[] {
         id: `toolu_mock_${++n}`,
         name: 'Bash',
         input: { command: 'touch tool-ran.txt', description: 'create a file' },
+      },
+    ];
+  }
+  if (/ESCALATE/.test(text)) {
+    const offered = (body.tools ?? []).map((t) => t.name ?? '');
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: offered.find((t) => /tacet.*escalate$/.test(t)) ?? 'mcp__tacet__escalate',
+        input: { question: 'Which database should the cache use?', urgency: 'normal' },
       },
     ];
   }
@@ -84,7 +99,12 @@ async function handle(
   if (!(req.method === 'POST' && req.url?.startsWith('/v1/messages'))) {
     return json(404, { type: 'error', error: { type: 'not_found_error', message: 'mock' } });
   }
-  log.push({ model: body.model, text: lastUser(body).text, messages: body.messages?.length ?? 0 });
+  log.push({
+    model: body.model,
+    text: lastUser(body).text,
+    messages: body.messages?.length ?? 0,
+    tools: (body.tools ?? []).map((t) => t.name ?? ''),
+  });
   const blocks = plan(body);
   const id = `msg_mock_${++n}`;
   const usage = {
