@@ -188,6 +188,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
       // Nobody can answer a prompt: git fails instead of waiting for a terminal or an editor.
       launch.env.GIT_TERMINAL_PROMPT = '0';
       launch.env.GIT_EDITOR = 'true';
+      // No unsupervised background work in the Worker's object store: a commit would otherwise
+      // start a detached `git maintenance run --auto` (seen on macOS CI, #124).
+      addGitConfig(launch.env, { 'maintenance.auto': 'false', 'gc.auto': '0' });
       // Tacet's own CODEX_HOME: Codex state, logs and config for this repo's Workers stay out of
       // the user's ~/.codex, and the user's config.toml cannot change a Worker (#116).
       codexHome = join(
@@ -787,6 +790,18 @@ export function configArgs(
     '-c',
     `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
   ]);
+}
+
+/** Append `-c`-style settings through `GIT_CONFIG_COUNT`, keeping any the caller already set. */
+function addGitConfig(env: Record<string, string>, settings: Record<string, string>): void {
+  const parsed = Number.parseInt(env.GIT_CONFIG_COUNT ?? '0', 10);
+  let n = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+  for (const [key, value] of Object.entries(settings)) {
+    env[`GIT_CONFIG_KEY_${n}`] = key;
+    env[`GIT_CONFIG_VALUE_${n}`] = value;
+    n += 1;
+  }
+  env.GIT_CONFIG_COUNT = String(n);
 }
 
 const GIT_LOCATION_VARS = [

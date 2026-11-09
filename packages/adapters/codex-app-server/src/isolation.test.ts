@@ -63,21 +63,6 @@ describe('Codex Worker isolation', () => {
     git(repo, 'init', '-q', '-b', 'main');
     git(repo, 'commit', '-q', '--allow-empty', '-m', 'init');
     git(repo, 'worktree', 'add', '-q', worktree, '-b', 'tacet/task-1');
-    // macOS: the first run of the Xcode `git` shim on a fresh machine builds xcrun's cache, which
-    // can outlast a turn deadline inside the sandbox. The Mini-conductor runs git outside the
-    // sandbox before any Worker starts, so warm it the same way.
-    if (process.platform === 'darwin') {
-      for (const cmd of [
-        ['git', '--version'],
-        ['xcrun', '-f', 'git'],
-      ]) {
-        try {
-          execFileSync(cmd[0] as string, cmd.slice(1), { env: gitEnv, stdio: 'ignore' });
-        } catch {
-          // Not every macOS machine has xcrun; the commit probe reports what happens.
-        }
-      }
-    }
   });
 
   afterAll(async () => {
@@ -101,7 +86,7 @@ describe('Codex Worker isolation', () => {
 
   // One tap per session: a session's event stream can only be consumed once.
   const taps = new WeakMap<SessionHandle, EventTap>();
-  async function run(a: CodexAppServerAdapter, h: SessionHandle, cmd: string, turnMs = 3500) {
+  async function run(a: CodexAppServerAdapter, h: SessionHandle, cmd: string) {
     let tap = taps.get(h);
     if (!tap) {
       tap = new EventTap(a.events(h));
@@ -116,8 +101,10 @@ describe('Codex Worker isolation', () => {
     // a denial fails the test with its summary instead of hanging the turn.
     const approvals: string[] = [];
     let at = start + 1;
-    // Under the test timeout, so a hung turn fails with what happened so far.
-    const deadline = Date.now() + turnMs;
+    // A hung turn fails here with what happened so far. Measured on macOS CI (#124): the first
+    // `git` inside Seatbelt costs about 4 s before git starts (the Xcode shim via xcrun), while
+    // `git add` + `git commit` take about 35 ms; 15 s leaves room for that and still fails a hang.
+    const deadline = Date.now() + 15_000;
     for (;;) {
       const next = await tap
         .waitFor(
@@ -135,8 +122,7 @@ describe('Codex Worker isolation', () => {
           }));
           throw new Error(
             `turn did not finish: events ${JSON.stringify(tap.events.slice(start))}; ` +
-              `model requests ${JSON.stringify(sent)}; approvals ${JSON.stringify(approvals)}; ` +
-              `codex home ${codexHomeDump()}`,
+              `model requests ${JSON.stringify(sent)}; approvals ${JSON.stringify(approvals)}`,
           );
         });
       at = next.index + 1;
@@ -154,20 +140,6 @@ describe('Codex Worker isolation', () => {
     return { events: tap.events, output };
   }
 
-  // DIAGNOSTIC (#124 macOS hang), revert before merge: the Worker CODEX_HOME's files and log tails.
-  const codexHomeDump = () => {
-    const codexHome = join(repoStateDir(repo, join(home, '.tacet', 'state')), 'codex');
-    return JSON.stringify(
-      files(codexHome)
-        .filter((f) => !f.includes(`${'/'}sessions${'/'}`) || f.endsWith('.jsonl'))
-        .map((f) => (/\.(log|txt)$/.test(f) ? `${f}: ${readFileSync(f, 'utf8').slice(-1500)}` : f))
-        .concat(
-          existsSync(join(worktree, 'git-trace.txt'))
-            ? [`git trace: ${readFileSync(join(worktree, 'git-trace.txt'), 'utf8').slice(-3000)}`]
-            : [],
-        ),
-    );
-  };
   const files = (dir: string): string[] =>
     existsSync(dir)
       ? readdirSync(dir).flatMap((f) => {
@@ -198,52 +170,33 @@ describe('Codex Worker isolation', () => {
     expect(() => workerWorktree(other, repo)).toThrow(/refusing worktree.*separate git repository/);
   });
 
-  // Several real Codex turns: each has its own 3.5 s deadline in `run`, so a hang still fails fast
-  // with a dump; the test as a whole needs more than the 5 s default.
+  // Several real Codex turns: each has its own deadline in `run`, so a hang still fails with a
+  // dump; the test as a whole needs more than the 5 s default.
   it('unattended: commits without approval, never writes the shared .git, integrates by push', {
     timeout: 30_000,
   }, async () => {
     const shared = join(repo, '.git');
     const refsBefore = git(repo, 'for-each-ref');
     const objectsBefore = files(join(shared, 'objects'));
-    // DIAGNOSTIC (#124 macOS hang), revert before merge: git traces into the worktree.
-    const traceFile = join(worktree, 'git-trace.txt');
-    const a = adapter({
-      baseEnv: {
-        ...gitEnv,
-        OPENAI_API_KEY: 'placeholder-not-a-real-key',
-        GIT_TRACE: traceFile,
-        GIT_TRACE_PERFORMANCE: traceFile,
-      },
-    });
+    const a = adapter();
     const h = await a.start({ cwd: worktree });
     // The Worker's worktree is checked out detached: HEAD is per-worktree, branches are shared.
     expect(() => git(worktree, 'symbolic-ref', '-q', 'HEAD')).toThrow();
     // One probe per turn, timestamped, so a slow step and a hung one can be told apart.
     const stamp = `perl -MTime::HiRes=time -e 'printf "t=%.2f\\n", time'`;
-    const probe = async (cmd: string, turnMs?: number) => {
-      const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`, turnMs);
+    const probe = async (cmd: string) => {
+      const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`);
       return r;
     };
-    // DIAGNOSTIC (#124 macOS hang), revert before merge: is the first turn of the file's first
-    // Codex session slow or hung, with or without git?
-    const first = await run(a, h, `${stamp}; echo FIRST_TURN; ${stamp}`, 25_000);
-    expect(first.output, first.output).toContain('FIRST_TURN');
-    // DIAGNOSTIC (#124 macOS hang), revert before merge: trace git into the worktree (read by
-    // the dump if the turn times out) and allow the turn 25 s.
     const commit = await probe(
-      [
-        'command -v git',
-        'echo hi > work.txt',
-        'git add work.txt && git commit -qm work && echo COMMITTED',
-        `${stamp}`,
-        'tail -c 3000 git-trace.txt',
-      ].join('; '),
-      25_000,
+      'command -v git; echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
     );
-    // DIAGNOSTIC (#124), revert before merge.
-    console.log(`DIAG commit turn: ${commit.output}`);
     expect(commit.output, commit.output).toContain('COMMITTED');
+    // No background maintenance in the Worker's object store.
+    const cfg = await probe(
+      'echo gc=$(git config --get gc.auto) mt=$(git config --get maintenance.auto)',
+    );
+    expect(cfg.output, cfg.output).toContain('gc=0 mt=false');
     const denied: [string, string][] = [
       ['git update-ref refs/heads/main HEAD && echo REF_MOVED', 'REF_MOVED'],
       ['git branch other && echo BRANCHED', 'BRANCHED'],
@@ -393,7 +346,7 @@ describe('Codex Worker isolation', () => {
     await expect(adapter().start({ cwd: wt })).rejects.toThrow(/no commit/);
   });
 
-  it('keeps the git dir writable for a resumed thread', async () => {
+  it('keeps the git dir writable for a resumed thread', { timeout: 60_000 }, async () => {
     const wt = addWorktree('resume');
     const a = adapter();
     const h = await a.start({ cwd: wt });
