@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmod, cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -160,6 +160,19 @@ describe('WorktreeManager', () => {
     expect(await readFile(path.join(worktree.path, '.env'), 'utf8')).toBe('local\n');
 
     await manager.remove(worktree.id, { force: true });
+    await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('replaces a hostile .git symlink without writing through it during removal', async () => {
+    const worktree = await manager.create('symlink-worker');
+    const sentinel = path.join(temporaryDirectory, 'outside-file');
+    await writeFile(sentinel, 'do not overwrite\n');
+    await rm(path.join(worktree.path, '.git'));
+    await symlink(sentinel, path.join(worktree.path, '.git'));
+
+    await manager.remove(worktree.id);
+
+    expect(await readFile(sentinel, 'utf8')).toBe('do not overwrite\n');
     await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

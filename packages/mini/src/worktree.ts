@@ -322,10 +322,18 @@ export class WorktreeManager {
       }
     }
     const gitDirectory = await this.worktreeGitDirectory(info);
-    await rm(path.join(info.path, '.git'), { recursive: true, force: true });
-    await writeFile(path.join(info.path, '.git'), `gitdir: ${gitDirectory}\n`, {
+    const gitFile = path.join(info.path, '.git');
+    const temporaryGitFile = path.join(info.path, `.git.${randomUUID()}.tmp`);
+    await writeFile(temporaryGitFile, `gitdir: ${gitDirectory}\n`, {
+      flag: 'wx',
       mode: 0o600,
     });
+    try {
+      await rename(temporaryGitFile, gitFile);
+    } catch (error) {
+      await rm(temporaryGitFile, { force: true });
+      throw error;
+    }
     const commonDirectory = await this.commonGitDirectory();
     await runCommand(
       'git',
