@@ -275,7 +275,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, Claude/Codex via adapters…).\n\n### Tasks\n- [ ] Use official ACP TS SDK\n- [ ] Capability negotiation → capability flags\n- [ ] Configurable command per agent\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, OpenCode, Claude/Codex via their ACP adapters). Implements ACP v1; v2 is tracked separately.\n\n### Tasks\n- [ ] Use official ACP TS SDK (`@agentclientprotocol/sdk`)\n- [ ] stdio transport: newline-delimited JSON-RPC, stderr captured to the Worker log\n- [ ] Capability negotiation → capability flags (fork only if `sessionCapabilities.fork`, marked unstable; live usage only if the agent sends `usage_update`)\n- [ ] Cancel flow: `session/cancel`, answer pending `session/request_permission` with `cancelled`, map `stopReason: cancelled` (or `-32800`) to a cancelled turn, not an error\n- [ ] Permission options → Decision (`allow_once`, `allow_always`, `reject_once`; Gemini's reject option id is `cancel`)\n- [ ] Model switch via the config option with category `model` (no `session/set_model`)\n- [ ] Per-session MCP injection via `session/new.mcpServers` with headers\n- [ ] Configurable command per agent\n- [ ] Auth default: API key only. Launch `@agentclientprotocol/claude-agent-acp` with `--hide-claude-auth` and `@agentclientprotocol/codex-acp` with `NO_BROWSER=1`; never call ACP `authenticate` with a subscription method (owner decision 2026-11-09; #65 stays open)\n- [ ] Keep the prompt-turn code isolated so an ACP v2 path can be added later\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite over ACP\n- Cancel and permission flows are covered by recorded fixtures (see docs/adapters/spikes/61-acp, 63-gemini)\n- Subscription auth methods are never selected by default (test)\n\n_See docs/adapters/capability-matrix.md (ACP section), docs/adapters/spikes/61-acp, 62-acp-adapters, 63-gemini, and docs/ARCHITECTURE.md._"
     },
     {
       "title": "Adapter: OpenCode server (HTTP + SSE)",
@@ -935,6 +935,17 @@
         "agent:either"
       ],
       "body": "Land the branches of parallel Worker sessions through a merge queue. The queue batches verified branches, runs verification on each batch, and bisects a failing batch to find the bad branch. The idea is borrowed from Gas Town's Refinery (`docs/design/architecture.md`, Merge Queue). Tacet reimplements it in TypeScript and does not port code (ADR-001). This is ADR-001 follow-up 5, and it relates to #19.\n\n### Tasks\n- [ ] Per-repo queue of verified Worker branches, in completion order\n- [ ] Batch branches onto the target branch in a scratch worktree and run the repo's verify commands from `.tacet/tacet.yaml`\n- [ ] On batch failure, bisect to isolate the failing branch and return it to its task as a verification failure\n- [ ] Record each queue step as events (`task.*` and `worker.*`), not ad-hoc state\n- [ ] Repo config for maximum batch size and verify timeout\n\n### Acceptance criteria\n- In a batch of three branches where one fails verification, the two good branches land and the bad one goes back to its task\n- In a batch of eight with one bad branch, bisection after the failed batch run isolates it in at most 3 verification runs\n- Queue state survives a mini-conductor restart (rebuilt from the event log)\n\n_See docs/adr/001-build-vs-extend.md (Consequences, follow-up 5) and docs/ARCHITECTURE.md §2.1._"
+    },
+    {
+      "title": "Track ACP v2: prompt ack + state_update lifecycle",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "ACP v2 (schema `2.0.0-alpha.14` on 2026-11-09) is a consolidation release: `session/prompt` only acknowledges acceptance, the turn's progress and stop reason arrive in `state_update` notifications, updates become upserts by id, the client filesystem/terminal/session-modes APIs are removed, and capabilities are reorganised. The ACP migration guide asks implementers to support v1 and v2 side by side. The generic ACP adapter (#13) implements v1; this issue tracks v2 until it stabilises.\n\n### Tasks\n- [ ] Watch the ACP v2 schema releases and RFD group; record the version when v2 leaves alpha\n- [ ] Check which agents Tacet supports (Gemini CLI, OpenCode, claude-agent-acp, codex-acp) advertise v2\n- [ ] Design the v2 prompt-turn path behind a flag in the ACP adapter (prompt ack + `state_update`)\n- [ ] Record findings in the ACP section of the capability matrix\n\n### Acceptance criteria\n- The matrix states the ACP v2 status with version and date\n- A go/no-go recommendation for v2 support in the ACP adapter (#13) is recorded\n\n_See docs/adapters/spikes/61-acp/README.md (ACP v2 section) and docs/adapters/capability-matrix.md._"
     }
   ]
 }
