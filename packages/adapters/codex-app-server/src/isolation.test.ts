@@ -101,7 +101,7 @@ describe('Codex Worker isolation', () => {
 
   // One tap per session: a session's event stream can only be consumed once.
   const taps = new WeakMap<SessionHandle, EventTap>();
-  async function run(a: CodexAppServerAdapter, h: SessionHandle, cmd: string) {
+  async function run(a: CodexAppServerAdapter, h: SessionHandle, cmd: string, turnMs = 3500) {
     let tap = taps.get(h);
     if (!tap) {
       tap = new EventTap(a.events(h));
@@ -117,7 +117,7 @@ describe('Codex Worker isolation', () => {
     const approvals: string[] = [];
     let at = start + 1;
     // Under the test timeout, so a hung turn fails with what happened so far.
-    const deadline = Date.now() + 3500;
+    const deadline = Date.now() + turnMs;
     for (;;) {
       const next = await tap
         .waitFor(
@@ -135,7 +135,8 @@ describe('Codex Worker isolation', () => {
           }));
           throw new Error(
             `turn did not finish: events ${JSON.stringify(tap.events.slice(start))}; ` +
-              `model requests ${JSON.stringify(sent)}; approvals ${JSON.stringify(approvals)}`,
+              `model requests ${JSON.stringify(sent)}; approvals ${JSON.stringify(approvals)}; ` +
+              `codex home ${codexHomeDump()}`,
           );
         });
       at = next.index + 1;
@@ -153,6 +154,15 @@ describe('Codex Worker isolation', () => {
     return { events: tap.events, output };
   }
 
+  // DIAGNOSTIC (#124 macOS hang), revert before merge: the Worker CODEX_HOME's files and log tails.
+  const codexHomeDump = () => {
+    const codexHome = join(repoStateDir(repo, join(home, '.tacet', 'state')), 'codex');
+    return JSON.stringify(
+      files(codexHome)
+        .filter((f) => !f.includes(`${'/'}sessions${'/'}`) || f.endsWith('.jsonl'))
+        .map((f) => (/\.(log|txt)$/.test(f) ? `${f}: ${readFileSync(f, 'utf8').slice(-1500)}` : f)),
+    );
+  };
   const files = (dir: string): string[] =>
     existsSync(dir)
       ? readdirSync(dir).flatMap((f) => {
@@ -201,6 +211,10 @@ describe('Codex Worker isolation', () => {
       const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`);
       return r;
     };
+    // DIAGNOSTIC (#124 macOS hang), revert before merge: is the first turn of the file's first
+    // Codex session slow or hung, with or without git?
+    const first = await run(a, h, `${stamp}; echo FIRST_TURN; ${stamp}`, 25_000);
+    expect(first.output, first.output).toContain('FIRST_TURN');
     const commit = await probe(
       'command -v git; echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
     );
