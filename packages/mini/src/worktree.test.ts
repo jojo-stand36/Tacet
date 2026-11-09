@@ -43,6 +43,7 @@ describe('WorktreeManager', () => {
     );
 
     expect(new Set(worktrees.map(({ branchName }) => branchName)).size).toBe(10);
+    expect(worktrees.every(({ branch, branchName }) => branch === branchName)).toBe(true);
     expect(new Set(worktrees.map(({ path: worktreePath }) => worktreePath)).size).toBe(10);
     expect((await manager.list()).length).toBe(10);
     expect(worktrees.every(({ baseBranch }) => baseBranch === 'main')).toBe(true);

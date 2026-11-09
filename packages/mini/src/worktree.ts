@@ -18,6 +18,7 @@ export interface CreateWorktreeOptions {
 export interface WorktreeInfo {
   id: string;
   workerId: string;
+  branch: string;
   branchName: string;
   path: string;
   baseBranch: string;
@@ -188,6 +189,7 @@ export class WorktreeManager {
     const info: WorktreeInfo = {
       id,
       workerId,
+      branch: branchName,
       branchName,
       path: worktreePath,
       baseBranch,
@@ -464,7 +466,7 @@ export class WorktreeManager {
       ) {
         return undefined;
       }
-      return info;
+      return { ...info, branch: info.branchName };
     } catch {
       return undefined;
     }
