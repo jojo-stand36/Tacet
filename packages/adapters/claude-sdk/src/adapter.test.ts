@@ -8,11 +8,11 @@ import type {
   SDKMessage,
   SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
+import { AsyncQueue } from '@tacet/core';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeSdkAdapter, toPermissionResult } from './adapter.js';
 import { AuthRoutingError } from './auth.js';
-import { AsyncQueue } from './queue.js';
 
 // Fake values only.
 const FAKE_KEY = 'fake-key-for-tests';

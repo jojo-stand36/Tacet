@@ -14,17 +14,19 @@ import {
   type AgentAdapter,
   type AgentEvent,
   type ApprovalDecision,
+  AsyncQueue,
   type InterruptResult,
+  mcpHeaderSecrets,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
   type SessionOptions,
   type SessionState,
+  scrubLiterals,
   type UserInput,
 } from '@tacet/core';
 import { authEnv, type ClaudeAuthRoute } from './auth.js';
 import { removeMcpConfig, writeMcpConfig } from './mcp-config.js';
-import { AsyncQueue } from './queue.js';
 
 /**
  * Capabilities verified against the Claude Agent SDK in spike #64
@@ -210,7 +212,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       interrupting: false,
       closing: false,
       ended: false,
-      secrets: secretsOf(opts),
+      secrets: mcpHeaderSecrets(opts.mcpServers),
       model: opts.model,
       costSoFar: opts.resume ? this.#costTotals.get(opts.resume.vendorSessionId) : 0,
       call: undefined,
@@ -308,7 +310,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
 
   /** Every event leaves through here: known key formats and this session's secrets are scrubbed. */
   #emit(s: Session, e: AgentEvent): void {
-    s.events.push(scrub(redactSecrets(e), s.secrets));
+    s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {
@@ -502,33 +504,6 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     // Inputs sent during the turn run next.
     if (s.pending.size > 0) this.#setState(s, 'running');
   }
-}
-
-/** Header values (and bare bearer tokens) of the session's MCP servers. */
-function secretsOf(opts: SessionOptions): string[] {
-  const out = new Set<string>();
-  for (const srv of opts.mcpServers ?? []) {
-    for (const v of Object.values(srv.headers ?? {})) {
-      if (v.length >= 8) out.add(v);
-      const bare = /^\s*\S+\s+(\S{8,})\s*$/.exec(v)?.[1];
-      if (bare) out.add(bare);
-    }
-  }
-  // Longest first, so a full header value is replaced before the token inside it.
-  return [...out].sort((a, b) => b.length - a.length);
-}
-
-/** `value` with every occurrence of each literal secret replaced by `[redacted]`. */
-function scrub<T>(value: T, secrets: string[]): T {
-  if (secrets.length === 0) return value;
-  if (typeof value === 'string') {
-    return secrets.reduce((acc, sec) => acc.split(sec).join('[redacted]'), value as string) as T;
-  }
-  if (Array.isArray(value)) return value.map((v) => scrub(v, secrets)) as T;
-  if (typeof value === 'object' && value !== null) {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrub(v, secrets)])) as T;
-  }
-  return value;
 }
 
 function deny(message: string, interrupt = false): PermissionResult {

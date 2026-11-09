@@ -4,8 +4,10 @@
  */
 export const packageName = '@tacet/core' as const;
 
+export * from './adapter/redact.js';
 export type * from './adapter/types.js';
 export * from './config/index.js';
 export * from './events/projection.js';
 export * from './schema/index.js';
 export { allJsonSchemas, type JsonSchemaDocument, toJsonSchema } from './schema/json-schema.js';
+export * from './util/async-queue.js';
