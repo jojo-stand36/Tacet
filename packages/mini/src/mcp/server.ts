@@ -114,6 +114,48 @@ function toHeaders(raw: IncomingMessage['headers']): Headers {
   return h;
 }
 
+/** After a 413, drain at most this much more before dropping the connection. */
+const DRAIN_BYTES = 16 * 1024 * 1024;
+const DRAIN_MS = 2000;
+
+/**
+ * The request body, or undefined once it exceeds `limit`. An oversize body is then drained (up
+ * to `DRAIN_BYTES` or `DRAIN_MS`) instead of destroyed at once: closing a socket with unread
+ * input sends a reset, which on macOS can reach the client before the 413 does.
+ */
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer | undefined> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let over = false;
+    req.on('data', (c: Buffer) => {
+      size += c.length;
+      if (over) {
+        if (size > limit + DRAIN_BYTES) req.destroy();
+        return;
+      }
+      if (size > limit) {
+        over = true;
+        chunks.length = 0;
+        setTimeout(() => req.destroy(), DRAIN_MS).unref();
+        resolve(undefined);
+        return;
+      }
+      chunks.push(c);
+    });
+    let ended = false;
+    req.once('end', () => {
+      ended = true;
+      resolve(over ? undefined : Buffer.concat(chunks));
+    });
+    req.once('error', (err) => (over ? undefined : reject(err)));
+    // A client that goes away mid-body never sends 'end'.
+    req.once('close', () => {
+      if (!ended && !over) reject(new Error('request aborted'));
+    });
+  });
+}
+
 function reply(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -222,24 +264,17 @@ async function serve(
   }
 
   const limit = opts.maxBodyBytes ?? 1024 * 1024;
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const c of req) {
-    size += (c as Buffer).length;
-    if (size > limit) {
-      // The rest of the body is never read, so this connection cannot carry another request.
-      res.setHeader('connection', 'close');
-      reply(res, 413, { error: 'request too large' });
-      res.once('finish', () => req.destroy());
-      return;
-    }
-    chunks.push(c as Buffer);
+  const body = await readBody(req, limit);
+  if (body === undefined) {
+    // The rest of the body is drained, not read, so this connection cannot carry another request.
+    res.setHeader('connection', 'close');
+    return reply(res, 413, { error: 'request too large' });
   }
   // Parse once and hand the SDK this same object, so the filter below and the SDK can never
   // read the body differently (e.g. a leading BOM). Anything that is not JSON is refused here.
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    parsed = JSON.parse(body.toString('utf8'));
   } catch {
     return reply(res, 400, {
       jsonrpc: '2.0',
