@@ -74,10 +74,17 @@ export const TacetConfig = z.strictObject({
     })
     .partial()
     .optional(),
-  /** Owner rule (2026-11-09): API key for parallel or unattended Workers, own login for interactive use. */
+  /**
+   * Owner rule (2026-11-09): API key for parallel or unattended Workers, own login for interactive
+   * use. `unattended` accepts only `api_key` (owner decision on #65): Tacet never runs parallel or
+   * unattended Workers on a subscription login.
+   */
   auth: z
     .strictObject({
-      unattended: z.enum(['api_key', 'subscription']),
+      unattended: z.literal('api_key', {
+        error:
+          'auth.unattended must be "api_key": parallel or unattended Workers never use a subscription login (owner decision, issue #65). Set auth.interactive to use your own login for interactive sessions.',
+      }),
       interactive: z.enum(['api_key', 'subscription']),
     })
     .partial()
