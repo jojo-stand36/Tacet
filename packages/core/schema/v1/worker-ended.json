@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:worker-ended:v1",
+  "title": "Tacet worker.ended payload",
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "reason": {
+      "enum": [
+        "completed",
+        "failed",
+        "stuck",
+        "restart",
+        "canceled",
+        "handoff"
+      ],
+      "x-tacet-fallback": "failed",
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "sessionId"
+  ]
+}

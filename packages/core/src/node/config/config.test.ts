@@ -125,6 +125,27 @@ describe('loadConfig', () => {
     expect(config.events?.retention?.transcript_days).toBe(30);
   });
 
+  it('defaults the Worker pool and rejects unknown or invalid worker keys', () => {
+    const { config } = loadConfig({ userDir, repoRoot });
+    expect(config.workers).toEqual({
+      max: 4,
+      stuck_after_s: 300,
+      nudge_grace_s: 900,
+      max_attempts: 3,
+    });
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'workers: { max: 2, per_adapter: { codex-app-server: 1 } }\n',
+    );
+    expect(loadConfig({ userDir, repoRoot }).config.workers).toMatchObject({
+      max: 2,
+      per_adapter: { 'codex-app-server': 1 },
+      max_attempts: 3,
+    });
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max: 0, maximum: 3 }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(ConfigError);
+  });
+
   it('reports every problem with file, line and column', () => {
     write(
       join(repoRoot, '.tacet', 'tacet.yaml'),

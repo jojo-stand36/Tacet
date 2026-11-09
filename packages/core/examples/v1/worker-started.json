@@ -1,0 +1,8 @@
+{
+  "sessionId": "sess-3",
+  "adapter": "codex-app-server",
+  "model": "gpt-codex-mini",
+  "workspaceId": "wt-task-42.2",
+  "attempt": 2,
+  "previousSessionId": "sess-2"
+}

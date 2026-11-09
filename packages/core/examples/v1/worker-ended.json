@@ -1,0 +1,5 @@
+{
+  "sessionId": "sess-2",
+  "reason": "stuck",
+  "message": "No activity for 20 minutes after a nudge"
+}

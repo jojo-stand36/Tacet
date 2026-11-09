@@ -109,6 +109,23 @@ export const TacetConfig = z.strictObject({
     })
     .optional(),
   secrets: z.record(NonEmpty, SecretRef).optional(),
+  /**
+   * Worker pool (#17). Capacity governor after Gas Town's `max_polecats` (ADR-001): `max` counts
+   * every running Worker of the repo, `per_adapter` caps one adapter further. Health thresholds
+   * after Gas Town's stale / very-stale heartbeats: a silent Worker is nudged after
+   * `stuck_after_s` and replaced after `nudge_grace_s` more. A sub-task fails for good after
+   * `max_attempts` failed runs (a Mini-conductor restart does not count).
+   */
+  workers: z
+    .strictObject({
+      max: z.number().int().positive(),
+      per_adapter: z.record(NonEmpty, z.number().int().positive()),
+      stuck_after_s: z.number().int().positive(),
+      nudge_grace_s: z.number().int().positive(),
+      max_attempts: z.number().int().positive(),
+    })
+    .partial()
+    .optional(),
 });
 /** One config file as written: every key is optional. */
 export type TacetConfig = z.infer<typeof TacetConfig>;
@@ -122,6 +139,7 @@ export const DEFAULT_CONFIG = {
   auth: { unattended: 'api_key', interactive: 'subscription' },
   policies: [],
   events: { retention: { transcript_days: 30 } },
+  workers: { max: 4, stuck_after_s: 300, nudge_grace_s: 900, max_attempts: 3 },
 } satisfies TacetConfig;
 
 /** Checks that only make sense on the merged result. */
