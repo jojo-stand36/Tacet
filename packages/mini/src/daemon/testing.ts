@@ -24,6 +24,8 @@ export type Script =
   | { do: 'error'; message: string }
   | { do: 'hold' }
   | { do: 'vanish' }
+  | { do: 'ignore' }
+  | { do: 'tool-hold' }
   | { do: 'auth' }
   | { do: 'approval'; toolName?: string; grant?: unknown };
 
@@ -143,8 +145,10 @@ export class ScriptedAdapter implements AgentAdapter {
 
   async #turn(s: FakeSession, input: string): Promise<void> {
     if (!this.#open.has(s)) return;
-    this.#emit(s, { t: 'status', state: 'running' });
     const step = this.#script(input, s);
+    // A hung session: the input is taken and nothing happens, not even a status.
+    if (step.do === 'ignore') return;
+    this.#emit(s, { t: 'status', state: 'running' });
     if (step.do === 'reply') {
       for (const part of step.text.match(/\S+\s*/g) ?? [step.text]) {
         this.#emit(s, { t: 'message.delta', text: part });
@@ -159,6 +163,16 @@ export class ScriptedAdapter implements AgentAdapter {
       s.events.end();
     } else if (step.do === 'auth') {
       this.#emit(s, { t: 'status', state: 'auth_required', message: 'invalid API key' });
+    } else if (step.do === 'tool-hold') {
+      this.#emit(s, {
+        t: 'tool.call',
+        id: `tool-${s.handle.id}`,
+        name: 'Bash',
+        input: { command: 'pnpm test' },
+      });
+      await new Promise<void>((resolve) => {
+        s.held = resolve;
+      });
     } else if (step.do === 'hold') {
       await new Promise<void>((resolve) => {
         s.held = resolve;

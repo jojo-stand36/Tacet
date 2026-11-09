@@ -848,4 +848,161 @@ describe('MiniConductor review fixes', () => {
     expect(fake.open).toBe(0);
     expect(revoked.sort()).toEqual(minted.sort());
   });
+
+  describe('Worker health', () => {
+    let t = Date.parse('2026-11-09T12:00:00.000Z');
+    const now = () => new Date(t);
+    const advance = (seconds: number) => {
+      t += seconds * 1000;
+    };
+    const health = {
+      ...CONFIG,
+      workers: { max: 4, max_attempts: 3, stuck_after_s: 300, nudge_grace_s: 900 },
+    };
+
+    it('nudges a silent Worker, then replaces it, and the retry carries on', async () => {
+      let sessions = 0;
+      fake = new ScriptedAdapter('fake', (input) => {
+        if (input.startsWith('Sub-task')) {
+          sessions += 1;
+          if (sessions === 1) return { do: 'hold' };
+        }
+        // The first session is hung: it takes the nudge and does nothing.
+        if (input.startsWith('Status check')) return { do: 'ignore' };
+        return script(input);
+      });
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect
+        .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
+        .toBe(1);
+      advance(299);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      advance(2);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
+      expect(fake.sessions[0]?.inputs.at(-1)).toMatch(/^Status check/);
+      advance(899);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ofType('worker.ended', sub)).toHaveLength(0);
+      advance(2);
+      await d.settled();
+      expect(ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason)).toEqual(
+        ['stuck', 'finished'],
+      );
+      expect(tasks()[sub]?.state).toBe('completed');
+      expect(
+        ofType('worker.started', sub).map((e) => (e.data as { attempt: number }).attempt),
+      ).toEqual([1, 2]);
+    });
+
+    it('does not nudge a Worker that reports progress', async () => {
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Sub-task') ? { do: 'hold' } : script(input),
+      );
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect
+        .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
+        .toBe(1);
+      const sessionId = (
+        ofType('worker.started', sub)[0]?.data as { sessionId: string } | undefined
+      )?.sessionId;
+      for (let i = 0; i < 4; i++) {
+        advance(200);
+        store.append({
+          v: 1,
+          id: newUlid(t),
+          ts: now().toISOString(),
+          source: { kind: 'worker', id: sessionId ?? '' },
+          taskId: sub,
+          ...(sessionId ? { sessionId } : {}),
+          type: 'worker.progress',
+          data: { summary: `step ${i}` },
+        });
+        await new Promise((r) => setTimeout(r, 60));
+      }
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      fake.release();
+      await d.settled();
+      expect(tasks()[sub]?.state).toBe('completed');
+    });
+
+    it('leaves a Worker running a long tool call alone', async () => {
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Sub-task') ? { do: 'tool-hold' } : script(input),
+      );
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => ofType('agent.tool.call', sub).length, { timeout: 5000 }).toBe(1);
+      advance(3600);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      expect(ofType('worker.ended', sub)).toHaveLength(0);
+    });
+
+    it('leaves a Worker waiting on an answer alone', async () => {
+      const escId = newUlid();
+      fake = new ScriptedAdapter('fake', (input, sess) => {
+        if (sess.inputs.length === 1) {
+          const started = ofType('worker.started').at(-1);
+          store.append({
+            v: 1,
+            id: newUlid(t),
+            ts: now().toISOString(),
+            source: { kind: 'worker', id: 'w' },
+            taskId: started?.taskId as string,
+            sessionId: (started?.data as { sessionId: string } | undefined)?.sessionId ?? '',
+            type: 'escalation.raised',
+            data: {
+              id: escId,
+              taskId: started?.taskId,
+              question: 'q?',
+              urgency: 'normal',
+              createdAt: now().toISOString(),
+              status: 'pending',
+            },
+          } as EventEnvelope);
+          return { do: 'reply', text: 'waiting' };
+        }
+        return script(input);
+      });
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+      advance(3600);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+    });
+
+    it('starts the heartbeat afresh after a restart', async () => {
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Sub-task') ? { do: 'hold' } : script(input),
+      );
+      const d1 = make({ config: health, now });
+      await d1.start();
+      const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect
+        .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
+        .toBe(1);
+      d1.crashForTest();
+      // Hours pass before the Mini-conductor comes back.
+      advance(5 * 3600);
+      fake = new ScriptedAdapter('fake', () => ({ do: 'hold' }));
+      const d2 = make({ config: health, now });
+      await d2.start();
+      await expect.poll(() => ofType('worker.started', sub).length, { timeout: 5000 }).toBe(2);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+    });
+  });
 });
