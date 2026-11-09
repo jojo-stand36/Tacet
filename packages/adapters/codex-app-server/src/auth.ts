@@ -20,6 +20,12 @@ export const API_KEY_PROVIDER_ID = 'tacet-openai-api-key';
 export const OPENAI_API_BASE_URL = 'https://api.openai.com/v1';
 
 const KEY_VARS = ['OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
+/**
+ * Debug logging for the Rust binary. At trace level it may write protocol traffic (including the
+ * thread config with MCP headers) to its logs; whether it does is unverified, so Workers never
+ * inherit it.
+ */
+const STRIPPED_VARS = ['RUST_LOG', 'RUST_BACKTRACE'] as const;
 
 export class AuthRoutingError extends Error {
   override name = 'AuthRoutingError';
@@ -60,6 +66,7 @@ export function codexLaunch(
 ): CodexLaunch {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
+  for (const k of STRIPPED_VARS) delete out[k];
   if (route === 'subscription') {
     for (const k of KEY_VARS) delete out[k];
     return { env: out, args: [] };

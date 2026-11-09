@@ -6,6 +6,8 @@ export {
   CODEX_VERSION,
   type CodexAdapterOptions,
   CodexAppServerAdapter,
+  configArgs,
+  grantSubset,
   toCodexDecision,
 } from './adapter.js';
 export {

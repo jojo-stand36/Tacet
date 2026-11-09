@@ -11,6 +11,7 @@ import {
   type ApprovalDecision,
   type ApprovalOption,
   AsyncQueue,
+  findSecrets,
   type InterruptResult,
   mcpHeaderSecrets,
   redactSecrets,
@@ -21,7 +22,7 @@ import {
   scrubLiterals,
   type UserInput,
 } from '@tacet/core';
-import { type CodexAuthRoute, codexLaunch } from './auth.js';
+import { AuthRoutingError, type CodexAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, METHOD_NOT_FOUND, RpcError } from './jsonrpc.js';
 
 /** The Codex CLI version this adapter is pinned to and conformance-tested against. */
@@ -96,6 +97,8 @@ interface Session {
   model: string | undefined;
   secrets: string[];
   exited: Promise<void>;
+  /** Set synchronously on exit; after that the process group must never be signalled. */
+  exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 }
 
 const CLIENT_INFO = { name: 'tacet', title: 'Tacet', version: '0.0.0' };
@@ -149,15 +152,21 @@ export class CodexAppServerAdapter implements AgentAdapter {
     const codexHome = launch.env.CODEX_HOME ?? join(launch.env.HOME ?? homedir(), '.codex');
     mkdirSync(codexHome, { recursive: true, mode: 0o700 });
 
-    const extra = Object.entries(this.#opts.config ?? {}).flatMap(([k, v]) => [
-      '-c',
-      `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
-    ]);
+    const extra = configArgs(this.#opts.config);
+    const secrets = [
+      ...mcpHeaderSecrets(opts.mcpServers),
+      // The key never leaves the environment, but if it shows up in output it is scrubbed too.
+      ...['OPENAI_API_KEY', 'CODEX_API_KEY'].flatMap((k) => {
+        const v = launch.env[k];
+        return v && v.length >= 8 ? [v] : [];
+      }),
+    ].sort((a, b) => b.length - a.length);
     // Its own process group, so close() can end Codex's children too (e.g. its background
     // plugin `git` sync, which outlives app-server otherwise).
     const proc = spawn(
       process.execPath,
-      [this.#opts.codexPath ?? defaultCodexPath(), 'app-server', ...launch.args, ...extra],
+      // The auth route's overrides come last, so nothing earlier can replace them.
+      [this.#opts.codexPath ?? defaultCodexPath(), 'app-server', ...extra, ...launch.args],
       {
         cwd: opts.cwd,
         env: launch.env,
@@ -165,7 +174,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
         detached: process.platform !== 'win32',
       },
     );
-    const exited = new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+    const exitInfo: { value: Session['exit'] } = { value: undefined };
+    const exited = new Promise<void>((resolve) =>
+      proc.once('exit', (code, signal) => {
+        exitInfo.value = { code, signal };
+        // Codex's children (e.g. its plugin `git` sync) keep the group alive, so signalling it
+        // here, synchronously on exit, cannot reach a reused group id. Later code never does.
+        signalGroup(proc, 'SIGTERM');
+        resolve();
+      }),
+    );
     const handle: SessionHandle = { id: randomUUID() };
     // Assigned right below; the handlers only run once the process has answered.
     let s: Session | undefined;
@@ -181,6 +199,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       },
     );
     proc.once('error', (err) => rpc.fail(err));
+    // EPIPE when Codex closed its input: fail the peer instead of crashing the host process.
+    proc.stdin?.on('error', (err) => rpc.fail(err));
 
     try {
       await rpc.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null });
@@ -231,12 +251,20 @@ export class CodexAppServerAdapter implements AgentAdapter {
         closing: false,
         ended: false,
         model: str(result.model) ?? opts.model,
-        secrets: mcpHeaderSecrets(opts.mcpServers),
+        secrets,
         exited,
+        get exit() {
+          return exitInfo.value;
+        },
       };
     } catch (err) {
-      signalTree(proc, 'SIGTERM');
-      throw err;
+      rpc.fail(new Error('start failed'));
+      proc.stdin?.end();
+      await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      // Codex's error text can quote the thread config, which holds the MCP headers.
+      throw new Error(
+        `codex app-server failed to start the session: ${scrubLiterals(redactSecrets(errorMessage(err)), secrets)}`,
+      );
     }
     const session = s;
     this.#sessions.set(handle.id, session);
@@ -289,7 +317,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
     if (!pending) throw new Error(`no pending approval ${requestId}`);
     s.approvals.delete(requestId);
     pending.resolve(toCodexDecision(pending.kind, pending.params, decision));
-    if (decision.kind === 'cancel') s.interrupting = true;
+    if (decision.kind !== 'cancel') return;
+    s.interrupting = true;
+    // Codex's command and file-change `cancel` interrupts the turn itself; a permissions or
+    // elicitation answer does not, so interrupt explicitly.
+    if (pending.kind === 'permissions' || pending.kind === 'elicitation') await this.interrupt(h);
   }
 
   async close(h: SessionHandle): Promise<void> {
@@ -303,21 +335,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // End of input asks app-server to finish; then SIGTERM (forwarded by the npm wrapper to
     // the native binary), then SIGKILL.
     s.proc.stdin?.end();
-    const exitedWithin = (ms: number) =>
-      Promise.race([
-        s.exited.then(() => true),
-        new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
-      ]);
-    const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (!(await exitedWithin(Math.min(500, timeout)))) {
-      signalTree(s.proc, 'SIGTERM');
-      if (!(await exitedWithin(timeout))) {
-        signalTree(s.proc, 'SIGKILL');
-        await s.exited;
-      }
-    }
-    // Children app-server left behind.
-    signalTree(s.proc, 'SIGTERM');
+    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined);
     this.#setState(s, 'done');
     s.events.end();
     this.#sessions.delete(h.id);
@@ -329,6 +347,25 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   status(h: SessionHandle): SessionState {
     return this.#sessions.get(h.id)?.state ?? 'done';
+  }
+
+  /**
+   * End a Codex process: end of input asks it to finish; then SIGTERM to its group (the npm
+   * wrapper forwards it to the native binary), then SIGKILL. Signals are sent only while the
+   * process is still running, so a long-dead group id is never signalled.
+   */
+  async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
+    const within = (ms: number) =>
+      Promise.race([
+        exited.then(() => true),
+        new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
+      ]);
+    const timeout = this.#opts.killTimeoutMs ?? 5000;
+    if (await within(Math.min(500, timeout))) return;
+    if (!hasExited()) signalGroup(proc, 'SIGTERM');
+    if (await within(timeout)) return;
+    if (!hasExited()) signalGroup(proc, 'SIGKILL');
+    await exited;
   }
 
   #session(h: SessionHandle): Session {
@@ -354,9 +391,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   #startNext(s: Session): void {
+    if (s.ended || s.rpc.closed) return;
     const next = s.queue.shift();
     if (!next) return;
-    if (next.model !== undefined) s.model = next.model;
     s.interrupting = false;
     this.#setState(s, 'running');
     const turn: Session['turn'] = {
@@ -370,10 +407,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
         .then((r) => {
           const id = isObj(r.turn) ? str(r.turn.id) : undefined;
           if (turn && id) turn.id = id;
+          if (next.model !== undefined) s.model = next.model;
           return id;
         })
         .catch((err: unknown) => {
-          if (s.turn === turn) this.#endTurn(s, 'error', errorMessage(err));
+          // A dead process is reported once, by #onExit.
+          if (s.turn === turn && !s.rpc.closed) {
+            this.#endTurn(s, 'error', scrubLiterals(redactSecrets(errorMessage(err)), s.secrets));
+          }
           return undefined;
         }),
     };
@@ -384,7 +425,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     s.turn = undefined;
     s.interrupting = false;
     this.#setState(s, state, message);
-    if (s.queue.length > 0 && !s.ended) this.#startNext(s);
+    if (s.queue.length > 0) this.#startNext(s);
   }
 
   #onNotification(s: Session, method: string, raw: unknown): void {
@@ -440,6 +481,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       }
       case 'turn/completed': {
         const turn = isObj(p.turn) ? p.turn : {};
+        // While `turn/start` has not answered, the id is unknown; one turn runs at a time, so
+        // the completion is ours.
         if (!s.turn || (s.turn.id && str(turn.id) !== s.turn.id)) return;
         const status = str(turn.status);
         if (status === 'interrupted' || s.interrupting) this.#endTurn(s, 'cancelled');
@@ -518,10 +561,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.#denyPending(s);
     s.rpc.fail(new Error('app-server exited'));
     if (s.closing) return;
+    // Any exit we did not ask for is a crash (adapter rules), during a turn or not.
+    const how = s.exit?.signal ? `signal ${s.exit.signal}` : `code ${s.exit?.code ?? '?'}`;
     this.#setState(
       s,
-      s.turn ? 'error' : 'done',
-      s.turn ? 'app-server exited during a turn' : undefined,
+      'error',
+      `app-server exited unexpectedly (${how})${s.turn ? ' during a turn' : ''}`,
     );
     s.turn = undefined;
     s.events.end();
@@ -533,7 +578,9 @@ const CANCEL: ApprovalDecision = { kind: 'cancel', persist: false };
 /**
  * Map a Tacet decision to the Codex response for that request kind (spike #58). `allow_always`
  * is session-scoped (`acceptForSession`) unless `persist` asks for Codex's proposed execpolicy
- * amendment, which writes a rule. Denying a permissions request returns an empty grant.
+ * amendment, which writes a rule. Denying a permissions request returns an empty grant, and a
+ * granted profile is cut down to what Codex asked for. Codex's decision types have no field for a
+ * reason, so `decision.message` is not forwarded (0.167.0 schema).
  */
 export function toCodexDecision(
   kind: PendingApproval['kind'],
@@ -569,7 +616,11 @@ export function toCodexDecision(
     case 'permissions': {
       const allow = d.kind === 'allow_once' || d.kind === 'allow_always';
       return {
-        permissions: allow ? (d.grant ?? params.permissions ?? {}) : {},
+        permissions: allow
+          ? d.grant === undefined
+            ? (params.permissions ?? {})
+            : grantSubset(params.permissions, d.grant)
+          : {},
         scope: d.kind === 'allow_always' ? 'session' : 'turn',
       };
     }
@@ -611,8 +662,55 @@ function toolInput(item: Obj): unknown {
   }
 }
 
+/**
+ * The part of `granted` that `requested` covers, so a Decision can narrow a permissions request
+ * but never widen it: objects keep only requested keys (recursively), arrays only requested
+ * elements, and other values only when equal to the request or `false`.
+ */
+export function grantSubset(requested: unknown, granted: unknown): unknown {
+  if (isObj(requested) && isObj(granted)) {
+    const out: Obj = {};
+    for (const [k, v] of Object.entries(granted)) {
+      if (!(k in requested)) continue;
+      const sub = grantSubset(requested[k], v);
+      if (sub !== undefined) out[k] = sub;
+    }
+    return out;
+  }
+  if (Array.isArray(requested) && Array.isArray(granted)) {
+    const allowed = new Set(requested.map((x) => JSON.stringify(x)));
+    return granted.filter((x) => allowed.has(JSON.stringify(x)));
+  }
+  if (granted === false || JSON.stringify(granted) === JSON.stringify(requested)) return granted;
+  return undefined;
+}
+
+const RESERVED_CONFIG =
+  /^(model_providers?|mcp_servers|openai_base_url|cli_auth_credentials_store|forced_login_method)(\.|$)|token|key|secret|auth|header|password|credential/i;
+
+/**
+ * `-c` arguments for `CodexAdapterOptions.config`. Anything that could change the auth route,
+ * the MCP servers or carry a credential is refused: these values end up on the command line.
+ */
+export function configArgs(
+  config: Record<string, string | number | boolean> | undefined,
+): string[] {
+  const entries = Object.entries(config ?? {});
+  for (const [k, v] of entries) {
+    if (RESERVED_CONFIG.test(k) || findSecrets(v).length > 0) {
+      throw new AuthRoutingError(
+        `config override "${k}" is not allowed: it could change auth or carry a credential`,
+      );
+    }
+  }
+  return entries.flatMap(([k, v]) => [
+    '-c',
+    `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
+  ]);
+}
+
 /** Signal the process group `proc` leads (POSIX), or just `proc`. Already-gone is fine. */
-function signalTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+function signalGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
   try {
     if (proc.pid !== undefined && process.platform !== 'win32') process.kill(-proc.pid, signal);
     else proc.kill(signal);

@@ -49,6 +49,11 @@ export class JsonRpcPeer {
     input.on('end', () => this.fail(new Error('app-server closed its output')));
   }
 
+  /** True once the peer failed or its input ended; requests then reject at once. */
+  get closed(): boolean {
+    return this.#closed !== undefined;
+  }
+
   request<T = unknown>(method: string, params?: unknown): Promise<T> {
     if (this.#closed) return Promise.reject(this.#closed);
     const id = this.#nextId++;
@@ -70,8 +75,18 @@ export class JsonRpcPeer {
     this.#pending.clear();
   }
 
+  /**
+   * Write one message. A pipe the other side already closed must never throw or emit an unhandled
+   * `error` (EPIPE would take down the host process): the caller also listens for `error` on the
+   * stream and fails the peer.
+   */
   #write(msg: RpcMessage): void {
-    this.output.write(`${JSON.stringify(msg)}\n`);
+    if (!this.output.writable || this.output.destroyed) return;
+    try {
+      this.output.write(`${JSON.stringify(msg)}\n`);
+    } catch (err) {
+      this.fail(err instanceof Error ? err : new Error(String(err)));
+    }
   }
 
   #onData(chunk: string): void {
@@ -96,9 +111,8 @@ export class JsonRpcPeer {
       // Answers go out while the pipe is open, even after fail(): a denial sent on close is the
       // last thing the server should hear.
       this.handlers.onRequest(msg.method, msg.params).then(
-        (result) => this.output.writable && this.#write({ id, result: result ?? {} }),
+        (result) => this.#write({ id, result: result ?? {} }),
         (err: unknown) =>
-          this.output.writable &&
           this.#write({
             id,
             error:

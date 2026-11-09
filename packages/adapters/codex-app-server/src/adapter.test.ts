@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, toCodexDecision } from './adapter.js';
+import { CodexAppServerAdapter, configArgs, grantSubset, toCodexDecision } from './adapter.js';
 import { API_KEY_PROVIDER_ID, AuthRoutingError, chooseAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, RpcError } from './jsonrpc.js';
 
@@ -45,6 +45,15 @@ describe('auth routing', () => {
       }),
     );
     expect(() => codexLaunch('api_key', {})).toThrow(AuthRoutingError);
+  });
+
+  it('never passes Rust debug logging to a Worker', () => {
+    const { env } = codexLaunch('api_key', {
+      OPENAI_API_KEY: FAKE_KEY,
+      RUST_LOG: 'trace',
+      RUST_BACKTRACE: '1',
+    });
+    expect(env).toEqual({ OPENAI_API_KEY: FAKE_KEY });
   });
 
   it('subscription strips key variables and adds no provider', () => {
@@ -96,6 +105,48 @@ describe('toCodexDecision', () => {
     });
     expect(toCodexDecision('elicitation', {}, d('cancel'))).toMatchObject({ action: 'cancel' });
     expect(toCodexDecision('elicitation', {}, d('allow_once'))).toMatchObject({ action: 'accept' });
+  });
+});
+
+describe('configArgs', () => {
+  it('turns plain settings into -c overrides', () => {
+    expect(configArgs({ 'features.plugins': false, model_verbosity: 'low' })).toEqual([
+      '-c',
+      'features.plugins=false',
+      '-c',
+      'model_verbosity="low"',
+    ]);
+    expect(configArgs(undefined)).toEqual([]);
+  });
+  it('refuses anything that could change auth or carry a credential', () => {
+    for (const key of [
+      'model_provider',
+      'model_providers.x.base_url',
+      'mcp_servers.tacet.url',
+      'openai_base_url',
+      'something.api_key',
+      'x.http_headers',
+      'some_token',
+    ]) {
+      expect(() => configArgs({ [key]: 'v' }), key).toThrow(AuthRoutingError);
+    }
+    expect(() => configArgs({ note: `sk-ant-${'a'.repeat(24)}` })).toThrow(AuthRoutingError);
+  });
+});
+
+describe('grantSubset', () => {
+  const requested = { network: { enabled: true }, fileSystem: { write: ['/w', '/x'] } };
+  it('narrows but never widens a permissions grant', () => {
+    expect(grantSubset(requested, requested)).toEqual(requested);
+    expect(grantSubset(requested, { fileSystem: { write: ['/x', '/etc'] } })).toEqual({
+      fileSystem: { write: ['/x'] },
+    });
+    expect(grantSubset(requested, { network: { enabled: false } })).toEqual({
+      network: { enabled: false },
+    });
+    expect(grantSubset(requested, { root: true, network: { enabled: true, all: true } })).toEqual({
+      network: { enabled: true },
+    });
   });
 });
 
@@ -268,6 +319,103 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     expect(clientLog().find((m) => m.method === 'turn/interrupt')).toMatchObject({
       params: { threadId: 'thread-1', turnId: 'turn-1' },
     });
+    // The first turn ends cancelled, then the queued input runs as its own turn.
+    const states = () => tap.events.flatMap((e) => (e.t === 'status' ? [e.state] : []));
+    await expect.poll(states).toEqual(['idle', 'running', 'cancelled', 'running', 'idle']);
+    expect(
+      clientLog()
+        .filter((m) => m.method === 'turn/start')
+        .map((m) => m.params.input[0].text),
+    ).toEqual(['first', 'second']);
+    await adapter.close(h);
+  });
+
+  it('interrupts a turn whose turn/start has not answered yet', async () => {
+    const adapter = make('slow-start');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    expect(await adapter.interrupt(h)).toEqual({ stillQueued: [] });
+    expect(clientLog().find((m) => m.method === 'turn/interrupt')).toMatchObject({
+      params: { turnId: 'turn-1' },
+    });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'cancelled', 5000);
+    await adapter.close(h);
+  });
+
+  it('survives Codex closing its input (EPIPE) and reports the session as failed', async () => {
+    const adapter = make('close-stdin');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await new Promise((r) => setTimeout(r, 150));
+    // These writes go to a closed pipe; they must not take down this process.
+    await adapter.send(h, { text: 'one' }).catch(() => {});
+    await adapter.send(h, { text: 'two' }).catch(() => {});
+    await tap.done;
+    expect(tap.events.at(-1)).toMatchObject({ t: 'status', state: 'error' });
+    await adapter.close(h);
+  });
+
+  it('reports an output close during turn/start once, and starts nothing after it', async () => {
+    const adapter = make('drop-stdout');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'one' });
+    await adapter.send(h, { text: 'two' });
+    await tap.done;
+    const states = tap.events.flatMap((e) => (e.t === 'status' ? [e.state] : []));
+    expect(states).toEqual(['idle', 'running', 'error']);
+    expect(clientLog().filter((m) => m.method === 'turn/start')).toHaveLength(1);
+    await adapter.close(h);
+  });
+
+  it('reports an unexpected exit while idle as error, with the exit code', async () => {
+    const adapter = make('exit-idle');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await tap.done;
+    expect(tap.events.at(-1)).toMatchObject({
+      t: 'status',
+      state: 'error',
+      message: expect.stringContaining('code 5'),
+    });
+    await adapter.close(h);
+  });
+
+  it('cancelling a permissions request denies it and interrupts the turn', async () => {
+    const adapter = make('permissions');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+    if (req.event.t !== 'approval.request') throw new Error('unreachable');
+    await adapter.respond(h, req.event.id, { kind: 'cancel', persist: false });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'cancelled', 5000);
+    expect(clientLog().find((m) => m.id === 902)).toMatchObject({
+      result: { permissions: {}, scope: 'turn' },
+    });
+    expect(clientLog().some((m) => m.method === 'turn/interrupt')).toBe(true);
+    await adapter.close(h);
+  });
+
+  it('a permissions grant wider than the request is cut down to it', async () => {
+    const adapter = make('permissions');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+    if (req.event.t !== 'approval.request') throw new Error('unreachable');
+    await adapter.respond(h, req.event.id, {
+      kind: 'allow_once',
+      persist: false,
+      grant: { network: { enabled: true }, fileSystem: { write: ['/w', '/etc'] }, root: true },
+    });
+    await expect
+      .poll(() => clientLog().find((m) => m.id === 902))
+      .toMatchObject({
+        result: { permissions: { network: { enabled: true }, fileSystem: { write: ['/w'] } } },
+      });
+    expect(JSON.stringify(clientLog().find((m) => m.id === 902))).not.toContain('/etc');
     await adapter.close(h);
   });
 });

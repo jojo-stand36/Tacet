@@ -84,6 +84,10 @@ describe(`codex app-server schema (pinned ${CODEX_VERSION})`, () => {
     for (const f of ['"config"', '"approvalPolicy"', '"sandbox"', '"developerInstructions"']) {
       expect(threadStart).toContain(f);
     }
+    // Resume and fork must accept the thread config too, or they would drop the MCP servers.
+    for (const f of ['v2/ThreadResumeParams.json', 'v2/ThreadForkParams.json']) {
+      expect(JSON.parse(read(f)).properties).toHaveProperty('config');
+    }
     const usage = read('v2/ThreadTokenUsageUpdatedNotification.json');
     for (const f of ['"last"', '"modelContextWindow"', '"inputTokens"', '"outputTokens"']) {
       expect(usage).toContain(f);
