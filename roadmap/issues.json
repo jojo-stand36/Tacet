@@ -1121,6 +1121,17 @@
         "agent:either"
       ],
       "body": "Follow-up from #17 (architect review). A `handoff.requested` with no later `worker.started` for that sub-task means the daemon stopped between accepting a HandoffPacket and starting the successor session. On restart the successor must start from the packet instead of resuming the old vendor session.\n\n### Tasks\n- [ ] Detect pending handoffs when rebuilding state\n- [ ] Start the successor seeded from the packet (`read_task` already returns the latest packet), with `previousSessionId` and `worker.ended {reason: handoff}` for the old one\n\n### Acceptance criteria\n- Crash after `handoff.requested`, restart: the successor session starts from the packet and the old session is not resumed (test)\n\n_See docs/ARCHITECTURE.md §2.3._"
+    },
+    {
+      "title": "Start dependent sub-tasks from their dependencies' integrated commits",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #119 (PR #133). The Mini-conductor integrates each Worker's commits into `refs/heads/tacet/<task>`, but every new checkout still starts from the repo's main branch, so a sub-task that depends on others does not see their work, and the review sub-task reviews nothing.\n\n### Tasks\n- [ ] Give `Workspaces.create` a base commit\n- [ ] One dependency: start from its integrated commit (`worker.integrated`)\n- [ ] Several dependencies: merge their integrated commits first (plumbing in the main repo: `merge-tree` / `commit-tree`; a conflict escalates)\n- [ ] Roll the integrated sub-task branches up into the parent task's branch when it completes\n\n### Acceptance criteria\n- A sub-task that depends on another sees the other's committed files in its checkout (test)\n- Two dependencies that touch different files are both present; a conflicting pair escalates instead of running (test)\n- The parent's branch holds the work of every completed sub-task (test)\n\n_See docs/ARCHITECTURE.md §2.1 and §6._"
     }
   ]
 }

@@ -61,6 +61,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Resume in-flight handoffs after a Mini-conductor restart** — `feature` `P2` `either`
+- [ ] **Start dependent sub-tasks from their dependencies' integrated commits** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 
