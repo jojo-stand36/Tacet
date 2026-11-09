@@ -6,6 +6,7 @@ const SECRET_PATTERNS: [string, RegExp][] = [
   ['AWS access key id', /\bAKIA[0-9A-Z]{16}\b/],
   ['Google API key', /\bAIza[0-9A-Za-z_-]{30,}/],
   ['Slack token', /\bxox[abprs]-[A-Za-z0-9-]{10,}/],
+  ['bearer token', /\bBearer\s+[A-Za-z0-9._~+/-]{20,}=*/],
   ['private key', /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
 ];
 

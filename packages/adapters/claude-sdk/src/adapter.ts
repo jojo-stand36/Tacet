@@ -78,9 +78,17 @@ interface Session {
   approvals: Map<string, PendingApproval>;
   interrupting: boolean;
   closing: boolean;
+  /** The process has exited or failed; only `close()`, `events()` and `status()` still work. */
+  ended: boolean;
+  /** Literal secrets of this session (MCP header values), scrubbed from every event. */
+  secrets: string[];
   model: string | undefined;
-  /** Last cumulative `total_cost_usd`, to turn it into per-turn deltas. */
-  costSoFar: number;
+  /**
+   * Last cumulative `total_cost_usd`, to turn it into per-turn deltas. `undefined` when resuming
+   * a session whose earlier total this adapter never saw: the first turn then sets the baseline
+   * and reports no cost, because its total includes the whole earlier session.
+   */
+  costSoFar: number | undefined;
   mcpConfigPath: string | undefined;
   loop: Promise<void>;
 }
@@ -91,11 +99,20 @@ const CLIENT_APP = 'tacet/0.0.0';
  * Tacet adapter for Claude Code, driven through the Claude Agent SDK's streaming-input
  * `query()`. One `query()` (one Claude Code process) per session. Vendor messages are mapped to
  * `AgentEvent`s here and nothing SDK-specific leaves this module.
+ *
+ * Status: `running` from the first `send()` until the turn's `result`, then `idle` (or
+ * `cancelled` / `error`). Input sent during a turn runs next, so `idle` can be followed at once
+ * by `running`: consumers must not read `idle` alone as "the Worker is finished". An approval
+ * the SDK aborts (e.g. the turn was interrupted) is dropped without an event; a later
+ * `respond()` for it throws. After the process exits, the session reports `done` or `error` and
+ * only `close()` remains useful.
  */
 export class ClaudeSdkAdapter implements AgentAdapter {
   readonly id = 'claude-sdk';
   readonly #opts: ClaudeSdkAdapterOptions;
   readonly #sessions = new Map<string, Session>();
+  /** Last cumulative cost seen per vendor session, so resume and fork report deltas. */
+  readonly #costTotals = new Map<string, number>();
 
   constructor(opts: ClaudeSdkAdapterOptions = {}) {
     this.#opts = opts;
@@ -183,8 +200,10 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       approvals: new Map(),
       interrupting: false,
       closing: false,
+      ended: false,
+      secrets: secretsOf(opts),
       model: opts.model,
-      costSoFar: 0,
+      costSoFar: opts.resume ? this.#costTotals.get(opts.resume.vendorSessionId) : 0,
       mcpConfigPath,
       loop: Promise.resolve(),
     };
@@ -195,7 +214,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   }
 
   async send(h: SessionHandle, input: UserInput, opts?: SendOptions): Promise<void> {
-    const s = this.#session(h);
+    const s = this.#live(h);
     if (opts?.model) {
       await s.q.setModel(opts.model);
       s.model = opts.model;
@@ -208,13 +227,18 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       parent_tool_use_id: null,
       uuid,
     } as SDKUserMessage);
-    if (s.state !== 'running') this.#setState(s, 'running');
+    if (s.state !== 'running') {
+      s.interrupting = false;
+      this.#setState(s, 'running');
+    }
   }
 
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
-    const s = this.#session(h);
+    const s = this.#live(h);
     if (s.state === 'running') s.interrupting = true;
     const receipt = await s.q.interrupt();
+    // The turn may have ended before the interrupt landed; then no result will consume the flag.
+    if (s.state !== 'running') s.interrupting = false;
     const stillQueued = (receipt?.still_queued ?? [])
       .map((uuid) => s.pending.get(uuid))
       .filter((t): t is string => t !== undefined);
@@ -222,7 +246,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   }
 
   async respond(h: SessionHandle, requestId: string, decision: ApprovalDecision): Promise<void> {
-    const s = this.#session(h);
+    const s = this.#live(h);
     const pending = s.approvals.get(requestId);
     if (!pending) throw new Error(`no pending approval ${requestId}`);
     s.approvals.delete(requestId);
@@ -262,8 +286,16 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     return s;
   }
 
+  /** A session whose process is still running. */
+  #live(h: SessionHandle): Session {
+    const s = this.#session(h);
+    if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
+    return s;
+  }
+
+  /** Every event leaves through here: known key formats and this session's secrets are scrubbed. */
   #emit(s: Session, e: AgentEvent): void {
-    s.events.push(e);
+    s.events.push(scrub(redactSecrets(e), s.secrets));
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {
@@ -294,7 +326,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         summary: ctx.title ?? `Claude wants to use ${toolName}`,
         toolName,
         options: ['allow_once', 'allow_always', 'reject', 'cancel'],
-        requestedGrant: redactSecrets({ input, suggestions: ctx.suggestions ?? [] }),
+        requestedGrant: { input, suggestions: ctx.suggestions ?? [] },
       });
     });
   }
@@ -306,6 +338,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     } catch (err) {
       if (!s.closing) this.#setState(s, 'error', errorMessage(err));
     } finally {
+      s.ended = true;
+      for (const p of s.approvals.values()) p.resolve(deny('session ended', true));
+      s.approvals.clear();
       if (!s.closing) {
         if (s.mcpConfigPath) removeMcpConfig(s.mcpConfigPath);
         s.events.end();
@@ -340,7 +375,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
               t: 'tool.call',
               id: b.id,
               name: b.name,
-              input: redactSecrets(b.input),
+              input: b.input,
             });
           }
         }
@@ -373,8 +408,12 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     }
 
     // Round to nano-dollars so float subtraction noise does not reach the ledger.
-    const cost = Math.round(Math.max(0, m.total_cost_usd - s.costSoFar) * 1e9) / 1e9;
-    s.costSoFar = Math.max(s.costSoFar, m.total_cost_usd);
+    const cost =
+      s.costSoFar === undefined
+        ? undefined
+        : Math.round(Math.max(0, m.total_cost_usd - s.costSoFar) * 1e9) / 1e9;
+    s.costSoFar = Math.max(s.costSoFar ?? 0, m.total_cost_usd);
+    if (s.handle.vendorSessionId) this.#costTotals.set(s.handle.vendorSessionId, s.costSoFar);
     const context = await s.q.getContextUsage({ detail: 'summary' }).catch(() => undefined);
     this.#emit(s, {
       t: 'usage',
@@ -383,7 +422,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         (m.usage.cache_creation_input_tokens ?? 0) +
         (m.usage.cache_read_input_tokens ?? 0),
       outputTokens: m.usage.output_tokens,
-      costUsd: cost,
+      ...(cost !== undefined ? { costUsd: cost } : {}),
       ...(context ? { contextUsed: context.totalTokens, contextMax: context.maxTokens } : {}),
       ...(s.model ? { model: s.model } : {}),
       source: 'estimated',
@@ -400,6 +439,33 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     // Inputs sent during the turn run next.
     if (s.pending.size > 0) this.#setState(s, 'running');
   }
+}
+
+/** Header values (and bare bearer tokens) of the session's MCP servers. */
+function secretsOf(opts: SessionOptions): string[] {
+  const out = new Set<string>();
+  for (const srv of opts.mcpServers ?? []) {
+    for (const v of Object.values(srv.headers ?? {})) {
+      if (v.length >= 8) out.add(v);
+      const bare = /^\s*\S+\s+(\S{8,})\s*$/.exec(v)?.[1];
+      if (bare) out.add(bare);
+    }
+  }
+  // Longest first, so a full header value is replaced before the token inside it.
+  return [...out].sort((a, b) => b.length - a.length);
+}
+
+/** `value` with every occurrence of each literal secret replaced by `[redacted]`. */
+function scrub<T>(value: T, secrets: string[]): T {
+  if (secrets.length === 0) return value;
+  if (typeof value === 'string') {
+    return secrets.reduce((acc, sec) => acc.split(sec).join('[redacted]'), value as string) as T;
+  }
+  if (Array.isArray(value)) return value.map((v) => scrub(v, secrets)) as T;
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, scrub(v, secrets)])) as T;
+  }
+  return value;
 }
 
 function deny(message: string, interrupt = false): PermissionResult {

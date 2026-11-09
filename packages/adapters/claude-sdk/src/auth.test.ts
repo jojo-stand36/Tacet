@@ -30,11 +30,9 @@ describe('authEnv', () => {
     expect(() => authEnv('api_key', { CLAUDE_CODE_USE_VERTEX: '0' })).toThrow(AuthRoutingError);
   });
   it('the error never includes environment values', () => {
-    try {
-      authEnv('api_key', { SOME_TOKEN: FAKE });
-    } catch (err) {
-      expect(String(err)).not.toContain(FAKE);
-    }
+    expect(() => authEnv('api_key', { SOME_TOKEN: FAKE })).toThrow(
+      expect.objectContaining({ message: expect.not.stringContaining(FAKE) }),
+    );
   });
   it('subscription removes API-key variables so the own login applies', () => {
     const env = authEnv('subscription', {

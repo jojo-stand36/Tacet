@@ -72,14 +72,17 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     expect(await turn(h2, new EventTap(adapter.events(h2)), 'SAY second')).toBe('You said second.');
     expect(h2.vendorSessionId).toBe(id);
     // The resumed request carries the earlier turn: user, assistant, user.
-    expect(api.requests.at(-1)).toMatchObject({ text: 'SAY second' });
-    expect(api.requests.at(-1)?.messages).toBeGreaterThanOrEqual(3);
+    expect(api.requests.findLast((r) => r.text === 'SAY second')?.messages).toBeGreaterThanOrEqual(
+      3,
+    );
     await adapter.close(h2);
 
     const h3 = await adapter.start({ cwd: worktree, resume: { vendorSessionId: id, fork: true } });
     expect(await turn(h3, new EventTap(adapter.events(h3)), 'SAY third')).toBe('You said third.');
     expect(h3.vendorSessionId).not.toBe(id);
-    expect(api.requests.at(-1)?.messages).toBeGreaterThanOrEqual(5);
+    expect(api.requests.findLast((r) => r.text === 'SAY third')?.messages).toBeGreaterThanOrEqual(
+      5,
+    );
     await adapter.close(h3);
   });
 
@@ -97,15 +100,29 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
       });
       // The binary is running once a turn has completed.
       expect(await turn(h, new EventTap(adapter.events(h)), 'SAY up')).toBe('You said up.');
-      const cmdlines = readdirSync('/proc')
-        .filter((d) => /^\d+$/.test(d))
-        .map((pid) => {
-          try {
-            return readFileSync(`/proc/${pid}/cmdline`, 'utf8');
-          } catch {
-            return '';
-          }
-        });
+      // Only this test's own process tree, so another Claude on the machine cannot satisfy it.
+      const read = (path: string) => {
+        try {
+          return readFileSync(path, 'utf8');
+        } catch {
+          return '';
+        }
+      };
+      const parent = new Map<number, number>();
+      for (const d of readdirSync('/proc').filter((x) => /^\d+$/.test(x))) {
+        // Field 4 of /proc/<pid>/stat, after the parenthesised command name.
+        const ppid = Number(read(`/proc/${d}/stat`).split(') ')[1]?.split(' ')[1]);
+        if (ppid) parent.set(Number(d), ppid);
+      }
+      const isDescendant = (pid: number): boolean => {
+        for (let p = parent.get(pid); p !== undefined; p = parent.get(p)) {
+          if (p === process.pid) return true;
+        }
+        return false;
+      };
+      const cmdlines = [...parent.keys()]
+        .filter(isDescendant)
+        .map((pid) => read(`/proc/${pid}/cmdline`));
       expect(cmdlines.some((c) => c.includes('--mcp-config'))).toBe(true);
       expect(cmdlines.some((c) => c.includes(marker))).toBe(false);
       await adapter.close(h);
@@ -134,7 +151,7 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     const p1 = Object.fromEntries(
       results.filter((r) => r.priority === 'P1').map((r) => [r.id, r.verdict]),
     );
-    expect(p1).toMatchObject({ resume: 'pass', 'model-switch': 'pass' });
+    expect(p1).toMatchObject({ 'live-input': 'pass', resume: 'pass', 'model-switch': 'pass' });
     // Every session removed its MCP config file on close, and none was written in the worktree.
     expect(readdirSync(join(root, 'run', 'mcp'))).toEqual([]);
     expect(existsSync(join(worktree, '.mcp.json'))).toBe(false);

@@ -35,7 +35,9 @@ export function chooseAuthRoute(
  * The environment for the Claude Code process on `route`, derived from the user's environment.
  * `api_key` requires an API key or cloud provider setting to be present and fails otherwise,
  * so an unattended Worker never silently falls back to the subscription login. `subscription`
- * removes API-key variables so the binary uses the user's own login. Values are passed through
+ * removes API-key variables so the binary uses the user's own login. It leaves cloud provider
+ * settings (`CLAUDE_CODE_USE_BEDROCK` and similar) alone: a user who set one chose that provider
+ * for their own sessions, so an interactive session follows it. Values are passed through
  * untouched and never logged.
  */
 export function authEnv(

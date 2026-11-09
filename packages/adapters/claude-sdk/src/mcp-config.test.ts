@@ -1,4 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -36,6 +45,41 @@ describe('writeMcpConfig', () => {
     expect(() =>
       writeMcpConfig(servers, { sessionId: 's1', worktree: wt, dir: join(wt, '.tacet') }),
     ).toThrow(/outside the worktree/);
+  });
+
+  it('refuses the worktree reached through symlinks or a ..-prefixed name', () => {
+    const wt = join(root, 'wt');
+    mkdirSync(wt);
+    symlinkSync(wt, join(root, 'link'));
+    // A symlinked parent of the directory points into the worktree.
+    expect(() =>
+      writeMcpConfig(servers, { sessionId: 's1', worktree: wt, dir: join(root, 'link', 'mcp') }),
+    ).toThrow(/outside the worktree/);
+    // The worktree itself is given through a symlink (as macOS tmpdir paths are).
+    expect(() =>
+      writeMcpConfig(servers, {
+        sessionId: 's1',
+        worktree: join(root, 'link'),
+        dir: join(wt, '.x'),
+      }),
+    ).toThrow(/outside the worktree/);
+    // A directory whose name starts with `..` is still inside.
+    expect(() =>
+      writeMcpConfig(servers, { sessionId: 's1', worktree: wt, dir: join(wt, '..cache') }),
+    ).toThrow(/outside the worktree/);
+    expect(readdirSync(wt)).toEqual([]);
+  });
+
+  it('refuses a directory that is a symlink', () => {
+    mkdirSync(join(root, 'real'));
+    symlinkSync(join(root, 'real'), join(root, 'mcp'));
+    expect(() =>
+      writeMcpConfig(servers, {
+        sessionId: 's1',
+        worktree: join(root, 'wt'),
+        dir: join(root, 'mcp'),
+      }),
+    ).toThrow(/not a directory/);
   });
 
   it('refuses to overwrite an existing file and rejects path-like session ids', () => {

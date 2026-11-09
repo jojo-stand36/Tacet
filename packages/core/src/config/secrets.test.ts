@@ -23,6 +23,13 @@ describe('redactSecrets', () => {
   it('drops a whole string holding a private key', () => {
     expect(redactSecrets('x\n-----BEGIN RSA PRIVATE KEY-----\nabc')).toBe('[redacted]');
   });
+  it('redacts bearer tokens, such as Worker tokens, which have no vendor prefix', () => {
+    expect(redactSecrets(`curl -H "Authorization: Bearer ${'Z9_-'.repeat(8)}" x`)).toBe(
+      'curl -H "Authorization: [redacted]" x',
+    );
+    expect(redactSecrets('Bearer short')).toBe('Bearer short');
+  });
+
   it('leaves ordinary text alone', () => {
     expect(redactSecrets('touch file.txt')).toBe('touch file.txt');
   });
