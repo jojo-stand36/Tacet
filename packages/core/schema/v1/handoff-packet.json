@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:handoff-packet:v1",
+  "title": "Tacet HandoffPacket",
+  "type": "object",
+  "properties": {
+    "v": {
+      "type": "number",
+      "const": 1
+    },
+    "id": {
+      "description": "handoffId, minted by the Mini-conductor when it accepts the packet",
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "parentSession": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "The session that wrote this packet"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "stateSummary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decisions": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "minLength": 1
+          },
+          "decision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "task",
+              "repo"
+            ]
+          }
+        },
+        "required": [
+          "topic",
+          "decision"
+        ]
+      }
+    },
+    "filesTouched": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "commandsRun": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "exitCode": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "summary": {
+            "description": "One line on what the output showed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    },
+    "openQuestions": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "nextAction": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "The very next step"
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "partial",
+            "not_run"
+          ]
+        },
+        "commands": {
+          "default": [],
+          "description": "Commands that verify the work",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    }
+  },
+  "required": [
+    "v",
+    "taskId",
+    "parentSession",
+    "createdAt",
+    "goal",
+    "acceptanceCriteria",
+    "stateSummary",
+    "nextAction",
+    "verification"
+  ]
+}

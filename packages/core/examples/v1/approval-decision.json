@@ -1,0 +1,5 @@
+{
+  "kind": "allow_always",
+  "persist": false,
+  "message": "Allowed for this session"
+}

@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:agent-event:v1",
+  "title": "Tacet AgentEvent",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "message.delta"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "text"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "tool.call"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {}
+      },
+      "required": [
+        "t",
+        "id",
+        "name",
+        "input"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "tool.result"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "id",
+        "ok"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "approval.request"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "toolName": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "description": "Choices the vendor surface supports; absent means all four",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "allow_once",
+              "allow_always",
+              "reject",
+              "cancel"
+            ]
+          }
+        },
+        "requestedGrant": {
+          "description": "For grant-style requests (e.g. Codex permissions): what the agent asked for"
+        }
+      },
+      "required": [
+        "t",
+        "id",
+        "summary"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "usage"
+        },
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Input tokens for this call (delta)"
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Output tokens for this call (delta)"
+        },
+        "contextUsed": {
+          "description": "Tokens currently in context (gauge)",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "contextMax": {
+          "description": "Context window size (gauge)",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "costUsd": {
+          "description": "Cost of this call in US dollars (delta)",
+          "type": "number",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "reported",
+            "estimated"
+          ]
+        }
+      },
+      "required": [
+        "t",
+        "inputTokens",
+        "outputTokens",
+        "source"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "status"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "running",
+            "idle",
+            "waiting_input",
+            "auth_required",
+            "cancelled",
+            "error",
+            "done"
+          ]
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "t",
+        "state"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "t": {
+          "type": "string",
+          "const": "escalation"
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "urgency": {
+          "type": "string",
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            "blocking"
+          ]
+        },
+        "context": {
+          "type": "string"
+        },
+        "contextRef": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "t",
+        "question",
+        "urgency"
+      ]
+    }
+  ]
+}
