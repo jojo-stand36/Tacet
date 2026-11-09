@@ -6,6 +6,7 @@ import { Escalation, EscalationExt } from './escalation.js';
 import { HandoffPacket } from './handoff.js';
 import { HelloParams, HelloResult } from './hello.js';
 import { TaskPlan } from './plan.js';
+import { SessionProfile } from './profile.js';
 import { SummaryPacket } from './summary.js';
 import { Task, TaskExt } from './task.js';
 import { WorkerEnded, WorkerNudged, WorkerStarted, WorkerVendorSession } from './worker.js';
@@ -18,6 +19,7 @@ export * from './escalation.js';
 export * from './handoff.js';
 export * from './hello.js';
 export * from './plan.js';
+export * from './profile.js';
 export * from './summary.js';
 export * from './task.js';
 export * from './worker.js';
@@ -34,6 +36,7 @@ export const jsonSchemas = {
   'agent-event': { schema: AgentEvent, title: 'Tacet AgentEvent' },
   'approval-decision': { schema: ApprovalDecision, title: 'Tacet ApprovalDecision' },
   task: { schema: Task, title: 'Tacet Task' },
+  'session-profile': { schema: SessionProfile, title: 'Tacet SessionProfile' },
   'task-ext': { schema: TaskExt, title: 'Tacet A2A task extension (urn:tacet:a2a-ext:task:v1)' },
   escalation: { schema: Escalation, title: 'Tacet Escalation' },
   'escalation-ext': {
