@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { type EventEnvelope, newUlid, type TacetConfig, tasksProjection } from '@tacet/core';
 import { type EventStore, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { EventLogBackend } from '../mcp/backend.js';
 import { MiniConductor, type MiniConductorOptions } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
 import type { Planner, ProposedSubtask, WorkerMcp } from './ports.js';
@@ -867,8 +868,6 @@ describe('MiniConductor review fixes', () => {
           sessions += 1;
           if (sessions === 1) return { do: 'hold' };
         }
-        // The first session is hung: it takes the nudge and does nothing.
-        if (input.startsWith('Status check')) return { do: 'ignore' };
         return script(input);
       });
       const d = make({ config: health, now });
@@ -883,7 +882,8 @@ describe('MiniConductor review fixes', () => {
       expect(ofType('worker.nudged', sub)).toHaveLength(0);
       advance(2);
       await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
-      expect(fake.sessions[0]?.inputs.at(-1)).toMatch(/^Status check/);
+      // Recorded, not sent: real adapters would queue it as the next turn.
+      expect(fake.sessions[0]?.inputs).toHaveLength(1);
       advance(899);
       await new Promise((r) => setTimeout(r, 100));
       expect(ofType('worker.ended', sub)).toHaveLength(0);
@@ -898,10 +898,12 @@ describe('MiniConductor review fixes', () => {
       ).toEqual([1, 2]);
     });
 
-    it('does not nudge a Worker that reports progress', async () => {
+    it('takes progress reports as signs of life, whatever the backend clock says', async () => {
       fake = new ScriptedAdapter('fake', (input) =>
         input.startsWith('Sub-task') ? { do: 'hold' } : script(input),
       );
+      // The MCP backend's clock runs an hour ahead of the daemon's.
+      const backend = new EventLogBackend({ store, now: () => new Date(t + 3_600_000) });
       const d = make({ config: health, now });
       await d.start();
       const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
@@ -909,30 +911,20 @@ describe('MiniConductor review fixes', () => {
       await expect
         .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
         .toBe(1);
-      const sessionId = (
-        ofType('worker.started', sub)[0]?.data as { sessionId: string } | undefined
-      )?.sessionId;
+      const binding = { workerSessionId: minted[0] ?? '', taskId: sub };
       for (let i = 0; i < 4; i++) {
         advance(200);
-        store.append({
-          v: 1,
-          id: newUlid(t),
-          ts: now().toISOString(),
-          source: { kind: 'worker', id: sessionId ?? '' },
-          taskId: sub,
-          ...(sessionId ? { sessionId } : {}),
-          type: 'worker.progress',
-          data: { summary: `step ${i}` },
-        });
+        await backend.reportProgress(binding, { summary: `step ${i}` });
         await new Promise((r) => setTimeout(r, 60));
       }
+      expect(ofType('worker.progress', sub)).toHaveLength(4);
       expect(ofType('worker.nudged', sub)).toHaveLength(0);
-      fake.release();
-      await d.settled();
-      expect(tasks()[sub]?.state).toBe('completed');
+      // Then silence: the skewed timestamps must not push the heartbeat into the future.
+      advance(301);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
     });
 
-    it('leaves a Worker running a long tool call alone', async () => {
+    it('leaves a Worker in a long tool call alone, but not forever', async () => {
       fake = new ScriptedAdapter('fake', (input) =>
         input.startsWith('Sub-task') ? { do: 'tool-hold' } : script(input),
       );
@@ -941,15 +933,24 @@ describe('MiniConductor review fixes', () => {
       const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
       const sub = `${id}/1`;
       await expect.poll(() => ofType('agent.tool.call', sub).length, { timeout: 5000 }).toBe(1);
-      advance(3600);
+      advance(1199);
       await new Promise((r) => setTimeout(r, 150));
       expect(ofType('worker.nudged', sub)).toHaveLength(0);
-      expect(ofType('worker.ended', sub)).toHaveLength(0);
+      // Open for stuck_after_s + nudge_grace_s: a hung watcher or prompt, not a long test run.
+      advance(2);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
+      advance(901);
+      await expect
+        .poll(() => ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason), {
+          timeout: 5000,
+        })
+        .toEqual(['stuck']);
+      await expect.poll(() => ofType('worker.started', sub).length, { timeout: 5000 }).toBe(2);
     });
 
     it('leaves a Worker waiting on an answer alone', async () => {
       const escId = newUlid();
-      fake = new ScriptedAdapter('fake', (input, sess) => {
+      fake = new ScriptedAdapter('fake', (_input, sess) => {
         if (sess.inputs.length === 1) {
           const started = ofType('worker.started').at(-1);
           store.append({
@@ -971,7 +972,8 @@ describe('MiniConductor review fixes', () => {
           } as EventEnvelope);
           return { do: 'reply', text: 'waiting' };
         }
-        return script(input);
+        // The answer starts a long, quiet turn.
+        return { do: 'hold' };
       });
       const d = make({ config: health, now });
       await d.start();
@@ -981,6 +983,15 @@ describe('MiniConductor review fixes', () => {
       advance(3600);
       await new Promise((r) => setTimeout(r, 150));
       expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      // The answer after an hour starts a new turn: the wait is not silence.
+      store.append(env(sub, 'escalation.resolved', { escalationId: escId, answer: 'yes' }));
+      await expect
+        .poll(() => ofType('escalation.delivered', sub).length, { timeout: 5000 })
+        .toBe(1);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      advance(301);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
     });
 
     it('starts the heartbeat afresh after a restart', async () => {

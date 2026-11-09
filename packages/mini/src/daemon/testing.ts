@@ -16,7 +16,7 @@ import type { Workspace, Workspaces } from './ports.js';
 
 /**
  * What a scripted Worker does with one input. `reply` ends the turn idle with that text;
- * `error` ends the session in error; `hold` keeps the turn running until `release()`;
+ * `error` ends the session in error; `hold` keeps the turn running until `release()`; `tool-hold` starts a tool call that never ends;
  * `approval` asks for an approval first, then replies with whether it was granted.
  */
 export type Script =
@@ -24,7 +24,6 @@ export type Script =
   | { do: 'error'; message: string }
   | { do: 'hold' }
   | { do: 'vanish' }
-  | { do: 'ignore' }
   | { do: 'tool-hold' }
   | { do: 'auth' }
   | { do: 'approval'; toolName?: string; grant?: unknown };
@@ -145,10 +144,8 @@ export class ScriptedAdapter implements AgentAdapter {
 
   async #turn(s: FakeSession, input: string): Promise<void> {
     if (!this.#open.has(s)) return;
-    const step = this.#script(input, s);
-    // A hung session: the input is taken and nothing happens, not even a status.
-    if (step.do === 'ignore') return;
     this.#emit(s, { t: 'status', state: 'running' });
+    const step = this.#script(input, s);
     if (step.do === 'reply') {
       for (const part of step.text.match(/\S+\s*/g) ?? [step.text]) {
         this.#emit(s, { t: 'message.delta', text: part });
