@@ -9,6 +9,7 @@ export {
   SingleStepPlanner,
 } from './daemon/planner.js';
 export type {
+  Integrator,
   Planner,
   ProposedSubtask,
   Verifier,
@@ -23,6 +24,13 @@ export {
   pickReady,
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
+export {
+  GitIntegrator,
+  type Integration,
+  integrateWorktree,
+  taskBranch,
+  WorktreeRefusedError,
+} from './git/integrate.js';
 export {
   type EscalationGate,
   EventLogBackend,

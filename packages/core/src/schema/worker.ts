@@ -64,3 +64,14 @@ export const WorkerNudged = z.object({
   silentForMs: z.number().int().nonnegative(),
 });
 export type WorkerNudged = z.infer<typeof WorkerNudged>;
+
+/**
+ * Payload of `worker.integrated`: the Mini-conductor brought the Worker's commit into the repo's
+ * shared object store and pointed the sub-task's branch at it (#119).
+ */
+export const WorkerIntegrated = z.object({
+  sessionId: Id,
+  commit: z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id'),
+  ref: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
+});
+export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;

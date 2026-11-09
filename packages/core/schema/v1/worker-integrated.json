@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:worker-integrated:v1",
+  "title": "Tacet worker.integrated payload",
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "ref": {
+      "type": "string",
+      "pattern": "^refs\\/heads\\/\\S+$"
+    }
+  },
+  "required": [
+    "sessionId",
+    "commit",
+    "ref"
+  ]
+}

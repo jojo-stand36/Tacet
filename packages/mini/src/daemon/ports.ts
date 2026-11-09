@@ -19,6 +19,18 @@ export interface Workspaces {
   remove(id: string): Promise<void>;
 }
 
+/**
+ * Brings a sub-task's Worker commits into the repo (#119). Returns undefined when there is
+ * nothing to integrate; throws `WorktreeRefusedError` when the checkout fails its integrity
+ * checks (nothing was run in it).
+ */
+export interface Integrator {
+  integrate(
+    subtaskId: string,
+    workspace: Workspace,
+  ): Promise<{ commit: string; ref: string } | undefined>;
+}
+
 /** Checks a finished Worker turn before its sub-task counts as `completed` (#19 replaces it). */
 export interface Verifier {
   verify(subtask: Task, workspace: Workspace): Promise<Verification>;

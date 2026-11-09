@@ -21,8 +21,10 @@ import {
   type VerificationStatus,
 } from '@tacet/core';
 import type { EventStore } from '@tacet/core/node';
+import { WorktreeRefusedError } from '../git/integrate.js';
 import { TOOL_NAMES } from '../mcp/tools.js';
 import type {
+  Integrator,
   Planner,
   Verifier,
   WorkerAdapter,
@@ -43,6 +45,8 @@ export interface MiniConductorOptions {
   planner: Planner;
   /** Default: passes, with the configured `verify` commands recorded as not run (#19). */
   verifier?: Verifier;
+  /** Brings Worker commits into the repo after each finished turn (#119). Default: none. */
+  integrator?: Integrator;
   mcp: WorkerMcp;
   /** Single-instance lock, e.g. `<repoStateDir>/mini.lock`. */
   lockPath: string;
@@ -97,6 +101,8 @@ interface Run {
   text: string;
   /** The last complete assistant message, for the summary. */
   lastMessage?: string;
+  /** The Worker's commit, once integrated into the repo. */
+  commit?: string;
   /** A turn is running: answers wait until it ends. */
   turnActive: boolean;
   /** The turn's end is being handled, so it is handled once. */
@@ -770,6 +776,11 @@ export class MiniConductor {
       }
       const view = this.#state().tasks[run.subtaskId];
       if (!view) return;
+      // The Worker's commits come into the repo before its work is verified or built on.
+      if (!(await this.#integrate(run))) {
+        ended = true;
+        return;
+      }
       const verification = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
         view.task,
         run.workspace,
@@ -808,10 +819,68 @@ export class MiniConductor {
       outcome,
       summary: text ? redactSecrets(text.slice(-2000)) : `Worker turn ended (${outcome}).`,
       filesTouched: [],
-      commits: [],
+      commits: run.commit ? [run.commit] : [],
       verification,
       openQuestions: [],
     };
+  }
+
+  /**
+   * Integrate the run's commits (#119). False when the run had to end: its checkout failed the
+   * integrity checks (the user is asked; nothing ran in it) or integration failed (a failed
+   * attempt).
+   */
+  async #integrate(run: Run): Promise<boolean> {
+    const integrator = this.#o.integrator;
+    if (!integrator) return true;
+    try {
+      const result = await integrator.integrate(run.subtaskId, run.workspace);
+      if (result && this.#runs.get(run.subtaskId) === run) {
+        run.commit = result.commit;
+        this.#o.store.append(
+          this.#env(
+            run.subtaskId,
+            'worker.integrated',
+            { sessionId: run.sessionId, ...result },
+            run.sessionId,
+          ),
+        );
+      }
+      return true;
+    } catch (err) {
+      this.#errors.push(err);
+      const message = redactSecrets((err as Error).message);
+      if (err instanceof WorktreeRefusedError) {
+        const now = this.#now().toISOString();
+        this.#o.store.append([
+          this.#env(run.subtaskId, 'escalation.raised', {
+            id: newUlid(this.#now().getTime()),
+            taskId: run.subtaskId,
+            question: `The Worker's checkout for ${run.subtaskId} failed its integrity checks (${message}). Nothing was run in it. Inspect it, then answer to let the sub-task run again.`,
+            urgency: 'high',
+            createdAt: now,
+            status: 'pending',
+          }),
+          this.#env(run.subtaskId, 'task.status', { state: 'input_required' }),
+        ]);
+        await this.#end(run, 'failed', 'checkout failed its integrity checks');
+        return false;
+      }
+      this.#o.store.append(
+        this.#env(
+          run.subtaskId,
+          'task.result',
+          this.#summary(run, 'failed', {
+            status: 'failed',
+            commands: [],
+            notes: `integrating the Worker's commits failed: ${message}`,
+          }),
+        ),
+      );
+      await this.#end(run, 'failed', 'integration failed');
+      this.#afterFailure(run.subtaskId);
+      return false;
+    }
   }
 
   #defaultVerifier(): Verifier {
