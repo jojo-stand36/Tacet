@@ -47,6 +47,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `copilot`
 - [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
 - [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
+- [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
 
 ## M2 · Conductor & escalation
 
