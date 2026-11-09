@@ -129,4 +129,63 @@ describe('EventLogBackend', () => {
       ),
     ).rejects.toBeInstanceOf(ToolError);
   });
+  it('never lets the gate approve a repo-scope decision', async () => {
+    const b = make({ gate: async () => ({ answer: 'yes', source: 'mini' }) });
+    const r = await b.recordDecision(W1, { topic: 'db', decision: 'postgres', scope: 'repo' });
+    expect(r.status).toBe('needs_approval');
+    expect(types()).not.toContain('escalation.resolved');
+    const raised = store.query({ typePrefix: 'escalation.raised' }).at(-1)?.raw.data;
+    expect(raised).toMatchObject({
+      category: 'decision',
+      proposedDecision: {
+        decisionId: r.decisionId,
+        topic: 'db',
+        decision: 'postgres',
+        scope: 'repo',
+      },
+    });
+  });
+
+  it('accepts one handoff per session and fills defaults, ignoring a worker-supplied id', async () => {
+    const b = make();
+    const packet = {
+      id: 'not-a-ulid',
+      goal: 'G',
+      acceptanceCriteria: [],
+      stateSummary: 's',
+      nextAction: 'n',
+      verification: { status: 'not_run' },
+    };
+    expect((await b.requestHandoff(W1, { reason: 'r', packet })).accepted).toBe(true);
+    await expect(b.requestHandoff(W1, { reason: 'r', packet })).rejects.toThrow(/already accepted/);
+    // The next session may hand off again.
+    await expect(
+      b.requestHandoff({ workerSessionId: 'w-2', taskId: 'task-1' }, { reason: 'r', packet }),
+    ).resolves.toMatchObject({ accepted: true });
+  });
+
+  it('records gate failures and late gate answers', async () => {
+    const failing = make({ gate: async () => Promise.reject(new Error('gate down')) });
+    await failing.escalate(W1, { question: 'q', urgency: 'low' });
+    expect(store.query({ typePrefix: 'escalation.gate_failed' })[0]?.raw.data).toMatchObject({
+      message: 'gate down',
+    });
+    let release: (v: { answer: string; source: 'mini' }) => void = () => {};
+    const late = make({
+      gate: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+      gateTimeoutMs: 10,
+    });
+    const esc = await late.escalate(W1, { question: 'q2', urgency: 'low' });
+    expect(esc.status).toBe('pending');
+    release({ answer: 'later', source: 'mini' });
+    await new Promise((r) => setImmediate(r));
+    expect(await late.getDecision(W1, { escalationId: esc.escalationId })).toEqual({
+      status: 'resolved',
+      answer: 'later',
+      source: 'mini',
+    });
+  });
 });

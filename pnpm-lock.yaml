@@ -276,6 +276,9 @@ importers:
       '@tacet/adapter-claude-sdk':
         specifier: workspace:*
         version: link:../adapters/claude-sdk
+      '@tacet/adapter-codex-app-server':
+        specifier: workspace:*
+        version: link:../adapters/codex-app-server
 
   packages/tui:
     dependencies:

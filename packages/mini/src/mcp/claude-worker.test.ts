@@ -109,5 +109,6 @@ describe('a real Claude Worker calls escalate (#18 acceptance)', () => {
     // Claude Code 2.1.319 defers MCP tools behind ToolSearch (not in the first request's tool
     // list); calling one by its `mcp__<server>__<tool>` name still works.
     expect(api.requests[0]?.tools).toContain('ToolSearch');
+    expect(api.requests[0]?.tools).not.toContain('mcp__tacet__escalate');
   });
 });

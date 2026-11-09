@@ -98,11 +98,12 @@ export class EventLogBackend implements MiniBackend {
     data: unknown,
     kind: 'worker' | 'mini',
   ): string {
-    const id = newUlid(this.#now().getTime());
+    const now = this.#now();
+    const id = newUlid(now.getTime());
     const env: EventEnvelope = {
       v: 1,
       id,
-      ts: this.#now().toISOString(),
+      ts: now.toISOString(),
       source:
         kind === 'worker' && b
           ? { kind, id: b.workerSessionId }
@@ -162,9 +163,15 @@ export class EventLogBackend implements MiniBackend {
     return { ack: true as const };
   }
 
-  async escalate(b: WorkerBinding, i: ToolInput<'escalate'>): Promise<ToolOutput<'escalate'>> {
+  /** Record a new pending escalation, without consulting the gate. */
+  #raise(
+    b: WorkerBinding,
+    i: ToolInput<'escalate'>,
+    extra: Record<string, unknown> = {},
+  ): Escalation {
+    const now = this.#now();
     const escalation = Escalation.parse({
-      id: newUlid(this.#now().getTime()),
+      id: newUlid(now.getTime()),
       taskId: b.taskId,
       sessionId: b.workerSessionId,
       ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
@@ -175,30 +182,62 @@ export class EventLogBackend implements MiniBackend {
       ...(i.contextRef !== undefined ? { contextRef: i.contextRef } : {}),
       blockedWorkers: i.urgency === 'blocking' ? 1 : 0,
       status: 'pending',
-      createdAt: this.#now().toISOString(),
+      createdAt: now.toISOString(),
     });
-    this.#append(b, 'escalation.raised', escalation, 'worker');
+    this.#append(b, 'escalation.raised', { ...escalation, ...extra }, 'worker');
+    return escalation;
+  }
+
+  async escalate(b: WorkerBinding, i: ToolInput<'escalate'>): Promise<ToolOutput<'escalate'>> {
+    const escalation = this.#raise(b, i);
     const gate = this.#o.gate;
-    if (gate) {
-      const timeout = this.#o.gateTimeoutMs ?? 3000;
-      const result = await Promise.race([
-        gate(escalation, b).catch(() => undefined),
-        new Promise<undefined>((r) => setTimeout(() => r(undefined), timeout).unref()),
-      ]);
-      if (result) {
+    if (!gate) return { escalationId: escalation.id, status: 'pending' };
+    const resolve = (result: { answer: string; source: 'policy' | 'precedent' | 'mini' }) =>
+      this.#append(
+        b,
+        'escalation.resolved',
+        { escalationId: escalation.id, answer: result.answer, source: result.source },
+        'mini',
+      );
+    let timedOut = false;
+    const answered = gate(escalation, b).then(
+      (result) => {
+        // A late answer is still recorded; the daemon delivers it as the worker's next message.
+        if (result && timedOut) resolve(result);
+        return result;
+      },
+      (err: unknown) => {
         this.#append(
           b,
-          'escalation.resolved',
-          { escalationId: escalation.id, answer: result.answer, source: result.source },
+          'escalation.gate_failed',
+          {
+            escalationId: escalation.id,
+            message: err instanceof Error ? err.message : String(err),
+          },
           'mini',
         );
-        return {
-          escalationId: escalation.id,
-          status: 'resolved',
-          answer: result.answer,
-          source: result.source,
-        };
-      }
+        return undefined;
+      },
+    );
+    let timer: NodeJS.Timeout | undefined;
+    const result = await Promise.race([
+      answered,
+      new Promise<undefined>((r) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          r(undefined);
+        }, this.#o.gateTimeoutMs ?? 3000);
+      }),
+    ]);
+    clearTimeout(timer);
+    if (result && !timedOut) {
+      resolve(result);
+      return {
+        escalationId: escalation.id,
+        status: 'resolved',
+        answer: result.answer,
+        source: result.source,
+      };
     }
     return { escalationId: escalation.id, status: 'pending' };
   }
@@ -232,10 +271,21 @@ export class EventLogBackend implements MiniBackend {
     b: WorkerBinding,
     i: ToolInput<'request_handoff'>,
   ): Promise<ToolOutput<'request_handoff'>> {
-    const raw = typeof i.packet === 'object' && i.packet !== null ? i.packet : {};
-    // Identity comes from the token, not from the packet.
+    // One accepted handoff per session: each one seeds a new session, so more would fan out cost.
+    const already = this.#events(b, 'handoff.requested').some(
+      (e) => e.sessionId === b.workerSessionId,
+    );
+    if (already) throw new ToolError('a handoff was already accepted for this session');
+    const raw = (typeof i.packet === 'object' && i.packet !== null ? i.packet : {}) as Record<
+      string,
+      unknown
+    >;
+    // Identity comes from the token, not from the packet; the Mini-conductor mints the id.
+    const { id: _ignored, ...rest } = raw;
     const parsed = HandoffPacket.safeParse({
-      ...raw,
+      v: 1,
+      createdAt: this.#now().toISOString(),
+      ...rest,
       taskId: b.taskId,
       parentSession: b.workerSessionId,
     });
@@ -254,6 +304,7 @@ export class EventLogBackend implements MiniBackend {
     const handoffId = newUlid(this.#now().getTime());
     const packet = { ...parsed.data, id: handoffId };
     this.#append(b, 'handoff.requested', { handoffId, reason: i.reason, packet }, 'worker');
+    this.#lastProgress.delete(b.workerSessionId);
     this.#o.onHandoff?.(b, packet, i.reason);
     return { accepted: true, handoffId };
   }
@@ -264,13 +315,29 @@ export class EventLogBackend implements MiniBackend {
   ): Promise<ToolOutput<'record_decision'>> {
     const decisionId = newUlid(this.#now().getTime());
     if (i.scope === 'repo' && !(this.#o.allowRepoDecision?.(b, i) ?? false)) {
-      // Repo-wide precedent needs approval: it becomes an escalation instead (ADR-003 §6).
-      const esc = await this.escalate(b, {
-        question: `Approve a repo-wide decision on "${i.topic}": ${i.decision}`,
-        urgency: 'normal',
-        ...(i.rationale !== undefined ? { context: i.rationale } : {}),
-      });
-      return { decisionId, status: 'needs_approval', escalationId: esc.escalationId };
+      // Repo-wide precedent needs approval: it becomes an escalation instead (ADR-003 §6). It
+      // never goes through the gate, which could otherwise approve it on its own; only repo
+      // policy (`allowRepoDecision`) or the user may. The proposal travels with the escalation,
+      // so an approval can record it under `decisionId`.
+      const esc = this.#raise(
+        b,
+        {
+          question: `Approve a repo-wide decision on "${i.topic}": ${i.decision}`,
+          urgency: 'normal',
+          ...(i.rationale !== undefined ? { context: i.rationale } : {}),
+        },
+        {
+          category: 'decision',
+          proposedDecision: {
+            decisionId,
+            topic: i.topic,
+            decision: i.decision,
+            ...(i.rationale !== undefined ? { rationale: i.rationale } : {}),
+            scope: 'repo',
+          },
+        },
+      );
+      return { decisionId, status: 'needs_approval', escalationId: esc.id };
     }
     const decision = Decision.parse({
       id: decisionId,
@@ -293,7 +360,7 @@ export class EventLogBackend implements MiniBackend {
   ): Promise<ToolOutput<'search_decisions'>> {
     const terms = i.query
       .toLowerCase()
-      .split(/\W+/)
+      .split(/[^\p{L}\p{N}]+/u)
       .filter((t) => t.length > 1);
     const scored = this.#decisions(b)
       .map((d, order) => {

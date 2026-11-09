@@ -1,5 +1,6 @@
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import type { McpServerConfig } from '@tacet/core';
 import {
@@ -24,6 +25,8 @@ export interface MiniMcpServerOptions {
   name?: string;
   /** Largest request body accepted, in bytes. Default 1 MiB. */
   maxBodyBytes?: number;
+  /** Told about internal failures (message only; never headers or bodies). */
+  onError?: (message: string) => void;
 }
 
 const VERSION = '0.0.0';
@@ -37,7 +40,8 @@ const PENDING_TEXT =
 export function buildToolServer(binding: WorkerBinding, opts: MiniMcpServerOptions): McpServer {
   const server = new McpServer(
     { name: opts.name ?? 'tacet-mini', version: VERSION },
-    { capabilities: { tools: {} } },
+    // The tool list never changes during a request, so no change notifications.
+    { capabilities: { tools: { listChanged: false } } },
   );
   const b = opts.backend;
   const run = {
@@ -50,7 +54,10 @@ export function buildToolServer(binding: WorkerBinding, opts: MiniMcpServerOptio
     search_decisions: (i: never) => b.searchDecisions(binding, i),
   } satisfies Record<ToolName, (i: never) => Promise<unknown>>;
 
+  const allowed = (name: ToolName) => opts.policy?.(name, binding) ?? true;
   for (const name of TOOL_NAMES) {
+    // A tool the policy refuses is not even listed; the call-time check below stays as a guard.
+    if (!allowed(name)) continue;
     const spec = ToolSchemas[name];
     server.registerTool(
       name,
@@ -65,7 +72,7 @@ export function buildToolServer(binding: WorkerBinding, opts: MiniMcpServerOptio
         },
       },
       async (args: unknown) => {
-        if (!(opts.policy?.(name, binding) ?? true)) {
+        if (!allowed(name)) {
           return failure(`${name} is not allowed for this worker`);
         }
         try {
@@ -79,6 +86,7 @@ export function buildToolServer(binding: WorkerBinding, opts: MiniMcpServerOptio
         } catch (err) {
           if (err instanceof ToolError) return failure(err.message, err.detail);
           // Internal errors are not described to the worker: they could carry anything.
+          opts.onError?.(`${name}: ${err instanceof Error ? err.message : String(err)}`);
           return failure(`${name} failed inside the Mini-conductor`);
         }
       },
@@ -96,10 +104,11 @@ function failure(message: string, detail?: Record<string, unknown>) {
   };
 }
 
+/** Request headers for the SDK, without `authorization`: the SDK never holds the token. */
 function toHeaders(raw: IncomingMessage['headers']): Headers {
   const h = new Headers();
   for (const [k, v] of Object.entries(raw)) {
-    if (v === undefined) continue;
+    if (v === undefined || k === 'authorization') continue;
     for (const one of Array.isArray(v) ? v : [v]) h.append(k, one);
   }
   return h;
@@ -120,31 +129,40 @@ function reply(res: ServerResponse, status: number, body: unknown): void {
 export class MiniMcpServer {
   readonly #opts: MiniMcpServerOptions;
   readonly #listener: LoopbackListener;
+  readonly #handler: McpHandler;
 
-  private constructor(opts: MiniMcpServerOptions, listener: LoopbackListener) {
+  private constructor(opts: MiniMcpServerOptions, listener: LoopbackListener, handler: McpHandler) {
     this.#opts = opts;
     this.#listener = listener;
+    this.#handler = handler;
   }
 
   static async start(opts: MiniMcpServerOptions): Promise<MiniMcpServer> {
-    const handler = createMcpHandler((ctx) => {
-      // The HTTP layer already checked the token; resolve it again from the request itself, so the
-      // identity never travels through any other object.
-      const binding = opts.tokens.resolveHeader(ctx.requestInfo?.headers.get('authorization'));
-      if (!binding) throw new Error('unauthenticated');
-      return buildToolServer(binding, opts);
-    });
+    // Identity is resolved by the HTTP layer and handed to the SDK as `authInfo` (worker session
+    // as clientId, task as a scope). The token itself is stripped from the request and replaced by
+    // a placeholder, so no SDK object ever holds it.
+    const handler = createMcpHandler(
+      (ctx) => {
+        const binding = fromAuthInfo(ctx.authInfo);
+        if (!binding) throw new Error('unauthenticated');
+        return buildToolServer(binding, opts);
+      },
+      // The tool surface uses no subscriptions (ADR-003 §6); `serve` rejects them, and this caps
+      // them should one get through.
+      { maxSubscriptions: 1 },
+    );
     let port = 0;
     const listener = await listenLoopback(() =>
       createServer((req, res) => {
-        serve(req, res, port, opts, handler).catch(() => {
+        serve(req, res, port, opts, handler).catch((err: unknown) => {
+          opts.onError?.(`request failed: ${err instanceof Error ? err.message : String(err)}`);
           if (!res.headersSent) reply(res, 500, { error: 'internal error' });
           else res.destroy();
         });
       }),
     );
     port = listener.port;
-    return new MiniMcpServer(opts, listener);
+    return new MiniMcpServer(opts, listener, handler);
   }
 
   get port(): number {
@@ -168,17 +186,22 @@ export class MiniMcpServer {
     };
   }
 
-  close(): Promise<void> {
-    return this.#listener.close();
+  /** Stop serving: aborts in-flight exchanges and drops open connections, then unbinds. */
+  async close(): Promise<void> {
+    await this.#handler.close();
+    for (const s of this.#listener.servers) (s as Server).closeAllConnections();
+    await this.#listener.close();
   }
 }
+
+type McpHandler = ReturnType<typeof createMcpHandler>;
 
 async function serve(
   req: IncomingMessage,
   res: ServerResponse,
   port: number,
   opts: MiniMcpServerOptions,
-  handler: ReturnType<typeof createMcpHandler>,
+  handler: McpHandler,
 ): Promise<void> {
   const check = checkHostAndOrigin(
     { host: req.headers.host, origin: req.headers.origin },
@@ -189,8 +212,13 @@ async function serve(
   const path = (req.url ?? '/').split('?')[0] ?? '/';
   if (path.startsWith('/.well-known/')) return reply(res, 404, { error: 'not found' });
   if (path !== '/mcp') return reply(res, 404, { error: 'not found' });
-  if (!opts.tokens.resolveHeader(req.headers.authorization)) {
-    return reply(res, 401, { error: 'invalid or missing worker token' });
+  const binding = opts.tokens.resolveHeader(req.headers.authorization);
+  if (!binding) return reply(res, 401, { error: 'invalid or missing worker token' });
+  // POST only: the tools need no server-to-client stream (GET would open one that never ends)
+  // and no session to delete. Clients treat 405 on GET as "no stream offered".
+  if (req.method !== 'POST') {
+    res.writeHead(405, { allow: 'POST', 'cache-control': 'no-store' });
+    return void res.end();
   }
 
   const limit = opts.maxBodyBytes ?? 1024 * 1024;
@@ -198,17 +226,79 @@ async function serve(
   let size = 0;
   for await (const c of req) {
     size += (c as Buffer).length;
-    if (size > limit) return reply(res, 413, { error: 'request too large' });
+    if (size > limit) {
+      // The rest of the body is never read, so this connection cannot carry another request.
+      res.setHeader('connection', 'close');
+      reply(res, 413, { error: 'request too large' });
+      res.once('finish', () => req.destroy());
+      return;
+    }
     chunks.push(c as Buffer);
   }
-  const method = req.method ?? 'GET';
+  const body = Buffer.concat(chunks);
+  if (wantsSubscription(body)) {
+    return reply(res, 200, {
+      jsonrpc: '2.0',
+      id: requestId(body),
+      error: { code: -32601, message: 'subscriptions are not offered by this server' },
+    });
+  }
+  // The exchange ends when the client goes away.
+  const abort = new AbortController();
+  res.once('close', () => abort.abort());
   const request = new Request(`http://127.0.0.1:${port}${req.url ?? '/mcp'}`, {
-    method,
+    method: 'POST',
     headers: toHeaders(req.headers),
-    ...(method === 'GET' || method === 'HEAD' ? {} : { body: Buffer.concat(chunks) }),
+    signal: abort.signal,
+    body,
   });
-  const response = await handler.fetch(request);
+  const response = await handler.fetch(request, { authInfo: toAuthInfo(binding) });
   res.writeHead(response.status, Object.fromEntries(response.headers));
   if (!response.body) return void res.end();
-  Readable.fromWeb(response.body as import('node:stream/web').ReadableStream).pipe(res);
+  await pipeline(
+    Readable.fromWeb(response.body as import('node:stream/web').ReadableStream),
+    res,
+  ).catch(() => {
+    // The client went away mid-stream; nothing left to answer.
+  });
+}
+
+const TASK_SCOPE = 'tacet-task:';
+
+function toAuthInfo(b: WorkerBinding) {
+  return { token: '[redacted]', clientId: b.workerSessionId, scopes: [`${TASK_SCOPE}${b.taskId}`] };
+}
+
+function fromAuthInfo(
+  info: { clientId?: string; scopes?: string[] } | undefined,
+): WorkerBinding | undefined {
+  const scope = info?.scopes?.find((x) => x.startsWith(TASK_SCOPE));
+  if (!info?.clientId || !scope) return undefined;
+  return { workerSessionId: info.clientId, taskId: scope.slice(TASK_SCOPE.length) };
+}
+
+function parse(body: Buffer): unknown {
+  try {
+    return JSON.parse(body.toString('utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+function wantsSubscription(body: Buffer): boolean {
+  const msg = parse(body);
+  const all = Array.isArray(msg) ? msg : [msg];
+  return all.some(
+    (m) =>
+      typeof m === 'object' &&
+      m !== null &&
+      (m as { method?: unknown }).method === 'subscriptions/listen',
+  );
+}
+
+function requestId(body: Buffer): unknown {
+  const msg = parse(body);
+  return typeof msg === 'object' && msg !== null && !Array.isArray(msg)
+    ? ((msg as { id?: unknown }).id ?? null)
+    : null;
 }
