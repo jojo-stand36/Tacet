@@ -12,8 +12,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
@@ -39,7 +39,13 @@ describe('Codex Worker isolation', () => {
 
   beforeAll(async () => {
     api = await startMockResponsesApi();
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-codex-iso-')));
+    // Outside every temp dir: Codex makes $TMPDIR and /tmp writable in workspace-write, so a repo
+    // there would not show what the sandbox protects. Excluding them instead (as an earlier
+    // version did) breaks git on macOS, where the Xcode `git` shim writes its cache under the
+    // per-user temp dir. node_modules/.cache is gitignored.
+    const cache = fileURLToPath(new URL('../node_modules/.cache/', import.meta.url));
+    mkdirSync(cache, { recursive: true });
+    root = realpathSync(mkdtempSync(join(cache, 'tacet-codex-iso-')));
     home = join(root, 'home');
     repo = join(root, 'repo');
     worktree = join(root, 'worktrees', 'task-1');
@@ -73,12 +79,6 @@ describe('Codex Worker isolation', () => {
       apiBaseUrl: api.url,
       approvalPolicy: 'on-request',
       sandbox: 'workspace-write',
-      // The test repo lives under the temp dir, which Codex makes writable by default; a real repo
-      // under $HOME is not, so take the temp dirs out of the sandbox here.
-      config: {
-        'sandbox_workspace_write.exclude_tmpdir_env_var': true,
-        'sandbox_workspace_write.exclude_slash_tmp': true,
-      },
       baseEnv: { ...gitEnv, OPENAI_API_KEY: 'placeholder-not-a-real-key' },
       ...(withRepoRoot ? { repoRoot: repo } : {}),
       ...extra,
