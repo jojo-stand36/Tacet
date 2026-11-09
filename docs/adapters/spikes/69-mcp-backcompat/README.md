@@ -53,3 +53,11 @@ Other findings:
 3. Add a conformance test with three clients: SDK v1 (legacy), client v2 pinned to `2026-07-28`, and client v2 default. All three must list and call every tool.
 4. Revisit when the SDK announces removal of legacy serving, or once every Worker host Tacet supports speaks 2026-07-28. Codex, Gemini CLI and OpenCode client revisions are still UNVERIFIED (spike #68). Until then, dropping legacy would risk locking those Workers out.
 5. Any MCP client Tacet itself runs sets `versionNegotiation: { mode: 'auto' }`.
+
+## Re-verification (2026-11-09, after the owner allowed `modelcontextprotocol.io`)
+
+- SDK docs, "Support legacy clients" (https://ts.sdk.modelcontextprotocol.io/v2/serving/legacy-clients.html) confirm the behaviour above: both entry points answer 2025-era clients from the same factory. HTTP defaults to `legacy: 'stateless'` (per-request, GET/DELETE 405), stdio defaults to `'serve'`, and `'reject'` answers `-32022` (HTTP 400). Neither page gives an end date for legacy-era serving. The only removal date stated is for the separate frozen package `@modelcontextprotocol/server-legacy/sse` (SSE transport), which is "planned for removal in v3".
+- SDK docs, "Protocol versions" (https://ts.sdk.modelcontextprotocol.io/v2/protocol-versions.html): every revision from `2024-10-07` to `2025-11-25` is the "legacy" era; `2026-07-28` starts the "modern" era; the SDK speaks and serves both. Separately, sampling, roots and logging are deprecated as of 2026-07-28 (SEP-2577) but stay in the spec for **at least twelve months**. That window is for those features, not for the legacy era.
+- Spec changelog (https://modelcontextprotocol.io/specification/2026-07-28/changelog): 2026-07-28 removes the `initialize` handshake and sessions, and `server/discover` may be used as a backward-compatibility probe on stdio (SEP-2575).
+
+**Support window: verified as "no announced end" for SDK v2.** Legacy serving is a first-class, default-on feature of `@modelcontextprotocol/server` v2. Expect any removal no earlier than a v3 major. Re-check when upgrading across a major version.
