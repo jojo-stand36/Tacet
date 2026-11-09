@@ -133,7 +133,24 @@ budget:
   per_task_usd: 2.00
   per_day_usd: 25.00
   api_key_per_month_usd: 200.00   # default monthly cap for API-key spend (owner decision, 2026-11-09)
+auth:
+  unattended: api_key      # default: API key for parallel or unattended Workers
+  interactive: subscription
+agents:                     # acp:<slug> agents and PTY presets
+  goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
+policies:
+  - { tool: Bash, match: "rm -rf *", decision: deny }
+retention:
+  transcript_days: 30
 ```
+
+**Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
+
+- Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
+- Exception: `policies` and `escalation.always_ask` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
+- Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
+- Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`.
+- `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
 
 ## 5. Packages (monorepo)
 

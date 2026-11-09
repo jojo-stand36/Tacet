@@ -24,5 +24,8 @@
   },
   "dependencies": {
     "@tacet/core": "workspace:*"
+  },
+  "bin": {
+    "tacet": "./dist/bin.js"
   }
 }
