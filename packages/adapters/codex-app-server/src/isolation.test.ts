@@ -160,7 +160,12 @@ describe('Codex Worker isolation', () => {
     return JSON.stringify(
       files(codexHome)
         .filter((f) => !f.includes(`${'/'}sessions${'/'}`) || f.endsWith('.jsonl'))
-        .map((f) => (/\.(log|txt)$/.test(f) ? `${f}: ${readFileSync(f, 'utf8').slice(-1500)}` : f)),
+        .map((f) => (/\.(log|txt)$/.test(f) ? `${f}: ${readFileSync(f, 'utf8').slice(-1500)}` : f))
+        .concat(
+          existsSync(join(worktree, 'git-trace.txt'))
+            ? [`git trace: ${readFileSync(join(worktree, 'git-trace.txt'), 'utf8').slice(-3000)}`]
+            : [],
+        ),
     );
   };
   const files = (dir: string): string[] =>
@@ -201,23 +206,43 @@ describe('Codex Worker isolation', () => {
     const shared = join(repo, '.git');
     const refsBefore = git(repo, 'for-each-ref');
     const objectsBefore = files(join(shared, 'objects'));
-    const a = adapter();
+    // DIAGNOSTIC (#124 macOS hang), revert before merge: git traces into the worktree.
+    const traceFile = join(worktree, 'git-trace.txt');
+    const a = adapter({
+      baseEnv: {
+        ...gitEnv,
+        OPENAI_API_KEY: 'placeholder-not-a-real-key',
+        GIT_TRACE: traceFile,
+        GIT_TRACE_PERFORMANCE: traceFile,
+      },
+    });
     const h = await a.start({ cwd: worktree });
     // The Worker's worktree is checked out detached: HEAD is per-worktree, branches are shared.
     expect(() => git(worktree, 'symbolic-ref', '-q', 'HEAD')).toThrow();
     // One probe per turn, timestamped, so a slow step and a hung one can be told apart.
     const stamp = `perl -MTime::HiRes=time -e 'printf "t=%.2f\\n", time'`;
-    const probe = async (cmd: string) => {
-      const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`);
+    const probe = async (cmd: string, turnMs?: number) => {
+      const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`, turnMs);
       return r;
     };
     // DIAGNOSTIC (#124 macOS hang), revert before merge: is the first turn of the file's first
     // Codex session slow or hung, with or without git?
     const first = await run(a, h, `${stamp}; echo FIRST_TURN; ${stamp}`, 25_000);
     expect(first.output, first.output).toContain('FIRST_TURN');
+    // DIAGNOSTIC (#124 macOS hang), revert before merge: trace git into the worktree (read by
+    // the dump if the turn times out) and allow the turn 25 s.
     const commit = await probe(
-      'command -v git; echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
+      [
+        'command -v git',
+        'echo hi > work.txt',
+        'git add work.txt && git commit -qm work && echo COMMITTED',
+        `${stamp}`,
+        'tail -c 3000 git-trace.txt',
+      ].join('; '),
+      25_000,
     );
+    // DIAGNOSTIC (#124), revert before merge.
+    console.log(`DIAG commit turn: ${commit.output}`);
     expect(commit.output, commit.output).toContain('COMMITTED');
     const denied: [string, string][] = [
       ['git update-ref refs/heads/main HEAD && echo REF_MOVED', 'REF_MOVED'],
