@@ -33,12 +33,17 @@ export interface ProposedSubtask {
   dependsOn?: string[];
 }
 
+export interface PlanResult {
+  subtasks: ProposedSubtask[];
+  rationale?: string;
+  planner?: { sessionId?: string; adapter?: string; model?: string };
+  /** Tokens and cost the planning used, charged to the planned task. */
+  usage?: { inputTokens: number; outputTokens: number; costUsd?: number; model?: string };
+}
+
 export interface Planner {
-  plan(task: Task): Promise<{
-    subtasks: ProposedSubtask[];
-    rationale?: string;
-    planner?: { sessionId?: string; adapter?: string; model?: string };
-  }>;
+  /** `signal` aborts when the Mini-conductor stops; the planner should end its session. */
+  plan(task: Task, opts?: { signal?: AbortSignal }): Promise<PlanResult>;
 }
 
 /**

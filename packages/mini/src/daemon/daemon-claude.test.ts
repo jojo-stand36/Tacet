@@ -77,7 +77,7 @@ describe('Mini-conductor with a real Claude Worker', () => {
       goal: 'ESCALATE before choosing a database',
       acceptanceCriteria: ['ok'],
     });
-    const sub = `${id}.1`;
+    const sub = `${id}/1`;
     const state = () => store.replay(tasksProjection).tasks[sub]?.state;
 
     await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('input_required');
@@ -103,8 +103,9 @@ describe('Mini-conductor with a real Claude Worker', () => {
       data: { escalationId, answer: 'Use Postgres' },
     });
     await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('completed');
-    await daemon.settled();
-    expect(store.replay(tasksProjection).tasks[id]?.state).toBe('completed');
+    await expect
+      .poll(() => store.replay(tasksProjection).tasks[id]?.state, { timeout: 10_000 })
+      .toBe('completed');
     expect(store.query({ taskId: sub, typePrefix: 'escalation.delivered' })).toHaveLength(1);
     // The answer reached the model as the Worker's next message.
     expect(api.requests.some((r) => r.text?.includes('Use Postgres'))).toBe(true);

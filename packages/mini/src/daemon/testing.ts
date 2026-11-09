@@ -23,6 +23,8 @@ export type Script =
   | { do: 'reply'; text: string }
   | { do: 'error'; message: string }
   | { do: 'hold' }
+  | { do: 'vanish' }
+  | { do: 'auth' }
   | { do: 'approval'; toolName?: string; grant?: unknown };
 
 interface FakeSession {
@@ -42,6 +44,10 @@ export class ScriptedAdapter implements AgentAdapter {
   readonly approvalsAnswered: ApprovalDecision[] = [];
   /** Highest number of sessions open at once. */
   maxConcurrent = 0;
+  /** Milliseconds `close()` takes, like a vendor process that exits slowly. */
+  closeDelayMs = 0;
+  /** Make the next `send()` calls throw. */
+  failSends = 0;
   readonly #script: (input: string, session: FakeSession) => Script;
   readonly #open = new Set<FakeSession>();
   #n = 0;
@@ -78,6 +84,10 @@ export class ScriptedAdapter implements AgentAdapter {
 
   async send(h: SessionHandle, input: UserInput): Promise<void> {
     const s = this.#get(h);
+    if (this.failSends > 0) {
+      this.failSends -= 1;
+      throw new Error('send failed');
+    }
     s.inputs.push(input.text);
     queueMicrotask(() => void this.#turn(s, input.text));
   }
@@ -96,6 +106,7 @@ export class ScriptedAdapter implements AgentAdapter {
   async close(h: SessionHandle): Promise<void> {
     const s = this.sessions.find((x) => x.handle.id === h.id);
     if (!s || !this.#open.has(s)) return;
+    if (this.closeDelayMs > 0) await new Promise((r) => setTimeout(r, this.closeDelayMs));
     this.#open.delete(s);
     s.held?.();
     this.#emit(s, { t: 'status', state: 'done' });
@@ -139,6 +150,12 @@ export class ScriptedAdapter implements AgentAdapter {
       this.#emit(s, { t: 'status', state: 'idle' });
     } else if (step.do === 'error') {
       this.#emit(s, { t: 'status', state: 'error', message: step.message });
+    } else if (step.do === 'vanish') {
+      // The vendor process went away: the stream ends without an error event.
+      this.#open.delete(s);
+      s.events.end();
+    } else if (step.do === 'auth') {
+      this.#emit(s, { t: 'status', state: 'auth_required', message: 'invalid API key' });
     } else if (step.do === 'hold') {
       await new Promise<void>((resolve) => {
         s.held = resolve;
@@ -180,7 +197,7 @@ export class TempWorkspaces implements Workspaces {
   readonly #all = new Map<string, Workspace>();
 
   async create(workerId: string): Promise<Workspace> {
-    const id = `ws-${workerId}`;
+    const id = `ws-${workerId.replace(/[^\w.-]/g, '_')}`;
     const path = join(this.root, id);
     mkdirSync(path, { recursive: true });
     const ws = { id, path };

@@ -1,6 +1,6 @@
 import { planIssues, type SessionHandle, type Task } from '@tacet/core';
 import { z } from 'zod';
-import type { Planner, ProposedSubtask, WorkerAdapter } from './ports.js';
+import type { Planner, PlanResult, ProposedSubtask, WorkerAdapter } from './ports.js';
 import { PLANNER_SYSTEM_PROMPT, plannerPrompt } from './prompts.js';
 
 const Proposal = z.object({
@@ -82,16 +82,20 @@ export class AdapterPlanner implements Planner {
     this.#o = opts;
   }
 
-  async plan(task: Task) {
+  async plan(task: Task, opts: { signal?: AbortSignal } = {}): Promise<PlanResult> {
     const { adapter } = this.#o.worker;
+    opts.signal?.throwIfAborted();
     const h = await adapter.start({
       cwd: this.#o.cwd,
       systemPrompt: PLANNER_SYSTEM_PROMPT,
       ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
       ...(this.#o.effort !== undefined ? { effort: this.#o.effort } : {}),
     });
+    const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    const onAbort = () => void adapter.close(h).catch(() => {});
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      const turns = this.#turns(h);
+      const turns = this.#turns(h, usage);
       let reply = await turns(plannerPrompt(task));
       let lastError: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -101,6 +105,12 @@ export class AdapterPlanner implements Planner {
             planner: {
               sessionId: h.id,
               adapter: this.#o.adapterId,
+              ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
+            },
+            usage: {
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+              ...(usage.costUsd > 0 ? { costUsd: Math.round(usage.costUsd * 1e6) / 1e6 } : {}),
               ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
             },
           };
@@ -115,12 +125,16 @@ export class AdapterPlanner implements Planner {
       }
       throw new Error(`planner reply invalid: ${(lastError as Error).message}`);
     } finally {
+      opts.signal?.removeEventListener('abort', onAbort);
       await adapter.close(h).catch(() => {});
     }
   }
 
   /** Send one input and collect the reply text until the turn ends. */
-  #turns(h: SessionHandle): (text: string) => Promise<string> {
+  #turns(
+    h: SessionHandle,
+    usage: { inputTokens: number; outputTokens: number; costUsd: number },
+  ): (text: string) => Promise<string> {
     const { adapter } = this.#o.worker;
     const iterator = adapter.events(h)[Symbol.asyncIterator]();
     return async (text) => {
@@ -141,7 +155,11 @@ export class AdapterPlanner implements Planner {
         if (next.done) throw new Error('planner session ended');
         const e = next.value;
         if (e.t === 'message.delta') reply += e.text;
-        else if (e.t === 'approval.request') {
+        else if (e.t === 'usage') {
+          usage.inputTokens += e.inputTokens;
+          usage.outputTokens += e.outputTokens;
+          usage.costUsd += e.costUsd ?? 0;
+        } else if (e.t === 'approval.request') {
           await adapter.respond(h, e.id, {
             kind: 'reject',
             persist: false,
@@ -161,7 +179,7 @@ export class AdapterPlanner implements Planner {
 
 /** One sub-task with the task's own goal and criteria: for small tasks and tests. */
 export class SingleStepPlanner implements Planner {
-  async plan(task: Task) {
+  async plan(task: Task): Promise<PlanResult> {
     return {
       subtasks: [{ key: 'all', goal: task.goal, acceptanceCriteria: [...task.acceptanceCriteria] }],
     };

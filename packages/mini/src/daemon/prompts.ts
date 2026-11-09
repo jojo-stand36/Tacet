@@ -37,12 +37,13 @@ report_progress at milestones, escalate when you are blocked on a decision only 
 (then end your turn and wait for the answer), and record_decision for choices others should reuse.
 When the sub-task is done, end your turn with a short summary of what you did.`;
 
-export function workerPrompt(subtask: Task, feedback?: string): string {
+export function workerPrompt(subtask: Task, feedback?: string, context: string[] = []): string {
   return [
     `Sub-task: ${subtask.goal}`,
     'Acceptance criteria:',
     ...subtask.acceptanceCriteria.map((c) => `- ${c}`),
-    ...(feedback ? ['', `Previous attempt did not pass verification: ${feedback}`] : []),
+    ...(feedback ? ['', `The previous attempt did not succeed: ${feedback}`] : []),
+    ...(context.length > 0 ? ['', ...context] : []),
   ].join('\n');
 }
 

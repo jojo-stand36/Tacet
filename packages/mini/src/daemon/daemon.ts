@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   type AgentEvent,
+  type Decision,
   type EventEnvelope,
   newUlid,
   type Priority,
+  redactSecrets,
   type SessionHandle,
   type SummaryPacket,
   type TacetConfig,
@@ -16,8 +18,10 @@ import {
   type TaskView,
   tasksProjection,
   type Verification,
+  type VerificationStatus,
 } from '@tacet/core';
 import type { EventStore } from '@tacet/core/node';
+import { TOOL_NAMES } from '../mcp/tools.js';
 import type {
   Planner,
   Verifier,
@@ -55,11 +59,30 @@ interface SessionRecord {
   sessionId: string;
   taskId: string;
   adapter?: string;
-  model?: string;
   workspaceId?: string;
-  attempt: number;
   vendorSessionId?: string;
   ended?: string;
+}
+
+interface EscalationRecord {
+  id: string;
+  taskId: string;
+  sessionId?: string;
+  resolved: boolean;
+  answer?: string;
+  decisionId?: string;
+  delivered: boolean;
+}
+
+/** One consistent reading of the log, rebuilt only when the log has grown. */
+interface View {
+  count: number;
+  tasks: Record<string, TaskView>;
+  sessions: Map<string, SessionRecord>;
+  kinds: Map<string, string>;
+  escalations: Map<string, EscalationRecord>;
+  decisions: Map<string, string>;
+  progress: Map<string, string>;
 }
 
 interface Run {
@@ -74,11 +97,16 @@ interface Run {
   text: string;
   /** The last complete assistant message, for the summary. */
   lastMessage?: string;
-  /** Set while the turn's end is being handled, so it is handled once. */
+  /** A turn is running: answers wait until it ends. */
+  turnActive: boolean;
+  /** The turn's end is being handled, so it is handled once. */
   settling: boolean;
 }
 
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
+/** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
+const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
+const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
 
 /**
  * The Mini-conductor's core loop (#17): accept a task, plan it into sub-tasks, schedule them
@@ -90,18 +118,32 @@ export class MiniConductor {
   readonly #o: MiniConductorOptions;
   readonly #runs = new Map<string, Run>();
   readonly #planning = new Set<string>();
+  /** Background work (plans, Worker event loops) that `stop()` waits for. */
+  readonly #inflight = new Set<Promise<unknown>>();
   #timer: NodeJS.Timeout | undefined;
+  #abort = new AbortController();
+  /** Bumped by start and stop; work started under an older generation drops its result. */
+  #gen = 0;
   #started = false;
-  #stopping = false;
   #ticking: Promise<void> = Promise.resolve();
+  #view: View | undefined;
   readonly #errors: unknown[] = [];
 
   constructor(opts: MiniConductorOptions) {
     for (const [id, w] of Object.entries(opts.adapters)) {
-      if (w.authRoute !== 'api_key') {
+      // The label must match what the adapter itself reports, where it reports one.
+      const own = (w.adapter as { authRoute?: unknown }).authRoute;
+      if (w.authRoute !== 'api_key' || (own !== undefined && own !== 'api_key')) {
         throw new Error(
           `adapter ${id}: Workers run unattended and must use the api_key route (#65)`,
         );
+      }
+    }
+    const worker = opts.config.tiers?.worker;
+    if (!worker) throw new Error('config has no tiers.worker');
+    for (const tier of [worker, opts.config.tiers?.review]) {
+      if (tier && !opts.adapters[tier.adapter]) {
+        throw new Error(`no Worker adapter ${tier.adapter} for its tier`);
       }
     }
     this.#o = opts;
@@ -117,10 +159,13 @@ export class MiniConductor {
     if (this.#started) return;
     this.#lock();
     this.#started = true;
+    this.#gen += 1;
+    this.#abort = new AbortController();
+    const v = this.#state();
     // Sessions without `worker.ended` belonged to a Mini-conductor that stopped without closing
     // them (a crash): they are gone now. Recording that is what lets their sub-tasks resume.
     const ended: EventEnvelope[] = [];
-    for (const s of this.#sessions().values()) {
+    for (const s of v.sessions.values()) {
       if (s.ended === undefined) {
         ended.push(
           this.#env(
@@ -133,9 +178,8 @@ export class MiniConductor {
       }
     }
     if (ended.length > 0) this.#o.store.append(ended);
-    for (const v of Object.values(this.#tasks())) {
-      if (!v.task.parentId && !TERMINAL.has(v.state) && v.plan === undefined)
-        void this.#plan(v.task);
+    for (const t of Object.values(v.tasks)) {
+      if (!t.task.parentId && !TERMINAL.has(t.state) && t.plan === undefined) this.#plan(t.task);
     }
     this.#timer = setInterval(() => this.#kick(), this.#o.pollMs ?? 1000);
     this.#timer.unref();
@@ -143,125 +187,192 @@ export class MiniConductor {
   }
 
   /** Accept a task. Returns its id; planning and scheduling continue in the background. */
-  submit(input: Omit<TaskInput, 'id' | 'createdAt'> & { id?: string }): string {
+  submit(input: Omit<TaskInput, 'id' | 'createdAt' | 'parentId'> & { id?: string }): string {
     if (!this.#started) throw new Error('call start() first');
+    if ('parentId' in input) throw new Error('sub-tasks are created by the Mini-conductor');
     const id = input.id ?? newUlid(this.#now().getTime());
+    // `/` separates a task from its sub-tasks, so ids never collide.
+    if (id.includes('/')) throw new Error('task ids must not contain "/"');
+    if (this.#state().tasks[id]) throw new Error(`task ${id} already exists`);
     const task = { ...input, id, createdAt: this.#now().toISOString() };
     this.#o.store.append(this.#env(id, 'task.created', task));
-    const view = this.#tasks()[id];
-    if (view) void this.#plan(view.task);
+    const view = this.#state().tasks[id];
+    if (view) this.#plan(view.task);
     return id;
   }
 
-  /** Wait until nothing is running or ready to run (for tests and `tacet run`). */
+  /**
+   * Wait until there is nothing left to do now: nothing planning or running, nothing ready to
+   * start, no answer waiting to be delivered and no result waiting to be rolled up.
+   */
   async settled(timeoutMs = 60_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       await this.#ticking;
-      if (this.#runs.size === 0 && this.#planning.size === 0 && this.#ready().length === 0) return;
-      if (Date.now() > deadline)
+      const busy = [...this.#runs.values()].some((r) => r.settling || r.turnActive);
+      // Idle sessions waiting on a person's answer do not count: there is nothing to do now.
+      if (!busy && this.#planning.size === 0 && !this.#hasWork()) return;
+      if (Date.now() > deadline) {
         throw new Error('timed out waiting for the Mini-conductor to settle');
+      }
       await new Promise((r) => setTimeout(r, 20));
+      this.#kick();
     }
   }
 
   /**
    * Stop: close every Worker session, recorded as `restart` so the next `start()` resumes it,
-   * and release the lock.
+   * wait for background work, and release the lock.
    */
   async stop(): Promise<void> {
     if (!this.#started) return;
-    this.#stopping = true;
+    this.#started = false;
+    this.#gen += 1;
+    this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
     await this.#ticking;
     await Promise.all([...this.#runs.values()].map((r) => this.#end(r, 'restart')));
-    this.#started = false;
-    this.#stopping = false;
+    await Promise.allSettled([...this.#inflight]);
     this.#unlock();
   }
 
-  /** Abandon everything without recording it, as a crash would (tests only). */
+  /**
+   * @internal Tests only: abandon everything without recording it, as a crash would. Sessions
+   * are left to the adapter; nothing more is written to the log by this instance.
+   */
   crashForTest(): void {
-    if (this.#timer) clearInterval(this.#timer);
-    this.#stopping = true;
-    this.#runs.clear();
     this.#started = false;
+    this.#gen += 1;
+    this.#abort.abort();
+    if (this.#timer) clearInterval(this.#timer);
+    this.#runs.clear();
     this.#unlock();
+  }
+
+  #live(gen: number): boolean {
+    return this.#started && gen === this.#gen;
+  }
+
+  #track<T>(p: Promise<T>): void {
+    const tracked = p
+      .catch((err: unknown) => this.#errors.push(err))
+      .finally(() => {
+        this.#inflight.delete(tracked);
+      });
+    this.#inflight.add(tracked);
   }
 
   // ---- planning --------------------------------------------------------------------------
 
-  async #plan(task: Task): Promise<void> {
+  #plan(task: Task): void {
     if (this.#planning.has(task.id)) return;
     this.#planning.add(task.id);
-    try {
-      const proposal = await this.#o.planner.plan(task);
-      const idOf = new Map(proposal.subtasks.map((s, i) => [s.key, `${task.id}.${i + 1}`]));
-      const plan = TaskPlan.parse({
-        subtasks: proposal.subtasks.map((s) => ({
-          id: idOf.get(s.key),
-          goal: s.goal,
-          acceptanceCriteria: s.acceptanceCriteria,
-          kind: s.kind ?? 'implement',
-          dependsOn: (s.dependsOn ?? []).map((d) => idOf.get(d) ?? d),
-        })),
-        ...(proposal.planner ? { planner: proposal.planner } : {}),
-        ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
-      });
-      if (this.#stopping) return;
-      const now = this.#now().toISOString();
-      // One batch: a crash leaves either no plan (re-planned on start) or the whole plan.
-      this.#o.store.append([
-        this.#env(task.id, 'task.planned', plan),
-        ...plan.subtasks.map((s) =>
-          this.#env(s.id, 'task.created', {
-            id: s.id,
-            goal: s.goal,
-            acceptanceCriteria: s.acceptanceCriteria,
-            priority: task.priority,
-            parentId: task.id,
-            ...(task.contextId !== undefined ? { contextId: task.contextId } : {}),
-            createdAt: now,
-          }),
-        ),
-        this.#env(task.id, 'task.status', { state: 'working' }),
-      ]);
-    } catch (err) {
-      this.#errors.push(err);
-      this.#o.store.append(
-        this.#env(task.id, 'task.status', {
-          state: 'failed',
-          message: `planning failed: ${(err as Error).message}`,
-        }),
-      );
-    } finally {
-      this.#planning.delete(task.id);
-      this.#kick();
-    }
+    const gen = this.#gen;
+    this.#track(
+      (async () => {
+        try {
+          const proposal = await this.#o.planner.plan(task, { signal: this.#abort.signal });
+          if (!this.#live(gen)) return;
+          const idOf = new Map(proposal.subtasks.map((s, i) => [s.key, `${task.id}/${i + 1}`]));
+          const plan = TaskPlan.parse({
+            subtasks: proposal.subtasks.map((s) => ({
+              id: idOf.get(s.key),
+              goal: s.goal,
+              acceptanceCriteria: s.acceptanceCriteria,
+              kind: s.kind ?? 'implement',
+              dependsOn: (s.dependsOn ?? []).map((d) => idOf.get(d) ?? d),
+            })),
+            ...(proposal.planner ? { planner: proposal.planner } : {}),
+            ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
+          });
+          const now = this.#now().toISOString();
+          // One batch: a crash leaves either no plan (re-planned on start) or the whole plan.
+          this.#o.store.append([
+            ...(proposal.usage
+              ? [
+                  this.#env(task.id, 'agent.usage', {
+                    t: 'usage',
+                    source: 'reported',
+                    ...proposal.usage,
+                  }),
+                ]
+              : []),
+            this.#env(task.id, 'task.planned', plan),
+            ...plan.subtasks.map((s) =>
+              this.#env(s.id, 'task.created', {
+                id: s.id,
+                goal: s.goal,
+                acceptanceCriteria: s.acceptanceCriteria,
+                priority: task.priority,
+                parentId: task.id,
+                ...(task.contextId !== undefined ? { contextId: task.contextId } : {}),
+                createdAt: now,
+              }),
+            ),
+            this.#env(task.id, 'task.status', { state: 'working' }),
+          ]);
+        } catch (err) {
+          if (!this.#live(gen)) return;
+          this.#errors.push(err);
+          this.#o.store.append(
+            this.#env(task.id, 'task.status', {
+              state: 'failed',
+              message: redactSecrets(`planning failed: ${(err as Error).message}`),
+            }),
+          );
+        } finally {
+          this.#planning.delete(task.id);
+          this.#kick();
+        }
+      })(),
+    );
   }
 
   // ---- scheduling ------------------------------------------------------------------------
 
   #kick(): void {
-    if (!this.#started || this.#stopping) return;
+    if (!this.#started) return;
+    const gen = this.#gen;
     this.#ticking = this.#ticking
-      .then(() => this.#tick())
+      .then(() => (this.#live(gen) ? this.#tick(gen) : undefined))
       .catch((err) => {
         this.#errors.push(err);
       });
   }
 
-  async #tick(): Promise<void> {
-    if (this.#stopping) return;
-    await this.#deliverAnswers();
+  async #tick(gen: number): Promise<void> {
+    for (const run of [...this.#runs.values()]) {
+      if (!this.#live(gen)) return;
+      await this.#deliverAnswers(run);
+    }
     this.#failBlocked();
     this.#rollUp();
-    for (const id of this.#ready()) await this.#run(id);
+    for (const id of this.#ready()) {
+      if (!this.#live(gen)) return;
+      // One sub-task that cannot start must not hold up the others, nor be retried every tick.
+      await this.#run(id).catch((err: unknown) => {
+        this.#errors.push(err);
+        this.#o.store.append(
+          this.#env(id, 'task.status', {
+            state: 'failed',
+            message: redactSecrets(`could not start a Worker: ${(err as Error).message}`),
+          }),
+        );
+      });
+    }
+  }
+
+  /** Is there something the next tick would do? */
+  #hasWork(): boolean {
+    const v = this.#state();
+    if (this.#ready().length > 0 || blockedByFailure(this.#schedulable()).length > 0) return true;
+    if (this.#parentUpdates(v).length > 0) return true;
+    return [...this.#runs.values()].some((r) => this.#undelivered(r.subtaskId).length > 0);
   }
 
   /** Sub-tasks of open tasks, as the scheduler sees them. */
   #schedulable(): SchedulableSubtask[] {
-    const tasks = this.#tasks();
+    const { tasks, kinds } = this.#state();
     const out: SchedulableSubtask[] = [];
     let order = 0;
     for (const parent of Object.values(tasks)) {
@@ -274,7 +385,7 @@ export class MiniConductor {
           dependsOn: p.dependsOn,
           phase: this.#phase(v),
           priority: parent.task.priority as Priority,
-          adapter: this.#tierFor(p.id).adapter,
+          adapter: this.#tierFor(kinds.get(p.id)).adapter,
           order: order++,
         });
       }
@@ -286,7 +397,7 @@ export class MiniConductor {
     if (this.#runs.has(v.task.id)) return 'running';
     if (v.state === 'completed') return 'done';
     if (TERMINAL.has(v.state)) return 'failed';
-    if (v.state === 'input_required') return 'blocked';
+    if (WAITING.has(v.state)) return 'blocked';
     return 'pending';
   }
 
@@ -299,9 +410,8 @@ export class MiniConductor {
     );
   }
 
-  #tierFor(subtaskId: string): { adapter: string; model?: string; effort?: string } {
+  #tierFor(kind: string | undefined): { adapter: string; model?: string; effort?: string } {
     const tiers = this.#o.config.tiers ?? {};
-    const kind = this.#plannedKind(subtaskId);
     const tier = (kind === 'review' ? tiers.review : undefined) ?? tiers.worker;
     if (!tier) throw new Error('config has no tiers.worker');
     return {
@@ -309,17 +419,6 @@ export class MiniConductor {
       model: tier.model,
       ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
     };
-  }
-
-  #plannedKind(subtaskId: string): string | undefined {
-    const parentId = this.#tasks()[subtaskId]?.task.parentId;
-    if (!parentId) return undefined;
-    const planned = this.#o.store
-      .query({ taskId: parentId, typePrefix: 'task.planned' })
-      .map((e) => TaskPlan.safeParse(e.envelope.data))
-      .filter((p) => p.success)
-      .at(-1);
-    return planned?.data.subtasks.find((s) => s.id === subtaskId)?.kind;
   }
 
   /** Pending sub-tasks behind a failed one can never run: fail them. */
@@ -336,33 +435,63 @@ export class MiniConductor {
     );
   }
 
-  /** A task is done when every sub-task is; it fails when any sub-task failed for good. */
-  #rollUp(): void {
-    const tasks = this.#tasks();
-    for (const parent of Object.values(tasks)) {
+  /**
+   * What each open parent task should be now: done when every sub-task completed, failed when
+   * one failed for good and nothing else can run, waiting (input or auth) while a sub-task waits
+   * on the user, otherwise working.
+   */
+  #parentUpdates(v: View): { parent: TaskView; subs: TaskView[]; state: TaskState }[] {
+    const out: { parent: TaskView; subs: TaskView[]; state: TaskState }[] = [];
+    for (const parent of Object.values(v.tasks)) {
       if (parent.task.parentId || !parent.plan || TERMINAL.has(parent.state)) continue;
       const subs = parent.plan
-        .map((p) => tasks[p.id])
-        .filter((v): v is TaskView => v !== undefined);
+        .map((p) => v.tasks[p.id])
+        .filter((t): t is TaskView => t !== undefined);
       if (subs.length !== parent.plan.length) continue;
-      const failed = subs.filter((v) => TERMINAL.has(v.state) && v.state !== 'completed');
-      const allDone = subs.every((v) => v.state === 'completed');
-      if (!allDone && (failed.length === 0 || subs.some((v) => !TERMINAL.has(v.state)))) continue;
-      const results = this.#o.store
-        .query({ typePrefix: 'task.result' })
-        .filter((e) => subs.some((v) => v.task.id === e.envelope.taskId))
-        .map((e) => e.envelope.data as SummaryPacket);
+      let state: TaskState;
+      if (subs.every((t) => t.state === 'completed')) state = 'completed';
+      else if (subs.every((t) => TERMINAL.has(t.state))) state = 'failed';
+      else state = subs.find((t) => WAITING.has(t.state))?.state ?? 'working';
+      if (state !== parent.state) out.push({ parent, subs, state });
+    }
+    return out;
+  }
+
+  #rollUp(): void {
+    const v = this.#state();
+    for (const { parent, subs, state } of this.#parentUpdates(v)) {
+      if (!TERMINAL.has(state)) {
+        this.#o.store.append(this.#env(parent.task.id, 'task.status', { state }));
+        continue;
+      }
+      // The latest result of each sub-task, not earlier failed attempts.
+      const results = subs
+        .map((t) =>
+          this.#o.store
+            .query({ taskId: t.task.id, typePrefix: 'task.result' })
+            .map((e) => e.envelope.data as SummaryPacket)
+            .at(-1),
+        )
+        .filter((r): r is SummaryPacket => r !== undefined);
+      const done = state === 'completed';
+      const statuses = results.map((r) => r.verification?.status);
+      const verification: VerificationStatus =
+        !done || statuses.includes('failed')
+          ? 'failed'
+          : statuses.some((s) => s !== 'passed')
+            ? 'not_run'
+            : 'passed';
+      const failed = subs.filter((t) => t.state !== 'completed').length;
       const summary: SummaryPacket = {
         v: 1,
         taskId: parent.task.id,
         createdAt: this.#now().toISOString(),
-        outcome: allDone ? 'completed' : 'failed',
-        summary:
-          subs.map((v) => `${v.task.id} ${v.state}: ${v.task.goal}`).join('\n') || parent.task.goal,
+        outcome: done ? 'completed' : 'failed',
+        summary: subs.map((t) => `${t.task.id} ${t.state}: ${t.task.goal}`).join('\n'),
         filesTouched: [...new Set(results.flatMap((r) => r.filesTouched ?? []))],
         commits: [...new Set(results.flatMap((r) => r.commits ?? []))],
         verification: {
-          status: allDone ? 'passed' : 'failed',
+          status: verification,
           commands: [...new Set(results.flatMap((r) => r.verification?.commands ?? []))],
         },
         openQuestions: results.flatMap((r) => r.openQuestions ?? []),
@@ -370,8 +499,8 @@ export class MiniConductor {
       this.#o.store.append([
         this.#env(parent.task.id, 'task.result', summary),
         this.#env(parent.task.id, 'task.status', {
-          state: allDone ? 'completed' : 'failed',
-          ...(allDone ? {} : { message: `${failed.length} sub-task(s) failed` }),
+          state,
+          ...(done ? {} : { message: `${failed} sub-task(s) failed` }),
         }),
       ]);
     }
@@ -381,22 +510,25 @@ export class MiniConductor {
 
   async #run(subtaskId: string): Promise<void> {
     if (this.#runs.has(subtaskId)) return;
-    const view = this.#tasks()[subtaskId];
+    const v = this.#state();
+    const view = v.tasks[subtaskId];
     if (!view) return;
-    const tier = this.#tierFor(subtaskId);
-    const worker = this.#o.adapters[tier.adapter];
-    if (!worker) {
+    const history = [...v.sessions.values()].filter((s) => s.taskId === subtaskId);
+    const failed = history.filter((s) => s.ended !== undefined && COUNTED.has(s.ended)).length;
+    const maxAttempts = this.#o.config.workers?.max_attempts ?? 3;
+    // A crash after the last failed attempt but before the terminal status: finish it now.
+    if (failed >= maxAttempts) {
       this.#o.store.append(
         this.#env(subtaskId, 'task.status', {
           state: 'failed',
-          message: `no adapter ${tier.adapter}`,
+          message: `failed after ${failed} attempts`,
         }),
       );
       return;
     }
-    const history = [...this.#sessions().values()].filter((s) => s.taskId === subtaskId);
+    const tier = this.#tierFor(v.kinds.get(subtaskId));
+    const worker = this.#o.adapters[tier.adapter] as WorkerAdapter;
     const last = history.at(-1);
-    const failed = history.filter((s) => s.ended === 'failed' || s.ended === 'stuck').length;
     // Reuse the checkout of an earlier run: a restart or a retry continues the same work.
     const existing = last?.workspaceId ? await this.#o.workspaces.get(last.workspaceId) : undefined;
     const workspace = existing ?? (await this.#o.workspaces.create(subtaskId));
@@ -428,16 +560,17 @@ export class MiniConductor {
         ? [this.#env(subtaskId, 'task.status', { state: 'working' })]
         : []),
     ]);
-    const { config, revoke } = this.#o.mcp.workerConfig({
-      workerSessionId: sessionId,
-      taskId: subtaskId,
-    });
+    let revoke = () => {};
+    let mcpServerName = '';
     let handle: SessionHandle;
     try {
+      const minted = this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId });
+      revoke = minted.revoke;
+      mcpServerName = minted.config.name;
       handle = await worker.adapter.start({
         cwd: workspace.path,
         systemPrompt: WORKER_SYSTEM_PROMPT,
-        mcpServers: [config],
+        mcpServers: [minted.config],
         ...(tier.model !== undefined ? { model: tier.model } : {}),
         ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
         ...(resume ? { resume } : {}),
@@ -449,7 +582,7 @@ export class MiniConductor {
         this.#env(
           subtaskId,
           'worker.ended',
-          { sessionId, reason: 'failed', message: (err as Error).message },
+          { sessionId, reason: 'failed', message: redactSecrets((err as Error).message) },
           sessionId,
         ),
       );
@@ -463,24 +596,38 @@ export class MiniConductor {
       handle,
       workspace,
       revoke,
-      mcpServerName: config.name,
+      mcpServerName,
       text: '',
+      turnActive: true,
       settling: false,
     };
     this.#runs.set(subtaskId, run);
     this.#noteVendorSession(run);
-    void this.#consume(run, worker);
-    const feedback = this.#lastFeedback(subtaskId);
-    await worker.adapter.send(handle, {
-      text: resume ? RESUME_PROMPT : workerPrompt(view.task, feedback),
-    });
+    this.#track(this.#consume(run, worker, this.#gen));
+    // Answers that came while no session was open go into the first message.
+    const answers = this.#undelivered(subtaskId);
+    const text = resume
+      ? [RESUME_PROMPT, ...answers.map(answerText)].join('\n\n')
+      : workerPrompt(view.task, this.#lastFeedback(subtaskId), [
+          ...(history.length > 0 && v.progress.has(subtaskId)
+            ? [`Progress reported before: ${v.progress.get(subtaskId)}`]
+            : []),
+          ...answers.map(answerText),
+        ]);
+    try {
+      await worker.adapter.send(handle, { text });
+      this.#markDelivered(run, answers);
+    } catch (err) {
+      this.#errors.push(err);
+      await this.#end(run, 'failed', `could not send the first message: ${(err as Error).message}`);
+      this.#afterFailure(subtaskId);
+    }
   }
 
   #noteVendorSession(run: Run): void {
     const v = run.handle.vendorSessionId;
-    if (v === undefined) return;
-    const known = this.#sessions().get(run.sessionId)?.vendorSessionId;
-    if (known === v) return;
+    if (v === undefined || this.#runs.get(run.subtaskId) !== run) return;
+    if (this.#state().sessions.get(run.sessionId)?.vendorSessionId === v) return;
     this.#o.store.append(
       this.#env(
         run.subtaskId,
@@ -491,11 +638,11 @@ export class MiniConductor {
     );
   }
 
-  async #consume(run: Run, worker: WorkerAdapter): Promise<void> {
+  async #consume(run: Run, worker: WorkerAdapter, gen: number): Promise<void> {
     let started = false;
     try {
       for await (const e of worker.adapter.events(run.handle)) {
-        if (this.#runs.get(run.subtaskId) !== run) break;
+        if (this.#runs.get(run.subtaskId) !== run || !this.#live(gen)) return;
         this.#record(run, e);
         if (e.t === 'approval.request') {
           // Calls to the Mini-conductor's own MCP tools are what a Worker is for; anything else
@@ -513,20 +660,41 @@ export class MiniConductor {
                 },
           );
         } else if (e.t === 'status') {
-          if (e.state === 'running') started = true;
-          else if (e.state === 'idle' && started) {
-            started = false;
-            this.#noteVendorSession(run);
-            await this.#turnEnded(run);
-          } else if (e.state === 'error' || e.state === 'auth_required') {
-            await this.#end(run, 'failed', e.message ?? e.state);
+          if (e.state === 'running') {
+            started = true;
+            run.turnActive = true;
+          } else if (e.state === 'idle') {
+            run.turnActive = false;
+            if (started) {
+              started = false;
+              this.#noteVendorSession(run);
+              await this.#turnEnded(run);
+            }
+          } else if (e.state === 'auth_required') {
+            // A login problem, not a failed attempt: the user has to fix it (ADR-003 §4).
+            this.#o.store.append(
+              this.#env(run.subtaskId, 'task.status', {
+                state: 'auth_required',
+                message: 'the Worker adapter needs valid credentials',
+              }),
+            );
+            await this.#end(run, 'canceled', 'auth required');
+            return;
+          } else if (e.state === 'error' || e.state === 'done') {
+            await this.#end(run, 'failed', redactSecrets(e.message ?? `session ${e.state}`));
             this.#afterFailure(run.subtaskId);
-            break;
+            return;
           }
         }
       }
     } catch (err) {
       this.#errors.push(err);
+    } finally {
+      // However the event stream ended, a run still registered is over: free its slot and token.
+      if (this.#runs.get(run.subtaskId) === run && this.#live(gen)) {
+        await this.#end(run, 'failed', 'the Worker session ended unexpectedly');
+        this.#afterFailure(run.subtaskId);
+      }
     }
   }
 
@@ -554,26 +722,35 @@ export class MiniConductor {
   }
 
   async #turnEnded(run: Run): Promise<void> {
-    if (run.settling || this.#stopping) return;
+    if (run.settling || !this.#started) return;
     run.settling = true;
+    let ended = false;
     try {
-      const pending = this.#escalations(run.subtaskId).filter(
-        (x) => x.sessionId === run.sessionId && !x.resolved,
+      // An answer that came while the turn ran: deliver it now and keep the session.
+      if (this.#undelivered(run.subtaskId).length > 0) {
+        run.settling = false;
+        await this.#deliverAnswers(run);
+        return;
+      }
+      const open = [...this.#state().escalations.values()].filter(
+        (x) => x.taskId === run.subtaskId && !x.resolved,
       );
-      if (pending.length > 0) {
+      if (open.length > 0) {
         this.#o.store.append(this.#env(run.subtaskId, 'task.status', { state: 'input_required' }));
         return;
       }
-      const view = this.#tasks()[run.subtaskId];
+      const view = this.#state().tasks[run.subtaskId];
       if (!view) return;
       const verification = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
         view.task,
         run.workspace,
       );
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
       if (verification.status === 'failed') {
         this.#o.store.append(
           this.#env(run.subtaskId, 'task.result', this.#summary(run, 'failed', verification)),
         );
+        ended = true;
         await this.#end(run, 'failed', 'verification failed');
         this.#afterFailure(run.subtaskId);
         return;
@@ -582,9 +759,12 @@ export class MiniConductor {
         this.#env(run.subtaskId, 'task.result', this.#summary(run, 'completed', verification)),
         this.#env(run.subtaskId, 'task.status', { state: 'completed' }),
       ]);
+      // Roll up and schedule dependents while the session closes.
+      this.#kick();
+      ended = true;
       await this.#end(run, 'finished');
     } finally {
-      run.settling = false;
+      if (!ended) run.settling = false;
       this.#kick();
     }
   }
@@ -597,7 +777,7 @@ export class MiniConductor {
       sessionId: run.sessionId,
       createdAt: this.#now().toISOString(),
       outcome,
-      summary: text ? text.slice(-2000) : `Worker turn ended (${outcome}).`,
+      summary: text ? redactSecrets(text.slice(-2000)) : `Worker turn ended (${outcome}).`,
       filesTouched: [],
       commits: [],
       verification,
@@ -624,8 +804,8 @@ export class MiniConductor {
 
   /** After a failed run: retry (a restart does not count) or fail the sub-task for good. */
   #afterFailure(subtaskId: string): void {
-    const failed = [...this.#sessions().values()].filter(
-      (s) => s.taskId === subtaskId && (s.ended === 'failed' || s.ended === 'stuck'),
+    const failed = [...this.#state().sessions.values()].filter(
+      (s) => s.taskId === subtaskId && s.ended !== undefined && COUNTED.has(s.ended),
     ).length;
     const max = this.#o.config.workers?.max_attempts ?? 3;
     if (failed >= max) {
@@ -647,8 +827,6 @@ export class MiniConductor {
     if (this.#runs.get(run.subtaskId) !== run) return;
     this.#runs.delete(run.subtaskId);
     run.revoke();
-    const worker = this.#o.adapters[run.adapterId];
-    await worker?.adapter.close(run.handle).catch((err: unknown) => this.#errors.push(err));
     this.#o.store.append(
       this.#env(
         run.subtaskId,
@@ -657,111 +835,137 @@ export class MiniConductor {
         run.sessionId,
       ),
     );
+    await this.#o.adapters[run.adapterId]?.adapter
+      .close(run.handle)
+      .catch((err: unknown) => this.#errors.push(err));
   }
 
   // ---- escalation answers ----------------------------------------------------------------
 
-  #escalations(
-    taskId: string,
-  ): { id: string; sessionId?: string; resolved: boolean; answer?: string; delivered: boolean }[] {
-    const out = new Map<
-      string,
-      { id: string; sessionId?: string; resolved: boolean; answer?: string; delivered: boolean }
-    >();
-    for (const { envelope: e } of this.#o.store.query({ taskId, typePrefix: 'escalation' })) {
-      const d = e.data as { id?: string; escalationId?: string; answer?: string };
-      if (e.type === 'escalation.raised' && d.id) {
-        out.set(d.id, {
-          id: d.id,
-          ...(e.sessionId ? { sessionId: e.sessionId } : {}),
-          resolved: false,
-          delivered: false,
-        });
-      } else if (e.type === 'escalation.resolved' && d.escalationId) {
-        const x = out.get(d.escalationId);
-        if (x) {
-          x.resolved = true;
-          if (d.answer !== undefined) x.answer = d.answer;
-        }
-      } else if (e.type === 'escalation.delivered' && d.escalationId) {
-        const x = out.get(d.escalationId);
-        if (x) x.delivered = true;
-      }
-    }
-    return [...out.values()];
+  /** Answered escalations of a sub-task that its Worker has not been sent yet. */
+  #undelivered(subtaskId: string): EscalationRecord[] {
+    return [...this.#state().escalations.values()].filter(
+      (x) => x.taskId === subtaskId && x.resolved && !x.delivered,
+    );
   }
 
   /**
-   * Send answered escalations to the Worker that asked, as its next message, once each
-   * (`escalation.delivered`). An answer that arrives while the Worker's session is gone (a
-   * restart) is delivered when the sub-task runs again.
+   * Send answered escalations to the sub-task's Worker as its next message, between turns only,
+   * and record each as delivered once the message is sent.
    */
-  async #deliverAnswers(): Promise<void> {
-    for (const run of this.#runs.values()) {
-      const undelivered = this.#escalations(run.subtaskId).filter(
-        (x) => x.resolved && !x.delivered && x.answer !== undefined,
-      );
-      if (undelivered.length === 0) continue;
-      const worker = this.#o.adapters[run.adapterId];
-      if (!worker) continue;
-      this.#o.store.append([
-        ...undelivered.map((x) =>
-          this.#env(
-            run.subtaskId,
-            'escalation.delivered',
-            { escalationId: x.id, sessionId: run.sessionId },
-            run.sessionId,
-          ),
+  async #deliverAnswers(run: Run): Promise<void> {
+    if (run.turnActive || run.settling || this.#runs.get(run.subtaskId) !== run) return;
+    const answers = this.#undelivered(run.subtaskId);
+    if (answers.length === 0) return;
+    const worker = this.#o.adapters[run.adapterId];
+    if (!worker) return;
+    run.turnActive = true;
+    try {
+      await worker.adapter.send(run.handle, { text: answers.map(answerText).join('\n') });
+    } catch (err) {
+      run.turnActive = false;
+      this.#errors.push(err);
+      return;
+    }
+    this.#markDelivered(run, answers);
+  }
+
+  #markDelivered(run: Run, answers: EscalationRecord[]): void {
+    if (answers.length === 0) return;
+    const waiting = this.#state().tasks[run.subtaskId]?.state === 'input_required';
+    this.#o.store.append([
+      ...answers.map((x) =>
+        this.#env(
+          run.subtaskId,
+          'escalation.delivered',
+          { escalationId: x.id, sessionId: run.sessionId },
+          run.sessionId,
         ),
-        ...(this.#tasks()[run.subtaskId]?.state === 'input_required'
-          ? [this.#env(run.subtaskId, 'task.status', { state: 'working' })]
-          : []),
-      ]);
-      await worker.adapter.send(run.handle, {
-        text: undelivered.map((x) => `Answer to your escalation ${x.id}: ${x.answer}`).join('\n'),
-      });
-    }
-    // Sub-tasks waiting on an answer whose session is gone run again once it is answered.
-    for (const v of Object.values(this.#tasks())) {
-      if (v.state !== 'input_required' || this.#runs.has(v.task.id)) continue;
-      const open = this.#escalations(v.task.id).filter((x) => !x.resolved);
-      if (open.length === 0)
-        this.#o.store.append(this.#env(v.task.id, 'task.status', { state: 'working' }));
-    }
+      ),
+      ...(waiting ? [this.#env(run.subtaskId, 'task.status', { state: 'working' })] : []),
+    ]);
   }
 
   // ---- event log -------------------------------------------------------------------------
 
-  #tasks(): Record<string, TaskView> {
-    return this.#o.store.replay(tasksProjection).tasks;
-  }
-
-  #sessions(): Map<string, SessionRecord> {
-    const out = new Map<string, SessionRecord>();
-    for (const { envelope: e } of this.#o.store.query({ typePrefix: 'worker' })) {
-      const d = e.data as Record<string, unknown>;
-      const id = typeof d.sessionId === 'string' ? d.sessionId : undefined;
-      if (!id || !e.taskId) continue;
-      if (e.type === 'worker.started') {
-        out.set(id, {
-          sessionId: id,
-          taskId: e.taskId,
-          attempt: typeof d.attempt === 'number' ? d.attempt : 1,
-          ...(typeof d.adapter === 'string' ? { adapter: d.adapter } : {}),
-          ...(typeof d.model === 'string' ? { model: d.model } : {}),
-          ...(typeof d.workspaceId === 'string' ? { workspaceId: d.workspaceId } : {}),
-        });
-      } else {
-        const s = out.get(id);
-        if (!s) continue;
-        if (e.type === 'worker.vendor_session' && typeof d.vendorSessionId === 'string') {
-          s.vendorSessionId = d.vendorSessionId;
-        } else if (e.type === 'worker.ended') {
-          s.ended = typeof d.reason === 'string' ? d.reason : 'failed';
+  /** The current reading of the log, rebuilt only when it has grown. */
+  #state(): View {
+    const count = this.#o.store.count();
+    if (this.#view && this.#view.count === count) return this.#view;
+    const tasks = this.#o.store.replay(tasksProjection).tasks;
+    const sessions = new Map<string, SessionRecord>();
+    const kinds = new Map<string, string>();
+    const escalations = new Map<string, EscalationRecord>();
+    const decisions = new Map<string, string>();
+    const progress = new Map<string, string>();
+    for (const { envelope: e } of this.#o.store.query({})) {
+      const d = (e.data ?? {}) as Record<string, unknown>;
+      const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
+      if (e.type.startsWith('worker.')) {
+        const id = str('sessionId');
+        if (!id || !e.taskId) continue;
+        if (e.type === 'worker.started') {
+          const adapter = str('adapter');
+          const workspaceId = str('workspaceId');
+          sessions.set(id, {
+            sessionId: id,
+            taskId: e.taskId,
+            ...(adapter ? { adapter } : {}),
+            ...(workspaceId ? { workspaceId } : {}),
+          });
+        } else {
+          const s = sessions.get(id);
+          if (!s) continue;
+          const vendor = str('vendorSessionId');
+          if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
+          else if (e.type === 'worker.ended') s.ended = str('reason') ?? 'failed';
+          else if (e.type === 'worker.progress') {
+            const summary = str('summary') ?? str('message');
+            if (summary) progress.set(e.taskId, summary);
+          }
+        }
+      } else if (e.type === 'task.planned') {
+        const plan = TaskPlan.safeParse(e.data);
+        if (plan.success) for (const s of plan.data.subtasks) kinds.set(s.id, s.kind);
+      } else if (e.type === 'escalation.raised') {
+        const id = str('id');
+        if (id && e.taskId) {
+          escalations.set(id, {
+            id,
+            taskId: e.taskId,
+            ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+            resolved: false,
+            delivered: false,
+          });
+        }
+      } else if (e.type === 'escalation.resolved') {
+        const x = escalations.get(str('escalationId') ?? '');
+        if (x) {
+          x.resolved = true;
+          const answer = str('answer');
+          const decisionId = str('decisionId');
+          if (answer !== undefined) x.answer = answer;
+          if (decisionId !== undefined) x.decisionId = decisionId;
+        }
+      } else if (e.type === 'escalation.delivered') {
+        const x = escalations.get(str('escalationId') ?? '');
+        if (x) x.delivered = true;
+      } else if (e.type === 'decision.recorded') {
+        const dec = d as Partial<Decision>;
+        if (typeof dec.id === 'string' && typeof dec.decision === 'string') {
+          decisions.set(dec.id, dec.decision);
         }
       }
     }
-    return out;
+    // An answer given as a recorded decision (ADR-003 §4 DecisionExt) carries its text there.
+    for (const x of escalations.values()) {
+      if (x.answer === undefined && x.decisionId) {
+        const text = decisions.get(x.decisionId);
+        if (text !== undefined) x.answer = text;
+      }
+    }
+    this.#view = { count, tasks, sessions, kinds, escalations, decisions, progress };
+    return this.#view;
   }
 
   #env(taskId: string, type: string, data: unknown, sessionId?: string): EventEnvelope {
@@ -788,24 +992,38 @@ export class MiniConductor {
   #lock(): void {
     const path = this.#o.lockPath;
     if (HELD_LOCKS.has(path)) {
-      throw new Error(`another Mini-conductor (pid ${process.pid}) is running for this repo`);
+      throw new Error('a Mini-conductor in this process is already running for this repo');
     }
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    try {
-      writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-      HELD_LOCKS.add(path);
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+        HELD_LOCKS.add(path);
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      }
+      // Take a stale lock over by renaming it away first: of two processes doing this at once,
+      // only one rename succeeds, and the loser retries against the winner's new lock.
+      const aside = `${path}.${process.pid}.${randomUUID()}.stale`;
+      try {
+        renameSync(path, aside);
+      } catch {
+        continue;
+      }
+      const pid = Number.parseInt(readFileSync(aside, 'utf8'), 10);
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
+        // Not stale after all: put it back and refuse.
+        try {
+          renameSync(aside, path);
+        } catch {
+          rmSync(aside, { force: true });
+        }
+        throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
+      }
+      rmSync(aside, { force: true });
     }
-    const pid = Number.parseInt(readFileSync(path, 'utf8'), 10);
-    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
-      throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
-    }
-    // A stale lock from a process that is gone (or from this process, not held any more).
-    rmSync(path, { force: true });
-    writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-    HELD_LOCKS.add(path);
+    throw new Error('could not take the Mini-conductor lock');
   }
 
   #unlock(): void {
@@ -814,18 +1032,21 @@ export class MiniConductor {
   }
 }
 
+function answerText(x: EscalationRecord): string {
+  return x.answer !== undefined
+    ? `Answer to your escalation ${x.id}: ${x.answer}`
+    : `Your escalation ${x.id} was resolved without an answer text; continue with your best judgement or escalate again.`;
+}
+
 /**
- * Whether an approval request is for one of the Mini-conductor's own MCP tools: Claude Code names
- * them `mcp__<server>__<tool>`; Codex asks through an MCP elicitation that names the server
- * (`serverName`, required in 0.167.0's McpServerElicitationRequestParams).
+ * Whether an approval request is for one of the Mini-conductor's own MCP tools. Claude Code asks
+ * before every MCP call and names the tool `mcp__<server>__<tool>`; only the exact names of the
+ * Mini's tools on its own server match, so a server named `tacet_` or a tool named `tacet__x`
+ * does not. Codex 0.167.0 calls a configured MCP server's tools without asking (verified live,
+ * #17), so its MCP elicitations are refused like everything else.
  */
-export function isOwnMcpTool(
-  e: { toolName?: string | undefined; requestedGrant?: unknown },
-  serverName: string,
-): boolean {
-  if (e.toolName?.startsWith(`mcp__${serverName}__`)) return true;
-  const grant = e.requestedGrant as { serverName?: unknown } | undefined;
-  return e.toolName === 'mcp_elicitation' && grant?.serverName === serverName;
+export function isOwnMcpTool(e: { toolName?: string | undefined }, serverName: string): boolean {
+  return TOOL_NAMES.some((t) => e.toolName === `mcp__${serverName}__${t}`);
 }
 
 /** Lock files held by Mini-conductors in this process. */
