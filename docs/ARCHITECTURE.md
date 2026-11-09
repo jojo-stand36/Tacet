@@ -1,6 +1,6 @@
 # Architecture (draft v0)
 
-_This is a proposal to be ratified via ADRs in milestone M0. Wire protocols and local security follow [ADR-003](adr/003-wire-protocols.md) (accepted 2026-11-09). Language and runtime follow [ADR-002](adr/002-language-runtime.md) (proposed; waits on ADR-001, issue #2)._
+_This is a proposal to be ratified via ADRs in milestone M0. Wire protocols and local security follow [ADR-003](adr/003-wire-protocols.md) (accepted 2026-11-09). Language and runtime follow [ADR-002](adr/002-language-runtime.md) (accepted 2026-11-09): TypeScript on Node 24 or later, no Bun. The build-vs-extend choice is [ADR-001](adr/001-build-vs-extend.md) (accepted 2026-11-09, option C: standalone with interop)._
 
 ## 1. Roles
 
@@ -132,6 +132,14 @@ budget:
 | `@tacet/tui` | Ink-based terminal mode |
 | `tacet` (cli) | `tacet up`, `tacet init`, `tacet status`, `tacet attach` |
 
+### Interop
+
+Tacet owns its core and interoperates at the protocol level ([ADR-001](adr/001-build-vs-extend.md), accepted 2026-11-09):
+
+- **Inbound.** A Mini-conductor exposed as an ACP agent (#51, milestone M2) can be driven by Omnigent (`acp:<slug>`), Gas City (its `acp` session provider) and editors. Agents in those tools can call the Mini's MCP tools with a per-session token ([ADR-003 §6](adr/003-wire-protocols.md#6-workers--mini-conductor-mcp-tool-surface)).
+- **Outbound.** Omnigent sessions or Gas City runs as Tacet Workers (`@tacet/adapter-omnigent`, `@tacet/adapter-gascity`) are added only if a user asks for them. They are not on the roadmap.
+- Tacet does not fork, vendor or embed Omnigent, Gas Town or Gas City.
+
 ## 6. Security & auth principles
 Local servers ([ADR-003 §3, §5, §6](adr/003-wire-protocols.md#3-auth-token-handshake-all-local-servers)):
 
@@ -145,7 +153,7 @@ Local servers ([ADR-003 §3, §5, §6](adr/003-wire-protocols.md#3-auth-token-ha
 Vendor auth and billing:
 
 - Never store, log, proxy or copy vendor OAuth or subscription tokens. Launch vendor CLIs and SDKs under the user's own login or API key.
-- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. The owner can override this in config. Many parallel Workers on one subscription is an open risk; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
+- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. The owner can override this in config. The same policy applies to Codex (#12): an API key for unattended or parallel Workers, and the user's own Codex login only for interactive use. Tacet never implements `chatgptAuthTokens`. Many parallel Workers on one subscription is an open risk; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
 
 Other:
 

@@ -46,6 +46,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **`tacet init` installer for repos** — `feature` `P0` `copilot`
 - [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `copilot`
 - [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
+- [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
 
 ## M2 · Conductor & escalation
 
@@ -58,6 +59,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Decision inbox: dedupe, batch, rank, answer, propagate** — `feature` `P0` `either`
 - [ ] **Summary packets (no transcripts upward)** — `feature` `P1` `either`
 - [ ] **Cross-project goals: split one goal into tasks across repos** — `feature` `P1` `either`
+- [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
 
 ## M3 · Context handoff & cost tiering
 
@@ -71,6 +73,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Escalation ladder: retry with stronger model before asking a human** — `feature` `P1` `either`
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
+- [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 
 ## M4 · Visual & terminal UI
 
@@ -100,7 +103,6 @@ Notifications, chat channels, phone access, non-code workflows and templates.
 Plugins, A2A/ACP exposure, sandboxing, evals, docs, release.
 
 - [ ] **Plugin system: adapters, channels, tools, workflows** — `feature` `P2` `either`
-- [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
 - [ ] **Expose conductor via A2A** — `feature` `P2` `claude`
 - [ ] **OS sandboxing for workers (bubblewrap / seatbelt / containers)** — `feature` `P2` `either`
 - [ ] **Evaluation harness: escalation quality, handoff fidelity, cost** — `feature` `P1` `either`

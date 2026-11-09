@@ -45,4 +45,4 @@ scripts/create-issues.sh OWNER/REPO             # create labels, milestones, iss
 
 ## License
 
-TBD in M0 (Apache-2.0 or MIT).
+Apache-2.0, decided 2026-11-09 ([ADR-001](docs/adr/001-build-vs-extend.md)). The `LICENSE` and `NOTICE` files land with the scaffold issue (#1).
