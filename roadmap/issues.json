@@ -141,7 +141,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Set up the monorepo skeleton described in docs/ARCHITECTURE.md §5.\n\n### Tasks\n- [ ] pnpm workspaces with packages: core, conductor, mini, adapters/*, web, tui, cli\n- [ ] TypeScript strict, shared tsconfig, ESLint + Prettier (or Biome)\n- [ ] Vitest, GitHub Actions CI on Ubuntu Linux + macOS\n- [ ] `engines.node: \">=24\"`, `.nvmrc` and `.node-version` set to 24; CI matrix {ubuntu, macos} x {Node 24, Node 26} (ADR-002)\n- [ ] LICENSE (decide: Apache-2.0 vs MIT), CONTRIBUTING, CODE_OF_CONDUCT, SECURITY\n\n### Acceptance criteria\n- `pnpm i && pnpm test` passes in CI on a clean checkout\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Set up the monorepo skeleton described in docs/ARCHITECTURE.md §5.\n\n### Tasks\n- [ ] pnpm workspaces with packages: core, conductor, mini, adapters/*, web, tui, cli\n- [ ] TypeScript strict, shared tsconfig, ESLint + Prettier (or Biome)\n- [ ] Vitest, GitHub Actions CI on Ubuntu Linux + macOS\n- [ ] `engines.node: \">=24\"`, `.nvmrc` and `.node-version` set to 24; CI matrix {ubuntu, macos} x {Node 24, Node 26} (ADR-002)\n- [ ] LICENSE: Apache-2.0 (decided 2026-11-09, ADR-001), CONTRIBUTING, CODE_OF_CONDUCT, SECURITY\n- [ ] NOTICE file for attribution of any ported ideas or code (ADR-001 policy: borrow ideas, port code only with attribution)\n\n### Acceptance criteria\n- `pnpm i && pnpm test` passes in CI on a clean checkout\n- `LICENSE` (Apache-2.0) and `NOTICE` are at the repo root\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "ADR-001: Build standalone vs extend Omnigent vs interop",
@@ -253,7 +253,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Drive Claude Code via the Agent SDK or `claude -p --input-format stream-json --output-format stream-json`.\n\n### Tasks\n- [ ] Multi-turn streaming input, canUseTool → approval events\n- [ ] Resume/fork by session id\n- [ ] Usage + context events\n- [ ] Auth: API key / cloud provider first; document subscription terms clearly\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Drive Claude Code through the Agent SDK (`@anthropic-ai/claude-agent-sdk`), per the #64 findings in `docs/adapters/capability-matrix.md`. Use `claude -p --input-format stream-json --output-format stream-json` only as a fallback.\n\n### Tasks\n- [ ] Multi-turn streaming input, canUseTool → approval events\n- [ ] Resume/fork by session id\n- [ ] Usage + context events\n- [ ] Auth routing (owner policy, RESEARCH §7): the user's own subscription login for interactive sessions; an API key for parallel or unattended Workers. Tacet never stores, proxies or copies tokens.\n\n### Acceptance criteria\n- Passes conformance suite\n- Auth mode selection follows the routing policy and is tested without real credentials\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: Codex app-server (JSON-RPC)",
@@ -330,7 +330,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\n### Tasks\n- [ ] Tools: escalate, report_progress, request_handoff, read_task, record_decision, spawn_worker (gated)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\nCompatibility: the server answers MCP 2026-07-28 and 2025-11-25 clients through SDK defaults. The core tools use no feature that exists only in 2026-07-28 (ADR-003, addendum 2026-11-09).\n\n### Tasks\n- [ ] Tools: escalate, report_progress, request_handoff, read_task, record_decision, spawn_worker (gated)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n- [ ] Three-client conformance test: a 2026-07-28 client, a 2025-11-25 client and a real vendor worker\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n- The three-client conformance test passes\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Verification pipeline: commands + reviewer agent",
@@ -694,7 +694,7 @@
     },
     {
       "title": "Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)",
-      "milestone": "M6 · Ecosystem & hardening",
+      "milestone": "M2 · Conductor & escalation",
       "labels": [
         "type:feature",
         "area:adapters",
@@ -913,6 +913,28 @@
         "agent:claude"
       ],
       "body": "Follow-up from ADR-002. Bun is excluded for v0 (ADR-002 decision 3). Re-check it when the node-pty bug oven-sh/bun#25822 closes. The check also covers the UNVERIFIED Bun.Terminal API details and the state of better-sqlite3 on Bun (#4290).\n\n### Tasks\n- [ ] Check the state of oven-sh/bun#25822 and the related crash reports\n- [ ] Read the Bun.Terminal API from primary docs and record its details\n- [ ] Check the state of better-sqlite3 on Bun (#4290) and `bun:sqlite` parity\n- [ ] Recommend whether Bun becomes a second tested runtime\n\n### Acceptance criteria\n- Findings are recorded in the ADR or matrix\n- The runtime does not change without an accepted ADR\n\n_See docs/adr/002-language-runtime.md (Node vs Bun, What would change this) for context._"
+    },
+    {
+      "title": "Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "Build the local auth module that every Tacet daemon (Conductor and Mini-conductors) uses. This is ADR-003 follow-up 2. It is security-sensitive, so it needs a reviewer pass before merge.\n\n### Tasks\n- [ ] Token file: 256-bit token from crypto.randomBytes, written with pid, port, protocolVersions and startedAt to `~/.tacet/run/` at mode 0600; rotated on every start; never logged or put in events\n- [ ] `tacet/hello` handshake: negotiate protocol versions (close with 4406 when none match); any other first method closes the socket with -32600\n- [ ] Host and Origin checks on every HTTP and WebSocket request (127.0.0.1, [::1] or localhost with the server port); failures close with 4401 or return 401/403\n- [ ] One-time-code browser login: `tacet open` passes `#code=`; `POST /auth/session` exchanges a single-use code (60 s lifetime) for an HttpOnly, SameSite=Strict session cookie\n- [ ] Per-worker MCP tokens bound to {workerSessionId, taskId}, injected into the worker's MCP config, revoked when the session closes\n- [ ] Bind 127.0.0.1 and ::1 on an OS-assigned port by default\n- [ ] Reviewer pass (`reviewer` agent) before the PR is opened\n\n### Acceptance criteria\n- A request with a wrong Host or Origin is rejected, including the DNS-rebinding case\n- A socket whose first frame is not `tacet/hello` is closed\n- A one-time code works once and expires after 60 s\n- A worker token cannot act on another task or session, and is rejected after revocation\n- No token value appears in logs, events or test snapshots\n\n_See docs/adr/003-wire-protocols.md §3, §5, §6 and docs/ARCHITECTURE.md §6._"
+    },
+    {
+      "title": "Merge queue: batch-then-bisect for parallel Worker branches",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Land the branches of parallel Worker sessions through a merge queue. The queue batches verified branches, runs verification on each batch, and bisects a failing batch to find the bad branch. The idea is borrowed from Gas Town's Refinery (`docs/design/architecture.md`, Merge Queue). Tacet reimplements it in TypeScript and does not port code (ADR-001). This is ADR-001 follow-up 5, and it relates to #19.\n\n### Tasks\n- [ ] Per-repo queue of verified Worker branches, in completion order\n- [ ] Batch branches onto the target branch in a scratch worktree and run the repo's verify commands from `.tacet/tacet.yaml`\n- [ ] On batch failure, bisect to isolate the failing branch and return it to its task as a verification failure\n- [ ] Record each queue step as events (`task.*` and `worker.*`), not ad-hoc state\n- [ ] Repo config for maximum batch size and verify timeout\n\n### Acceptance criteria\n- In a batch of three branches where one fails verification, the two good branches land and the bad one goes back to its task\n- In a batch of eight with one bad branch, bisection after the failed batch run isolates it in at most 3 verification runs\n- Queue state survives a mini-conductor restart (rebuilt from the event log)\n\n_See docs/adr/001-build-vs-extend.md (Consequences, follow-up 5) and docs/ARCHITECTURE.md §2.1._"
     }
   ]
 }

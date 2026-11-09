@@ -182,6 +182,16 @@ The owner accepted this ADR in full on 2026-11-09. The ADR has no separate list 
 
 Follow-ups for an accepted ADR, applied with this decision: `docs/ARCHITECTURE.md` (§1, §2.2, §3, §5, §6), `docs/RESEARCH.md` §4 and §8, the MCP and Claude Code timeout facts in `docs/adapters/capability-matrix.md`, and removal of Windows from the scaffold issue (#1) and the ADR-002 issue (#3). The schema follow-up is covered by issue #4. The local auth module follow-up has no roadmap issue yet.
 
+### Addendum (2026-11-09): MCP compatibility for #18
+
+The owner decided how the mini-conductor's MCP server handles older clients. This answers follow-up 4 in Consequences.
+
+- **Revisions served:** the MCP server answers both `2026-07-28` and `2025-11-25` clients, through the SDK's default negotiation.
+- **Tools:** the core tools in §6 do not rely on any feature that exists only in `2026-07-28`, so clients on either revision get the same tool surface.
+- **Conformance:** a three-client conformance test covers this. It is part of #18. The SDK-level result of spike #69 is still recorded in that spike.
+- **Revisit:** when the MCP TypeScript SDK announces that it will remove legacy (`2025-11-25`) serving.
+- **Auth module:** follow-up 2 (local auth module) is now a roadmap entry in M1 (`agent:claude`, `priority:p0`, `area:security`, with a reviewer pass required).
+
 ## Consequences
 
 - `docs/ARCHITECTURE.md` needs, in the PR that accepts this ADR:

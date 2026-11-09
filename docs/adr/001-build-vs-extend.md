@@ -1,7 +1,8 @@
 # ADR-001: Build standalone vs extend Omnigent vs interop
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-09
+- Accepted by the owner on 2026-11-09.
 
 Resolves issue #2. Decides `docs/RESEARCH.md` §9. ADR-002 (language and runtime) is held until this ADR is decided. ADR-003 (wire protocols) is treated here as accepted, as the owner instructed.
 
@@ -166,6 +167,29 @@ Proposed: **Option C, standalone with interop.**
 - Omnigent ships a stable orchestration plugin API, or an ACP or A2A server endpoint for its sessions. That would make deeper interop, or building on it, cheaper.
 - Gas City adds a harness-neutral, non-tmux, non-Dolt mode and a stable API. It would then become a stronger interop target, and possibly a backend for Worker scheduling.
 - Measured cost of the M1 adapters is much higher than expected (for example, the Claude and Codex adapters take far longer than estimated). Then reconsider driving Workers through Omnigent as a backend.
+
+## Owner answers (2026-11-09)
+
+The owner accepted option C on 2026-11-09, with these answers:
+
+- **Spike:** accepted without the hands-on spike (Consequences, follow-up 1). The issue #2 tasks "Run Omnigent locally" and "Run Gas Town on a toy repo" remain not done. The UNVERIFIED items stay open (follow-up 6).
+- **Language:** Python is ruled out for the core. ADR-002 applies as written.
+- **#51 (Mini-conductor as an ACP agent):** moved to milestone "M2 · Conductor & escalation" in `roadmap/issues.json`. Its priority is unchanged.
+- **Outbound adapters** (`@tacet/adapter-omnigent`, `@tacet/adapter-gascity`): added only if a user asks for one. No roadmap entry.
+- **Policy:** "borrow ideas, port code only with attribution." Tacet's license is **Apache-2.0** (issue #1). The `NOTICE` file for attribution is part of #1.
+- **Merge queue:** added to the roadmap for M3 (follow-up 5). It uses the batch-then-bisect approach from Gas Town's Refinery.
+
+Follow-up status after these answers:
+
+| # | Follow-up | Status |
+|---|---|---|
+| 1 | Hands-on spike | Waived by the owner |
+| 2 | Borrow rows added to the task lists of #5, #10, #15, #17, #18, #19, #25, #26, #30, #31, #35, #50 | Open, not applied in the 2026-11-09 change |
+| 3 | Re-prioritise #51 | Milestone moved to M2. Priority unchanged |
+| 4 | Outbound adapters (P2) | Not added. On request only |
+| 5 | Merge queue (M3+) | Added to the roadmap (M3, p2) |
+| 6 | Verify UNVERIFIED items | Open (`agent:claude`) |
+| 7 | License | Apache-2.0 |
 
 ## Consequences
 

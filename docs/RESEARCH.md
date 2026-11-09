@@ -32,6 +32,8 @@ These run N agent CLIs side by side, usually one git worktree each, with a UI fo
 | Claude Code **Agent Teams** (experimental) | Team lead + teammate sessions, shared task list and per-agent mailbox, all as files under `~/.claude/teams/`. | Claude-only, single repo, no nested teams, notable token cost (reports of 3–15× a single session). Useful as a *backend* a mini-conductor could drive, not a competitor to the cross-repo layer. |
 | Kilo's hosted Gas Town, Paperclip, CodeAgentSwarm, opengoat | Hosted/closed variants | Not local-first. |
 
+**Update (2026-11-09, [ADR-001](adr/001-build-vs-extend.md)).** Gas Town is being succeeded by **Gas City** (MIT, Go, very active). Track Gas City as the successor; Gas Town is near-frozen. Vibe Kanban is sunsetting, as its README says, and gets only occasional commits. Tacet's decision is option C: a standalone core that interoperates over ACP and MCP. The rows above are the research as it stood before ADR-001.
+
 ### 2.3 The gap tacet can own
 
 1. **Two-tier hierarchy across many repos/projects** — global Conductor + persistent per-repo Mini-conductors (most tools have one tier, Gas Town has it but is heavy and Claude-centric).
@@ -94,21 +96,24 @@ Evidence points the same way: lossy auto-compaction degrades long sessions; **fr
 - **Anthropic: billing for `claude -p` and the Agent SDK (corrected 2026-11-09).** An earlier draft of this section said this usage moved to a separate credit pool on 2026-06-15. The Anthropic help article says that change is **paused**, with no resume date. When signed in with a Claude plan, `claude -p` and the Agent SDK still draw from the plan's usage limits. Max, Ultra and Team plans include monthly API credits, but the SDK and `claude -p` can use them only through an API key from a linked Console organization. Pro and Enterprise eligibility is UNVERIFIED. Source: https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan (read 2026-11-09).
 - **Owner setup (2026-11-09).** The owner runs Workers on their own Claude subscription, signing in to the unmodified CLI personally. The owner also holds an Anthropic API key with a **$200/month** usage budget. Tacet never stores, proxies or copies tokens.
 - **Default auth routing (owner decision, 2026-11-09).** Prefer the API key for parallel or unattended Workers, and the subscription login for interactive or single sessions. The owner can override this in config. The budget default lives in the cost ledger issue (#35) and in `docs/ARCHITECTURE.md` §4.
+- **Codex login (owner decision, 2026-11-09).** The same rule applies to Codex (#12). Use an API key for unattended or parallel Workers. Use the user's own Codex login (`codex login`, or the browser or device-code flow inside Codex) only for interactive use. Tacet never implements `chatgptAuthTokens`, which the Codex 0.167.0 schema marks as OpenAI internal use only (spike #59). See [capability matrix §2](adapters/capability-matrix.md#2-codex-app-server-json-rpc).
 - **Open risk (needs-human).** Many parallel Workers on one subscription may exceed "ordinary individual usage" in Anthropic's terms. This is unresolved. It is tracked as a `needs-human` item in the capability matrix (Gaps, item 9).
 - **OpenAI (UNVERIFIED).** An earlier draft said OpenAI publicly endorses using Codex subscriptions in third-party harnesses. The primary page could not be read, so do not rely on this claim. See [capability matrix §2](adapters/capability-matrix.md#2-codex-app-server-json-rpc), Terms row.
 - **Design implication:** tacet never handles vendor OAuth tokens itself. It launches the vendor's own CLI/SDK under the user's own login or API key, supports API keys / gateways (OpenRouter, LiteLLM, local Ollama/vLLM) first-class, and documents per-vendor billing behaviour. Re-verify vendor terms before each release; this area moves fast.
 
 ## 8. Recommended technical direction
 
-- **Language:** TypeScript on Node (or Bun) — the Claude Agent SDK, Codex SDK/app-server TS schemas, ACP SDK, OpenCode SDK, MCP SDK and AG-UI client all have first-class TS support. Python is the alternative (Omnigent chose it).
+- **Language:** TypeScript on Node 24 or later, decided by [ADR-002](adr/002-language-runtime.md). Bun is excluded, and Python is not used in core packages. The Claude Agent SDK, Codex SDK/app-server TS schemas, ACP SDK, OpenCode SDK, MCP SDK and AG-UI client all have first-class TS support. Python was considered (Omnigent chose it) and rejected.
 - **Shape:** pnpm monorepo: `core` (types, event schema), `conductor` (daemon), `mini` (per-repo daemon + MCP server, published as the installable package), `adapters/*`, `web` (React + xterm.js), `tui` (Ink), `cli`.
 - **State:** append-only event log in SQLite per mini-conductor (event sourcing → replay, audit, UI timelines); Conductor keeps an aggregated index.
 - **Isolation:** git worktree per worker by default; optional sandbox (bubblewrap/seatbelt/containers) later.
 - **Local-first security:** bind to 127.0.0.1 and ::1, a token rotated on every daemon start, one-time codes for browsers, and explicit opt-in for LAN/phone access ([ADR-003 §3](adr/003-wire-protocols.md#3-auth-token-handshake-all-local-servers)).
 
-## 9. Build-vs-extend decision (open)
+## 9. Build-vs-extend decision (decided: option C)
 
-Before writing much code, spend a spike deciding between:
+**Decision (accepted by the owner, 2026-11-09):** option C, standalone with interop. See [ADR-001](adr/001-build-vs-extend.md). The owner accepted without the hands-on spike. The options are kept below as the record.
+
+Options considered:
 - **A. Standalone** (recommended default): own the hierarchy, escalation and handoff layers; borrow ideas freely.
 - **B. Build on Omnigent**: implement mini-conductor/escalation/handoff as Omnigent agents + policies. Faster start, but Python and someone else's core.
 - **C. Interop**: standalone, but treat Omnigent / Gas Town / Vibe Kanban sessions as just another adapter.

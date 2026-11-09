@@ -1,7 +1,8 @@
 # ADR-002: Language and runtime (TypeScript on Node vs Bun vs Python)
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-09
+- Accepted by the owner on 2026-11-09.
 
 Resolves issue #3. Depends on nothing; ADR-001 (build vs extend) may revisit it if it chooses option B (build on Omnigent, which is Python).
 
@@ -85,6 +86,7 @@ The owner answered the open questions on 2026-11-09. The answers are recorded he
 - **Platforms:** macOS and Linux (Ubuntu) only. Windows is removed from targets, the CI matrix and the ConPTY consequences.
 - **Status:** this ADR stays `proposed`. Acceptance waits on ADR-001 (Omnigent build-vs-extend, issue #2), because ADR-001 may revisit this decision.
 - **SQLite:** the driver choice is deferred to the event-log issue (#6), as recommended in decision 5.
+- **Acceptance (2026-11-09):** ADR-001 chose option C (standalone with interop), so this ADR is accepted as written. The "stays proposed" bullet above is superseded.
 
 ## Consequences
 
