@@ -1,0 +1,10 @@
+import { spawn } from 'node:child_process'; import readline from 'node:readline';
+const [cmd, ...args] = process.argv.slice(2);
+const p = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], env: process.env });
+p.stderr.on('data', () => {});
+const rl = readline.createInterface({ input: p.stdout }); const pend = new Map(); let id = 0;
+rl.on('line', (l) => { let m; try { m = JSON.parse(l); } catch { return; } console.log('<<', l.slice(0, 600)); if (m.id != null && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } });
+const req = (method, params) => new Promise((r) => { const i = ++id; pend.set(i, r); const s = JSON.stringify({ jsonrpc: '2.0', id: i, method, params }); console.log('>>', s); p.stdin.write(s + '\n'); setTimeout(() => r({ timeout: true }), 30000); });
+await req('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } });
+await req('session/new', { cwd: process.cwd(), mcpServers: [{ type: 'http', name: 'tacet', url: 'http://127.0.0.1:8795/mcp', headers: [{ name: 'X-Tacet-Token', value: 'dummy-token' }] }] });
+await new Promise(r => setTimeout(r, 4000)); p.kill('SIGTERM'); process.exit(0);
