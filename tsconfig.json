@@ -1,0 +1,38 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/core"
+    },
+    {
+      "path": "./packages/conductor"
+    },
+    {
+      "path": "./packages/mini"
+    },
+    {
+      "path": "./packages/adapters/claude-sdk"
+    },
+    {
+      "path": "./packages/adapters/codex-app-server"
+    },
+    {
+      "path": "./packages/adapters/opencode"
+    },
+    {
+      "path": "./packages/adapters/acp"
+    },
+    {
+      "path": "./packages/adapters/pty"
+    },
+    {
+      "path": "./packages/web"
+    },
+    {
+      "path": "./packages/tui"
+    },
+    {
+      "path": "./packages/cli"
+    }
+  ]
+}

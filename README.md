@@ -4,7 +4,7 @@
 
 *Tacet* (TAH-set) is the musical marking that tells an instrument to stay silent. Tacet's agents work quietly in the background and only interrupt you for the decisions that need you.
 
-**Status:** research & planning. No code yet. See the [roadmap](ROADMAP.md).
+**Status:** early development (M0). The monorepo is scaffolded; the packages are still placeholders. See the [roadmap](ROADMAP.md). Licensed under [Apache-2.0](LICENSE).
 
 ## The idea
 

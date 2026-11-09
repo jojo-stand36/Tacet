@@ -1,0 +1,25 @@
+{
+  "name": "tacet-monorepo",
+  "private": true,
+  "description": "Tacet: a local-first orchestrator for AI coding agents (monorepo root).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "pnpm@12.18.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "test": "tsc -b && vitest run",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "check:generated": "node scripts/gen-roadmap.mjs --check && node scripts/sync-agents.mjs --check"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.6",
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}
