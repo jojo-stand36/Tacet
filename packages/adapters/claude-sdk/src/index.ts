@@ -1,2 +1,11 @@
-/** Claude adapter built on the Claude Agent SDK. Placeholder until its roadmap issue lands. */
+/** Claude adapter built on the Claude Agent SDK (issue #11). */
 export const packageName = '@tacet/adapter-claude-sdk' as const;
+
+export {
+  CLAUDE_SDK_CAPABILITIES,
+  ClaudeSdkAdapter,
+  type ClaudeSdkAdapterOptions,
+  toPermissionResult,
+} from './adapter.js';
+export { AuthRoutingError, authEnv, type ClaudeAuthRoute, chooseAuthRoute } from './auth.js';
+export { defaultMcpConfigDir, removeMcpConfig, writeMcpConfig } from './mcp-config.js';

@@ -29,3 +29,23 @@ export function findSecrets(value: unknown, path = ''): SecretFinding[] {
   }
   return [];
 }
+
+const GLOBAL_PATTERNS = SECRET_PATTERNS.map(([, re]) => new RegExp(re.source, 'g'));
+
+/**
+ * Copy of `value` with every substring that looks like a credential replaced by `[redacted]`.
+ * Adapters run tool inputs through this before emitting `tool.call` events (ADR-003 §1).
+ * Pattern-based, so it catches well-known key formats only; it is a safety net, not a guarantee.
+ */
+export function redactSecrets<T>(value: T): T {
+  if (typeof value === 'string') {
+    // A PEM block cannot be cut out by its header alone, so the whole string goes.
+    if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(value)) return '[redacted]' as T;
+    return GLOBAL_PATTERNS.reduce((s, re) => s.replace(re, '[redacted]'), value as string) as T;
+  }
+  if (Array.isArray(value)) return value.map((v) => redactSecrets(v)) as T;
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactSecrets(v)])) as T;
+  }
+  return value;
+}
