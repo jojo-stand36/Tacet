@@ -1,20 +1,37 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { Ajv2020 } from 'ajv/dist/2020.js';
+import addFormatsModule from 'ajv-formats';
 import { describe, expect, it } from 'vitest';
 import {
   AgentEvent,
+  ApprovalDecision,
   allJsonSchemas,
+  Decision,
+  DecisionExt,
+  Escalation,
+  EscalationExt,
   EventEnvelope,
   HandoffPacket,
+  isKnownEventNamespace,
   type JsonSchemaName,
   jsonSchemas,
+  parseAgentEvent,
   Task,
+  TaskExt,
   toJsonSchema,
+  Ulid,
 } from '../index.js';
 
-const examplesDir = join(import.meta.dirname, '..', '..', 'examples', 'v1');
-const readExample = (name: string): unknown =>
-  JSON.parse(readFileSync(join(examplesDir, `${name}.json`), 'utf8'));
+// ajv-formats ships CommonJS; depending on the loader the plugin is the module or its `.default`.
+const addFormats = ((addFormatsModule as unknown as { default?: unknown }).default ??
+  addFormatsModule) as (ajv: Ajv2020) => Ajv2020;
+
+const root = join(import.meta.dirname, '..', '..');
+const examplesDir = join(root, 'examples', 'v1');
+const readJson = (file: string): unknown => JSON.parse(readFileSync(file, 'utf8'));
+const example = (name: string): Record<string, unknown> =>
+  readJson(join(examplesDir, `${name}.json`)) as Record<string, unknown>;
 const names = Object.keys(jsonSchemas) as JsonSchemaName[];
 
 describe('examples', () => {
@@ -23,17 +40,23 @@ describe('examples', () => {
     expect(files.sort()).toEqual([...names].sort());
   });
 
-  it.each(names)('%s example parses and round-trips', (name) => {
+  it.each(names)('%s example parses and round-trips through zod', (name) => {
     const { schema } = jsonSchemas[name];
-    const parsed = schema.parse(readExample(name));
+    const parsed = schema.parse(example(name));
     expect(schema.parse(JSON.parse(JSON.stringify(parsed)))).toEqual(parsed);
+  });
+
+  it.each(names)('%s example validates against the committed JSON Schema', (name) => {
+    const ajv = new Ajv2020({ strict: false, allErrors: true });
+    addFormats(ajv);
+    const validate = ajv.compile(readJson(join(root, 'schema', 'v1', `${name}.json`)) as object);
+    expect(validate(example(name)), JSON.stringify(validate.errors)).toBe(true);
   });
 });
 
 describe('forward compatibility (ADR-003 §2)', () => {
   it('ignores unknown fields instead of rejecting them', () => {
-    const doc = { ...(readExample('task') as object), futureField: 1 };
-    const parsed = Task.parse(doc);
+    const parsed = Task.parse({ ...example('task'), futureField: 1 });
     expect(parsed).not.toHaveProperty('futureField');
   });
 
@@ -42,51 +65,108 @@ describe('forward compatibility (ADR-003 §2)', () => {
       expect(JSON.stringify(doc)).not.toContain('"additionalProperties":false');
     }
   });
+
+  it('accepts envelopes in namespaces this version does not know', () => {
+    const env = EventEnvelope.parse({ ...example('envelope'), type: 'ui.panel.opened' });
+    expect(isKnownEventNamespace(env.type)).toBe(false);
+    expect(isKnownEventNamespace('agent.usage')).toBe(true);
+  });
+
+  it('parseAgentEvent ignores an unknown event kind and validates known ones', () => {
+    expect(parseAgentEvent({ t: 'telepathy', x: 1 })).toBeUndefined();
+    expect(parseAgentEvent(null)).toBeUndefined();
+    expect(parseAgentEvent({ t: 'message.delta', text: 'hi' })?.t).toBe('message.delta');
+    expect(() => parseAgentEvent({ t: 'usage', inputTokens: -1 })).toThrow();
+  });
 });
 
-describe('HandoffPacket', () => {
-  const packet = readExample('handoff-packet') as Record<string, unknown>;
+describe('defaults', () => {
+  it('fills Task, Escalation, Decision, HandoffPacket and ApprovalDecision defaults', () => {
+    const { priority: _p, ...task } = example('task');
+    expect(Task.parse(task).priority).toBe('p2');
 
-  it('rejects a packet without nextAction', () => {
+    const { status: _s, blockedWorkers: _b, reescalations: _r, ...esc } = example('escalation');
+    const e = Escalation.parse(esc);
+    expect([e.status, e.blockedWorkers, e.reescalations]).toEqual(['pending', 0, 0]);
+
+    const { tags: _t, ...dec } = example('decision');
+    expect(Decision.parse(dec).tags).toEqual([]);
+
+    const {
+      decisions: _d,
+      filesTouched: _f,
+      commandsRun: _c,
+      openQuestions: _o,
+      ...packet
+    } = example('handoff-packet');
+    const h = HandoffPacket.parse(packet);
+    expect([h.decisions, h.filesTouched, h.commandsRun, h.openQuestions]).toEqual([[], [], [], []]);
+
+    expect(ApprovalDecision.parse({ kind: 'allow_always' }).persist).toBe(false);
+  });
+});
+
+describe('rejections', () => {
+  const cases: [string, { safeParse(v: unknown): { success: boolean } }, unknown][] = [
+    ['Task without a goal', Task, { ...example('task'), goal: '' }],
+    ['Task with an unknown priority', Task, { ...example('task'), priority: 'urgent' }],
+    ['TaskExt with a negative budget', TaskExt, { ...example('task-ext'), budget: { usd: -1 } }],
+    ['Escalation with an unknown urgency', Escalation, { ...example('escalation'), urgency: 'x' }],
+    [
+      'EscalationExt without blockedWorkers',
+      EscalationExt,
+      { escalationId: example('escalation-ext').escalationId, urgency: 'low' },
+    ],
+    [
+      'Decision with global scope (not in ADR-003)',
+      Decision,
+      { ...example('decision'), scope: 'global' },
+    ],
+    ['DecisionExt without a choice', DecisionExt, { ...example('decision-ext'), choice: '' }],
+    ['ApprovalDecision with an unknown kind', ApprovalDecision, { kind: 'maybe' }],
+    ['AgentEvent with an unknown kind', AgentEvent, { t: 'telepathy' }],
+    [
+      'EventEnvelope with a non-ULID id',
+      EventEnvelope,
+      { ...example('envelope'), id: 'not-a-ulid' },
+    ],
+    [
+      'EventEnvelope with an undotted type',
+      EventEnvelope,
+      { ...example('envelope'), type: 'usage' },
+    ],
+  ];
+
+  it.each(cases)('rejects %s', (_label, schema, value) => {
+    expect(schema.safeParse(value).success).toBe(false);
+  });
+
+  it('rejects a ULID whose first character overflows 48 bits', () => {
+    expect(Ulid.safeParse('8ZZZZZZZZZZZZZZZZZZZZZZZZZ').success).toBe(false);
+    expect(Ulid.safeParse('7ZZZZZZZZZZZZZZZZZZZZZZZZZ').success).toBe(true);
+  });
+
+  it('accepts usage without context or cost (not every vendor reports them)', () => {
+    expect(
+      AgentEvent.parse({ t: 'usage', inputTokens: 1, outputTokens: 2, source: 'estimated' }).t,
+    ).toBe('usage');
+  });
+});
+
+describe('HandoffPacket nextAction', () => {
+  const packet = example('handoff-packet');
+
+  it('is required', () => {
     const { nextAction: _omit, ...rest } = packet;
     expect(HandoffPacket.safeParse(rest).success).toBe(false);
   });
 
-  it('rejects a blank nextAction', () => {
+  it('rejects blank text, in zod and in the JSON Schema alike', () => {
     expect(HandoffPacket.safeParse({ ...packet, nextAction: '   ' }).success).toBe(false);
-  });
-});
-
-describe('AgentEvent', () => {
-  it('accepts usage without context or cost (not every vendor reports them)', () => {
-    const e = AgentEvent.parse({
-      t: 'usage',
-      inputTokens: 1,
-      outputTokens: 2,
-      source: 'estimated',
-    });
-    expect(e.t).toBe('usage');
-  });
-
-  it('rejects an unknown event kind', () => {
-    expect(AgentEvent.safeParse({ t: 'telepathy' }).success).toBe(false);
-  });
-});
-
-describe('EventEnvelope', () => {
-  const env = readExample('envelope') as Record<string, unknown>;
-
-  it('rejects a type outside the known namespaces', () => {
-    expect(EventEnvelope.safeParse({ ...env, type: 'secrets.dump' }).success).toBe(false);
-  });
-
-  it('rejects an id that is not a ULID', () => {
-    expect(EventEnvelope.safeParse({ ...env, id: 'not-a-ulid' }).success).toBe(false);
-  });
-
-  it('carries an agent event as data', () => {
-    const parsed = EventEnvelope.parse(env);
-    expect(AgentEvent.parse(parsed.data).t).toBe('usage');
+    const ajv = new Ajv2020({ strict: false });
+    addFormats(ajv);
+    const validate = ajv.compile(toJsonSchema('handoff-packet'));
+    expect(validate({ ...packet, nextAction: '   ' })).toBe(false);
   });
 });
 
@@ -98,7 +178,6 @@ describe('JSON Schema export', () => {
   });
 
   it.each(names)('committed schema/v1/%s.json matches the zod source', (name) => {
-    const file = join(import.meta.dirname, '..', '..', 'schema', 'v1', `${name}.json`);
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(toJsonSchema(name));
+    expect(readJson(join(root, 'schema', 'v1', `${name}.json`))).toEqual(toJsonSchema(name));
   });
 });

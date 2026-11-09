@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:approval-decision:v1",
+  "title": "Tacet ApprovalDecision",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": [
+        "allow_once",
+        "allow_always",
+        "reject",
+        "cancel"
+      ]
+    },
+    "persist": {
+      "default": false,
+      "description": "Only meaningful with allow_always",
+      "type": "boolean"
+    },
+    "message": {
+      "description": "Reason shown to the agent on reject or cancel",
+      "type": "string"
+    },
+    "updatedInput": {
+      "description": "Replacement tool input on allow, if supported"
+    },
+    "grant": {
+      "description": "Granted subset for grant-style requests; omit to grant what was requested"
+    }
+  },
+  "required": [
+    "kind"
+  ]
+}

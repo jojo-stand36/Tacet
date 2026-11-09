@@ -6,7 +6,7 @@
   "properties": {
     "escalationId": {
       "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
     },
     "choice": {
       "type": "string",
@@ -19,8 +19,7 @@
       "type": "string",
       "enum": [
         "task",
-        "repo",
-        "global"
+        "repo"
       ]
     }
   },

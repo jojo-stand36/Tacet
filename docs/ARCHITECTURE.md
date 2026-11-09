@@ -69,7 +69,7 @@ interface AgentAdapter {
   start(opts: SessionOptions): Promise<SessionHandle>;
   send(h: SessionHandle, input: UserInput): Promise<void>;
   interrupt(h: SessionHandle): Promise<void>;
-  respond(h: SessionHandle, req: ApprovalId, decision: Decision): Promise<void>;
+  respond(h: SessionHandle, req: ApprovalId, decision: ApprovalDecision): Promise<void>;
   close(h: SessionHandle): Promise<void>;
   events(h: SessionHandle): AsyncIterable<AgentEvent>; // normalized
 }
@@ -78,14 +78,20 @@ type AgentEvent =                     // zod source: packages/core/src/schema/ag
   | { t: "message.delta"; text: string }
   | { t: "tool.call"; id: string; name: string; input: unknown }   // input redacted
   | { t: "tool.result"; id: string; ok: boolean; summary?: string }
-  | { t: "approval.request"; id: string; summary: string; toolName?: string }
+  | { t: "approval.request"; id: string; summary: string; toolName?: string;
+      options?: ("allow_once" | "allow_always" | "reject" | "cancel")[]; requestedGrant?: unknown }
   | { t: "usage"; inputTokens: number; outputTokens: number; contextUsed?: number; contextMax?: number;
       costUsd?: number; model?: string; source: "reported" | "estimated" }
-  | { t: "status"; state: "running" | "idle" | "waiting_input" | "cancelled" | "error" | "done"; message?: string }
-  | { t: "escalation"; question: string; options?: string[]; urgency: Urgency };
+  | { t: "status"; state: "running" | "idle" | "waiting_input" | "auth_required" | "cancelled" | "error" | "done";
+      message?: string }
+  | { t: "escalation"; question: string; options?: string[]; urgency: Urgency; context?: string; contextRef?: string };
+
+// The answer to an approval.request. allow_always is session-scoped unless persist is true.
+type ApprovalDecision = { kind: "allow_once" | "allow_always" | "reject" | "cancel"; persist?: boolean;
+  message?: string; updatedInput?: unknown; grant?: unknown };
 ```
 
-The shared schemas (`AgentEvent`, `Task`, `Escalation`, `Decision`, `HandoffPacket`, the event envelope and the A2A extension metadata) are zod 4 schemas in `@tacet/core`, exported as JSON Schema 2020-12 in `packages/core/schema/v1/` (#5, [ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)). Context and cost fields on `usage` are optional because not every vendor reports them ([capability matrix §7](adapters/capability-matrix.md)).
+The shared schemas (`AgentEvent`, `Task`, `Escalation`, `Decision`, `HandoffPacket`, the event envelope and the A2A extension metadata) are zod 4 schemas in `@tacet/core`, exported as JSON Schema 2020-12 in `packages/core/schema/v1/` (#5, [ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)). On `usage`, token and cost fields are per-call deltas (adapters convert cumulative vendor totals), `contextUsed`/`contextMax` are gauges, and context and cost are optional because not every vendor reports them ([capability matrix §7](adapters/capability-matrix.md)). `ApprovalDecision` (an adapter's answer to a tool-approval request) is distinct from `Decision` (a recorded answer to an escalation, reused as precedent). Receivers parse agent events with `parseAgentEvent`, which ignores unknown kinds.
 
 All events go to an append-only **event log** (SQLite) → UI timelines, replay, audit, cost.
 

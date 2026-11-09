@@ -8,6 +8,11 @@
       "type": "number",
       "const": 1
     },
+    "id": {
+      "description": "handoffId, minted by the Mini-conductor when it accepts the packet",
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
     "taskId": {
       "type": "string",
       "minLength": 1,
@@ -40,6 +45,7 @@
       "minLength": 1
     },
     "decisions": {
+      "default": [],
       "type": "array",
       "items": {
         "type": "object",
@@ -59,8 +65,7 @@
             "type": "string",
             "enum": [
               "task",
-              "repo",
-              "global"
+              "repo"
             ]
           }
         },
@@ -71,6 +76,7 @@
       }
     },
     "filesTouched": {
+      "default": [],
       "type": "array",
       "items": {
         "type": "string",
@@ -78,6 +84,7 @@
       }
     },
     "commandsRun": {
+      "default": [],
       "type": "array",
       "items": {
         "type": "object",
@@ -102,6 +109,7 @@
       }
     },
     "openQuestions": {
+      "default": [],
       "type": "array",
       "items": {
         "type": "string",
@@ -110,7 +118,8 @@
     },
     "nextAction": {
       "type": "string",
-      "minLength": 1
+      "pattern": "\\S",
+      "description": "The very next step"
     },
     "verification": {
       "type": "object",
@@ -150,10 +159,6 @@
     "goal",
     "acceptanceCriteria",
     "stateSummary",
-    "decisions",
-    "filesTouched",
-    "commandsRun",
-    "openQuestions",
     "nextAction",
     "verification"
   ]

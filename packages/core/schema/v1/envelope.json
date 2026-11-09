@@ -10,7 +10,7 @@
     },
     "id": {
       "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$",
       "description": "Unique and sortable; also the idempotency key"
     },
     "ts": {
@@ -43,7 +43,8 @@
     },
     "repo": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 256
     },
     "taskId": {
       "type": "string",
@@ -57,15 +58,16 @@
     },
     "correlationId": {
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "maxLength": 256
     },
     "causationId": {
       "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
     },
     "type": {
       "type": "string",
-      "pattern": "^(agent|task|escalation|decision|handoff|worker|budget)(\\.[a-z][a-z0-9_]*)+$"
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
     },
     "data": {}
   },

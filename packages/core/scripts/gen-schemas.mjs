@@ -23,12 +23,16 @@ if (check) {
   let existing = [];
   try {
     existing = readdirSync(outDir).filter((f) => f.endsWith('.json'));
-  } catch {}
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
   for (const [file, text] of expected) {
     let current = null;
     try {
       current = readFileSync(join(outDir, file), 'utf8');
-    } catch {}
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
     if (current !== text) problems.push(`${file} is ${current === null ? 'missing' : 'stale'}`);
   }
   for (const file of existing) if (!expected.has(file)) problems.push(`${file} is not generated`);

@@ -1,15 +1,16 @@
 import { z } from 'zod';
 import { Id, Timestamp, Ulid } from './common.js';
 
-/**
- * Where a decision applies. `task`: this task only. `repo`: precedent for the repo.
- * `global`: precedent the Conductor broadcasts to every Mini-conductor (`tacet/decision.record`).
- */
-export const DecisionScope = z.enum(['task', 'repo', 'global']);
+/** Where a decision applies (ADR-003 §6): `task` only, or `repo`, as precedent for the repo. */
+export const DecisionScope = z.enum(['task', 'repo']);
 export type DecisionScope = z.infer<typeof DecisionScope>;
 
-/** Who made the decision (matches the `source` of the MCP `escalate` result, ADR-003 §6). */
-export const DecisionSource = z.enum(['policy', 'precedent', 'mini', 'user']);
+/**
+ * Who made the decision. `policy`, `precedent`, `mini` and `user` match the `source` of the MCP
+ * `escalate` result (ADR-003 §6); `worker` is a task-scope decision a Worker recorded itself
+ * through MCP `record_decision`.
+ */
+export const DecisionSource = z.enum(['policy', 'precedent', 'mini', 'user', 'worker']);
 export type DecisionSource = z.infer<typeof DecisionSource>;
 
 /**

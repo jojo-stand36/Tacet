@@ -1,9 +1,9 @@
 import { z } from 'zod';
 
-/** ULID: 26 Crockford base32 characters. Used for event and record ids (ADR-003 §1). */
+/** ULID: 26 Crockford base32 characters, first one 0-7 (48-bit time). ADR-003 §1. */
 export const Ulid = z
   .string()
-  .regex(/^[0-9A-HJKMNP-TV-Z]{26}$/, 'expected a ULID (26 Crockford base32 characters)');
+  .regex(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/, 'expected a ULID (26 Crockford base32 characters)');
 
 /** Opaque, non-empty identifier minted by another system (A2A task ids, vendor session ids). */
 export const Id = z.string().min(1).max(256);

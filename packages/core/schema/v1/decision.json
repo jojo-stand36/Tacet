@@ -6,12 +6,12 @@
   "properties": {
     "id": {
       "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
     },
     "escalationId": {
       "description": "The escalation this answers, if any",
       "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
     },
     "taskId": {
       "type": "string",
@@ -38,8 +38,7 @@
       "type": "string",
       "enum": [
         "task",
-        "repo",
-        "global"
+        "repo"
       ]
     },
     "source": {
@@ -48,7 +47,8 @@
         "policy",
         "precedent",
         "mini",
-        "user"
+        "user",
+        "worker"
       ]
     },
     "tags": {
@@ -68,7 +68,7 @@
     "supersedes": {
       "description": "An earlier decision this one replaces",
       "type": "string",
-      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
     }
   },
   "required": [

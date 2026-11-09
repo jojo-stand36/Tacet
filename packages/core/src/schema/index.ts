@@ -1,5 +1,5 @@
 import type { z } from 'zod';
-import { AgentEvent } from './agent-event.js';
+import { AgentEvent, ApprovalDecision } from './agent-event.js';
 import { Decision, DecisionExt } from './decision.js';
 import { EventEnvelope } from './envelope.js';
 import { Escalation, EscalationExt } from './escalation.js';
@@ -24,6 +24,7 @@ export const SCHEMA_VERSION = 1;
 export const jsonSchemas = {
   envelope: { schema: EventEnvelope, title: 'Tacet event envelope' },
   'agent-event': { schema: AgentEvent, title: 'Tacet AgentEvent' },
+  'approval-decision': { schema: ApprovalDecision, title: 'Tacet ApprovalDecision' },
   task: { schema: Task, title: 'Tacet Task' },
   'task-ext': { schema: TaskExt, title: 'Tacet A2A task extension (urn:tacet:a2a-ext:task:v1)' },
   escalation: { schema: Escalation, title: 'Tacet Escalation' },
@@ -40,3 +41,13 @@ export const jsonSchemas = {
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;
+
+/**
+ * Input types: what a producer may send. Fields with defaults are optional here, unlike the
+ * parsed (output) types exported next to each schema.
+ */
+export type TaskInput = z.input<typeof Task>;
+export type EscalationInput = z.input<typeof Escalation>;
+export type DecisionInput = z.input<typeof Decision>;
+export type HandoffPacketInput = z.input<typeof HandoffPacket>;
+export type ApprovalDecisionInput = z.input<typeof ApprovalDecision>;
