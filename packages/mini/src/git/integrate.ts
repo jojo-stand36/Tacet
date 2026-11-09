@@ -4,6 +4,7 @@ import {
   constants,
   existsSync,
   fstatSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -13,7 +14,6 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   readWorkerFile,
@@ -104,23 +104,34 @@ export async function integrateWorktree(opts: IntegrateOptions): Promise<Integra
   };
 
   await git(['check-ref-format', opts.ref]);
-  const commit = await workerHead(wt, git);
-  if (!commit) return undefined;
-  // No commit of its own: the HEAD is the base it started from (or older).
-  if (await ok(['merge-base', '--is-ancestor', commit, 'HEAD'])) return undefined;
-
+  const head = await workerHead(wt, git);
+  if (!head) return undefined;
+  const { commit } = head;
   const current = await git(['rev-parse', '--verify', '-q', opts.ref]).catch(() => '');
   if (current === commit) return { commit, ref: opts.ref };
+  // No commit of its own: the HEAD is something a branch or tag of the repo already has (its
+  // base, or any other existing commit), other than its own task branch or Worker branch.
+  const containing = await git([
+    'for-each-ref',
+    '--contains',
+    commit,
+    '--format=%(refname)',
+    'refs/heads',
+    'refs/tags',
+  ]).catch(() => '');
+  const others = containing.split('\n').filter((r) => r && r !== opts.ref && r !== head.branch);
+  if (others.length > 0) return undefined;
 
   const reachable = ['rev-list', '--objects', commit, '--not', '--branches', '--tags'];
   if (!(await ok(reachable))) {
-    const snapshot = mkdtempSync(join(tmpdir(), 'tacet-integrate-'));
+    // Inside the shared .git, which the Worker cannot write: a snapshot in a temp dir the
+    // sandbox can write could be given an `info/alternates` of the Worker's choosing.
+    const snapshot = mkdtempSync(join(wt.commonDir, 'tacet-snapshot-'));
     try {
-      snapshotLooseObjects(
-        join(wt.gitDir, 'objects'),
-        snapshot,
-        opts.maxBytes ?? 512 * 1024 * 1024,
-      );
+      await snapshotLooseObjects(join(wt.gitDir, 'objects'), snapshot, {
+        maxBytes: opts.maxBytes ?? 512 * 1024 * 1024,
+        deadline: Date.now() + timeoutMs,
+      });
       const withSnapshot = { ...base, GIT_ALTERNATE_OBJECT_DIRECTORIES: snapshot };
       const list = await git(reachable, withSnapshot);
       // index-pack writes into a directory of ours, so a rejected pack leaves nothing in the
@@ -181,7 +192,7 @@ export async function integrateWorktree(opts: IntegrateOptions): Promise<Integra
 async function workerHead(
   wt: WorkerWorktree,
   git: (args: string[]) => Promise<string>,
-): Promise<string | undefined> {
+): Promise<{ commit: string; branch?: string } | undefined> {
   let head: string;
   try {
     head = readWorkerFile(join(wt.gitDir, 'HEAD'), 512).trim();
@@ -190,7 +201,7 @@ async function workerHead(
       `the Worker HEAD cannot be read safely: ${(err as Error).message}`,
     );
   }
-  if (COMMIT_ID.test(head)) return head;
+  if (COMMIT_ID.test(head)) return { commit: head };
   const ref = /^ref: (refs\/heads\/\S+)$/.exec(head)?.[1];
   if (!ref) throw new WorktreeRefusedError('the Worker HEAD is neither a commit nor a branch');
   try {
@@ -199,53 +210,123 @@ async function workerHead(
     throw new WorktreeRefusedError('the Worker HEAD names an invalid branch');
   }
   const sha = await git(['rev-parse', '--verify', '-q', `${ref}^{commit}`]).catch(() => '');
-  return COMMIT_ID.test(sha) ? sha : undefined;
+  return COMMIT_ID.test(sha) ? { commit: sha, branch: ref } : undefined;
+}
+
+const MAX_FILES = 100_000;
+/** Every file counts at least this much against the byte budget, so empty files are not free. */
+const MIN_FILE_COST = 4096;
+/** On Linux, files are opened through the open directory itself, so a swapped path is moot. */
+const PROC_FD = existsSync('/proc/self/fd');
+
+interface OpenDir {
+  fd: number;
+  path: string;
+  dev: number;
+  ino: number;
+}
+
+/**
+ * Open `name` inside `parent` (or the absolute path `name` when there is no parent), never
+ * following a symlink in the last component and never blocking. On Linux the open goes through
+ * `/proc/self/fd/<parent fd>`, so the Worker swapping a directory on the path for a symlink after
+ * it was checked has no effect. Elsewhere the parent's identity is checked again after the open.
+ */
+function openIn(parent: OpenDir | undefined, name: string, flags: number): number {
+  const path = !parent
+    ? name
+    : PROC_FD
+      ? `/proc/self/fd/${parent.fd}/${name}`
+      : join(parent.path, name);
+  const fd = openSync(path, flags | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  if (parent && !PROC_FD) {
+    const now = lstatSync(parent.path);
+    if (now.dev !== parent.dev || now.ino !== parent.ino) {
+      closeSync(fd);
+      throw new Error("the Worker's object store changed while it was copied");
+    }
+  }
+  return fd;
+}
+
+function openDir(parent: OpenDir | undefined, name: string): OpenDir | undefined {
+  let fd: number;
+  try {
+    fd = openIn(parent, name, constants.O_RDONLY | constants.O_DIRECTORY);
+  } catch (err) {
+    if ((err as Error).message.includes('changed while')) throw err;
+    return undefined;
+  }
+  const st = fstatSync(fd);
+  return { fd, path: parent ? join(parent.path, name) : name, dev: st.dev, ino: st.ino };
+}
+
+function listDir(dir: OpenDir): string[] {
+  return readdirSync(PROC_FD ? `/proc/self/fd/${dir.fd}` : dir.path);
 }
 
 /**
  * Copy the Worker's loose objects into `dest`: only `xx/yyyy…` names, only regular files, never
- * through a symlink or a FIFO, at most `maxBytes` in all. Anything else in the store is ignored,
- * except packs, which are refused.
+ * through a symlink or a FIFO, at most `maxBytes` (each file costing at least 4 KiB) and 100,000
+ * files, before `deadline`, yielding to the event loop as it goes. Anything else in the store is
+ * ignored, except packs, which are refused.
  */
-function snapshotLooseObjects(src: string, dest: string, maxBytes: number): void {
-  let total = 0;
-  for (const d of safeList(src)) {
-    if (d === 'pack') {
-      const packs = safeList(join(src, d)).filter((f) => !f.startsWith('.'));
-      if (packs.length > 0) {
-        throw new Error("the Worker's object store has packs, which are not supported");
+async function snapshotLooseObjects(
+  src: string,
+  dest: string,
+  limits: { maxBytes: number; deadline: number },
+): Promise<void> {
+  const root = openDir(undefined, src);
+  if (!root) return;
+  let cost = 0;
+  let files = 0;
+  try {
+    for (const d of listDir(root)) {
+      if (d === 'pack') {
+        const pack = openDir(root, d);
+        if (pack) {
+          try {
+            if (listDir(pack).some((f) => !f.startsWith('.'))) {
+              throw new Error("the Worker's object store has packs, which are not supported");
+            }
+          } finally {
+            closeSync(pack.fd);
+          }
+        }
+        continue;
       }
-      continue;
+      if (!LOOSE_DIR.test(d)) continue;
+      const sub = openDir(root, d);
+      if (!sub) continue;
+      try {
+        for (const f of listDir(sub)) {
+          if (!LOOSE_FILE.test(f)) continue;
+          files += 1;
+          if (files > MAX_FILES) throw new Error("the Worker's object store has too many objects");
+          if (files % 500 === 0) {
+            if (Date.now() > limits.deadline)
+              throw new Error('copying the Worker objects timed out');
+            await new Promise((r) => setImmediate(r));
+          }
+          const data = readRegular(sub, f, limits.maxBytes - cost);
+          cost += Math.max(data.length, MIN_FILE_COST);
+          if (cost > limits.maxBytes) {
+            throw new Error("the Worker's new objects are too large to integrate");
+          }
+          mkdirSync(join(dest, d), { recursive: true, mode: 0o700 });
+          writeFileSync(join(dest, d, f), data, { flag: 'wx', mode: 0o400 });
+        }
+      } finally {
+        closeSync(sub.fd);
+      }
     }
-    if (!LOOSE_DIR.test(d)) continue;
-    for (const f of safeList(join(src, d))) {
-      if (!LOOSE_FILE.test(f)) continue;
-      const data = readRegular(join(src, d, f), maxBytes - total);
-      total += data.length;
-      mkdirSync(join(dest, d), { recursive: true, mode: 0o700 });
-      writeFileSync(join(dest, d, f), data, { flag: 'wx', mode: 0o400 });
-    }
+  } finally {
+    closeSync(root.fd);
   }
 }
 
-/** Names in a directory that is not a symlink; empty if it is missing or not a directory. */
-function safeList(dir: string): string[] {
-  let fd: number;
-  try {
-    fd = openSync(dir, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY);
-  } catch {
-    return [];
-  }
-  closeSync(fd);
-  try {
-    return readdirSync(dir);
-  } catch {
-    return [];
-  }
-}
-
-function readRegular(file: string, budget: number): Buffer {
-  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+function readRegular(dir: OpenDir, name: string, budget: number): Buffer {
+  const fd = openIn(dir, name, constants.O_RDONLY);
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error('a Worker object is not a regular file');

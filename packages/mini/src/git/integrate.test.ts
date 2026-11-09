@@ -300,4 +300,47 @@ describe('integrateWorktree', () => {
     git(w.dir, ['repack', '-adq'], w.wenv);
     await expect(integrate(w, 'packed')).rejects.toThrow(/packs/);
   });
+
+  it('keeps its working copies inside the repo .git and leaves none behind', async () => {
+    const w = worker('clean');
+    commitIn(w, 'k.txt', 'k\n');
+    const tmpBefore = readdirSync(tmpdir()).filter((f) => f.startsWith('tacet-'));
+    await integrate(w, 'clean');
+    expect(readdirSync(tmpdir()).filter((f) => f.startsWith('tacet-'))).toEqual(tmpBefore);
+    expect(readdirSync(join(repo, '.git')).filter((f) => f.startsWith('tacet-'))).toEqual([]);
+  });
+
+  it('records no commit for a HEAD set to an existing branch tip', async () => {
+    git(repo, ['branch', 'release']);
+    git(repo, ['commit', '--allow-empty', '-qm', 'later on main']);
+    const w = worker('borrow');
+    writeFileSync(join(w.wt.gitDir, 'HEAD'), `${git(repo, ['rev-parse', 'release'])}\n`);
+    expect(await integrate(w, 'borrow')).toBeUndefined();
+    expect(refExists('borrow')).toBe(false);
+  });
+
+  it('records no commit when the main checkout is on another branch', async () => {
+    const w = worker('base');
+    git(repo, ['checkout', '-q', '-b', 'elsewhere']);
+    git(repo, ['commit', '--allow-empty', '-qm', 'unrelated']);
+    expect(await integrate(w, 'base')).toBeUndefined();
+  });
+
+  it('counts empty files against the size cap', async () => {
+    const w = worker('many');
+    commitIn(w, 'm.txt', 'm\n');
+    mkdirSync(join(w.wt.gitDir, 'objects', 'ee'), { recursive: true });
+    for (let i = 0; i < 300; i++) {
+      writeFileSync(join(w.wt.gitDir, 'objects', 'ee', i.toString(16).padStart(38, '0')), '');
+    }
+    await expect(
+      integrateWorktree({
+        cwd: w.dir,
+        repoRoot: repo,
+        ref: taskBranch('many'),
+        env,
+        maxBytes: 64 * 4096,
+      }),
+    ).rejects.toThrow(/too large/);
+  });
 });
