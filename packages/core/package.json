@@ -38,9 +38,11 @@
     "check:schemas": "tsc -b && node scripts/gen-schemas.mjs --check"
   },
   "dependencies": {
+    "better-sqlite3": "13.0.3",
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1"
   }

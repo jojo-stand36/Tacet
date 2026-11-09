@@ -99,6 +99,8 @@ Every adapter must pass the conformance bench in `@tacet/core/testing` (`runConf
 
 All events go to an append-only **event log** (SQLite) → UI timelines, replay, audit, cost.
 
+The log is `openEventStore()` in `@tacet/core/node` (#6). It stores each envelope verbatim, is idempotent on the envelope id, and blocks `UPDATE`/`DELETE` with triggers. State is rebuilt with pure projections (`tasksProjection` in `@tacet/core`). Retention deletes old transcript-grade events (`agent.message`, `agent.tool`, `agent.approval`, `agent.status`, `agent.escalation`) and keeps every summary-grade event, so task state replays exactly after compaction. Driver: `better-sqlite3`, chosen under [ADR-002](adr/002-language-runtime.md) decision 5 because `node:sqlite` is still a release candidate (Stability 1.2) in Node 24 and 26 as of 2026-11-09; callers use the `EventStore` interface, so moving to `node:sqlite` once it is Stable touches one file.
+
 Every state change is wrapped in an **event envelope** before it is stored or forwarded: `{v, id (ULID), ts, source, repo?, taskId?, sessionId?, correlationId?, causationId?, type, data}`. `AgentEvent` above is the payload of the `agent.*` envelope types (for example `agent.message.delta` and `agent.usage`). The other namespaces are `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `worker.*` and `budget.*`. Receivers ignore unknown fields and unknown event types. The full envelope is in [ADR-003 §1](adr/003-wire-protocols.md#1-one-transport-envelope-and-one-event-envelope).
 
 ## 4. Configuration layers
