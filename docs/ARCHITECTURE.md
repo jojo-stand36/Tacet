@@ -45,7 +45,7 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 ### 2.1 Task flow
 1. User (or a workflow) gives the Conductor a goal; Conductor routes it to one or more mini-conductors as **tasks** (A2A-shaped: id, goal, acceptance criteria, budget, priority).
 2. Mini-conductor plans → sub-tasks → picks adapter+model per its tier policy → spawns workers in worktrees.
-   - The plan is one `task.planned` event (`TaskPlan`: sub-tasks with `dependsOn`), written in the same batch as one `task.created` per sub-task with `parentId`. Each `task.planned` is the full current plan: a replan lists every sub-task again, completed ones included. A sub-task's own `task.created` is authoritative for its goal and criteria. Dependencies live in the plan, not on `Task`, because `Task.parentId` is A2A `referenceTaskIds` and sub-tasks stay internal to the Mini-conductor ([ADR-003 §4](adr/003-wire-protocols.md#4-conductor--mini-conductor-a2a-shapes-over-a-json-rpc-websocket)).
+   - The plan is one `task.planned` event (`TaskPlan`: sub-tasks with `dependsOn`), written in the same batch as one `task.created` per sub-task with `parentId`. Each `task.planned` is the full current plan: a replan lists every sub-task again, completed ones included. A sub-task's own `task.created` is authoritative for its goal and criteria. A sub-task kind a receiver does not know reads as `explore`, the read-only kind (owner decision, 2026-11-09). Dependencies live in the plan, not on `Task`, because `Task.parentId` is A2A `referenceTaskIds` and sub-tasks stay internal to the Mini-conductor ([ADR-003 §4](adr/003-wire-protocols.md#4-conductor--mini-conductor-a2a-shapes-over-a-json-rpc-websocket)).
    - A sub-task is scheduled once every sub-task it depends on is `completed`, within the `workers` capacity limits (§4).
 3. Workers report via events and MCP tools; mini-conductor verifies (tests, lint, reviewer agent).
    - A Worker turn that ends idle with no pending escalation or approval is *finished*, not completed: it goes through verification first. One that ends with an escalation pending with the user is `input_required`. `completed` keeps its A2A meaning, "done and verified", and its `task.result` has `verification.status: passed`.
@@ -148,7 +148,7 @@ workers:                    # Worker pool (#17); defaults shown
   # per_adapter: { codex-app-server: 2 }
   stuck_after_s: 300        # silent this long: nudge
   nudge_grace_s: 900        # still silent this much later: replace the session
-  max_attempts: 3           # failed or stuck runs before a sub-task fails (restarts, handoffs do not count)
+  max_attempts: 3           # failed or stuck runs (or an unknown end reason) before a sub-task fails; restarts, handoffs and cancels do not count (owner decision)
 events:
   # state_dir: ~/.tacet/state   # DB at <state_dir>/<repo-hash>/events.db, outside the repo
   retention:
@@ -158,6 +158,7 @@ events:
 **Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
 
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
+- The task layer may only **lower** `workers.*`, never raise it, because the Worker pool is repo-wide (owner decision, 2026-11-09): a raise is a config error.
 - Exception: `policies` and `escalation.always_ask` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
 - Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.

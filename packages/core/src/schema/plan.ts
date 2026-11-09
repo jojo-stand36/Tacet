@@ -4,7 +4,7 @@ import { Id, openEnum } from './common.js';
 /**
  * What a sub-task asks its Worker to do (Polly's dispatch purposes, ADR-001). Unknown values fall
  * back to `explore`, the read-only kind: a kind this version does not know never gets write
- * access by default.
+ * access by default (owner decision, 2026-11-09).
  */
 export const SubtaskKind = openEnum(['implement', 'review', 'explore'], 'explore');
 export type SubtaskKind = z.infer<typeof SubtaskKind>;
