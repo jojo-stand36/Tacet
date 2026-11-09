@@ -187,7 +187,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Single source of truth for all shared types, with runtime validation (zod or JSON Schema).\n\n### Tasks\n- [ ] Task (id, goal, acceptance criteria, budget, priority, parent)\n- [ ] Normalized AgentEvent union (see ARCHITECTURE.md §3)\n- [ ] Escalation + Decision (with precedent tags)\n- [ ] HandoffPacket (goal, acceptance_criteria, state_summary, decisions, files_touched, commands_run, open_questions, next_action, verification, parent_session)\n- [ ] Export JSON Schema for non-TS consumers\n\n### Acceptance criteria\n- Schemas published from @tacet/core with tests and examples\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Single source of truth for all shared types, with runtime validation (zod or JSON Schema).\n\n### Tasks\n- [ ] Task (id, goal, acceptance criteria, budget, priority, parent)\n- [ ] Normalized AgentEvent union (see ARCHITECTURE.md §3)\n- [ ] Escalation + Decision (with precedent tags)\n- [ ] HandoffPacket (goal, acceptance_criteria, state_summary, decisions, files_touched, commands_run, open_questions, next_action, verification, parent_session)\n- [ ] Export JSON Schema for non-TS consumers\n- [ ] Borrow (ADR-001): Add `stale_after` and `max_reescalations` to the Escalation schema (Gas Town severity-routed escalation, `docs/design/escalation.md`)\n- [ ] Borrow (ADR-001): Add an optional Escalation `category` (`decision`, `help`, `blocked`, `failed`, `emergency`, `gate_timeout`, `lifecycle`) (Gas Town §Category Routing)\n\n### Acceptance criteria\n- Schemas published from @tacet/core with tests and examples\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Event log: append-only SQLite store with replay",
@@ -242,7 +242,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Define the adapter contract and a shared test bench every adapter must pass (inspired by Omnigent's harness test bench).\n\n### Tasks\n- [ ] Record real-session fixtures per surface (stream, approval, interrupt, usage) so CI never calls vendors live (capability matrix gap 10)\n- [ ] Interface per ARCHITECTURE.md §3 with capability flags\n- [ ] Fake/mock adapter for tests\n- [ ] Conformance tests: start, stream, approval round-trip, interrupt, usage events, close\n\n### Acceptance criteria\n- Mock adapter passes the suite in CI\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Define the adapter contract and a shared test bench every adapter must pass (inspired by Omnigent's harness test bench).\n\n### Tasks\n- [ ] Record real-session fixtures per surface (stream, approval, interrupt, usage) so CI never calls vendors live (capability matrix gap 10)\n- [ ] Interface per ARCHITECTURE.md §3 with capability flags\n- [ ] Fake/mock adapter for tests\n- [ ] Conformance tests: start, stream, approval round-trip, interrupt, usage events, close\n- [ ] Borrow (ADR-001): Use Omnigent's harness test bench as the conformance checklist: capability probes, declared-vs-observed `DRIFT` verdicts, P0 probes gate CI and P1 only report (`docs/harness-bench-design.md`)\n- [ ] Borrow (ADR-001): Extend `AdapterCapabilities` with Omnigent executor flags (streaming, live message queue, tool-boundary interrupt) (`omnigent/inner/executor.py`)\n- [ ] Borrow (ADR-001): Cross-check `AgentAdapter` against Gas City's `AgentProvider` (Start / IsReady / SendMessage / GetStatus / InjectContext / Resume / Fork / Exec / GetUsage) and its `REQUIREMENTS.md` scenario ledger; add `isReady` and `injectContext` if missing\n\n### Acceptance criteria\n- Mock adapter passes the suite in CI\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: Claude Code (Agent SDK / stream-json)",
@@ -297,7 +297,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n- [ ] Borrow (ADR-001): Run native PTY wrappers inside an OS sandbox (`bwrap` on Linux, `seatbelt` on macOS), as Omnigent does (`omnigent/sandbox/`); coordinate with #53\n- [ ] Borrow (ADR-001): Use Gas Town's agent preset schema (launch command, ready prompt, resume flag, process name) for per-CLI PTY config (`docs/agent-provider-integration.md` §Tier 1)\n- [ ] Borrow (ADR-001): Context-pressure injection through a `UserPromptSubmit` hook with a model id → window table, after Gas City (`cmd/gc/context_inject.go`); re-derive the table from vendor docs\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Worktree manager",
@@ -319,7 +319,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "The core loop: accept task → plan sub-tasks → schedule onto workers (concurrency limits) → collect results.\n\n### Tasks\n- [ ] Planner uses the mini tier model\n- [ ] Dependency-aware scheduling\n- [ ] Max concurrency per repo/adapter\n- [ ] Restart-safe (rehydrate from event log)\n\n### Acceptance criteria\n- Daemon restart mid-task resumes without losing work\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "The core loop: accept task → plan sub-tasks → schedule onto workers (concurrency limits) → collect results.\n\n### Tasks\n- [ ] Planner uses the mini tier model\n- [ ] Dependency-aware scheduling\n- [ ] Max concurrency per repo/adapter\n- [ ] Restart-safe (rehydrate from event log)\n- [ ] Borrow (ADR-001): Planner prompt after Omnigent's Polly: the lead writes no code, delegates to Workers in worktrees, and sends review to a different vendor (`examples/polly/config.yaml`)\n- [ ] Borrow (ADR-001): Worker health: heartbeat stuck-worker detection with nudge-or-handoff recovery, using one heartbeat store (Gas Town Witness, `docs/concepts/heartbeats.md`)\n- [ ] Borrow (ADR-001): Capacity governor for the worker pool, after Gas Town's scheduler `max_polecats` (`docs/design/scheduler.md`)\n\n### Acceptance criteria\n- Daemon restart mid-task resumes without losing work\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision…)",
@@ -330,7 +330,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\nCompatibility (required, per #68: Codex, Gemini CLI and OpenCode default to 2025-era MCP): the server answers MCP 2026-07-28 and 2025-era (2025-06-18, 2025-11-25) clients through SDK defaults. The core tools use no feature that exists only in 2026-07-28 (ADR-003, addendum 2026-11-09).\n\n### Tasks\n- [ ] Tools (ADR-003 §6): read_task, report_progress, escalate (non-blocking, returns pending), get_decision, request_handoff, record_decision, search_decisions. No spawn_worker in v1\n- [ ] Return a fast 404 for `/.well-known/*` (Codex probes OAuth discovery, #68)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n- [ ] Three-client conformance test: an MCP SDK v2 client on 2026-07-28, an SDK v1 client on 2025-era, and Claude Code as a real vendor worker\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n- The three-client conformance test passes\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\nCompatibility (required, per #68: Codex, Gemini CLI and OpenCode default to 2025-era MCP): the server answers MCP 2026-07-28 and 2025-era (2025-06-18, 2025-11-25) clients through SDK defaults. The core tools use no feature that exists only in 2026-07-28 (ADR-003, addendum 2026-11-09).\n\n### Tasks\n- [ ] Tools (ADR-003 §6): read_task, report_progress, escalate (non-blocking, returns pending), get_decision, request_handoff, record_decision, search_decisions. No spawn_worker in v1\n- [ ] Return a fast 404 for `/.well-known/*` (Codex probes OAuth discovery, #68)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n- [ ] Three-client conformance test: an MCP SDK v2 client on 2026-07-28, an SDK v1 client on 2025-era, and Claude Code as a real vendor worker\n- [ ] Borrow (ADR-001): Interop: Omnigent and other agents call the Mini's MCP tools as an MCP `url` with a per-session bearer header (Omnigent `docs/AGENT_YAML_SPEC.md` L825–840; token scoping per ADR-003 §6)\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n- The three-client conformance test passes\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Verification pipeline: commands + reviewer agent",
@@ -341,7 +341,7 @@
         "priority:p1",
         "agent:either"
       ],
-      "body": "Run repo verify commands and an optional reviewer agent (cross-vendor by default) before a task is marked done.\n\n### Tasks\n- [ ] Run verify commands from config in worktree\n- [ ] Reviewer agent on a different vendor than author\n- [ ] Failure → feedback to worker, retry budget\n\n### Acceptance criteria\n- Failing tests block completion and loop back to the worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Run repo verify commands and an optional reviewer agent (cross-vendor by default) before a task is marked done.\n\n### Tasks\n- [ ] Run verify commands from config in worktree\n- [ ] Reviewer agent on a different vendor than author\n- [ ] Failure → feedback to worker, retry budget\n- [ ] Borrow (ADR-001): Cross-vendor review: the reviewer agent uses a different vendor from the Worker (Omnigent Polly pattern)\n\n### Acceptance criteria\n- Failing tests block completion and loop back to the worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "`tacet init` installer for repos",
@@ -409,7 +409,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Resolve what can be resolved locally (policy, precedent decisions, own reasoning); escalate the rest.\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Resolve what can be resolved locally (policy, precedent decisions, own reasoning); escalate the rest.\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n- [ ] Borrow (ADR-001): Three-level policy model with ALLOW/DENY/ASK where DENY short-circuits, mapped to task > repo `.tacet/` > user config; ASK becomes an Escalation (Omnigent `docs/POLICIES.md`)\n- [ ] Borrow (ADR-001): Severity-routed escalation where each tier resolves or forwards, plus stale re-escalation (Gas Town `docs/design/escalation.md`)\n- [ ] Borrow (ADR-001): Later (M2+): CEL for side-effect-free inline policy rules (Omnigent `policies/builtins/cel.py`); a TS CEL dependency must be justified\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Decision inbox: dedupe, batch, rank, answer, propagate",
@@ -420,7 +420,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n- [ ] Borrow (ADR-001): Per-severity notification routes and stale re-escalation (`stale_after`, max 2) for unanswered Decisions (Gas Town `docs/design/escalation.md`); coordinate with #45\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Summary packets (no transcripts upward)",
@@ -466,7 +466,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Normalize context used/max from every adapter (usage events, statusline/PreCompact hooks as fallback).\n\n### Tasks\n- [ ] Per-adapter extraction\n- [ ] Estimate when adapter lacks it\n- [ ] Expose in events + UI\n\n### Acceptance criteria\n- Usage within ±5% of vendor-reported for tier-1 adapters\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Normalize context used/max from every adapter (usage events, statusline/PreCompact hooks as fallback).\n\n### Tasks\n- [ ] Per-adapter extraction\n- [ ] Estimate when adapter lacks it\n- [ ] Expose in events + UI\n- [ ] Borrow (ADR-001): Detect compaction boundaries (Claude `isCompactSummary`, Codex `compacted.replacement_history`) as a signal that compaction happened anyway (Omnigent `docs/session-compaction.md`)\n- [ ] Borrow (ADR-001): Context-pressure computation from the transcript plus a model id → window table, after Gas City (`internal/modelwindow/`); re-derive from vendor docs\n\n### Acceptance criteria\n- Usage within ±5% of vendor-reported for tier-1 adapters\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Automatic handoff: thresholds, packet generation, validation, reseed",
@@ -477,7 +477,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Implement the handoff flow in ARCHITECTURE.md §2.3.\n\n### Tasks\n- [ ] warn/handoff/hard bands from config\n- [ ] Disable vendor auto-compaction where possible\n- [ ] Prompt worker for HandoffPacket; validate (reject if next_action missing)\n- [ ] Store in .tacet/handoffs/, start fresh session seeded with it\n- [ ] Optional model change on handoff\n\n### Acceptance criteria\n- Handoff preserves task progress in ≥ 90% of eval runs\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Implement the handoff flow in ARCHITECTURE.md §2.3.\n\n### Tasks\n- [ ] warn/handoff/hard bands from config\n- [ ] Disable vendor auto-compaction where possible\n- [ ] Prompt worker for HandoffPacket; validate (reject if next_action missing)\n- [ ] Store in .tacet/handoffs/, start fresh session seeded with it\n- [ ] Optional model change on handoff\n- [ ] Borrow (ADR-001): Use Gas Town handoff mail (`Context / Status / Next` plus the work id) as evidence for the HandoffPacket fields; `nextAction` stays required (`docs/design/mail-protocol.md` §HANDOFF)\n- [ ] Borrow (ADR-001): Use compaction-boundary detection (Omnigent) as a fallback trigger\n- [ ] Borrow (ADR-001): Later (M3+, with #32): a new session can ask its predecessor a question when the packet is not enough (Gas Town `gt seance`)\n\n### Acceptance criteria\n- Handoff preserves task progress in ≥ 90% of eval runs\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Conductor & mini-conductor self-handoff",
@@ -522,7 +522,7 @@
         "priority:p1",
         "agent:copilot"
       ],
-      "body": "Track spend from usage events; enforce soft/hard budget policies.\n\n### Tasks\n- [ ] Pricing table per model (config-driven, updatable)\n- [ ] Soft warn → escalate; hard cap → pause\n- [ ] Distinguish API-key spend vs subscription usage\n- [ ] Default API-key budget: $200/month (owner decision, 2026-11-09), config key `api_key_per_month_usd` (ARCHITECTURE §4)\n\n### Acceptance criteria\n- Budget caps enforced in tests\n- The $200/month API-key default is enforced in tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Track spend from usage events; enforce soft/hard budget policies.\n\n### Tasks\n- [ ] Pricing table per model (config-driven, updatable)\n- [ ] Soft warn → escalate; hard cap → pause\n- [ ] Distinguish API-key spend vs subscription usage\n- [ ] Default API-key budget: $200/month (owner decision, 2026-11-09), config key `api_key_per_month_usd` (ARCHITECTURE §4)\n- [ ] Borrow (ADR-001): Soft `ask_thresholds_usd` (each becomes an Escalation) plus a hard cap, after Omnigent's cost policy (`omnigent/policies/builtins/cost.py`)\n\n### Acceptance criteria\n- Budget caps enforced in tests\n- The $200/month API-key default is enforced in tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Measure orchestration overhead",
@@ -690,7 +690,7 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n- [ ] Borrow (ADR-001): Adapter package contract shaped like Omnigent's `HarnessContribution` (ids, aliases, install/login hints, labels) (`designs/harness-plugin-interface.md`)\n- [ ] Borrow (ADR-001): Later: CEL policy rules as a plugin (see #25)\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)",
