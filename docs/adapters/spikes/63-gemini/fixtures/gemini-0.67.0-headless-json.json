@@ -1,0 +1,58 @@
+{
+  "session_id": "cdf298b3-2f6f-474b-bd91-2f0e767b3a11",
+  "response": "You said alpha.",
+  "stats": {
+    "models": {
+      "mock-model": {
+        "api": {
+          "totalRequests": 1,
+          "totalErrors": 0,
+          "totalLatencyMs": 52,
+          "errorsByType": {}
+        },
+        "tokens": {
+          "input": 120,
+          "prompt": 120,
+          "candidates": 8,
+          "total": 128,
+          "cached": 0,
+          "thoughts": 0,
+          "tool": 0
+        },
+        "roles": {
+          "main": {
+            "totalRequests": 1,
+            "totalErrors": 0,
+            "totalLatencyMs": 52,
+            "tokens": {
+              "input": 120,
+              "prompt": 120,
+              "candidates": 8,
+              "total": 128,
+              "cached": 0,
+              "thoughts": 0,
+              "tool": 0
+            }
+          }
+        }
+      }
+    },
+    "tools": {
+      "totalCalls": 0,
+      "totalSuccess": 0,
+      "totalFail": 0,
+      "totalDurationMs": 0,
+      "totalDecisions": {
+        "accept": 0,
+        "reject": 0,
+        "modify": 0,
+        "auto_accept": 0
+      },
+      "byName": {}
+    },
+    "files": {
+      "totalLinesAdded": 0,
+      "totalLinesRemoved": 0
+    }
+  }
+}
