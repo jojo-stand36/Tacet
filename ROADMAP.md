@@ -52,6 +52,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)** — `feature` `P1` `claude`
 - [ ] **Sweep stale Worker MCP config files at startup** — `feature` `P2` `either`
 - [ ] **Scrub Worker tokens split across streamed message deltas** — `feature` `P2` `either`
+- [ ] **Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 
