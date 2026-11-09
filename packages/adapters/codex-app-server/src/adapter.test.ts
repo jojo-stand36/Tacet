@@ -251,7 +251,7 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
   });
 
   it('reports auth_required when the own-login route has no login', async () => {
-    const adapter = make('normal', { authRoute: 'subscription' });
+    const adapter = make('normal', { authRoute: 'subscription', mode: 'interactive' });
     const h = await adapter.start({ cwd: root });
     expect(adapter.status(h)).toBe('auth_required');
     expect(clientLog().find((m) => m.method === 'thread/start')).toBeDefined();

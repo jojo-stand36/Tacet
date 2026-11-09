@@ -7,8 +7,12 @@ export {
   type CodexAdapterOptions,
   CodexAppServerAdapter,
   configArgs,
+  gitRepoRoot,
   grantSubset,
   toCodexDecision,
+  type WorkerWorktree,
+  workerGitEnv,
+  workerWorktree,
 } from './adapter.js';
 export {
   API_KEY_PROVIDER_ID,

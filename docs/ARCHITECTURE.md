@@ -201,7 +201,7 @@ Other:
 
 - Worktree isolation by default; optional OS sandbox later.
 - **Codex Worker isolation** (owner decision, 2026-11-09; #116):
-  - The Codex sandbox's writable roots gain the Worker's *own* worktree git directory (the one `git rev-parse --git-dir` names for that worktree), and no other, so `git commit` works without an escalation each time.
+  - The Codex sandbox's writable roots gain the Worker's *own* worktree git directory (the one `git rev-parse --git-dir` names for that worktree), and no other, so `git commit` works without an escalation each time. A commit also writes objects and a branch ref to the repo's shared `.git`, so (owner decision, option B) the Worker commits on a **detached HEAD** (HEAD is per-worktree) into its **own object store**: the adapter sets `GIT_OBJECT_DIRECTORY=<worktree git dir>/objects` and `GIT_ALTERNATE_OBJECT_DIRECTORIES=<repo>/.git/objects`. The shared `.git` (refs, objects, config) stays read-only to the Worker. The Mini-conductor integrates outside the sandbox with the same git environment: `git push <repo> HEAD:refs/heads/tacet/<task>`. Worker-side commands that write shared refs (`git checkout -b`, `git branch`, `git stash`) fail in the sandbox and escalate.
   - Unattended Codex Workers get their own `CODEX_HOME` at `~/.tacet/state/<repo>/codex`; interactive sessions keep the user's `~/.codex`. The user's `config.toml` customisations (including their MCP servers) therefore do not apply to unattended Workers.
   - Codex `features.plugins` is off for unattended Workers, so a Worker start never syncs plugins from GitHub.
 - All approvals and decisions are logged and attributable.

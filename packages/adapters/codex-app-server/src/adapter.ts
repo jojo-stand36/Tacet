@@ -1,9 +1,9 @@
-import { type ChildProcess, spawn } from 'node:child_process';
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -22,6 +22,7 @@ import {
   scrubLiterals,
   type UserInput,
 } from '@tacet/core';
+import { defaultStateDir, repoStateDir } from '@tacet/core/node';
 import { AuthRoutingError, type CodexAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, METHOD_NOT_FOUND, RpcError } from './jsonrpc.js';
 
@@ -70,6 +71,23 @@ export interface CodexAdapterOptions {
    * line.
    */
   config?: Record<string, string | number | boolean>;
+  /**
+   * Who the session is for (#116). Default `unattended`: a Worker nobody is watching. It must use
+   * the `api_key` route (#65), gets its own `CODEX_HOME` at `<stateDir>/<repo-hash>/codex`
+   * (so the user's `~/.codex/config.toml`, MCP servers and logins never apply) and runs with
+   * Codex plugins off. In a linked git worktree it is checked out detached and commits into the
+   * worktree's own object store; the only writable git path is that worktree's git dir, and the
+   * Mini-conductor integrates the commits (see `workerGitEnv`). `interactive`: the user's own
+   * `CODEX_HOME`, config and checkout, untouched.
+   */
+  mode?: 'unattended' | 'interactive';
+  /**
+   * The repo the Worker belongs to, which keys its state directory like the event log does.
+   * Default: the main worktree of the git repo at `cwd`, else `cwd`.
+   */
+  repoRoot?: string;
+  /** Tacet state directory (config `events.state_dir`). Default `<HOME>/.tacet/state`. */
+  stateDir?: string;
 }
 
 type Queued = { text: string; model?: string; effort?: string };
@@ -143,16 +161,56 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
     const route = this.#opts.authRoute ?? 'api_key';
+    const unattended = (this.#opts.mode ?? 'unattended') === 'unattended';
+    if (unattended && route !== 'api_key') {
+      throw new AuthRoutingError('unattended Codex Workers must use the api_key route (#65)');
+    }
     const launch = codexLaunch(
       route,
       { ...(this.#opts.baseEnv ?? process.env), ...opts.env },
       this.#opts.apiBaseUrl !== undefined ? { baseUrl: this.#opts.apiBaseUrl } : {},
     );
-    // Codex refuses to start when CODEX_HOME does not exist.
-    const codexHome = launch.env.CODEX_HOME ?? join(launch.env.HOME ?? homedir(), '.codex');
-    mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    const home = launch.env.HOME ?? homedir();
+    let codexHome: string;
+    if (unattended) {
+      // Nothing inherited may point a Worker's git somewhere else.
+      for (const k of GIT_LOCATION_VARS) delete launch.env[k];
+      // Tacet's own CODEX_HOME: Codex state, logs and config for this repo's Workers stay out of
+      // the user's ~/.codex, and the user's config.toml cannot change a Worker (#116).
+      codexHome = join(
+        repoStateDir(
+          this.#opts.repoRoot ?? gitRepoRoot(opts.cwd, launch.env) ?? opts.cwd,
+          this.#opts.stateDir ?? defaultStateDir(home),
+        ),
+        'codex',
+      );
+      privateDir(codexHome);
+      launch.env.CODEX_HOME = codexHome;
+    } else {
+      codexHome = launch.env.CODEX_HOME ?? join(home, '.codex');
+      // Codex refuses to start when CODEX_HOME does not exist.
+      mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    }
 
-    const extra = configArgs(this.#opts.config);
+    const extra = [
+      ...configArgs(this.#opts.config),
+      // After the caller's overrides, so they cannot turn plugins back on: no plugin sync from
+      // GitHub when a Worker starts (#116).
+      ...(unattended ? ['-c', 'features.plugins=false'] : []),
+    ];
+    // Unattended Worker in a linked worktree (#116, option B): it commits on a detached HEAD into
+    // its own object store, and the only writable git path is its own worktree git dir. The
+    // Mini-conductor integrates the commits outside the sandbox (see `workerGitEnv`).
+    const wt = unattended ? workerWorktree(opts.cwd, launch.env) : undefined;
+    if (wt) {
+      mkdirSync(join(wt.gitDir, 'objects'), { recursive: true });
+      Object.assign(launch.env, workerGitEnv(wt));
+      execFileSync('git', ['-C', opts.cwd, 'checkout', '-q', '--detach'], {
+        env: launch.env,
+        stdio: 'ignore',
+      });
+    }
+    const gitDir = wt?.gitDir;
     const secrets = [
       ...mcpHeaderSecrets(opts.mcpServers),
       // The key never leaves the environment, but if it shows up in output it is scrubbed too.
@@ -211,23 +269,25 @@ export class CodexAppServerAdapter implements AgentAdapter {
         sandbox: this.#opts.sandbox ?? 'workspace-write',
         ...(opts.model !== undefined ? { model: opts.model } : {}),
         ...(opts.systemPrompt !== undefined ? { developerInstructions: opts.systemPrompt } : {}),
-        // Per-session MCP servers travel over stdin as thread config, so the Worker token is
-        // never on the command line or on disk (verified on 0.167.0, #12).
-        ...(opts.mcpServers?.length
-          ? {
-              config: {
+        config: {
+          // Per-session MCP servers travel over stdin as thread config, so the Worker token is
+          // never on the command line or on disk (verified on 0.167.0, #12).
+          ...(opts.mcpServers?.length
+            ? {
                 mcp_servers: Object.fromEntries(
                   opts.mcpServers.map((m) => [
                     m.name,
                     { url: m.url, ...(m.headers ? { http_headers: m.headers } : {}) },
                   ]),
                 ),
-                ...(opts.effort !== undefined ? { model_reasoning_effort: opts.effort } : {}),
-              },
-            }
-          : opts.effort !== undefined
-            ? { config: { model_reasoning_effort: opts.effort } }
+              }
             : {}),
+          ...(opts.effort !== undefined ? { model_reasoning_effort: opts.effort } : {}),
+          // Codex keeps a linked worktree's git dir read-only; the Worker's own one is made
+          // writable, and nothing else of the repo's .git (#116). Thread config keys are dotted
+          // override paths, so this sets only `writable_roots` and keeps the rest of the table.
+          ...(gitDir !== undefined ? { 'sandbox_workspace_write.writable_roots': [gitDir] } : {}),
+        },
       };
       const result = await rpc.request<Obj>(
         opts.resume ? (opts.resume.fork ? 'thread/fork' : 'thread/resume') : 'thread/start',
@@ -712,6 +772,74 @@ export function configArgs(
     '-c',
     `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
   ]);
+}
+
+const GIT_LOCATION_VARS = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_COMMON_DIR',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+] as const;
+
+/** Create `dir` (0700) if needed and refuse anything but a real directory owned by us. */
+function privateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) {
+    throw new Error(`Codex home ${dir} is not a private directory`);
+  }
+  chmodSync(dir, 0o700);
+}
+
+function git(cwd: string, env: Record<string, string>, args: string[]): string | undefined {
+  try {
+    return execFileSync('git', ['-C', cwd, 'rev-parse', '--path-format=absolute', ...args], {
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The repo's main worktree for a checkout at `cwd` (any linked worktree maps to it). */
+export function gitRepoRoot(cwd: string, env: Record<string, string>): string | undefined {
+  const common = git(cwd, env, ['--git-common-dir']);
+  if (common === undefined || !isAbsolute(common)) return undefined;
+  return basename(common) === '.git' ? dirname(common) : resolve(common);
+}
+
+/** A linked worktree's own git dir and the repo's shared one. */
+export interface WorkerWorktree {
+  gitDir: string;
+  commonDir: string;
+}
+
+/** The linked worktree at `cwd`; undefined for a main worktree or no repo. */
+export function workerWorktree(
+  cwd: string,
+  env: Record<string, string>,
+): WorkerWorktree | undefined {
+  const out = git(cwd, env, ['--git-dir', '--git-common-dir']);
+  const [gitDir, commonDir] = out?.split('\n') ?? [];
+  if (!gitDir || !commonDir || !isAbsolute(gitDir) || gitDir === commonDir) return undefined;
+  return { gitDir, commonDir };
+}
+
+/**
+ * Git environment of an unattended Worker in `wt` (#116): new objects go to the worktree's own
+ * git dir, existing ones are read from the repo's shared store. The Mini-conductor uses the same
+ * environment outside the sandbox to integrate, e.g.
+ * `git push <repo> HEAD:refs/heads/tacet/<task>`.
+ */
+export function workerGitEnv(wt: WorkerWorktree): Record<string, string> {
+  return {
+    GIT_OBJECT_DIRECTORY: join(wt.gitDir, 'objects'),
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: join(wt.commonDir, 'objects'),
+  };
 }
 
 /** Signal the process group `proc` leads (POSIX), or just `proc`. Already-gone is fine. */
