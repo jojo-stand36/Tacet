@@ -200,6 +200,10 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 
 - **Owner decision:** adding a value to an enum is an additive, non-breaking change under §2. Receivers map an unknown value to that enum's documented fallback instead of rejecting the message. Discriminators (`AgentEvent.t`, the `tacet/hello` `role`) are not covered: an unknown `AgentEvent.t` is ignored, as §2 already says for unknown event types. In `@tacet/core` this is `openEnum()`; each JSON Schema enum carries its fallback as `x-tacet-fallback` (#5 follow-up).
 
+### Addendum (2026-11-09): sibling Worker MCP tokens (§6)
+
+- **Owner decision (accepted interim risk, 2026-11-09):** each Worker's MCP config, with its per-worker token, is a 0600 file in `~/.tacet/run/mcp/` (outside the worktree and deleted on close by the adapter, #11; the Mini-conductor revokes the token through `WorkerTokens` when the Worker ends). Workers share one OS user, so until the worker sandbox (#53) denies `~/.tacet/run/mcp` (alongside `~/.tacet/run`), a Worker that can run shell commands can read a sibling Worker's token and act as that Worker toward the Mini-conductor.
+
 ## Consequences
 
 - `docs/ARCHITECTURE.md` needs, in the PR that accepts this ADR:
