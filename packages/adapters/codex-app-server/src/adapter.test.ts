@@ -391,10 +391,14 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     if (req.event.t !== 'approval.request') throw new Error('unreachable');
     await adapter.respond(h, req.event.id, { kind: 'cancel', persist: false });
     await tap.waitFor((e) => e.t === 'status' && e.state === 'cancelled', 5000);
-    expect(clientLog().find((m) => m.id === 902)).toMatchObject({
-      result: { permissions: {}, scope: 'turn' },
-    });
-    expect(clientLog().some((m) => m.method === 'turn/interrupt')).toBe(true);
+    await expect
+      .poll(() => clientLog().find((m) => m.id === 902))
+      .toMatchObject({ result: { permissions: {}, scope: 'turn' } });
+    // The denial reaches Codex before the interrupt.
+    const order = clientLog().flatMap((m) =>
+      m.id === 902 ? ['reply'] : m.method === 'turn/interrupt' ? ['interrupt'] : [],
+    );
+    expect(order).toEqual(['reply', 'interrupt']);
     await adapter.close(h);
   });
 

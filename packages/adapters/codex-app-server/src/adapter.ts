@@ -321,7 +321,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
     s.interrupting = true;
     // Codex's command and file-change `cancel` interrupts the turn itself; a permissions or
     // elicitation answer does not, so interrupt explicitly.
-    if (pending.kind === 'permissions' || pending.kind === 'elicitation') await this.interrupt(h);
+    if (pending.kind === 'permissions' || pending.kind === 'elicitation') {
+      // The reply above is written on a later tick; let it reach Codex before the interrupt, so
+      // Codex sees the denial first and then the interrupt.
+      await new Promise((r) => setImmediate(r));
+      await this.interrupt(h);
+    }
   }
 
   async close(h: SessionHandle): Promise<void> {
