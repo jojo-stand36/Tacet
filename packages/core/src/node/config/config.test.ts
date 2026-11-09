@@ -122,7 +122,7 @@ describe('loadConfig', () => {
   it('works with no files at all (defaults only)', () => {
     const { config } = loadConfig({ userDir, repoRoot });
     expect(config.budget?.api_key_per_month_usd).toBe(200);
-    expect(config.retention?.transcript_days).toBe(30);
+    expect(config.events?.retention?.transcript_days).toBe(30);
   });
 
   it('reports every problem with file, line and column', () => {

@@ -1,11 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { project, type TasksState, tasksProjection } from '../../events/projection.js';
 import { EventEnvelope } from '../../schema/envelope.js';
-import { type EventStore, openEventStore } from './store.js';
+import { defaultEventDbPath, type EventStore, openEventStore } from './store.js';
 
 const fixture: Record<string, unknown>[] = readFileSync(
   join(import.meta.dirname, 'fixtures', 'recorded-session.jsonl'),
@@ -173,5 +173,17 @@ describe('event log', () => {
     raw.close();
     expect(() => openEventStore(path)).toThrow(/schema version 99/);
     store = openEventStore(join(dir, 'other.db'));
+  });
+
+  it('creates the DB directory with mode 0700, and defaults to a per-repo path outside the repo', () => {
+    const nested = join(dir, 'state', 'abc', 'events.db');
+    const s2 = openEventStore(nested);
+    s2.close();
+    expect(statSync(join(dir, 'state', 'abc')).mode & 0o777).toBe(0o700);
+    const p = defaultEventDbPath('/src/api', join(dir, 'state'));
+    expect(p).toBe(defaultEventDbPath('/src/api/', join(dir, 'state')));
+    expect(p).not.toBe(defaultEventDbPath('/src/web', join(dir, 'state')));
+    expect(p.startsWith(join(dir, 'state'))).toBe(true);
+    expect(p.endsWith('events.db')).toBe(true);
   });
 });
