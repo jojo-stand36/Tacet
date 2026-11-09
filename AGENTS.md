@@ -42,7 +42,7 @@ scripts/                      repo tooling (node, no dependencies)
 | Create roadmap issues on GitHub | `scripts/create-issues.sh OWNER/REPO [--dry-run]` |
 | Install / lint / typecheck / test | `pnpm install`, `pnpm lint` (Biome), `pnpm typecheck` (`tsc -b`), `pnpm test` (Vitest) |
 
-`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. CI runs them on Ubuntu and macOS with Node 24 and 26.
+`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. On pull requests CI runs them on Ubuntu with Node 24 and 26 and on macOS with Node 24, plus one `check` job (generated files, no tracked ignored files); pushes to `main` run the full Ubuntu and macOS × Node 24 and 26 matrix.
 
 ## How to work an issue
 

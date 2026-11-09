@@ -18,7 +18,12 @@ const HelloBase = {
  * A Mini-conductor also sends a lightweight Agent Card.
  */
 export const HelloParams = z.discriminatedUnion('role', [
-  z.object({ role: z.literal('ui'), ...HelloBase }),
+  z.object({
+    role: z.literal('ui'),
+    ...HelloBase,
+    /** Browser session token from `POST /auth/session` (ADR-003 §3.4 addendum). */
+    sessionToken: z.string().min(1),
+  }),
   z.object({ role: z.literal('cli'), ...HelloBase }),
   z.object({
     role: z.literal('mini'),

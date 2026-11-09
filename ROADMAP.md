@@ -49,6 +49,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
 - [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
 - [ ] **Browser session via hello frame instead of cookie (ADR-003 §3.4 addendum)** — `feature` `P0` `claude`
+- [ ] **Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 
