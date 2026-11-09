@@ -185,6 +185,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
     if (unattended) {
       // Nothing inherited may point a Worker's git somewhere else.
       for (const k of GIT_LOCATION_VARS) delete launch.env[k];
+      // Nobody can answer a prompt: git fails instead of waiting for a terminal or an editor.
+      launch.env.GIT_TERMINAL_PROMPT = '0';
+      launch.env.GIT_EDITOR = 'true';
       // Tacet's own CODEX_HOME: Codex state, logs and config for this repo's Workers stay out of
       // the user's ~/.codex, and the user's config.toml cannot change a Worker (#116).
       codexHome = join(

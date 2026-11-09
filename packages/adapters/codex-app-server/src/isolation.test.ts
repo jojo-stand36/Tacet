@@ -95,14 +95,28 @@ describe('Codex Worker isolation', () => {
     // a denial fails the test with its summary instead of hanging the turn.
     const approvals: string[] = [];
     let at = start + 1;
+    // Under the test timeout, so a hung turn fails with what happened so far.
+    const deadline = Date.now() + 3500;
     for (;;) {
-      const next = await tap.waitFor(
-        (e) =>
-          e.t === 'approval.request' ||
-          (e.t === 'status' && (e.state === 'idle' || e.state === 'error')),
-        60_000,
-        at,
-      );
+      const next = await tap
+        .waitFor(
+          (e) =>
+            e.t === 'approval.request' ||
+            (e.t === 'status' && (e.state === 'idle' || e.state === 'error')),
+          Math.max(1, deadline - Date.now()),
+          at,
+        )
+        .catch(() => {
+          const sent = api.requests.slice(from).map((r) => ({
+            text: r.text,
+            toolResult: r.toolResult,
+            toolOutput: r.toolOutput,
+          }));
+          throw new Error(
+            `turn did not finish: events ${JSON.stringify(tap.events.slice(start))}; ` +
+              `model requests ${JSON.stringify(sent)}; approvals ${JSON.stringify(approvals)}`,
+          );
+        });
       at = next.index + 1;
       if (next.event.t !== 'approval.request') {
         expect(next.event).toMatchObject({ state: 'idle' });
