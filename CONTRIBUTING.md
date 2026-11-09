@@ -13,7 +13,7 @@ Thanks for helping. Tacet is built by humans and AI coding agents (Claude Code a
 Requirements: Node.js 24 or later (`.nvmrc`), pnpm 12 (pinned in `package.json` `packageManager`; use `corepack enable` on Node 24, or install pnpm directly on Node 25+, which no longer bundles Corepack), macOS or Linux. Windows is not a supported platform ([ADR-002](docs/adr/002-language-runtime.md)).
 
 ```bash
-corepack enable   # Node 24; on Node 25+ install pnpm 12 instead
+corepack enable   # Node 24; on Node 25+ run `npm i -g pnpm@12` instead
 pnpm install
 pnpm lint        # Biome: lint + format check
 pnpm typecheck   # tsc -b over every package
@@ -32,4 +32,4 @@ All four must pass before a PR is ready. CI runs them on Ubuntu and macOS with N
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the [Apache License 2.0](LICENSE). If you port code from another project, keep its license terms and add an entry to [`NOTICE`](NOTICE).
+By contributing, you agree that your contributions are licensed under the [Apache License 2.0](LICENSE). Tacet borrows ideas freely but ports code only with attribution ([ADR-001](docs/adr/001-build-vs-extend.md)). If you port code from another project, keep its license terms and add an entry (project, URL, license, files) to [`NOTICE`](NOTICE).

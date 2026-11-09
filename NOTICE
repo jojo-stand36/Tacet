@@ -1,12 +1,7 @@
 Tacet
-Copyright 2026 The Tacet Authors
+Copyright 2026 The Tacet Authors (the contributors listed in the Git history)
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
-
-Attribution policy (ADR-001, docs/adr/001-build-vs-extend.md): Tacet borrows
-ideas freely from other projects but ports code only with attribution. Any
-source code ported or adapted from a third-party project must be listed below
-with the project name, its URL, its license, and the files it appears in.
 
 Third-party code included in this product
 -----------------------------------------
