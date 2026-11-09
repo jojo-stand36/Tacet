@@ -178,6 +178,102 @@ describe('loadConfig', () => {
     expect(config.secrets?.webhook).toEqual({ keychain: 'tacet/webhook' });
   });
 
+  it('replaces a secret reference whole when a higher layer switches its kind', () => {
+    const layers = (lower: object, higher: object) =>
+      mergeConfig([
+        { name: 'user', origin: 'u', data: lower },
+        { name: 'local', origin: 'l', data: higher },
+      ]);
+    const toKeychain = layers(
+      { secrets: { webhook: { env: 'WEBHOOK_TOKEN' } } },
+      { secrets: { webhook: { keychain: 'tacet/webhook' } } },
+    );
+    expect(toKeychain.config.secrets).toEqual({ webhook: { keychain: 'tacet/webhook' } });
+    expect(toKeychain.errors).toEqual([]);
+    expect(toKeychain.explain.find((e) => e.path === 'secrets.webhook')?.sources).toEqual([
+      { layer: 'local', origin: 'l' },
+    ]);
+    const toEnv = layers(
+      { secrets: { webhook: { keychain: 'tacet/webhook' } } },
+      { secrets: { webhook: { env: 'WEBHOOK_TOKEN' } } },
+    );
+    expect(toEnv.config.secrets).toEqual({ webhook: { env: 'WEBHOOK_TOKEN' } });
+
+    const agent = (env: object) => ({
+      agents: { goose: { kind: 'acp', command: ['goose'], env } },
+    });
+    const agentEnv = layers(
+      agent({ KEY: { env: 'GOOSE_KEY' }, OTHER: { env: 'OTHER' } }),
+      agent({ KEY: { keychain: 'tacet/goose' } }),
+    );
+    expect(agentEnv.config.agents?.goose?.env).toEqual({
+      KEY: { keychain: 'tacet/goose' },
+      OTHER: { env: 'OTHER' },
+    });
+    expect(agentEnv.errors).toEqual([]);
+  });
+
+  it('replaces references whole even when names contain dots or are empty', () => {
+    const merged = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: {
+          secrets: { 'webhook.prod': { env: 'WEBHOOK_TOKEN' } },
+          agents: {
+            goose: {
+              kind: 'acp',
+              command: ['goose'],
+              env: { 'A.B': { env: 'AB' }, '': { env: 'EMPTY' } },
+            },
+          },
+        },
+      },
+      {
+        name: 'local',
+        origin: 'l',
+        data: {
+          secrets: { 'webhook.prod': { keychain: 'tacet/webhook' } },
+          agents: {
+            goose: {
+              kind: 'acp',
+              command: ['goose'],
+              env: { 'A.B': { keychain: 'tacet/ab' }, '': { keychain: 'tacet/empty' } },
+            },
+          },
+        },
+      },
+    ]);
+    expect(merged.errors).toEqual([]);
+    expect(merged.config.secrets?.['webhook.prod']).toEqual({ keychain: 'tacet/webhook' });
+    expect(merged.config.agents?.['goose']?.env).toEqual({
+      'A.B': { keychain: 'tacet/ab' },
+      '': { keychain: 'tacet/empty' },
+    });
+  });
+
+  it('reports a merged config that no longer matches the schema', () => {
+    const bad = mergeConfig([
+      { name: 'user', origin: 'u', data: { secrets: { x: { env: 'A', keychain: 'b' } } } as never },
+    ]);
+    expect(bad.errors.some((e) => e.startsWith('secrets.x'))).toBe(true);
+  });
+
+  it('refuses a subscription login for unattended Workers, allows it for interactive ones', () => {
+    write(join(userDir, 'config.yaml'), 'auth:\n  unattended: subscription\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(
+      /auth\.unattended must be "api_key".*#65/s,
+    );
+    write(
+      join(userDir, 'config.yaml'),
+      'auth:\n  unattended: api_key\n  interactive: subscription\n',
+    );
+    expect(loadConfig({ userDir, repoRoot }).config.auth).toEqual({
+      unattended: 'api_key',
+      interactive: 'subscription',
+    });
+  });
+
   it('validates task overrides like any other layer', () => {
     expect(() => loadConfig({ userDir, task: { budget: { per_task_usd: -1 } } })).toThrow(
       /task overrides/,

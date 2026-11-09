@@ -157,7 +157,7 @@ events:
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
 - Exception: `policies` and `escalation.always_ask` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
-- Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`.
+- Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
 - `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
 
 ## 5. Packages (monorepo)
@@ -166,7 +166,7 @@ events:
 |---|---|
 | `@tacet/core` | Types, zod 4 protocol and event schemas ([ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)), HandoffPacket schema, config loader |
 | `@tacet/conductor` | Global daemon: registry, inbox, workflows, API for UI |
-| `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package |
+| `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package. The Worker MCP server (#18, `MiniMcpServer`) serves the ADR-003 §6 tools over Streamable HTTP at `http://127.0.0.1:<port>/mcp` to 2026-07-28 and 2025-era clients, takes identity only from the per-worker bearer token, and records every tool effect in the event log (`EventLogBackend`). `workerConfig()` mints the MCP config an adapter injects into a Worker session. |
 | `@tacet/adapter-*` | `claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty` |
 | `@tacet/web` | React UI: board, inbox, live terminals (xterm.js), cost |
 | `@tacet/tui` | Ink-based terminal mode |
@@ -183,27 +183,31 @@ Tacet owns its core and interoperates at the protocol level ([ADR-001](adr/001-b
 ## 6. Security & auth principles
 Local servers ([ADR-003 §3, §5, §6](adr/003-wire-protocols.md#3-auth-token-handshake-all-local-servers)):
 
-The building blocks live in `@tacet/core/node` (`packages/core/src/node/auth/`, #77): `writeRuntimeFile`/`readRuntimeFile`, `listenLoopback`, `checkHostAndOrigin`, `HelloGate`, `OneTimeCodes`/`BrowserSessions`/`exchangeCode`, `WorkerTokens`, and a `Secret` wrapper that prints `[redacted]` everywhere except `reveal()`. The daemons wire them into their HTTP and WebSocket servers.
+The building blocks live in `@tacet/core/node` (`packages/core/src/node/auth/`, #77): `writeRuntimeFile`/`readRuntimeFile`, `listenLoopback`, `checkHostAndOrigin`, `HelloGate`, `OneTimeCodes`/`BrowserSessions`/`exchangeCode` (session token in the response body, never a cookie; `HelloGate` checks it for `role: "ui"` via `verifyBrowserSession`), `WorkerTokens`, and a `Secret` wrapper that prints `[redacted]` everywhere except `reveal()`. The daemons wire them into their HTTP and WebSocket servers.
 
 - **Binding.** The Conductor and each mini-conductor bind `127.0.0.1` and `::1` on an OS-assigned port. Remote or LAN access is an explicit opt-in (`remote: true` plus TLS) and is out of scope for v0.
 - **Token.** Each daemon generates a 256-bit token on start and rotates it on every start. The token is written, with the pid, port and protocol versions, to a runtime file in `~/.tacet/run/` that only the user can read (mode 0600 on POSIX). It is never inside a repo, and it is never logged or put in events.
-- **Browsers** never get the daemon token, and no cookie is set ([ADR-003 §3.4 addendum](adr/003-wire-protocols.md#addendum-2026-11-09-browser-session-without-cookies-34)). `tacet open` opens `http://127.0.0.1:<port>/#code=<one-time-code>`. The page exchanges the code (single use, 60 s lifetime) at `POST /auth/session` for a browser session token, keeps it in memory only (never `localStorage` or a cookie), sends it in the `tacet/hello` frame on the WebSocket and as `Authorization: Bearer` on HTTP calls.
-- **Host and Origin.** Requests are rejected unless `Host` is `127.0.0.1`, `[::1]` or `localhost` with the server port (DNS-rebinding defence). Browser requests must also match the served `Origin`.
+- **Browsers** never get the daemon token, and no cookie is set ([ADR-003 §3.4 addendum](adr/003-wire-protocols.md#addendum-2026-11-09-browser-session-without-cookies-34)). `tacet open` opens `http://127.0.0.1:<port>/#code=<one-time-code>`. The page exchanges the code (single use, 60 s lifetime) at `POST /auth/session` for a browser session token, keeps it in memory only (never `localStorage` or a cookie), sends it in the `tacet/hello` frame on the WebSocket and as `Authorization: Bearer` on HTTP calls. An upgrade without a daemon bearer token may only hello as `ui` with a valid session token, so a local process cannot claim the `cli` or `mini` role, and a present `Origin` must always match. The upgrade and the code exchange require `Origin`; session-token HTTP calls may omit it only on GET and HEAD, where browsers do not send it outside CORS. A missing `Origin` is not proof of same-origin (cross-origin no-cors GETs omit it too): the session token is the control, so session GET/HEAD routes must not change state. Daemons use `authorizeSessionRequest`, which validates the token and takes the method from the request line.
+- **Host and Origin.** Requests are rejected unless `Host` is `127.0.0.1`, `[::1]` or `localhost` with the server port (DNS-rebinding defence). A present `Origin` must match the served origin; when it is required is set per request kind (`RequestAuth`: `browser`, `session`, `bearer`).
 - **Hello.** The first frame on any socket must be `tacet/hello`. Any other method before hello closes the socket.
 - **Workers** get their own MCP token, bound to `{workerSessionId, taskId}` and revoked when the session closes. Tools take no `taskId` or `workerId` argument, and the token never appears in events ([ADR-003 §6](adr/003-wire-protocols.md#6-workers--mini-conductor-mcp-tool-surface)).
 
 Vendor auth and billing:
 
 - Never store, log, proxy or copy vendor OAuth or subscription tokens. Launch vendor CLIs and SDKs under the user's own login or API key.
-- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. The owner can override this in config. The same policy applies to Codex (#12): an API key for unattended or parallel Workers, and the user's own Codex login only for interactive use. Tacet never implements `chatgptAuthTokens`. Many parallel Workers on one subscription is an open risk; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
+- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. Only the interactive route is configurable: `auth.unattended` accepts only `api_key` (owner decision on #65). The same policy applies to Codex (#12): an API key for unattended or parallel Workers, and the user's own Codex login only for interactive use. Tacet never implements `chatgptAuthTokens`. Tacet never runs parallel Workers on one subscription; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
 
 Accepted residual risks (owner decision, 2026-11-09):
 
-- **Workers can read `~/.tacet/run`.** Workers run as the same OS user, so file modes alone cannot keep the daemon tokens in `~/.tacet/run/*.json` from them. Until the worker sandbox (#53) denies that path, a worker that reads the file can act as the Mini-conductor or Conductor. The sandbox profile closes this.
+- **Workers can read `~/.tacet/run`.** Workers run as the same OS user, so file modes alone cannot keep the daemon tokens in `~/.tacet/run/*.json` from them. Until the worker sandbox (#53) denies that path, a worker that reads the file can act as the Mini-conductor or Conductor. The sandbox profile closes this. The same holds for sibling Workers' MCP tokens in `~/.tacet/run/mcp/` (accepted interim risk, ADR-003 addendum): a Worker that reads one can act as that Worker until #53 denies the path; each file is deleted when its session closes, and the Mini-conductor revokes the token when the Worker ends.
 - **The one-time code is visible in the process list.** `tacet open` passes the URL (code in the fragment) to the browser launcher, so `ps` shows it to processes of the same user. Accepted: the code is single use, expires after 60 s, and only same-user processes can see it.
 - **Worker MCP config files** hold the worker's token. Adapters write them outside the worktree at mode 0600 and delete them when the session closes, so they cannot be committed (#11–#15).
 
 Other:
 
 - Worktree isolation by default; optional OS sandbox later.
+- **Codex Worker isolation** (owner decision, 2026-11-09; #116):
+  - The Codex sandbox's writable roots gain the Worker's *own* worktree git directory (the one `git rev-parse --git-dir` names for that worktree), and no other, so `git commit` works without an escalation each time.
+  - Unattended Codex Workers get their own `CODEX_HOME` at `~/.tacet/state/<repo>/codex`; interactive sessions keep the user's `~/.codex`. The user's `config.toml` customisations (including their MCP servers) therefore do not apply to unattended Workers.
+  - Codex `features.plugins` is off for unattended Workers, so a Worker start never syncs plugins from GitHub.
 - All approvals and decisions are logged and attributable.

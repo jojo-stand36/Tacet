@@ -194,11 +194,15 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 
 ### Addendum (2026-11-09): browser session without cookies (§3.4)
 
-- **Owner decision (accepted 2026-11-09):** browser auth does not use cookies. A cookie on `127.0.0.1` is sent to every local server on that host, on any port, including dev servers a Worker starts from repo code, which could replay it. §3.4 changes as follows: `POST /auth/session` exchanges the one-time code for a **browser session token** (no `Set-Cookie`). The page keeps the token in memory only (not `localStorage`), presents it in the `tacet/hello` params on the WebSocket and as `Authorization: Bearer` on HTTP calls. The Host and Origin checks in §3.5 are unchanged. Tracked as a new M1 security issue; it replaces the cookie in the #77 auth module.
+- **Owner decision (accepted 2026-11-09):** browser auth does not use cookies. A cookie on `127.0.0.1` is sent to every local server on that host, on any port, including dev servers a Worker starts from repo code, which could replay it. §3.4 changes as follows: `POST /auth/session` exchanges the one-time code for a **browser session token** (no `Set-Cookie`). The page keeps the token in memory only (not `localStorage`), presents it in the `tacet/hello` params on the WebSocket and as `Authorization: Bearer` on HTTP calls. The Host and Origin checks in §3.5 are unchanged. Tracked as a new M1 security issue; it replaces the cookie in the #77 auth module. Because the browser's WebSocket upgrade now carries no credential, the daemon accepts it unauthenticated, but such a socket may only send a `role: "ui"` hello with a valid session token; `cli` and `mini` hellos are accepted only on an upgrade that carried a valid daemon bearer token (#100). The browser upgrade and the code exchange require a matching `Origin`. Browser HTTP calls with a session token require it too, except GET and HEAD, which browsers send without `Origin` outside CORS (Fetch standard); a present `Origin` must always match. A missing `Origin` is not proof of same-origin, so the session token stays the control and session GET/HEAD routes must not change state.
 
 ### Addendum (2026-11-09): enum evolution (§2)
 
 - **Owner decision:** adding a value to an enum is an additive, non-breaking change under §2. Receivers map an unknown value to that enum's documented fallback instead of rejecting the message. Discriminators (`AgentEvent.t`, the `tacet/hello` `role`) are not covered: an unknown `AgentEvent.t` is ignored, as §2 already says for unknown event types. In `@tacet/core` this is `openEnum()`; each JSON Schema enum carries its fallback as `x-tacet-fallback` (#5 follow-up).
+
+### Addendum (2026-11-09): sibling Worker MCP tokens (§6)
+
+- **Owner decision (accepted interim risk, 2026-11-09):** each Worker's MCP config, with its per-worker token, is a 0600 file in `~/.tacet/run/mcp/` (outside the worktree and deleted on close by the adapter, #11; the Mini-conductor revokes the token through `WorkerTokens` when the Worker ends). Workers share one OS user, so until the worker sandbox (#53) denies `~/.tacet/run/mcp` (alongside `~/.tacet/run`), a Worker that can run shell commands can read a sibling Worker's token and act as that Worker toward the Mini-conductor.
 
 ## Consequences
 

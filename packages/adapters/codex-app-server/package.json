@@ -13,6 +13,11 @@
       "@tacet/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@tacet/source": "./src/testing/mock-responses-api.ts",
+      "types": "./dist/testing/mock-responses-api.d.ts",
+      "default": "./dist/testing/mock-responses-api.js"
     }
   },
   "files": [
@@ -23,6 +28,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@openai/codex": "0.167.0",
     "@tacet/core": "workspace:*"
   }
 }

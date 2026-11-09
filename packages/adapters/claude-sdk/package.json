@@ -13,6 +13,11 @@
       "@tacet/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@tacet/source": "./src/testing/mock-messages-api.ts",
+      "types": "./dist/testing/mock-messages-api.d.ts",
+      "default": "./dist/testing/mock-messages-api.js"
     }
   },
   "files": [
@@ -23,6 +28,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.319",
     "@tacet/core": "workspace:*"
   }
 }
