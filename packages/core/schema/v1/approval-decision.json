@@ -5,13 +5,14 @@
   "type": "object",
   "properties": {
     "kind": {
-      "type": "string",
       "enum": [
         "allow_once",
         "allow_always",
         "reject",
         "cancel"
-      ]
+      ],
+      "x-tacet-fallback": "reject",
+      "type": "string"
     },
     "persist": {
       "default": false,

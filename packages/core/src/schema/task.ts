@@ -1,8 +1,9 @@
 import { z } from 'zod';
-import { Autonomy, Id, Timestamp, TokenCount, Usd } from './common.js';
+import { Autonomy, Id, openEnum, Timestamp, TokenCount, Usd } from './common.js';
 
 /** Task priority, highest first. */
-export const Priority = z.enum(['p0', 'p1', 'p2', 'p3']);
+/** Unknown values fall back to `p2`. */
+export const Priority = openEnum(['p0', 'p1', 'p2', 'p3'], 'p2');
 export type Priority = z.infer<typeof Priority>;
 
 /** Spending limits for one task. Either limit may be omitted. */

@@ -106,24 +106,59 @@ describe('defaults', () => {
   });
 });
 
+describe('open enums (owner decision 2026-11-09, ADR-003 §2)', () => {
+  it('reads unknown enum values as the documented fallback instead of rejecting', () => {
+    expect(Task.parse({ ...example('task'), priority: 'urgent' }).priority).toBe('p2');
+    expect(Escalation.parse({ ...example('escalation'), urgency: 'x' }).urgency).toBe('normal');
+    expect(Decision.parse({ ...example('decision'), scope: 'global' }).scope).toBe('task');
+    expect(Decision.parse({ ...example('decision'), source: 'oracle' }).source).toBe('mini');
+    expect(ApprovalDecision.parse({ kind: 'maybe' }).kind).toBe('reject');
+    expect(
+      EventEnvelope.parse({ ...example('envelope'), source: { kind: 'robot', id: 'x' } }).source
+        .kind,
+    ).toBe('worker');
+    expect(AgentEvent.parse({ t: 'status', state: 'hibernating' })).toEqual({
+      t: 'status',
+      state: 'running',
+    });
+  });
+
+  it('keeps discriminators closed: an unknown AgentEvent kind is still rejected by the schema', () => {
+    expect(AgentEvent.safeParse({ t: 'telepathy' }).success).toBe(false);
+  });
+
+  it('publishes each fallback as x-tacet-fallback, not as a JSON Schema default', () => {
+    const urgency = (
+      toJsonSchema('escalation').properties as Record<string, Record<string, unknown>>
+    ).urgency;
+    expect(urgency).toMatchObject({
+      'x-tacet-fallback': 'normal',
+      enum: ['low', 'normal', 'high', 'blocking'],
+    });
+    expect(urgency).not.toHaveProperty('default');
+    const priority = (toJsonSchema('task').properties as Record<string, Record<string, unknown>>)
+      .priority;
+    expect(priority).toMatchObject({ default: 'p2', 'x-tacet-fallback': 'p2' });
+  });
+});
+
 describe('rejections', () => {
   const cases: [string, { safeParse(v: unknown): { success: boolean } }, unknown][] = [
     ['Task without a goal', Task, { ...example('task'), goal: '' }],
-    ['Task with an unknown priority', Task, { ...example('task'), priority: 'urgent' }],
     ['TaskExt with a negative budget', TaskExt, { ...example('task-ext'), budget: { usd: -1 } }],
-    ['Escalation with an unknown urgency', Escalation, { ...example('escalation'), urgency: 'x' }],
     [
       'EscalationExt without blockedWorkers',
       EscalationExt,
       { escalationId: example('escalation-ext').escalationId, urgency: 'low' },
     ],
-    [
-      'Decision with global scope (not in ADR-003)',
-      Decision,
-      { ...example('decision'), scope: 'global' },
-    ],
     ['DecisionExt without a choice', DecisionExt, { ...example('decision-ext'), choice: '' }],
-    ['ApprovalDecision with an unknown kind', ApprovalDecision, { kind: 'maybe' }],
+    ['ApprovalDecision without a kind', ApprovalDecision, { persist: true }],
+    [
+      'Escalation without an urgency',
+      Escalation,
+      (({ urgency: _u, ...e }) => e)(example('escalation')),
+    ],
+    ['Status with a non-string state', AgentEvent, { t: 'status', state: 3 }],
     ['AgentEvent with an unknown kind', AgentEvent, { t: 'telepathy' }],
     [
       'EventEnvelope with a non-ULID id',

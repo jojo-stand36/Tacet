@@ -946,6 +946,17 @@
         "agent:claude"
       ],
       "body": "ACP v2 (schema `2.0.0-alpha.14` on 2026-11-09) is a consolidation release: `session/prompt` only acknowledges acceptance, the turn's progress and stop reason arrive in `state_update` notifications, updates become upserts by id, the client filesystem/terminal/session-modes APIs are removed, and capabilities are reorganised. The ACP migration guide asks implementers to support v1 and v2 side by side. The generic ACP adapter (#13) implements v1; this issue tracks v2 until it stabilises.\n\n### Tasks\n- [ ] Watch the ACP v2 schema releases and RFD group; record the version when v2 leaves alpha\n- [ ] Check which agents Tacet supports (Gemini CLI, OpenCode, claude-agent-acp, codex-acp) advertise v2\n- [ ] Design the v2 prompt-turn path behind a flag in the ACP adapter (prompt ack + `state_update`)\n- [ ] Record findings in the ACP section of the capability matrix\n\n### Acceptance criteria\n- The matrix states the ACP v2 status with version and date\n- A go/no-go recommendation for v2 support in the ACP adapter (#13) is recorded\n\n_See docs/adapters/spikes/61-acp/README.md (ACP v2 section) and docs/adapters/capability-matrix.md._"
+    },
+    {
+      "title": "UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "ADR-003 §5 carries Tacet-specific UI items as AG-UI `CUSTOM` events with `name` ∈ `tacet.usage`, `tacet.escalation`, `tacet.decision`, `tacet.budget`, and §7 lists a `ui-custom-events` JSON Schema. #5 left it out because it needs `@ag-ui/core`. This issue adds those payload schemas to `@tacet/core`.\n\n### Tasks\n- [ ] Add `@ag-ui/core` (1.x, ADR-003 §2) to `@tacet/core`, justified in the PR, through the pnpm catalog\n- [ ] zod schemas for the four `CUSTOM` payloads, reusing `Usage`, `Escalation`, `Decision` and budget types; enums via `openEnum`\n- [ ] Export `ui-custom-events` to `packages/core/schema/v1/` with an example\n- [ ] Contract test: every `tacet/ui.event` payload validates against `@ag-ui/core` (ADR-003 §7)\n\n### Acceptance criteria\n- `pnpm check:generated` covers the new schema\n- The contract test passes for one example of each custom event\n\n_See docs/adr/003-wire-protocols.md §5 and §7._"
     }
   ]
 }

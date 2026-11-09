@@ -35,16 +35,16 @@
       }
     },
     "urgency": {
-      "type": "string",
       "enum": [
         "low",
         "normal",
         "high",
         "blocking"
-      ]
+      ],
+      "x-tacet-fallback": "normal",
+      "type": "string"
     },
     "category": {
-      "type": "string",
       "enum": [
         "decision",
         "help",
@@ -53,7 +53,9 @@
         "emergency",
         "gate_timeout",
         "lifecycle"
-      ]
+      ],
+      "x-tacet-fallback": "help",
+      "type": "string"
     },
     "context": {
       "description": "Short free-text context from the Worker",
@@ -72,13 +74,14 @@
     },
     "status": {
       "default": "pending",
-      "type": "string",
       "enum": [
         "pending",
         "resolved",
         "expired",
         "cancelled"
-      ]
+      ],
+      "x-tacet-fallback": "pending",
+      "type": "string"
     },
     "createdAt": {
       "type": "string",

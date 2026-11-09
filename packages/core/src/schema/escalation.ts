@@ -1,19 +1,18 @@
 import { z } from 'zod';
-import { Id, Timestamp, Ulid, Urgency } from './common.js';
+import { Id, openEnum, Timestamp, Ulid, Urgency } from './common.js';
 
-/** Optional routing category, borrowed from Gas Town's escalation design (ADR-001). */
-export const EscalationCategory = z.enum([
-  'decision',
+/** Optional routing category (Gas Town, ADR-001). Unknown values fall back to `help`. */
+export const EscalationCategory = openEnum(
+  ['decision', 'help', 'blocked', 'failed', 'emergency', 'gate_timeout', 'lifecycle'],
   'help',
-  'blocked',
-  'failed',
-  'emergency',
-  'gate_timeout',
-  'lifecycle',
-]);
+);
 export type EscalationCategory = z.infer<typeof EscalationCategory>;
 
-export const EscalationStatus = z.enum(['pending', 'resolved', 'expired', 'cancelled']);
+/** Unknown values fall back to `pending`, so the escalation stays visible. */
+export const EscalationStatus = openEnum(
+  ['pending', 'resolved', 'expired', 'cancelled'],
+  'pending',
+);
 export type EscalationStatus = z.infer<typeof EscalationStatus>;
 
 /** A question a Worker or Mini-conductor could not resolve on its own (ARCHITECTURE.md §2.2). */

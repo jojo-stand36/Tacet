@@ -62,11 +62,12 @@
             "type": "string"
           },
           "scope": {
-            "type": "string",
             "enum": [
               "task",
               "repo"
-            ]
+            ],
+            "x-tacet-fallback": "task",
+            "type": "string"
           }
         },
         "required": [
@@ -125,13 +126,14 @@
       "type": "object",
       "properties": {
         "status": {
-          "type": "string",
           "enum": [
             "passed",
             "failed",
             "partial",
             "not_run"
-          ]
+          ],
+          "x-tacet-fallback": "not_run",
+          "type": "string"
         },
         "commands": {
           "default": [],

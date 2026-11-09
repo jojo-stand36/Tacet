@@ -16,13 +16,14 @@
       }
     },
     "urgency": {
-      "type": "string",
       "enum": [
         "low",
         "normal",
         "high",
         "blocking"
-      ]
+      ],
+      "x-tacet-fallback": "normal",
+      "type": "string"
     },
     "blockedWorkers": {
       "type": "integer",

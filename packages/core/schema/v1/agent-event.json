@@ -93,13 +93,14 @@
           "description": "Choices the vendor surface supports; absent means all four",
           "type": "array",
           "items": {
-            "type": "string",
             "enum": [
               "allow_once",
               "allow_always",
               "reject",
               "cancel"
-            ]
+            ],
+            "x-tacet-fallback": "reject",
+            "type": "string"
           }
         },
         "requestedGrant": {
@@ -153,11 +154,12 @@
           "minLength": 1
         },
         "source": {
-          "type": "string",
           "enum": [
             "reported",
             "estimated"
-          ]
+          ],
+          "x-tacet-fallback": "estimated",
+          "type": "string"
         }
       },
       "required": [
@@ -175,7 +177,6 @@
           "const": "status"
         },
         "state": {
-          "type": "string",
           "enum": [
             "running",
             "idle",
@@ -184,7 +185,9 @@
             "cancelled",
             "error",
             "done"
-          ]
+          ],
+          "x-tacet-fallback": "running",
+          "type": "string"
         },
         "message": {
           "type": "string"
@@ -214,13 +217,14 @@
           }
         },
         "urgency": {
-          "type": "string",
           "enum": [
             "low",
             "normal",
             "high",
             "blocking"
-          ]
+          ],
+          "x-tacet-fallback": "normal",
+          "type": "string"
         },
         "context": {
           "type": "string"
