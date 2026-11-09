@@ -28,10 +28,9 @@ import {
   OneTimeCodes,
   openUrl,
   readRuntimeFile,
-  readSessionCookie,
   removeRuntimeFile,
+  SESSION_RESPONSE_HEADERS,
   Secret,
-  sessionCookieName,
   WorkerTokens,
   writeRuntimeFile,
 } from '../index.js';
@@ -374,6 +373,49 @@ describe('tacet/hello gate', () => {
     expect(g.handle(hello([1]))).toMatchObject({ kind: 'close' });
   });
 
+  it('opens a UI hello only with a valid browser session token, and hides the token', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const seen: unknown[] = [];
+    const uiGate = () =>
+      new HelloGate({
+        versions: [1],
+        serverInfo: { name: 'c', version: '0' },
+        newSessionId: () => 's',
+        verifyBrowserSession: (t) => sessions.validate(t),
+        onHello: (p) => seen.push(p),
+      });
+    const uiHello = (sessionToken?: string) =>
+      hello([1], { role: 'ui', ...(sessionToken === undefined ? {} : { sessionToken }) });
+
+    const ok = uiGate();
+    expect(ok.handle(uiHello(token))).toMatchObject({ kind: 'reply' });
+    expect(JSON.stringify(seen)).not.toContain(token);
+    expect(seen[0]).toMatchObject({ role: 'ui' });
+
+    for (const [label, frame] of [
+      ['forged', uiHello('forged')],
+      ['missing', uiHello()],
+    ] as const) {
+      const action = uiGate().handle(frame);
+      expect(action.kind, label).toBe('close');
+      expect(JSON.stringify(action), label).not.toContain(token);
+    }
+    expect(uiGate().handle(uiHello('forged'))).toMatchObject({ kind: 'close', code: 4401 });
+
+    sessions.revoke(token);
+    expect(uiGate().handle(uiHello(token))).toMatchObject({ kind: 'close', code: 4401 });
+  });
+
+  it('refuses every UI hello when no browser-session verifier is configured', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    expect(gate().handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'close',
+      code: 4401,
+    });
+  });
+
   it('answers a valid hello with the highest common version, then passes frames through', () => {
     const g = new HelloGate({
       versions: [1, 2],
@@ -393,23 +435,79 @@ describe('tacet/hello gate', () => {
 describe('one-time code browser login', () => {
   const port = 4100;
 
-  it('works once, then never again, and sets a per-port HttpOnly SameSite=Strict cookie', () => {
+  it('works once, then never again, and returns a session token in the body, never a cookie', () => {
     const codes = new OneTimeCodes();
     const sessions = new BrowserSessions();
     const code = codes.issue();
-    const first = exchangeCode(codes, sessions, code.reveal(), port);
-    expect(first.ok).toBe(true);
-    expect(exchangeCode(codes, sessions, code.reveal(), port)).toEqual({
-      ok: false,
-      httpStatus: 401,
-    });
+    const first = exchangeCode(codes, sessions, code.reveal());
+    expect(exchangeCode(codes, sessions, code.reveal())).toEqual({ ok: false, httpStatus: 401 });
     if (!first.ok) throw new Error('unreachable');
-    expect(first.setCookie.startsWith(`${sessionCookieName(port)}=`)).toBe(true);
-    expect(first.setCookie).toMatch(/; HttpOnly; SameSite=Strict; Path=\/$/);
-    const cookie = `other=1; ${first.setCookie.split(';')[0]}`;
-    expect(sessions.validate(readSessionCookie(cookie, port))).toBe(true);
-    expect(readSessionCookie(cookie, 4101)).toBeUndefined();
+    expect(first).not.toHaveProperty('setCookie');
+    const { sessionToken } = JSON.parse(first.body) as { sessionToken: string };
+    expect(first.token.equals(sessionToken)).toBe(true);
+    expect(sessions.validate(sessionToken)).toBe(true);
+    expect(sessions.validateHeader(`Bearer ${sessionToken}`)).toBe(true);
+    expect(sessions.validateHeader(`Bearer forged`)).toBe(false);
     expect(sessions.validate('forged')).toBe(false);
+    expect(Object.keys(SESSION_RESPONSE_HEADERS).map((h) => h.toLowerCase())).not.toContain(
+      'set-cookie',
+    );
+    expect(SESSION_RESPONSE_HEADERS['cache-control']).toBe('no-store');
+    expect(inspect(sessions)).not.toContain(sessionToken);
+  });
+
+  it('never sends Set-Cookie over HTTP, and the token authenticates hello and Bearer calls', async () => {
+    const codes = new OneTimeCodes();
+    const sessions = new BrowserSessions();
+    const code = codes.issue();
+    const listener = await listenLoopback(() =>
+      http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/auth/session') {
+          const r = exchangeCode(codes, sessions, req.headers['x-code'] as string | undefined);
+          if (!r.ok) return void res.writeHead(r.httpStatus).end();
+          return void res.writeHead(200, SESSION_RESPONSE_HEADERS).end(r.body);
+        }
+        res.writeHead(sessions.validateHeader(req.headers.authorization) ? 200 : 401).end();
+      }),
+    );
+    const call = (method: string, path: string, headers: Record<string, string>) =>
+      new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>(
+        (resolve, reject) => {
+          const req = request(
+            { host: '127.0.0.1', port: listener.port, method, path, headers },
+            (res) => {
+              let body = '';
+              res.on('data', (c) => {
+                body += c;
+              });
+              res.on('end', () =>
+                resolve({ status: res.statusCode ?? 0, headers: res.headers, body }),
+              );
+            },
+          );
+          req.on('error', reject);
+          req.end();
+        },
+      );
+    try {
+      const login = await call('POST', '/auth/session', { 'x-code': code.reveal() });
+      expect(login.status).toBe(200);
+      expect(login.headers['set-cookie']).toBeUndefined();
+      const { sessionToken } = JSON.parse(login.body) as { sessionToken: string };
+      const replay = await call('POST', '/auth/session', { 'x-code': code.reveal() });
+      expect(replay.status).toBe(401);
+      expect(replay.headers['set-cookie']).toBeUndefined();
+      expect((await call('GET', '/api', { authorization: `Bearer ${sessionToken}` })).status).toBe(
+        200,
+      );
+      expect((await call('GET', '/api', {})).status).toBe(401);
+      sessions.revoke(sessionToken);
+      expect((await call('GET', '/api', { authorization: `Bearer ${sessionToken}` })).status).toBe(
+        401,
+      );
+    } finally {
+      await listener.close();
+    }
   });
 
   it('expires after 60 s', () => {

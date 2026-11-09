@@ -1,12 +1,4 @@
-import { randomToken, type Secret, tokenKey } from './secret.js';
-
-/**
- * Cookie name for the daemon on `port`. Cookies are not isolated by port, so each daemon (the
- * Conductor and every Mini-conductor) uses its own name to avoid overwriting the others'.
- */
-export function sessionCookieName(port: number): string {
-  return `tacet_session_${port}`;
-}
+import { parseBearer, randomToken, type Secret, tokenKey } from './secret.js';
 
 /**
  * Single-use login codes for `tacet open` (ADR-003 §3.4). Only hashes are stored. A code is
@@ -55,8 +47,11 @@ export class OneTimeCodes {
 }
 
 /**
- * Browser sessions created by redeeming a one-time code. In memory; they end with the daemon.
- * At most `max` sessions are kept; creating one more evicts the oldest.
+ * Browser sessions created by redeeming a one-time code (ADR-003 §3.4 addendum, 2026-11-09).
+ * The page holds the session token in memory only and presents it in the `tacet/hello` params
+ * on the WebSocket and as `Authorization: Bearer` on HTTP. No cookie is ever set. Only token
+ * hashes are stored, in memory; sessions end with the daemon. At most `max` are kept; creating
+ * one more evicts the oldest.
  */
 export class BrowserSessions {
   readonly #sessions = new Set<string>();
@@ -81,6 +76,11 @@ export class BrowserSessions {
     return typeof id === 'string' && id.length > 0 && this.#sessions.has(tokenKey(id));
   }
 
+  /** Validate an `Authorization: Bearer <token>` header from the page's HTTP calls. */
+  validateHeader(header: string | undefined | null): boolean {
+    return this.validate(parseBearer(header));
+  }
+
   revoke(id: string): boolean {
     return this.#sessions.delete(tokenKey(id));
   }
@@ -90,42 +90,37 @@ export class BrowserSessions {
   }
 }
 
-/**
- * `Set-Cookie` value for a session: HttpOnly and SameSite=Strict (ADR-003 §3.4). No `Secure`
- * flag, because the daemon serves plain HTTP on loopback; no expiry, so it is a session cookie.
- */
-export function sessionCookie(id: Secret, port: number): string {
-  return `${sessionCookieName(port)}=${id.reveal()}; HttpOnly; SameSite=Strict; Path=/`;
-}
-
-/** This daemon's session id from a `Cookie` request header, if present. */
-export function readSessionCookie(
-  cookieHeader: string | undefined | null,
-  port: number,
-): string | undefined {
-  if (typeof cookieHeader !== 'string') return undefined;
-  const wanted = sessionCookieName(port);
-  for (const part of cookieHeader.split(';')) {
-    const [name, ...rest] = part.trim().split('=');
-    if (name === wanted && rest.length > 0) return rest.join('=');
-  }
-  return undefined;
-}
-
 /** URL `tacet open` launches: the code travels in the fragment, which browsers never send. */
 export function openUrl(port: number, code: Secret): string {
   return `http://127.0.0.1:${port}/#code=${code.reveal()}`;
 }
 
-export type CodeExchange = { ok: true; setCookie: string } | { ok: false; httpStatus: 401 };
+/** Response headers for `POST /auth/session`: JSON, never cached. No `Set-Cookie`. */
+export const SESSION_RESPONSE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  'content-type': 'application/json',
+  'cache-control': 'no-store',
+});
 
-/** Handler logic for `POST /auth/session`: trade a valid one-time code for a session cookie. */
+export type CodeExchange =
+  | {
+      ok: true;
+      /** The new browser session token, for the server's own bookkeeping. */
+      token: Secret;
+      /** JSON body to send: `{"sessionToken":"…"}`. The page keeps it in memory only. */
+      body: string;
+    }
+  | { ok: false; httpStatus: 401 };
+
+/**
+ * Handler logic for `POST /auth/session`: trade a valid one-time code for a browser session
+ * token, returned in the JSON body. Send it with `SESSION_RESPONSE_HEADERS`.
+ */
 export function exchangeCode(
   codes: OneTimeCodes,
   sessions: BrowserSessions,
   code: string | undefined | null,
-  port: number,
 ): CodeExchange {
   if (!codes.redeem(code)) return { ok: false, httpStatus: 401 };
-  return { ok: true, setCookie: sessionCookie(sessions.create(), port) };
+  const token = sessions.create();
+  return { ok: true, token, body: JSON.stringify({ sessionToken: token.reveal() }) };
 }
