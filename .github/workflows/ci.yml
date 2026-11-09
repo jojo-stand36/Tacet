@@ -26,6 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: No ignored files are tracked (build output, node_modules)
+        run: test -z "$(git ls-files -ci --exclude-standard)"
+
       # Reads the pnpm version from package.json "packageManager".
       # Node 25+ no longer bundles Corepack, so pnpm is installed by this action.
       - uses: pnpm/action-setup@v6
