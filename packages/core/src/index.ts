@@ -11,3 +11,4 @@ export * from './events/projection.js';
 export * from './schema/index.js';
 export { allJsonSchemas, type JsonSchemaDocument, toJsonSchema } from './schema/json-schema.js';
 export * from './util/async-queue.js';
+export * from './util/ulid.js';
