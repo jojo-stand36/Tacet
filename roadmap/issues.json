@@ -968,6 +968,17 @@
         "agent:claude"
       ],
       "body": "The owner decided on 2026-11-09 that browser auth must not use cookies: a cookie on 127.0.0.1 reaches every local server on that host, including dev servers a Worker starts (see the ADR-003 §3.4 addendum). This replaces the session cookie in the #77 auth module (`exchangeCode`, `sessionCookie`, `readSessionCookie`). Security-sensitive: a `reviewer` agent pass is required before the PR.\n\n### Tasks\n- [ ] `POST /auth/session` exchanges the one-time code for a browser session token (256-bit, stored as a hash, capped like today's sessions); no `Set-Cookie`\n- [ ] `HelloParams` for `role: \"ui\"` carries the browser session token; `HelloGate` validates it before opening\n- [ ] HTTP calls from the page use `Authorization: Bearer <session token>`; `checkHostAndOrigin` stays as-is\n- [ ] Remove the cookie helpers from `@tacet/core/node`; update ARCHITECTURE §6\n- [ ] Document for the web UI (M4) that the token lives in memory only, never `localStorage`\n- [ ] Reviewer pass (`reviewer` agent) before the PR is opened\n\n### Acceptance criteria\n- No code path emits `Set-Cookie` (test)\n- A hello without a valid browser session token is closed; a revoked token is rejected\n- The token never appears in logs, events or test snapshots\n\n_See docs/adr/003-wire-protocols.md §3.4 addendum and docs/ARCHITECTURE.md §6._"
+    },
+    {
+      "title": "Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:handoff",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Owner request (2026-11-09): ship Tacet's handoff as a **standalone Claude Code plugin**, so a plain Claude Code session can hand off its context before it degrades, without running the Conductor or a Mini-conductor. This is an early, usable slice of M3 (#29, #31) built on the `HandoffPacket` schema from #5.\n\n### Tasks\n- [ ] Verify the current Claude Code plugin and hook surface from primary docs (`verify-vendor-facts`): plugin manifest, `PreCompact`, `SessionStart`, `Stop`, slash commands, and how a hook can start a new session. Record it in the capability matrix.\n- [ ] A `/handoff` command that has the session write a `HandoffPacket` (goal, acceptance criteria, state summary, decisions, files touched, commands run, open questions, `nextAction`, verification). It is validated against `@tacet/core` and rejected if `nextAction` is missing.\n- [ ] Automatic trigger: at a configurable context threshold (and on `PreCompact`), write the packet before vendor compaction happens.\n- [ ] Reseed: start a fresh session seeded with the packet (via `SessionStart` context injection or a documented `claude` launch command). The old session ends cleanly.\n- [ ] Store packets in `.tacet/handoffs/` (git-ignored by default), never with secrets; reuse the redaction rules.\n- [ ] Packaging: an installable Claude Code plugin from this repo, with a short README.\n- [ ] Later, sharing code with #31 so the daemon path and the plugin path produce identical packets.\n\n### Acceptance criteria\n- In a recorded fixture session, the plugin writes a valid HandoffPacket at the threshold, and a new session starts with it as context\n- A packet without `nextAction` is rejected\n- No token or secret appears in a packet (test)\n\n_See docs/ARCHITECTURE.md §2.3, issues #29–#32, and the `session-handoff` skill._"
     }
   ]
 }
