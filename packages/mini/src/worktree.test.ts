@@ -188,6 +188,72 @@ describe('WorktreeManager', () => {
     await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('does not expose rebase while worker-controlled HEAD could target a shared branch', async () => {
+    const worktree = await manager.create('hostile-head-worker');
+    const adminDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    const mainHead = (await git(repository, ['rev-parse', 'refs/heads/main'])).trim();
+    await writeFile(path.join(adminDirectory, 'HEAD'), 'ref: refs/heads/main\n');
+
+    expect(manager).not.toHaveProperty('rebase');
+    expect((await manager.list()).map(({ id }) => id)).toContain(worktree.id);
+    await manager.remove(worktree.id, { force: true });
+
+    expect((await git(repository, ['rev-parse', 'refs/heads/main'])).trim()).toBe(mainHead);
+  });
+
+  it('does not hide or trust a worktree whose admin gitdir was rewritten', async () => {
+    const worktree = await manager.create('rewritten-gitdir-worker');
+    const adminDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    await writeFile(path.join(adminDirectory, 'gitdir'), `${temporaryDirectory}/elsewhere/.git\n`);
+
+    expect((await manager.list()).map(({ id }) => id)).toContain(worktree.id);
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
+      'worktree Git directory does not point to its manager-owned worktree',
+    );
+    expect(await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).toMatchObject({
+      removed: [],
+      skipped: [{ id: worktree.id, reason: 'worktree Git metadata is invalid' }],
+    });
+    await manager.remove(worktree.id, { force: true });
+  });
+
+  it('refuses symlinked admin reflog paths', async () => {
+    const worktree = await manager.create('reflog-symlink-worker');
+    const adminDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    const sentinel = path.join(temporaryDirectory, 'outside-reflog');
+    const logsDirectory = path.join(adminDirectory, 'logs');
+    await writeFile(sentinel, 'keep\n');
+    await rm(logsDirectory, { recursive: true, force: true });
+    await mkdir(logsDirectory);
+    await symlink(sentinel, path.join(logsDirectory, 'HEAD'));
+
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
+      'worktree Git reflog path must not be a symlink',
+    );
+    expect(await readFile(sentinel, 'utf8')).toBe('keep\n');
+  });
+
   it('keeps detached-head worktrees listed and uses their HEAD for merge checks', async () => {
     const worktree = await manager.create('detached-worker');
     await git(worktree.path, ['checkout', '--detach']);
@@ -245,7 +311,7 @@ describe('WorktreeManager', () => {
     );
     await writeFile(path.join(worktree.path, '.gitattributes'), 'file.txt filter=hostile\n');
 
-    await expect(manager.rebase(worktree.id, 'main')).rejects.toThrow(
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
       'worktree-specific Git config is not allowed',
     );
     await expect(manager.remove(worktree.id)).rejects.toThrow(
@@ -257,7 +323,7 @@ describe('WorktreeManager', () => {
   it('refuses repositories with extensions.worktreeConfig enabled', async () => {
     const worktree = await manager.create('extension-config-worker');
     await git(repository, ['config', 'extensions.worktreeConfig', 'true']);
-    await expect(manager.rebase(worktree.id, 'main')).rejects.toThrow(
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
       'extensions.worktreeConfig is not allowed for managed worktrees',
     );
   });
@@ -290,7 +356,7 @@ describe('WorktreeManager', () => {
     await writeFile(commondirFile, `${hostileCommonDirectory}\n`);
     expect(await readFile(commondirFile, 'utf8')).not.toBe(`${commonDirectory}\n`);
 
-    await expect(manager.rebase(worktree.id, 'main')).rejects.toThrow(
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
       'worktree common directory is not the manager-owned directory',
     );
     await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
@@ -300,14 +366,13 @@ describe('WorktreeManager', () => {
     );
   });
 
-  it('detects conflicts without modifying the target and aborts a conflicted rebase', async () => {
+  it('detects conflicts without modifying the target', async () => {
     const worktree = await manager.create('conflicting-worker');
     await git(repository, ['tag', 'main', 'HEAD']);
     await writeFile(path.join(worktree.path, 'file.txt'), 'worker change\n');
     await git(worktree.path, ['add', 'file.txt']);
     await git(worktree.path, ['commit', '-m', 'worker change']);
     const workerCommit = (await git(worktree.path, ['rev-parse', 'HEAD'])).trim();
-
     await writeFile(path.join(repository, 'file.txt'), 'target change\n');
     await git(repository, ['commit', '-am', 'target change']);
 
@@ -319,10 +384,6 @@ describe('WorktreeManager', () => {
     const merge = await manager.merge(worktree.id, 'squash-to-branch', 'main');
     expect(merge).toMatchObject({ status: 'conflict', conflicts: ['file.txt'] });
     expect((await git(repository, ['status', '--porcelain'])).trim()).toBe('');
-
-    expect(await manager.rebase(worktree.id, 'main')).toContain('file.txt');
-    expect((await git(worktree.path, ['rev-parse', 'HEAD'])).trim()).toBe(workerCommit);
-    expect((await git(worktree.path, ['status', '--porcelain'])).trim()).toBe('');
   });
 
   it('prepares PR and manual strategies and stages squash results on an isolated target branch', async () => {
