@@ -33,7 +33,8 @@ const IPV6_UNAVAILABLE = new Set(['EADDRNOTAVAIL', 'EAFNOSUPPORT', 'EINVAL']);
 /**
  * Listen on 127.0.0.1 and ::1 with the same OS-assigned port (ADR-003 §3.1). Never binds a
  * wildcard address. `create` is called once per address and must return a fresh server, e.g.
- * `() => http.createServer(handler)`. If the IPv6 loopback is unavailable, only IPv4 is used.
+ * `() => http.createServer(handler)`. If the IPv6 loopback is unavailable, only IPv4 is used,
+ * which is why clients must dial `127.0.0.1`, never `localhost` (which may resolve to ::1).
  */
 export async function listenLoopback(
   create: () => Server,

@@ -29,12 +29,14 @@ export interface HelloGateOptions {
 }
 
 /**
- * Per-socket handshake state machine (ADR-003 §3.6). Feed it every text frame; it answers the
- * first frame and tells the caller to close the socket unless that frame is a valid
- * `tacet/hello` with a protocol version both sides support. Later frames pass through.
+ * Per-socket handshake state machine (ADR-003 §3.6). Feed it every frame: text frames to
+ * `handle()`, binary frames to `handleBinary()`. It answers the first frame and tells the caller
+ * to close the socket unless that frame is a valid `tacet/hello` with a protocol version both
+ * sides support. After a failure it stays closed: every later frame also gets a close action.
+ * After success, later frames pass through.
  */
 export class HelloGate {
-  #done = false;
+  #state: 'waiting' | 'open' | 'failed' = 'waiting';
   readonly #opts: HelloGateOptions;
 
   constructor(opts: HelloGateOptions) {
@@ -43,24 +45,30 @@ export class HelloGate {
   }
 
   get open(): boolean {
-    return this.#done;
+    return this.#state === 'open';
+  }
+
+  /** Binary frames are never valid before hello. */
+  handleBinary(): GateAction {
+    if (this.#state === 'open') return { kind: 'pass' };
+    return this.#fail(null, -32600, 'first frame must be a tacet/hello text frame');
   }
 
   handle(frame: string): GateAction {
-    if (this.#done) return { kind: 'pass' };
+    if (this.#state === 'open') return { kind: 'pass' };
+    if (this.#state === 'failed') return this.#fail(null, -32600, 'handshake failed');
     let msg: unknown;
     try {
       msg = JSON.parse(frame);
     } catch {
       return this.#fail(null, -32700, 'parse error');
     }
-    const { id, method, params } = (msg ?? {}) as {
-      id?: unknown;
-      method?: unknown;
-      params?: unknown;
-    };
+    if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
+      return this.#fail(null, -32600, 'first request must be tacet/hello');
+    }
+    const { jsonrpc, id, method, params } = msg as Record<string, unknown>;
     const rpcId = typeof id === 'string' || typeof id === 'number' ? id : null;
-    if (method !== 'tacet/hello' || rpcId === null) {
+    if (jsonrpc !== '2.0' || method !== 'tacet/hello' || rpcId === null) {
       return this.#fail(rpcId, -32600, 'first request must be tacet/hello');
     }
     const parsed = HelloParams.safeParse(params);
@@ -68,6 +76,7 @@ export class HelloGate {
 
     const common = parsed.data.protocolVersions.filter((v) => this.#opts.versions.includes(v));
     if (common.length === 0) {
+      this.#state = 'failed';
       return {
         kind: 'close',
         code: CLOSE_NO_COMMON_VERSION,
@@ -83,8 +92,12 @@ export class HelloGate {
       };
     }
     const protocolVersion = Math.max(...common);
-    this.#done = true;
-    this.#opts.onHello?.(parsed.data, protocolVersion);
+    try {
+      this.#opts.onHello?.(parsed.data, protocolVersion);
+    } catch {
+      return this.#fail(rpcId, -32603, 'hello rejected');
+    }
+    this.#state = 'open';
     return {
       kind: 'reply',
       message: {
@@ -101,6 +114,7 @@ export class HelloGate {
   }
 
   #fail(id: string | number | null, code: number, message: string): GateAction {
+    this.#state = 'failed';
     return {
       kind: 'close',
       code: CLOSE_POLICY_VIOLATION,

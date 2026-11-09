@@ -1,6 +1,12 @@
 import { randomToken, type Secret, tokenKey } from './secret.js';
 
-export const SESSION_COOKIE = 'tacet_session';
+/**
+ * Cookie name for the daemon on `port`. Cookies are not isolated by port, so each daemon (the
+ * Conductor and every Mini-conductor) uses its own name to avoid overwriting the others'.
+ */
+export function sessionCookieName(port: number): string {
+  return `tacet_session_${port}`;
+}
 
 /**
  * Single-use login codes for `tacet open` (ADR-003 §3.4). Only hashes are stored. A code is
@@ -48,13 +54,26 @@ export class OneTimeCodes {
   }
 }
 
-/** Browser sessions created by redeeming a one-time code. In memory; they end with the daemon. */
+/**
+ * Browser sessions created by redeeming a one-time code. In memory; they end with the daemon.
+ * At most `max` sessions are kept; creating one more evicts the oldest.
+ */
 export class BrowserSessions {
   readonly #sessions = new Set<string>();
+  readonly #max: number;
+
+  constructor(opts: { max?: number } = {}) {
+    this.#max = opts.max ?? 32;
+  }
 
   create(): Secret {
     const id = randomToken(32);
     this.#sessions.add(tokenKey(id.reveal()));
+    while (this.#sessions.size > this.#max) {
+      const oldest = this.#sessions.values().next().value;
+      if (oldest === undefined) break;
+      this.#sessions.delete(oldest);
+    }
     return id;
   }
 
@@ -71,17 +90,24 @@ export class BrowserSessions {
   }
 }
 
-/** `Set-Cookie` value for a session: HttpOnly and SameSite=Strict (ADR-003 §3.4). */
-export function sessionCookie(id: Secret): string {
-  return `${SESSION_COOKIE}=${id.reveal()}; HttpOnly; SameSite=Strict; Path=/`;
+/**
+ * `Set-Cookie` value for a session: HttpOnly and SameSite=Strict (ADR-003 §3.4). No `Secure`
+ * flag, because the daemon serves plain HTTP on loopback; no expiry, so it is a session cookie.
+ */
+export function sessionCookie(id: Secret, port: number): string {
+  return `${sessionCookieName(port)}=${id.reveal()}; HttpOnly; SameSite=Strict; Path=/`;
 }
 
-/** The session id from a `Cookie` request header, if present. */
-export function readSessionCookie(cookieHeader: string | undefined | null): string | undefined {
+/** This daemon's session id from a `Cookie` request header, if present. */
+export function readSessionCookie(
+  cookieHeader: string | undefined | null,
+  port: number,
+): string | undefined {
   if (typeof cookieHeader !== 'string') return undefined;
+  const wanted = sessionCookieName(port);
   for (const part of cookieHeader.split(';')) {
     const [name, ...rest] = part.trim().split('=');
-    if (name === SESSION_COOKIE && rest.length > 0) return rest.join('=');
+    if (name === wanted && rest.length > 0) return rest.join('=');
   }
   return undefined;
 }
@@ -98,7 +124,8 @@ export function exchangeCode(
   codes: OneTimeCodes,
   sessions: BrowserSessions,
   code: string | undefined | null,
+  port: number,
 ): CodeExchange {
   if (!codes.redeem(code)) return { ok: false, httpStatus: 401 };
-  return { ok: true, setCookie: sessionCookie(sessions.create()) };
+  return { ok: true, setCookie: sessionCookie(sessions.create(), port) };
 }

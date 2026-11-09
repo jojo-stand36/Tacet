@@ -55,7 +55,7 @@ export function tokenKey(value: string): string {
 /** Extract the token from an `Authorization: Bearer <token>` header value. */
 export function parseBearer(header: string | undefined | null): string | undefined {
   if (typeof header !== 'string') return undefined;
-  const match = /^Bearer[ ]+([A-Za-z0-9._~+/=-]+)$/.exec(header.trim());
+  const match = /^bearer +([A-Za-z0-9._~+/=-]+)$/i.exec(header.trim());
   return match?.[1];
 }
 

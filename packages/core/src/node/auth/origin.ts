@@ -20,6 +20,12 @@ export interface RequestHeaders {
   origin?: string | undefined;
 }
 
+/**
+ * How the request authenticates. `cookie` (browser session) always requires a matching `Origin`.
+ * `bearer` (CLI, Mini-conductor, worker MCP) may omit `Origin`, but a present one must match.
+ */
+export type RequestAuth = 'cookie' | 'bearer';
+
 const reject = (reason: string, httpStatus: 401 | 403 = 403): RequestCheck => ({
   ok: false,
   httpStatus,
@@ -29,20 +35,21 @@ const reject = (reason: string, httpStatus: 401 | 403 = 403): RequestCheck => ({
 
 /**
  * Host and Origin checks for every HTTP and WebSocket request (ADR-003 §3.5). The `Host` must be
- * a loopback name with the server's port; anything else, including a DNS-rebinding hostname that
- * resolved to 127.0.0.1, is rejected. A request that carries an `Origin` must come from a page
- * this daemon served. Set `browser` for cookie-authenticated requests, which must send `Origin`.
+ * exactly a loopback name with the server's port; anything else, including a DNS-rebinding
+ * hostname that resolved to 127.0.0.1, is rejected. A present `Origin` must be a page this daemon
+ * served. `auth` is required so a cookie route cannot forget the Origin requirement; it fails
+ * closed for anything other than `bearer`.
  */
 export function checkHostAndOrigin(
   headers: RequestHeaders,
   port: number,
-  opts: { browser?: boolean } = {},
+  auth: RequestAuth,
 ): RequestCheck {
   const host = headers.host?.trim().toLowerCase();
   if (!host || !allowedHosts(port).includes(host)) return reject('host not allowed');
   const origin = headers.origin?.trim().toLowerCase();
   if (origin === undefined || origin === '') {
-    return opts.browser ? reject('origin required') : { ok: true };
+    return auth === 'bearer' ? { ok: true } : reject('origin required');
   }
   if (!allowedOrigins(port).includes(origin)) return reject('origin not allowed');
   return { ok: true };

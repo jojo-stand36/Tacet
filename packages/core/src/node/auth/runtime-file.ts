@@ -1,13 +1,16 @@
+import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
+  constants,
+  fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
   rmSync,
-  statSync,
   writeSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -54,10 +57,35 @@ export interface WriteRuntimeFileOptions {
   now?: () => Date;
 }
 
+/** Error about a runtime file. Its message never includes file contents. */
+export class RuntimeFileError extends Error {
+  override name = 'RuntimeFileError';
+}
+
+const currentUid = (): number | undefined => process.getuid?.();
+
+/**
+ * Create the run directory if needed and make sure it is a real directory (not a symlink) owned
+ * by the current user, with mode 0700.
+ */
+function ensurePrivateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
+  if (!st.isDirectory() || st.isSymbolicLink()) {
+    throw new RuntimeFileError(`run directory ${dir} is not a directory`);
+  }
+  const uid = currentUid();
+  if (uid !== undefined && st.uid !== uid) {
+    throw new RuntimeFileError(`run directory ${dir} is owned by another user`);
+  }
+  chmodSync(dir, 0o700);
+}
+
 /**
  * Generate a new 256-bit token and write `{pid, port, token, protocolVersions, startedAt}` to
- * `path` with mode 0600, atomically (temp file + rename). Call on every daemon start, so the token
- * rotates. The containing directory is created (or tightened) to mode 0700.
+ * `path` with mode 0600, atomically (exclusive temp file + rename, so a symlink planted at either
+ * path is never followed). Call on every daemon start, so the token rotates. The directory must
+ * be a real directory owned by the current user; it is tightened to mode 0700.
  */
 export function writeRuntimeFile(opts: WriteRuntimeFileOptions): RuntimeInfo {
   const token = randomToken(32);
@@ -68,38 +96,71 @@ export function writeRuntimeFile(opts: WriteRuntimeFileOptions): RuntimeInfo {
     protocolVersions: [...opts.protocolVersions],
     startedAt: (opts.now?.() ?? new Date()).toISOString(),
   };
-  const dir = dirname(opts.path);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
+  ensurePrivateDir(dirname(opts.path));
   const body = `${JSON.stringify({ ...info, token: token.reveal() })}\n`;
-  const tmp = `${opts.path}.${process.pid}.${Date.now()}.tmp`;
+  const tmp = `${opts.path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   const fd = openSync(tmp, 'wx', 0o600);
   try {
-    writeSync(fd, body);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    try {
+      writeSync(fd, body);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, opts.path);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
   }
-  renameSync(tmp, opts.path);
   return info;
 }
 
 /**
- * Read a runtime file written by `writeRuntimeFile`. Refuses a file that group or others can read
- * or write, since the token inside would then be exposed.
+ * Read a runtime file written by `writeRuntimeFile`. The file is opened without following
+ * symlinks and checked through the open descriptor: it must be a regular file owned by the
+ * current user that neither group nor others can access. Errors never contain file contents.
  */
 export function readRuntimeFile(path: string): RuntimeInfo {
-  const mode = statSync(path).mode & 0o777;
-  if ((mode & 0o077) !== 0) {
-    throw new Error(`runtime file ${path} has mode ${mode.toString(8)}; expected 600`);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') throw err;
+    throw new RuntimeFileError(`cannot open runtime file ${path} (${code ?? 'error'})`);
   }
-  const parsed = RuntimeFileJson.parse(JSON.parse(readFileSync(path, 'utf8')));
-  return { ...parsed, token: new Secret(parsed.token) };
+  let text: string;
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new RuntimeFileError(`runtime file ${path} is not a regular file`);
+    const uid = currentUid();
+    if (uid !== undefined && st.uid !== uid) {
+      throw new RuntimeFileError(`runtime file ${path} is owned by another user`);
+    }
+    const mode = st.mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      throw new RuntimeFileError(`runtime file ${path} has mode ${mode.toString(8)}; expected 600`);
+    }
+    text = readFileSync(fd, 'utf8');
+  } finally {
+    closeSync(fd);
+  }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    // JSON.parse messages quote the input, which would leak part of the token.
+    throw new RuntimeFileError(`runtime file ${path} is not valid JSON`);
+  }
+  const parsed = RuntimeFileJson.safeParse(json);
+  if (!parsed.success) throw new RuntimeFileError(`runtime file ${path} has an invalid shape`);
+  return { ...parsed.data, token: new Secret(parsed.data.token) };
 }
 
 /**
  * Delete the runtime file on shutdown, but only if it still holds our token, so a daemon that
- * restarted in the meantime keeps its file.
+ * restarted in the meantime keeps its file. A restart between the read and the delete is a narrow
+ * race; the restarted daemon rewrites its file on its next start.
  */
 export function removeRuntimeFile(path: string, ours: Secret): boolean {
   try {
