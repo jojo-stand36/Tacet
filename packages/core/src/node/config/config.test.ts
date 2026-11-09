@@ -154,6 +154,32 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ userDir, repoRoot })).toThrow(/more than workers.max/);
   });
 
+  it('lets a task lower the Worker pool limits but never raise them', () => {
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'workers: { max: 3, per_adapter: { claude-sdk: 2 } }\n',
+    );
+    const lowered = loadConfig({
+      userDir,
+      repoRoot,
+      task: { workers: { max: 1, per_adapter: { 'claude-sdk': 1, pty: 1 }, stuck_after_s: 60 } },
+    }).config.workers;
+    expect(lowered).toMatchObject({
+      max: 1,
+      per_adapter: { 'claude-sdk': 1, pty: 1 },
+      stuck_after_s: 60,
+    });
+    for (const task of [
+      { workers: { max: 8 } },
+      { workers: { per_adapter: { 'claude-sdk': 3 } } },
+      // A cap the repo does not set is compared with workers.max.
+      { workers: { per_adapter: { pty: 4 } } },
+      { workers: { max_attempts: 9 } },
+    ]) {
+      expect(() => loadConfig({ userDir, repoRoot, task })).toThrow(/may only lower it/);
+    }
+  });
+
   it('merges workers.per_adapter key by key across layers', () => {
     write(
       join(userDir, 'config.yaml'),

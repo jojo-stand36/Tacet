@@ -42,7 +42,7 @@ export type WorkerVendorSession = z.infer<typeof WorkerVendorSession>;
  * - `restart`: the Mini-conductor stopped while it ran. Does not count.
  * - `handoff`: replaced by a fresh session with a HandoffPacket. Does not count.
  * - `canceled`: the task was canceled. Does not count.
- * Unknown values fall back to `failed`, and so count.
+ * Unknown values fall back to `failed`, and so count. (Owner decision, 2026-11-09.)
  */
 export const WorkerEndReason = openEnum(
   ['finished', 'failed', 'stuck', 'restart', 'canceled', 'handoff'],
