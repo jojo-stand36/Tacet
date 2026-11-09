@@ -60,6 +60,12 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 - Packet validated → stored in `.tacet/handoffs/<task>/<n>.json` → session closed → new session seeded with it (model may change per policy).
 - The same packet type is used for mini→conductor summaries and for the Conductor's own self-handoff.
 
+### 2.4 Worker worktrees
+- The Mini-conductor creates each Worker in a uniquely named local branch and a dedicated worktree outside the repository. Creation uses an explicit local base branch (or the checked-out branch).
+- Setup commands are opt-in, run with argv rather than shell interpolation, have a timeout, and receive a limited environment by default. Tacet does not copy `.env` files.
+- Garbage collection removes only stale, manager-owned, clean worktrees; active, modified, untracked, or ignored-file worktrees are retained.
+- PR and manual strategies leave the Worker branch for review or user handling. Squash-to-branch stages the result in a separate managed worktree based on the target branch; it does not change the target, commit, or push. Conflict checks do not modify branches, and conflicted rebases are aborted.
+
 ## 3. Key interfaces (sketch)
 
 ```ts
