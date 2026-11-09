@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import {
   type AgentEvent,
   type Decision,
+  Escalation,
   type EventEnvelope,
   newUlid,
   type Priority,
@@ -145,6 +146,8 @@ export class MiniConductor {
   readonly #planning = new Set<string>();
   /** Background work (plans, Worker event loops) that `stop()` waits for. */
   readonly #inflight = new Set<Promise<unknown>>();
+  /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
+  readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
@@ -558,13 +561,21 @@ export class MiniConductor {
   }
 
   async #rollUp(gen: number): Promise<void> {
-    const v = this.#state();
-    for (const { parent, subs, state } of this.#parentUpdates(v)) {
-      if (!this.#live(gen)) return;
+    const updates = this.#parentUpdates(this.#state());
+    // Waiting and working states first, as they are now: the awaits below must not make them stale.
+    for (const { parent, state } of updates) {
       if (!TERMINAL.has(state)) {
         this.#o.store.append(this.#env(parent.task.id, 'task.status', { state }));
-        continue;
       }
+    }
+    for (const update of updates) {
+      if (!this.#live(gen) || !TERMINAL.has(update.state)) continue;
+      // Still due after the awaits of earlier parents?
+      const fresh = this.#parentUpdates(this.#state()).find(
+        (u) => u.parent.task.id === update.parent.task.id && u.state === update.state,
+      );
+      if (!fresh) continue;
+      const { parent, subs, state } = fresh;
       // The latest result of each sub-task, not earlier failed attempts.
       const results = subs
         .map((t) =>
@@ -652,12 +663,25 @@ export class MiniConductor {
     }
   }
 
-  /** The sub-tasks `subtaskId` depends on, from its parent's plan. */
+  /**
+   * The sub-tasks `subtaskId` depends on, directly or not, from its parent's plan: direct ones
+   * first. Indirect ones count because a sub-task that commits nothing (a review) has no commit
+   * of its own to carry its dependencies' work forward.
+   */
   #dependencies(subtaskId: string): string[] {
     const v = this.#state();
     const parentId = v.tasks[subtaskId]?.task.parentId;
     const plan = parentId ? v.tasks[parentId]?.plan : undefined;
-    return [...(plan?.find((p) => p.id === subtaskId)?.dependsOn ?? [])];
+    const deps = (id: string) => plan?.find((p) => p.id === id)?.dependsOn ?? [];
+    const out: string[] = [];
+    const queue = [...deps(subtaskId)];
+    while (queue.length > 0) {
+      const id = queue.shift() as string;
+      if (id === subtaskId || out.includes(id)) continue;
+      out.push(id);
+      queue.push(...deps(id));
+    }
+    return out;
   }
 
   /** The commit holding a completed sub-task's work, if it made one. */
@@ -687,47 +711,72 @@ export class MiniConductor {
     if (!integrator || deps.length === 0) return { notes: [] };
     try {
       const commit = await integrator.combine(deps.map((d) => d.commit));
+      this.#combineFailures.delete(subtaskId);
       return { ...(commit !== undefined ? { commit } : {}), notes: [] };
     } catch (err) {
       if (!this.#live(gen)) return undefined;
       this.#errors.push(err);
       if (!(err instanceof MergeConflictError)) {
-        this.#o.store.append(
-          this.#env(subtaskId, 'task.status', {
-            state: 'failed',
-            message: `combining the work it depends on failed: ${redactSecrets((err as Error).message)}`,
-          }),
-        );
+        // A git error (a timeout, say) may pass: try again on later ticks, a few times.
+        const n = (this.#combineFailures.get(subtaskId) ?? 0) + 1;
+        this.#combineFailures.set(subtaskId, n);
+        if (n >= (this.#o.config.workers?.max_attempts ?? 3)) {
+          this.#combineFailures.delete(subtaskId);
+          this.#o.store.append(
+            this.#env(subtaskId, 'task.status', {
+              state: 'failed',
+              message: `combining the work it depends on failed: ${redactSecrets((err as Error).message)}`,
+            }),
+          );
+        }
         return undefined;
       }
       const key = `tacet:merge-conflict:${deps.map((d) => d.commit).join(',')}`;
       const [first, ...rest] = deps as [{ id: string; commit: string }, ...typeof deps];
-      const answered = [...this.#state().escalations.values()].some(
-        (x) => x.taskId === subtaskId && x.contextRef === key && x.resolved,
+      // Only the Mini-conductor's own question (no Worker session) counts.
+      const answer = [...this.#state().escalations.values()].find(
+        (x) => x.taskId === subtaskId && x.contextRef === key && !x.sessionId && x.resolved,
       );
-      if (answered) {
+      if (answer) {
         return {
           commit: first.commit,
           notes: [
-            `Your checkout has the work of ${first.id} only. The work of ${rest.map((d) => d.id).join(', ')}, which this sub-task also depends on, conflicts with it (${fileList(err.files)}). Before anything else, merge these commits into your HEAD with git and resolve the conflicts: ${rest.map((d) => d.commit).join(' ')}.`,
+            `Your checkout started from the work of ${first.id} only. The work of ${rest.map((d) => d.id).join(', ')}, which this sub-task also depends on, conflicts with it (${fileList(err.files)}). Unless your HEAD already has them, first merge these commits into it with git and resolve the conflicts: ${rest.map((d) => d.commit).join(' ')}.`,
+            // A retry or a new session after the answer went out still needs it.
+            ...(answer.delivered && answer.answer
+              ? [`The user's guidance on the conflict: ${answer.answer}`]
+              : []),
           ],
         };
       }
-      this.#o.store.append([
-        this.#env(subtaskId, 'escalation.raised', {
-          id: newUlid(this.#now().getTime()),
-          taskId: subtaskId,
-          question: `The work of ${deps.map((d) => d.id).join(', ')}, which ${subtaskId} depends on, conflicts (${fileList(err.files)}). When you answer, ${subtaskId} starts from the work of ${first.id} and its Worker merges the rest and resolves the conflicts, with your answer as guidance.`,
-          urgency: 'normal',
-          category: 'blocked',
-          contextRef: key,
-          createdAt: this.#now().toISOString(),
-          status: 'pending',
-        }),
-        this.#env(subtaskId, 'task.status', { state: 'input_required' }),
-      ]);
+      this.#raise(
+        subtaskId,
+        `The work of ${deps.map((d) => d.id).join(', ')}, which ${subtaskId} depends on, conflicts (${fileList(err.files)}). When you answer, ${subtaskId} starts from the work of ${first.id} and its Worker merges the rest and resolves the conflicts, with your answer as guidance.`,
+        { urgency: 'normal', category: 'blocked', contextRef: key },
+      );
       return undefined;
     }
+  }
+
+  /** The Mini-conductor's own escalation on `taskId`, which waits for it (`input_required`). */
+  #raise(
+    taskId: string,
+    question: string,
+    extra: Pick<Escalation, 'urgency'> & Partial<Pick<Escalation, 'category' | 'contextRef'>>,
+  ): void {
+    const escalation = Escalation.parse({
+      id: newUlid(this.#now().getTime()),
+      taskId,
+      ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+      question,
+      ...extra,
+      createdAt: this.#now().toISOString(),
+      status: 'pending',
+    });
+    this.#o.store.append([
+      this.#env(taskId, 'escalation.raised', escalation),
+      this.#env(taskId, 'task.status', { state: 'input_required' }),
+    ]);
   }
 
   // ---- Workers ---------------------------------------------------------------------------
@@ -760,14 +809,12 @@ export class MiniConductor {
         ? await this.#o.workspaces.get(last.workspaceId)
         : undefined;
     const sessionId = randomUUID();
-    let baseCommit = existing ? last?.baseCommit : undefined;
-    const notes: string[] = [];
-    if (!existing) {
-      const start = await this.#startingPoint(subtaskId, gen);
-      if (!start || !this.#live(gen) || this.#runs.has(subtaskId)) return;
-      baseCommit = start.commit;
-      notes.push(...start.notes);
-    }
+    // Worked out for a reused checkout too: it keeps its base, but its Worker may still have to
+    // merge conflicting work (#134).
+    const start = await this.#startingPoint(subtaskId, gen);
+    if (!start || !this.#live(gen) || this.#runs.has(subtaskId)) return;
+    const baseCommit = existing ? last?.baseCommit : start.commit;
+    const notes = start.notes;
     // A new checkout is named after the session that first uses it, so a sub-task that needs a
     // fresh one (its last failed the integrity checks) never collides with its old one.
     const workspace = existing ?? (await this.#o.workspaces.create(sessionId, baseCommit));
@@ -1081,17 +1128,11 @@ export class MiniConductor {
       this.#errors.push(err);
       if (err instanceof WorktreeRefusedError) {
         // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
-        this.#o.store.append([
-          this.#env(run.subtaskId, 'escalation.raised', {
-            id: newUlid(this.#now().getTime()),
-            taskId: run.subtaskId,
-            question: `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
-            urgency: 'high',
-            createdAt: this.#now().toISOString(),
-            status: 'pending',
-          }),
-          this.#env(run.subtaskId, 'task.status', { state: 'input_required' }),
-        ]);
+        this.#raise(
+          run.subtaskId,
+          `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
+          { urgency: 'high' },
+        );
         await this.#end(run, 'canceled', 'checkout failed its integrity checks', {
           workspaceRefused: true,
         });
@@ -1406,6 +1447,8 @@ function alive(pid: number): boolean {
 /** Conflicting files for a question: repo-relative, at most 20. */
 function fileList(files: readonly string[]): string {
   if (files.length === 0) return 'no file named';
-  const shown = files.slice(0, 20).join(', ');
+  // Names come from Worker commits: keep each one short.
+  const name = (f: string) => (f.length > 120 ? `${f.slice(0, 117)}...` : f);
+  const shown = files.slice(0, 20).map(name).join(', ');
   return files.length > 20 ? `${shown} and ${files.length - 20} more` : shown;
 }

@@ -9,7 +9,7 @@ import { GitIntegrator, resultBranch, taskBranch } from '../git/integrate.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
 import type { Planner, ProposedSubtask, Workspace, Workspaces } from './ports.js';
-import { ScriptedAdapter } from './testing.js';
+import { type Script, ScriptedAdapter } from './testing.js';
 
 /**
  * The daemon with real git checkouts (#119): a Worker commits the way a sandboxed Codex Worker
@@ -76,12 +76,11 @@ describe('MiniConductor with git worktrees', () => {
   });
 
   function start(
-    script: (cwd: string, input: string) => void,
+    script: (cwd: string, input: string) => unknown,
     planner: Planner = new SingleStepPlanner(),
   ) {
     const fake = new ScriptedAdapter('fake', (input, s) => {
-      script(s.opts.cwd, input);
-      return { do: 'reply', text: 'done' };
+      return (script(s.opts.cwd, input) as Script | undefined) ?? { do: 'reply', text: 'done' };
     });
     daemon = new MiniConductor({
       store,
@@ -120,6 +119,17 @@ describe('MiniConductor with git worktrees', () => {
         { key: 'c', goal: 'write [c]', acceptanceCriteria: ['ok'], dependsOn: ['a', 'b'] },
       ];
       return { subtasks, rationale: 'diamond', planner: { adapter: 'test' } };
+    },
+  };
+  /** Implement, a review that commits nothing, then a fix that depends on the review. */
+  const chain: Planner = {
+    async plan() {
+      const subtasks: ProposedSubtask[] = [
+        { key: 'a', goal: 'write [a]', acceptanceCriteria: ['ok'] },
+        { key: 'b', goal: 'review [b]', acceptanceCriteria: ['ok'], dependsOn: ['a'] },
+        { key: 'c', goal: 'fix [c]', acceptanceCriteria: ['ok'], dependsOn: ['b'] },
+      ];
+      return { subtasks, rationale: 'chain', planner: { adapter: 'test' } };
     },
   };
   const tasks = () => store.replay(tasksProjection).tasks;
@@ -286,6 +296,8 @@ describe('MiniConductor with git worktrees', () => {
       else if (input.includes('[b]')) commitFiles(cwd, { 'x.txt': 'from b\n' });
       else if (input.includes('[c]')) {
         inputs.push(input);
+        // The first attempt fails before merging anything; the retry still gets the guidance.
+        if (inputs.length === 1) return { do: 'error', message: 'crashed' };
         commitFiles(cwd, { 'c.txt': 'c\n' });
       }
     }, diamond);
@@ -314,14 +326,41 @@ describe('MiniConductor with git worktrees', () => {
     });
     await d.settled();
     expect(tasks()[c]?.state).toBe('completed');
-    expect(inputs).toHaveLength(1);
-    expect(inputs[0]).toMatch(/merge these commits/);
-    expect(inputs[0]).toContain('keep the a version');
+    expect(inputs).toHaveLength(2);
+    for (const input of inputs) {
+      expect(input).toMatch(/merge these commits/);
+      expect(input).toContain('keep the a version');
+    }
+    const workspaces = data<{ workspaceId: string }>(c, 'worker.started').map((x) => x.workspaceId);
+    expect(new Set(workspaces).size).toBe(1);
     const a = data<{ commits: string[] }>(`${id}/1`, 'task.result').at(-1)?.commits?.[0];
     expect(data<{ baseCommit?: string }>(c, 'worker.started')[0]?.baseCommit).toBe(a);
     // c did not merge b, so the whole task cannot be combined: said, not hidden.
     const parent = data<{ openQuestions: string[] }>(id, 'task.result').at(-1);
     expect(parent?.openQuestions.join('\n')).toMatch(/conflicts \(x\.txt\)/);
     expect(() => git(repo, ['rev-parse', '--verify', '-q', resultBranch(id)])).toThrow();
+  });
+
+  it('carries work through a sub-task that commits nothing', async () => {
+    const seen: Record<string, boolean> = {};
+    const d = start((cwd, input) => {
+      if (input.includes('[a]')) commitFiles(cwd, { 'a.txt': 'a\n' });
+      else if (input.includes('[b]')) seen.b = existsSync(join(cwd, 'a.txt'));
+      else if (input.includes('[c]')) {
+        seen.c = existsSync(join(cwd, 'a.txt'));
+        commitFiles(cwd, { 'c.txt': 'c\n' });
+      }
+    }, chain);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    // One dependency: its own commit. Through the review, which committed nothing: still a's.
+    expect(seen).toEqual({ b: true, c: true });
+    expect(data<{ commits: string[] }>(`${id}/2`, 'task.result').at(-1)?.commits).toEqual([]);
+    const result = resultBranch(id);
+    for (const f of ['a.txt', 'c.txt']) git(repo, ['cat-file', '-e', `${result}:${f}`]);
+    // a is in c, so the result is c's commit itself: no needless merge.
+    expect(git(repo, ['rev-parse', result])).toBe(git(repo, ['rev-parse', taskBranch(`${id}/3`)]));
   });
 });
