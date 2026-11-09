@@ -156,6 +156,8 @@ Tacet owns its core and interoperates at the protocol level ([ADR-001](adr/001-b
 ## 6. Security & auth principles
 Local servers ([ADR-003 §3, §5, §6](adr/003-wire-protocols.md#3-auth-token-handshake-all-local-servers)):
 
+The building blocks live in `@tacet/core/node` (`packages/core/src/node/auth/`, #77): `writeRuntimeFile`/`readRuntimeFile`, `listenLoopback`, `checkHostAndOrigin`, `HelloGate`, `OneTimeCodes`/`BrowserSessions`/`exchangeCode`, `WorkerTokens`, and a `Secret` wrapper that prints `[redacted]` everywhere except `reveal()`. The daemons wire them into their HTTP and WebSocket servers.
+
 - **Binding.** The Conductor and each mini-conductor bind `127.0.0.1` and `::1` on an OS-assigned port. Remote or LAN access is an explicit opt-in (`remote: true` plus TLS) and is out of scope for v0.
 - **Token.** Each daemon generates a 256-bit token on start and rotates it on every start. The token is written, with the pid, port and protocol versions, to a runtime file in `~/.tacet/run/` that only the user can read (mode 0600 on POSIX). It is never inside a repo, and it is never logged or put in events.
 - **Browsers** never get the token. `tacet open` opens `http://127.0.0.1:<port>/#code=<one-time-code>`. The page exchanges the code (single use, 60 s lifetime) at `POST /auth/session` for an `HttpOnly; SameSite=Strict` session cookie.

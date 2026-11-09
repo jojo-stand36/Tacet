@@ -209,7 +209,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Implement config layering from ARCHITECTURE.md §4 with schema validation and helpful errors.\n\n### Tasks\n- [ ] ~/.tacet/config.yaml, <repo>/.tacet/tacet.yaml, <repo>/.tacet/local.yaml\n- [ ] Merge semantics documented; `tacet config explain` shows effective config + source of each value\n- [ ] Secrets referenced from env/keychain, never stored in repo config\n\n### Acceptance criteria\n- Effective config is deterministic and explainable\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Implement config layering from ARCHITECTURE.md §4 with schema validation and helpful errors.\n\n### Tasks\n- [ ] ~/.tacet/config.yaml, <repo>/.tacet/tacet.yaml, <repo>/.tacet/local.yaml\n- [ ] Merge semantics documented; `tacet config explain` shows effective config + source of each value\n- [ ] Secrets referenced from env/keychain, never stored in repo config\n- [ ] Borrow (ADR-001): Three-level policy model (task > repo `.tacet/` > user) with ALLOW/DENY/ASK, where DENY short-circuits and ASK becomes an Escalation (Omnigent `docs/POLICIES.md`); coordinate with #25\n- [ ] Borrow (ADR-001): Generic `acp:<slug>` agent registry in user config (Omnigent `docs/AGENT_YAML_SPEC.md` §Custom ACP agents); coordinate with #13\n- [ ] Borrow (ADR-001): Per-CLI agent presets as config (launch command, ready prompt, resume flag, process name), after Gas Town's provider presets (`docs/agent-provider-integration.md` §Tier 1); used by #15\n\n### Acceptance criteria\n- Effective config is deterministic and explainable\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Spike: adapter capability matrix across Claude, Codex, OpenCode, Gemini, ACP",
@@ -275,7 +275,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, OpenCode, Claude/Codex via their ACP adapters). Implements ACP v1; v2 is tracked separately.\n\n### Tasks\n- [ ] Use official ACP TS SDK (`@agentclientprotocol/sdk`)\n- [ ] stdio transport: newline-delimited JSON-RPC, stderr captured to the Worker log\n- [ ] Capability negotiation → capability flags (fork only if `sessionCapabilities.fork`, marked unstable; live usage only if the agent sends `usage_update`)\n- [ ] Cancel flow: `session/cancel`, answer pending `session/request_permission` with `cancelled`, map `stopReason: cancelled` (or `-32800`) to a cancelled turn, not an error\n- [ ] Permission options → Decision (`allow_once`, `allow_always`, `reject_once`; Gemini's reject option id is `cancel`)\n- [ ] Model switch via the config option with category `model` (no `session/set_model`)\n- [ ] Per-session MCP injection via `session/new.mcpServers` with headers\n- [ ] Configurable command per agent\n- [ ] Auth default: API key only. Launch `@agentclientprotocol/claude-agent-acp` with `--hide-claude-auth` and `@agentclientprotocol/codex-acp` with `NO_BROWSER=1`; never call ACP `authenticate` with a subscription method (owner decision 2026-11-09; #65 stays open)\n- [ ] Keep the prompt-turn code isolated so an ACP v2 path can be added later\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite over ACP\n- Cancel and permission flows are covered by recorded fixtures (see docs/adapters/spikes/61-acp, 63-gemini)\n- Subscription auth methods are never selected by default (test)\n\n_See docs/adapters/capability-matrix.md (ACP section), docs/adapters/spikes/61-acp, 62-acp-adapters, 63-gemini, and docs/ARCHITECTURE.md._"
+      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, OpenCode, Claude/Codex via their ACP adapters). Implements ACP v1; v2 is tracked separately.\n\n### Tasks\n- [ ] Use official ACP TS SDK (`@agentclientprotocol/sdk`)\n- [ ] stdio transport: newline-delimited JSON-RPC, stderr captured to the Worker log\n- [ ] Capability negotiation → capability flags (fork only if `sessionCapabilities.fork`, marked unstable; live usage only if the agent sends `usage_update`)\n- [ ] Cancel flow: `session/cancel`, answer pending `session/request_permission` with `cancelled`, map `stopReason: cancelled` (or `-32800`) to a cancelled turn, not an error\n- [ ] Permission options → Decision (`allow_once`, `allow_always`, `reject_once`; Gemini's reject option id is `cancel`)\n- [ ] Model switch via the config option with category `model` (no `session/set_model`)\n- [ ] Per-session MCP injection via `session/new.mcpServers` with headers\n- [ ] Configurable command per agent\n- [ ] Auth default: API key only. Launch `@agentclientprotocol/claude-agent-acp` with `--hide-claude-auth` and `@agentclientprotocol/codex-acp` with `NO_BROWSER=1`; never call ACP `authenticate` with a subscription method (owner decision 2026-11-09; #65 stays open)\n- [ ] Keep the prompt-turn code isolated so an ACP v2 path can be added later\n- [ ] Borrow (ADR-001): Generic `acp:<slug>` registry so any ACP agent can be added by config (Omnigent `docs/AGENT_YAML_SPEC.md` §Custom ACP agents)\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite over ACP\n- Cancel and permission flows are covered by recorded fixtures (see docs/adapters/spikes/61-acp, 63-gemini)\n- Subscription auth methods are never selected by default (test)\n\n_See docs/adapters/capability-matrix.md (ACP section), docs/adapters/spikes/61-acp, 62-acp-adapters, 63-gemini, and docs/ARCHITECTURE.md._"
     },
     {
       "title": "Adapter: OpenCode server (HTTP + SSE)",
@@ -308,7 +308,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Create/clean git worktrees per worker; branch naming; merge/rebase helpers; conflict detection.\n\n### Tasks\n- [ ] Create from base branch, setup script hook (install deps, copy .env)\n- [ ] GC of stale worktrees\n- [ ] Merge strategies: PR, squash-to-branch, manual\n\n### Acceptance criteria\n- 10 parallel workers without collisions on a sample repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Create/clean git worktrees per worker; branch naming; merge/rebase helpers; conflict detection.\n\n### Tasks\n- [ ] Create from base branch, setup script hook (install deps, copy .env)\n- [ ] GC of stale worktrees\n- [ ] Merge strategies: PR, squash-to-branch, manual\n- [ ] Borrow (ADR-001): Review Vibe Kanban's worktree manager crate for design ideas only (Apache-2.0, Rust, project sunsetting; `crates/worktree-manager`); no code port\n\n### Acceptance criteria\n- 10 parallel workers without collisions on a sample repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Mini-conductor daemon: task queue, planner, worker pool",
@@ -353,7 +353,7 @@
         "good first issue",
         "agent:copilot"
       ],
-      "body": "Scaffold `.tacet/` in a repo with sensible defaults and detect available agent CLIs.\n\n### Tasks\n- [ ] Detect installed CLIs (claude, codex, gemini, opencode, goose…) and auth state\n- [ ] Write tacet.yaml + .gitignore entry for local.yaml\n- [ ] Idempotent re-run\n\n### Acceptance criteria\n- Works on a fresh clone in < 30s\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Scaffold `.tacet/` in a repo with sensible defaults and detect available agent CLIs.\n\n### Tasks\n- [ ] Detect installed CLIs (claude, codex, gemini, opencode, goose…) and auth state\n- [ ] Write tacet.yaml + .gitignore entry for local.yaml\n- [ ] Idempotent re-run\n- [ ] Borrow (ADR-001): A matching `tacet uninstall`: preview what will be removed first, `--purge` with a backup (Omnigent `docs/UNINSTALL_DESIGN.md`); Gas Town is criticised for being hard to remove\n\n### Acceptance criteria\n- Works on a fresh clone in < 30s\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "CLI: tacet run / status / attach / logs (standalone mode)",
@@ -500,7 +500,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security → frontier)\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security → frontier)\n- [ ] Borrow (ADR-001): Capacity governor: a per-repo cap on concurrent workers, after Gas Town's scheduler `max_polecats` (`docs/design/scheduler.md`); coordinate with #17\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Escalation ladder: retry with stronger model before asking a human",
@@ -634,7 +634,7 @@
         "priority:p1",
         "agent:copilot"
       ],
-      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n- [ ] Borrow (ADR-001): Per-severity notification routes, with stale re-escalation feeding the channels (Gas Town `docs/design/escalation.md`); coordinate with #26\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Chat channels: Slack / Discord / Telegram (two-way)",
@@ -668,7 +668,7 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Reusable multi-step workflows, including non-code folders as 'workspaces'.\n\n### Tasks\n- [ ] Template format (YAML)\n- [ ] Starter templates\n- [ ] Sequential + parallel steps\n\n### Acceptance criteria\n- 3 templates shipped and documented\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Reusable multi-step workflows, including non-code folders as 'workspaces'.\n\n### Tasks\n- [ ] Template format (YAML)\n- [ ] Starter templates\n- [ ] Sequential + parallel steps\n- [ ] Borrow (ADR-001): Later: workflow graphs as data, after Gas City formulas (TOML workflow graphs; gascity `README.md`, `docs/`)\n\n### Acceptance criteria\n- 3 templates shipped and documented\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Scheduled and triggered tasks",
@@ -679,7 +679,7 @@
         "priority:p2",
         "agent:copilot"
       ],
-      "body": "Cron/webhook/GitHub-event triggered tasks (e.g. nightly dependency triage).\n\n### Tasks\n- [ ] Scheduler\n- [ ] GitHub webhook trigger\n\n### Acceptance criteria\n- Nightly job demo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Cron/webhook/GitHub-event triggered tasks (e.g. nightly dependency triage).\n\n### Tasks\n- [ ] Scheduler\n- [ ] GitHub webhook trigger\n- [ ] Borrow (ADR-001): Later: scheduled or triggered runs, after Gas City orders (gascity `README.md`, `docs/`)\n\n### Acceptance criteria\n- Nightly job demo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Plugin system: adapters, channels, tools, workflows",
@@ -701,7 +701,7 @@
         "priority:p2",
         "agent:claude"
       ],
-      "body": "Let editors talk to a repo's mini-conductor as a single agent.\n\n### Tasks\n- [ ] ACP agent server\n- [ ] Map escalations to ACP permission requests\n\n### Acceptance criteria\n- Works from Zed\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Let editors talk to a repo's mini-conductor as a single agent.\n\n### Tasks\n- [ ] ACP agent server\n- [ ] Map escalations to ACP permission requests\n- [ ] Borrow (ADR-001): Interop: register a Mini-conductor in Omnigent as `acp:tacet` (Omnigent `docs/AGENT_YAML_SPEC.md` L410–445, `docs/openclaw.md`)\n- [ ] Borrow (ADR-001): Interop: run as a Gas City worker through its `acp` session provider or `exec:` (gascity `docs/reference/config.md` §ACPSessionConfig)\n- [ ] Borrow (ADR-001): Prior art: Gas Town's Mayor over ACP as a headless proxy (`internal/acp/proxy.go`, `internal/cmd/mayor.go`)\n\n### Acceptance criteria\n- Works from Zed\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Expose conductor via A2A",
@@ -723,7 +723,7 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n- [ ] Borrow (ADR-001): OS sandbox wrappers for workers: `bwrap` on Linux, `seatbelt` on macOS, as Omnigent does (`omnigent/sandbox/`); coordinate with #15\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Evaluation harness: escalation quality, handoff fidelity, cost",
