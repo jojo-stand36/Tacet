@@ -19,6 +19,11 @@
       "types": "./dist/node/index.d.ts",
       "default": "./dist/node/index.js"
     },
+    "./testing": {
+      "@tacet/source": "./src/testing/index.ts",
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
     "./schema/v1/*.json": "./schema/v1/*.json"
   },
   "files": [
