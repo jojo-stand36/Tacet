@@ -12,11 +12,28 @@ export interface Workspace {
 }
 
 export interface Workspaces {
-  /** A fresh checkout for `workerId` (the sub-task id). */
+  /** A fresh checkout for the Worker session `workerId`; never an existing one. */
   create(workerId: string): Promise<Workspace>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   remove(id: string): Promise<void>;
+}
+
+/** The Worker's checkout failed its integrity checks: nothing was run in it. */
+export class WorktreeRefusedError extends Error {
+  override name = 'WorktreeRefusedError';
+}
+
+/**
+ * Brings a sub-task's Worker commits into the repo (#119). Returns undefined when there is
+ * nothing to integrate; throws `WorktreeRefusedError` when the checkout fails its integrity
+ * checks (nothing was run in it).
+ */
+export interface Integrator {
+  integrate(
+    subtaskId: string,
+    workspace: Workspace,
+  ): Promise<{ commit: string; ref: string } | undefined>;
 }
 
 /** Checks a finished Worker turn before its sub-task counts as `completed` (#19 replaces it). */

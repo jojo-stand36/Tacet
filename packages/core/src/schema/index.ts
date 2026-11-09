@@ -9,7 +9,13 @@ import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
 import { SummaryPacket } from './summary.js';
 import { Task, TaskExt } from './task.js';
-import { WorkerEnded, WorkerNudged, WorkerStarted, WorkerVendorSession } from './worker.js';
+import {
+  WorkerEnded,
+  WorkerIntegrated,
+  WorkerNudged,
+  WorkerStarted,
+  WorkerVendorSession,
+} from './worker.js';
 
 export * from './agent-event.js';
 export * from './common.js';
@@ -60,6 +66,7 @@ export const jsonSchemas = {
   },
   'worker-ended': { schema: WorkerEnded, title: 'Tacet worker.ended payload' },
   'worker-nudged': { schema: WorkerNudged, title: 'Tacet worker.nudged payload' },
+  'worker-integrated': { schema: WorkerIntegrated, title: 'Tacet worker.integrated payload' },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;
