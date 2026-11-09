@@ -21,12 +21,29 @@ export interface RequestHeaders {
 }
 
 /**
- * Who is calling. `browser`: the web UI, i.e. the unauthenticated WebSocket upgrade and every
- * HTTP call that carries a browser session token; it always requires a matching `Origin`.
- * `bearer`: programmatic clients with a daemon or worker token (CLI, Mini-conductor, worker MCP);
- * they may omit `Origin`, but a present one must match.
+ * Who is calling. A present `Origin` must always match; the kinds differ only in whether it may
+ * be missing.
+ * - `browser`: requests without a credential the page could only hold if served by this daemon,
+ *   i.e. the unauthenticated WebSocket upgrade and the one-time-code exchange. `Origin` required.
+ * - `session`: HTTP calls carrying a validated browser session token. Browsers send no `Origin`
+ *   on GET and HEAD unless the request is CORS (Fetch standard, "append a request `Origin`
+ *   header"), so it may be missing there; any other method requires it. A missing `Origin` is not
+ *   proof of same-origin: the session token is the control and the Origin check is extra defence,
+ *   so session GET/HEAD handlers must not change state. Low-level: daemons should call
+ *   `authorizeSessionRequest`, which validates the token and rejects upgrades first.
+ * - `bearer`: programmatic clients with a daemon or worker token (CLI, Mini-conductor, worker
+ *   MCP). `Origin` may be missing.
  */
-export type RequestAuth = 'browser' | 'bearer';
+export type RequestAuth = 'browser' | 'session' | 'bearer';
+
+const SAFE_METHODS = new Set(['GET', 'HEAD']);
+
+function originOptional(auth: RequestAuth, method: string | undefined): boolean {
+  if (auth === 'bearer') return true;
+  // Methods are case-sensitive (RFC 9110 §9.1); Node and browsers send them uppercase.
+  if (auth === 'session') return method !== undefined && SAFE_METHODS.has(method);
+  return false;
+}
 
 const reject = (reason: string, httpStatus: 401 | 403 = 403): RequestCheck => ({
   ok: false,
@@ -39,19 +56,21 @@ const reject = (reason: string, httpStatus: 401 | 403 = 403): RequestCheck => ({
  * Host and Origin checks for every HTTP and WebSocket request (ADR-003 §3.5). The `Host` must be
  * exactly a loopback name with the server's port; anything else, including a DNS-rebinding
  * hostname that resolved to 127.0.0.1, is rejected. A present `Origin` must be a page this daemon
- * served. `auth` is required so a browser route cannot forget the Origin requirement; it fails
- * closed for anything other than `bearer`.
+ * served. `auth` is required so a browser route cannot forget the Origin requirement; a missing
+ * `Origin` fails closed except where `RequestAuth` allows it. `method` is the request line's
+ * method (`req.method`), never a header, and is only read for `session`.
  */
 export function checkHostAndOrigin(
   headers: RequestHeaders,
   port: number,
   auth: RequestAuth,
+  method?: string,
 ): RequestCheck {
   const host = headers.host?.trim().toLowerCase();
   if (!host || !allowedHosts(port).includes(host)) return reject('host not allowed');
   const origin = headers.origin?.trim().toLowerCase();
   if (origin === undefined || origin === '') {
-    return auth === 'bearer' ? { ok: true } : reject('origin required');
+    return originOptional(auth, method) ? { ok: true } : reject('origin required');
   }
   if (!allowedOrigins(port).includes(origin)) return reject('origin not allowed');
   return { ok: true };

@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  authorizeSessionRequest,
   BrowserSessions,
   CLOSE_NO_COMMON_VERSION,
   CLOSE_POLICY_VIOLATION,
@@ -193,6 +194,7 @@ describe('Host and Origin checks', () => {
   ])('rejects Origin: %s', (_label, origin) => {
     expect(checkHostAndOrigin({ host, origin }, port, 'bearer').ok).toBe(false);
     expect(checkHostAndOrigin({ host, origin }, port, 'browser').ok).toBe(false);
+    expect(checkHostAndOrigin({ host, origin }, port, 'session', 'GET').ok).toBe(false);
   });
 
   it.each(['http://127.0.0.1:4100', 'http://[::1]:4100', 'HTTP://LOCALHOST:4100'])(
@@ -206,6 +208,114 @@ describe('Host and Origin checks', () => {
     expect(checkHostAndOrigin({ host }, port, 'browser').ok).toBe(false);
     expect(checkHostAndOrigin({ host, origin: '' }, port, 'browser').ok).toBe(false);
     expect(checkHostAndOrigin({ host }, port, 'bearer').ok).toBe(true);
+  });
+
+  it('lets session-token GET and HEAD omit Origin, nothing else', () => {
+    for (const method of ['GET', 'HEAD']) {
+      expect(checkHostAndOrigin({ host }, port, 'session', method).ok).toBe(true);
+    }
+    for (const method of ['get', 'POST', 'PUT', 'DELETE', 'PATCH', undefined]) {
+      expect(checkHostAndOrigin({ host }, port, 'session', method)).toMatchObject({
+        ok: false,
+        reason: 'origin required',
+      });
+    }
+    // The Host check still applies, so a rebinding hostname cannot use the exemption.
+    expect(checkHostAndOrigin({ host: 'evil.example:4100' }, port, 'session', 'GET').ok).toBe(
+      false,
+    );
+    // A `method` header is not the method: only the argument counts.
+    const spoofed = { host, method: 'GET' } as { host: string };
+    expect(checkHostAndOrigin(spoofed, port, 'session').ok).toBe(false);
+    // The WebSocket upgrade is also a GET but uses `browser`, which never exempts.
+    expect(checkHostAndOrigin({ host }, port, 'browser', 'GET').ok).toBe(false);
+  });
+
+  it('authorizeSessionRequest checks the token, then Origin with the real method', () => {
+    const sessions = new BrowserSessions();
+    const authorization = `Bearer ${sessions.create().reveal()}`;
+    const req = (method: string, headers: Record<string, string>) => ({
+      method,
+      headers: { host, ...headers },
+    });
+    expect(authorizeSessionRequest(req('GET', { authorization }), port, sessions).ok).toBe(true);
+    expect(authorizeSessionRequest(req('GET', {}), port, sessions)).toMatchObject({
+      ok: false,
+      httpStatus: 401,
+    });
+    expect(
+      authorizeSessionRequest(req('GET', { authorization: 'Bearer forged' }), port, sessions),
+    ).toMatchObject({ ok: false, httpStatus: 401 });
+    expect(authorizeSessionRequest(req('POST', { authorization }), port, sessions)).toMatchObject({
+      ok: false,
+      reason: 'origin required',
+    });
+    expect(
+      authorizeSessionRequest(
+        req('POST', { authorization, origin: `http://127.0.0.1:${port}` }),
+        port,
+        sessions,
+      ).ok,
+    ).toBe(true);
+    expect(
+      authorizeSessionRequest(
+        req('GET', { authorization, origin: 'http://attacker.example' }),
+        port,
+        sessions,
+      ).ok,
+    ).toBe(false);
+    // A rebinding Host is refused before the token is looked at.
+    expect(
+      authorizeSessionRequest(
+        { method: 'GET', headers: { host: 'evil.example:4100', authorization: 'Bearer forged' } },
+        port,
+        sessions,
+      ),
+    ).toMatchObject({ ok: false, httpStatus: 403, reason: 'host not allowed' });
+    // An upgrade never takes the session path, even with a valid token.
+    expect(
+      authorizeSessionRequest(req('GET', { authorization, upgrade: 'websocket' }), port, sessions)
+        .ok,
+    ).toBe(false);
+  });
+
+  it('authorizeSessionRequest ignores a spoofed method header on a real server', async () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const listener = await listenLoopback(() =>
+      http.createServer((req, res) => {
+        const check = authorizeSessionRequest(req, listener.port, sessions);
+        res.writeHead(check.ok ? 200 : check.httpStatus).end();
+      }),
+    );
+    const send = (method: string, headers: Record<string, string>) =>
+      new Promise<number>((resolve, reject) => {
+        const r = request(
+          {
+            host: '127.0.0.1',
+            port: listener.port,
+            method,
+            path: '/',
+            headers: {
+              host: `127.0.0.1:${listener.port}`,
+              authorization: `Bearer ${token}`,
+              ...headers,
+            },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        r.on('error', reject);
+        r.end();
+      });
+    try {
+      expect(await send('GET', {})).toBe(200);
+      expect(await send('POST', { method: 'GET', 'x-http-method-override': 'GET' })).toBe(403);
+    } finally {
+      await listener.close();
+    }
   });
 
   it('rejects a DNS-rebinding request against a real loopback server', async () => {

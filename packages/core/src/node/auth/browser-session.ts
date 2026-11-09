@@ -1,3 +1,4 @@
+import { checkHostAndOrigin, type RequestCheck } from './origin.js';
 import { parseBearer, randomToken, type Secret, tokenKey } from './secret.js';
 
 /**
@@ -123,4 +124,41 @@ export function exchangeCode(
 ): CodeExchange {
   if (!codes.redeem(code)) return { ok: false, httpStatus: 401 };
   return { ok: true, token: sessions.create() };
+}
+
+/**
+ * Authorize a web UI HTTP call that carries a browser session token: rejects WebSocket upgrades
+ * (they use `checkHostAndOrigin(..., 'browser')` and the hello), then applies the `session`
+ * Host/Origin rule with the real request method (403), then requires a valid
+ * `Authorization: Bearer <session token>` (401). Pass Node's `req` (`method` and `headers`) directly.
+ */
+export function authorizeSessionRequest(
+  req: {
+    method?: string | undefined;
+    headers: {
+      host?: string | undefined;
+      origin?: string | undefined;
+      authorization?: string | undefined;
+      upgrade?: string | undefined;
+    };
+  },
+  port: number,
+  sessions: BrowserSessions,
+): RequestCheck {
+  if (req.headers.upgrade !== undefined) {
+    return {
+      ok: false,
+      httpStatus: 403,
+      wsCloseCode: 4401,
+      reason: 'upgrade is not a session call',
+    };
+  }
+  // Host and Origin first, as for every request, so a rebinding Host never reaches the token
+  // lookup. Both checks must pass; the order only decides the status code.
+  const check = checkHostAndOrigin(req.headers, port, 'session', req.method);
+  if (!check.ok) return check;
+  if (!sessions.validateHeader(req.headers.authorization)) {
+    return { ok: false, httpStatus: 401, wsCloseCode: 4401, reason: 'invalid session' };
+  }
+  return check;
 }
