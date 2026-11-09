@@ -723,7 +723,7 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n- [ ] Borrow (ADR-001): OS sandbox wrappers for workers: `bwrap` on Linux, `seatbelt` on macOS, as Omnigent does (`omnigent/sandbox/`); coordinate with #15\n- [ ] Deny worker access to `~/.tacet/run` in the sandbox profile (bwrap/seatbelt); conformance test proves a worker can't read a daemon token (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n- [ ] Borrow (ADR-001): OS sandbox wrappers for workers: `bwrap` on Linux, `seatbelt` on macOS, as Omnigent does (`omnigent/sandbox/`); coordinate with #15\n- [ ] Deny worker access to `~/.tacet/run` in the sandbox profile (bwrap/seatbelt); conformance test proves a worker can't read a daemon token (owner decision 2026-11-09)\n- [ ] Deny `~/.tacet/run/mcp` too, except the Worker's own MCP config file (bind it read-only, or move it to a sandbox-local path), so a Worker cannot read sibling Workers' MCP tokens; the Claude Code binary reads its own file through `--mcp-config`, so a blanket deny would break it. Test that a sandboxed Worker can read its own config but not a sibling's (owner decision 2026-11-09, ADR-003 addendum \"sibling Worker MCP tokens\")\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Evaluation harness: escalation quality, handoff fidelity, cost",
@@ -968,6 +968,54 @@
         "agent:claude"
       ],
       "body": "The owner decided on 2026-11-09 that browser auth must not use cookies: a cookie on 127.0.0.1 reaches every local server on that host, including dev servers a Worker starts (see the ADR-003 §3.4 addendum). This replaces the session cookie in the #77 auth module (`exchangeCode`, `sessionCookie`, `readSessionCookie`). Security-sensitive: a `reviewer` agent pass is required before the PR.\n\n### Tasks\n- [ ] `POST /auth/session` exchanges the one-time code for a browser session token (256-bit, stored as a hash, capped like today's sessions); no `Set-Cookie`\n- [ ] `HelloParams` for `role: \"ui\"` carries the browser session token; `HelloGate` validates it before opening\n- [ ] HTTP calls from the page use `Authorization: Bearer <session token>`; `checkHostAndOrigin` stays as-is\n- [ ] Remove the cookie helpers from `@tacet/core/node`; update ARCHITECTURE §6\n- [ ] Document for the web UI (M4) that the token lives in memory only, never `localStorage`\n- [ ] Reviewer pass (`reviewer` agent) before the PR is opened\n\n### Acceptance criteria\n- No code path emits `Set-Cookie` (test)\n- A hello without a valid browser session token is closed; a revoked token is rejected\n- The token never appears in logs, events or test snapshots\n\n_See docs/adr/003-wire-protocols.md §3.4 addendum and docs/ARCHITECTURE.md §6._"
+    },
+    {
+      "title": "Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:handoff",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Owner request (2026-11-09): ship Tacet's handoff as a **standalone Claude Code plugin**, so a plain Claude Code session can hand off its context before it degrades, without running the Conductor or a Mini-conductor. This is an early, usable slice of M3 (#29, #31) built on the `HandoffPacket` schema from #5.\n\n### Tasks\n- [ ] Verify the current Claude Code plugin and hook surface from primary docs (`verify-vendor-facts`): plugin manifest, `PreCompact`, `SessionStart`, `Stop`, slash commands, and how a hook can start a new session. Record it in the capability matrix.\n- [ ] A `/handoff` command that has the session write a `HandoffPacket` (goal, acceptance criteria, state summary, decisions, files touched, commands run, open questions, `nextAction`, verification). It is validated against `@tacet/core` and rejected if `nextAction` is missing.\n- [ ] Automatic trigger: at a configurable context threshold (and on `PreCompact`), write the packet before vendor compaction happens.\n- [ ] Reseed: start a fresh session seeded with the packet (via `SessionStart` context injection or a documented `claude` launch command). The old session ends cleanly.\n- [ ] Store packets in `.tacet/handoffs/` (git-ignored by default), never with secrets; reuse the redaction rules.\n- [ ] Packaging: an installable Claude Code plugin from this repo, with a short README.\n- [ ] Later, sharing code with #31 so the daemon path and the plugin path produce identical packets.\n\n### Acceptance criteria\n- In a recorded fixture session, the plugin writes a valid HandoffPacket at the threshold, and a new session starts with it as context\n- A packet without `nextAction` is rejected\n- No token or secret appears in a packet (test)\n\n_See docs/ARCHITECTURE.md §2.3, issues #29–#32, and the `session-handoff` skill._"
+    },
+    {
+      "title": "Per-session model, effort and context-size selection",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:cost",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Owner request (2026-11-09): Tacet should choose, for each Worker session, the model, the reasoning effort and the context size, instead of a fixed tier per repo. Today `tiers.*` in config sets `adapter`, `model` and `effort` statically. `SessionOptions` carries only `model`, and `send()` can switch the model mid-session where `capabilities().modelSwitch` allows it.\n\n### Tasks\n- [ ] Verify each vendor's controls from primary docs (`verify-vendor-facts`) and record them in the capability matrix:\n  - Claude SDK: `model`, effort or thinking options, `betas` for long context, `fallbackModel`\n  - Codex app-server: model and reasoning effort per turn\n  - OpenCode: model per message\n  - Gemini CLI: model at launch\n- [ ] Core: a `SessionProfile { model, effort?, contextWindow? }` type in `@tacet/core`, with `effort` as an `openEnum`. Add it to `SessionOptions` and `SendOptions`. Extend `AdapterCapabilities` with what each adapter can honour, for example `effortSwitch` and `contextSizes`.\n- [ ] Policy: the Mini-conductor picks a profile from the task (kind, size, risk), budget headroom (the cost ledger) and observed outcomes. Config sets the bounds: allowed models per tier, maximum effort, and a context cap.\n- [ ] Every choice is recorded as an event (`worker.profile`) with its reason, so `tacet config explain` and the cost ledger can show why a session ran on what.\n- [ ] Adapters: Claude SDK first (this repo's #11 adapter), then Codex. Each adapter declares its support honestly and the conformance suite checks it with a new P1 probe.\n- [ ] Docs: the ARCHITECTURE §cost tiering section and the config reference.\n\n### Acceptance criteria\n- A task can run with a profile chosen by policy, the chosen profile is visible in the event log, and the adapter applies it (verified against the mock API by the model and effort sent).\n- A profile outside the configured bounds is refused before launch.\n- An adapter that cannot honour a field reports this through its capabilities instead of silently ignoring it.\n\n### Open questions (needs-human)\n- Is effort a per-session choice, or per-turn where the vendor allows it?\n- Should context size be a cost lever, for example opting into 1M-token windows only when the handoff threshold would otherwise trigger?\n\n_See docs/ARCHITECTURE.md (tiers, budget), docs/adapters/capability-matrix.md §7, and #29–#32 (handoff)._\n"
+    },
+    {
+      "title": "Sweep stale Worker MCP config files at startup",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #11. Each Worker's MCP config (with its per-worker token) is a 0600 file in `~/.tacet/run/mcp/<session-id>.json`, deleted when the session closes. If the Mini-conductor is killed (SIGKILL, crash, power loss), files stay behind. Their tokens are revoked because tokens rotate on restart, but the files should not accumulate. Several Mini-conductors can share the directory, so a sweep must only remove files no live process owns.\n\n### Tasks\n- [ ] Record the owning Mini-conductor in each file's name or a sidecar (e.g. `<mini-pid>-<session-id>.json`), or keep one subdirectory per Mini-conductor\n- [ ] On Mini-conductor start, remove files whose owner is not running (checked with the runtime file in `~/.tacet/run/minis/`), never another live Mini-conductor's files\n- [ ] Log how many files were removed, never their contents\n\n### Acceptance criteria\n- A test leaves a file from a dead owner and one from a live owner; startup removes only the dead owner's file\n- No file content or token appears in logs\n\n_See packages/adapters/claude-sdk/src/mcp-config.ts and docs/adr/003-wire-protocols.md §3 and §6._"
+    },
+    {
+      "title": "Scrub Worker tokens split across streamed message deltas",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #11. Adapters scrub each emitted event of the session's literal secrets (MCP header values) and known key formats. A token the model echoes can arrive split across two `message.delta` events, and per-event scrubbing then misses it. Unlikely, since the model would have to echo the token, but the event log is durable.\n\n### Tasks\n- [ ] In the Claude adapter, hold back a short tail of each delta (the longest secret's length minus one) and scrub across the join before emitting; flush the tail at turn end\n- [ ] Move the helper to `@tacet/core` so every adapter (Codex, ACP, OpenCode, PTY) can use it\n- [ ] Keep delta latency bounded: the held-back tail is at most the longest secret's length\n\n### Acceptance criteria\n- A test streams a token split at every possible offset across two deltas; no emitted event contains it, and the concatenated text equals the original with the token replaced\n- Streaming still emits at least as many deltas for ordinary text (conformance `stream` probe passes)\n\n_See packages/adapters/claude-sdk/src/adapter.ts (`#emit`) and ADR-003 §1._"
     }
   ]
 }

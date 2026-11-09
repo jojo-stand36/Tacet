@@ -49,6 +49,9 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
 - [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
 - [ ] **Browser session via hello frame instead of cookie (ADR-003 §3.4 addendum)** — `feature` `P0` `claude`
+- [ ] **Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)** — `feature` `P1` `claude`
+- [ ] **Sweep stale Worker MCP config files at startup** — `feature` `P2` `either`
+- [ ] **Scrub Worker tokens split across streamed message deltas** — `feature` `P2` `either`
 
 ## M2 · Conductor & escalation
 
@@ -77,6 +80,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
+- [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude + human`
 
 ## M4 · Visual & terminal UI
 
