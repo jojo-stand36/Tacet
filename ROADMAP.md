@@ -80,7 +80,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
-- [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude + human`
+- [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
 
 ## M4 · Visual & terminal UI
 
