@@ -282,12 +282,8 @@ export class WorktreeManager {
       if (!id || !worktreeIdPattern.test(id)) continue;
       const info = await this.readInfo(root, id);
       if (!info || info.path !== path.join(root, id)) continue;
-      try {
-        if ((await realpath(info.path)) !== info.path) continue;
-        result.push(info);
-      } catch {
-        continue;
-      }
+      const actualPath = await realpath(info.path).catch(() => undefined);
+      if (actualPath === info.path) result.push(info);
     }
     return result;
   }
