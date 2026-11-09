@@ -619,7 +619,7 @@ export function toCodexDecision(
         permissions: allow
           ? d.grant === undefined
             ? (params.permissions ?? {})
-            : grantSubset(params.permissions, d.grant)
+            : (grantSubset(params.permissions, d.grant) ?? {})
           : {},
         scope: d.kind === 'allow_always' ? 'session' : 'turn',
       };
