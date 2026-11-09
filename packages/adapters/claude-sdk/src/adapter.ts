@@ -94,6 +94,8 @@ interface Session {
 }
 
 const CLIENT_APP = 'tacet/0.0.0';
+/** Vendor sessions whose cost baseline is remembered for resume; the oldest is dropped. */
+const COST_TOTALS_MAX = 1000;
 
 /**
  * Tacet adapter for Claude Code, driven through the Claude Agent SDK's streaming-input
@@ -413,7 +415,15 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         ? undefined
         : Math.round(Math.max(0, m.total_cost_usd - s.costSoFar) * 1e9) / 1e9;
     s.costSoFar = Math.max(s.costSoFar ?? 0, m.total_cost_usd);
-    if (s.handle.vendorSessionId) this.#costTotals.set(s.handle.vendorSessionId, s.costSoFar);
+    if (s.handle.vendorSessionId) {
+      // Re-insert so the map stays in recency order, and keep it bounded.
+      this.#costTotals.delete(s.handle.vendorSessionId);
+      this.#costTotals.set(s.handle.vendorSessionId, s.costSoFar);
+      if (this.#costTotals.size > COST_TOTALS_MAX) {
+        const oldest = this.#costTotals.keys().next();
+        if (!oldest.done) this.#costTotals.delete(oldest.value);
+      }
+    }
     const context = await s.q.getContextUsage({ detail: 'summary' }).catch(() => undefined);
     this.#emit(s, {
       t: 'usage',

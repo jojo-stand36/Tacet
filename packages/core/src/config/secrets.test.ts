@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { redactSecrets } from './secrets.js';
+import { findSecrets, redactSecrets } from './secrets.js';
 
 // Shaped like real keys but invented for this test.
 const KEY = `sk-ant-${'a'.repeat(24)}`;
@@ -28,6 +28,10 @@ describe('redactSecrets', () => {
       'curl -H "Authorization: [redacted]" x',
     );
     expect(redactSecrets('Bearer short')).toBe('Bearer short');
+  });
+  it('does not flag an environment reference after Bearer in config', () => {
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: a literal ${VAR} reference is the input under test
+    expect(findSecrets({ headers: { authorization: 'Bearer ${TACET_TOKEN}' } })).toEqual([]);
   });
 
   it('leaves ordinary text alone', () => {
