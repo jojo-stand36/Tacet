@@ -769,4 +769,70 @@ describe('MiniConductor review fixes', () => {
       d.submit({ goal: 'g', acceptanceCriteria: ['ok'], parentId: 'x' } as never),
     ).toThrow(/sub-tasks/);
   });
+
+  for (const how of ['stop', 'crash'] as const) {
+    it(`runs a waiting sub-task again after a ${how} once its escalation is answered`, async () => {
+      const escId = newUlid();
+      fake = new ScriptedAdapter('fake', (input, sess) => {
+        if (input.includes('[wait]') && sess.inputs.length === 1) {
+          raise(ofType('worker.started').at(-1)?.taskId as string, escId);
+          return { do: 'reply', text: 'waiting' };
+        }
+        return script(input);
+      });
+      const d1 = make({
+        planner: new FixedPlanner([{ key: 'a', goal: 'db [wait]', acceptanceCriteria: ['ok'] }]),
+      });
+      await d1.start();
+      const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+      if (how === 'stop') await d1.stop();
+      else d1.crashForTest();
+      // The answer arrives while no Mini-conductor is running.
+      store.append(env(sub, 'escalation.resolved', { escalationId: escId, answer: 'Postgres' }));
+      fake = new ScriptedAdapter('fake', script);
+      const d2 = make();
+      await d2.start();
+      await d2.settled();
+      expect(tasks()[sub]?.state).toBe('completed');
+      expect(tasks()[id]?.state).toBe('completed');
+      // The answer went into the first message of the new session, once.
+      const first = fake.sessions[0]?.inputs[0] ?? '';
+      expect(first).toContain(`Answer to your escalation ${escId}: Postgres`);
+      expect(ofType('escalation.delivered', sub)).toHaveLength(1);
+    });
+  }
+
+  it('retries an auth_required sub-task after a restart', async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'auth' }));
+    const d1 = make();
+    await d1.start();
+    const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d1.settled();
+    expect(tasks()[id]?.state).toBe('auth_required');
+    await d1.stop();
+    // The user fixed the key.
+    fake = new ScriptedAdapter('fake', script);
+    const d2 = make();
+    await d2.start();
+    await d2.settled();
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+    expect(tasks()[id]?.state).toBe('completed');
+  });
+
+  it('writes nothing more after a crash while a session is starting', async () => {
+    fake.startDelayMs = 200;
+    const d = make();
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('worker.started', `${id}/1`).length, { timeout: 5000 }).toBe(1);
+    d.crashForTest();
+    const before = store.count();
+    await new Promise((r) => setTimeout(r, 400));
+    expect(store.count()).toBe(before);
+    // The session that finished starting was given back, and its token revoked.
+    expect(fake.open).toBe(0);
+    expect(revoked.sort()).toEqual(minted.sort());
+  });
 });

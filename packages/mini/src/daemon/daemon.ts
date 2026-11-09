@@ -177,6 +177,17 @@ export class MiniConductor {
         );
       }
     }
+    // A login problem may be fixed by now: try those sub-tasks again.
+    for (const t of Object.values(v.tasks)) {
+      if (t.task.parentId && t.state === 'auth_required') {
+        ended.push(
+          this.#env(t.task.id, 'task.status', {
+            state: 'working',
+            message: 'retrying after a restart',
+          }),
+        );
+      }
+    }
     if (ended.length > 0) this.#o.store.append(ended);
     for (const t of Object.values(v.tasks)) {
       if (!t.task.parentId && !TERMINAL.has(t.state) && t.plan === undefined) this.#plan(t.task);
@@ -350,7 +361,7 @@ export class MiniConductor {
     for (const id of this.#ready()) {
       if (!this.#live(gen)) return;
       // One sub-task that cannot start must not hold up the others, nor be retried every tick.
-      await this.#run(id).catch((err: unknown) => {
+      await this.#run(id, gen).catch((err: unknown) => {
         this.#errors.push(err);
         this.#o.store.append(
           this.#env(id, 'task.status', {
@@ -397,6 +408,14 @@ export class MiniConductor {
     if (this.#runs.has(v.task.id)) return 'running';
     if (v.state === 'completed') return 'done';
     if (TERMINAL.has(v.state)) return 'failed';
+    if (v.state === 'input_required') {
+      // With no session open and every escalation answered, it runs again; the answers go into
+      // the first message of the new session.
+      const open = [...this.#state().escalations.values()].some(
+        (x) => x.taskId === v.task.id && !x.resolved,
+      );
+      return open ? 'blocked' : 'pending';
+    }
     if (WAITING.has(v.state)) return 'blocked';
     return 'pending';
   }
@@ -508,8 +527,8 @@ export class MiniConductor {
 
   // ---- Workers ---------------------------------------------------------------------------
 
-  async #run(subtaskId: string): Promise<void> {
-    if (this.#runs.has(subtaskId)) return;
+  async #run(subtaskId: string, gen: number): Promise<void> {
+    if (this.#runs.has(subtaskId) || !this.#live(gen)) return;
     const v = this.#state();
     const view = v.tasks[subtaskId];
     if (!view) return;
@@ -532,6 +551,7 @@ export class MiniConductor {
     // Reuse the checkout of an earlier run: a restart or a retry continues the same work.
     const existing = last?.workspaceId ? await this.#o.workspaces.get(last.workspaceId) : undefined;
     const workspace = existing ?? (await this.#o.workspaces.create(subtaskId));
+    if (!this.#live(gen)) return;
     const resume =
       last?.ended === 'restart' &&
       last.vendorSessionId !== undefined &&
@@ -577,6 +597,7 @@ export class MiniConductor {
       });
     } catch (err) {
       revoke();
+      if (!this.#live(gen)) return;
       this.#errors.push(err);
       this.#o.store.append(
         this.#env(
@@ -587,6 +608,12 @@ export class MiniConductor {
         ),
       );
       this.#afterFailure(subtaskId);
+      return;
+    }
+    if (!this.#live(gen)) {
+      // Stopped while the session started: give it back without registering it.
+      revoke();
+      await worker.adapter.close(handle).catch(() => {});
       return;
     }
     const run: Run = {
@@ -603,7 +630,7 @@ export class MiniConductor {
     };
     this.#runs.set(subtaskId, run);
     this.#noteVendorSession(run);
-    this.#track(this.#consume(run, worker, this.#gen));
+    this.#track(this.#consume(run, worker, gen));
     // Answers that came while no session was open go into the first message.
     const answers = this.#undelivered(subtaskId);
     const text = resume
@@ -616,8 +643,9 @@ export class MiniConductor {
         ]);
     try {
       await worker.adapter.send(handle, { text });
-      this.#markDelivered(run, answers);
+      if (this.#live(gen)) this.#markDelivered(run, answers);
     } catch (err) {
+      if (!this.#live(gen)) return;
       this.#errors.push(err);
       await this.#end(run, 'failed', `could not send the first message: ${(err as Error).message}`);
       this.#afterFailure(subtaskId);
@@ -664,9 +692,10 @@ export class MiniConductor {
             started = true;
             run.turnActive = true;
           } else if (e.state === 'idle') {
-            run.turnActive = false;
+            // Only the idle that ends a turn counts: adapters also report idle when they start.
             if (started) {
               started = false;
+              run.turnActive = false;
               this.#noteVendorSession(run);
               await this.#turnEnded(run);
             }
