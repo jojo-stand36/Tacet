@@ -84,10 +84,16 @@ describe('Codex Worker isolation', () => {
       ...extra,
     });
 
+  // One tap per session: a session's event stream can only be consumed once.
+  const taps = new WeakMap<SessionHandle, EventTap>();
   async function run(a: CodexAppServerAdapter, h: SessionHandle, cmd: string) {
-    const tap = new EventTap(a.events(h));
+    let tap = taps.get(h);
+    if (!tap) {
+      tap = new EventTap(a.events(h));
+      taps.set(h, tap);
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
+    }
     const from = api.requests.length;
-    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
     const start = tap.events.length;
     await a.send(h, { text: `RUN_CMD ${cmd}` });
     // Codex asks for an approval when the sandbox denies a command it wants to retry outside it.
@@ -162,7 +168,11 @@ describe('Codex Worker isolation', () => {
     expect(() => workerWorktree(other, repo)).toThrow(/refusing worktree.*separate git repository/);
   });
 
-  it('unattended: commits without approval, never writes the shared .git, integrates by push', async () => {
+  // Several real Codex turns: each has its own 3.5 s deadline in `run`, so a hang still fails fast
+  // with a dump; the test as a whole needs more than the 5 s default.
+  it('unattended: commits without approval, never writes the shared .git, integrates by push', {
+    timeout: 30_000,
+  }, async () => {
     const shared = join(repo, '.git');
     const refsBefore = git(repo, 'for-each-ref');
     const objectsBefore = files(join(shared, 'objects'));
@@ -170,23 +180,29 @@ describe('Codex Worker isolation', () => {
     const h = await a.start({ cwd: worktree });
     // The Worker's worktree is checked out detached: HEAD is per-worktree, branches are shared.
     expect(() => git(worktree, 'symbolic-ref', '-q', 'HEAD')).toThrow();
-    const { events, output } = await run(
-      a,
-      h,
-      [
-        'command -v git',
-        'echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
-        'git update-ref refs/heads/main HEAD && echo REF_MOVED',
-        'git branch other && echo BRANCHED',
-        `touch ${shared}/objects/tacet-probe && echo OBJECTS_WRITABLE`,
-        `touch ${shared}/tacet-probe && echo SHARED_WRITABLE`,
-      ].join('; '),
+    // One probe per turn, timestamped, so a slow step and a hung one can be told apart.
+    const stamp = `perl -MTime::HiRes=time -e 'printf "t=%.2f\\n", time'`;
+    const probe = async (cmd: string) => {
+      const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`);
+      return r;
+    };
+    const commit = await probe(
+      'command -v git; echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
     );
-    await a.close(h);
-    expect(output, output).toContain('COMMITTED');
-    for (const leak of ['REF_MOVED', 'BRANCHED', 'OBJECTS_WRITABLE', 'SHARED_WRITABLE']) {
-      expect(output).not.toContain(leak);
+    expect(commit.output, commit.output).toContain('COMMITTED');
+    const denied: [string, string][] = [
+      ['git update-ref refs/heads/main HEAD && echo REF_MOVED', 'REF_MOVED'],
+      ['git branch other && echo BRANCHED', 'BRANCHED'],
+      [`touch ${shared}/objects/tacet-probe && echo OBJECTS_WRITABLE`, 'OBJECTS_WRITABLE'],
+      [`touch ${shared}/tacet-probe && echo SHARED_WRITABLE`, 'SHARED_WRITABLE'],
+    ];
+    let events = commit.events;
+    for (const [cmd, leak] of denied) {
+      const r = await probe(cmd);
+      expect(r.output, r.output).not.toContain(leak);
+      events = r.events;
     }
+    await a.close(h);
     // No approval was asked for. (Under `on-request` Codex does not ask on a sandbox denial, so
     // COMMITTED above is what proves the commit worked inside the sandbox.)
     expect(events.filter((e) => e.t === 'approval.request')).toEqual([]);
