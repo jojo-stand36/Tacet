@@ -213,6 +213,45 @@ describe('loadConfig', () => {
     expect(agentEnv.errors).toEqual([]);
   });
 
+  it('replaces references whole even when names contain dots or are empty', () => {
+    const merged = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: {
+          secrets: { 'webhook.prod': { env: 'WEBHOOK_TOKEN' } },
+          agents: {
+            goose: {
+              kind: 'acp',
+              command: ['goose'],
+              env: { 'A.B': { env: 'AB' }, '': { env: 'EMPTY' } },
+            },
+          },
+        },
+      },
+      {
+        name: 'local',
+        origin: 'l',
+        data: {
+          secrets: { 'webhook.prod': { keychain: 'tacet/webhook' } },
+          agents: {
+            goose: {
+              kind: 'acp',
+              command: ['goose'],
+              env: { 'A.B': { keychain: 'tacet/ab' }, '': { keychain: 'tacet/empty' } },
+            },
+          },
+        },
+      },
+    ]);
+    expect(merged.errors).toEqual([]);
+    expect(merged.config.secrets?.['webhook.prod']).toEqual({ keychain: 'tacet/webhook' });
+    expect(merged.config.agents?.['goose']?.env).toEqual({
+      'A.B': { keychain: 'tacet/ab' },
+      '': { keychain: 'tacet/empty' },
+    });
+  });
+
   it('reports a merged config that no longer matches the schema', () => {
     const bad = mergeConfig([
       { name: 'user', origin: 'u', data: { secrets: { x: { env: 'A', keychain: 'b' } } } as never },

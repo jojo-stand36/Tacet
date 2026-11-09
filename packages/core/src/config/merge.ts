@@ -22,8 +22,13 @@ export const UNION_PATHS: ReadonlySet<string> = new Set(['policies', 'escalation
  * (`{ env }` or `{ keychain }`). Merging them would keep the lower layer's credential source next
  * to the higher one's.
  */
-export function isAtomicPath(path: string): boolean {
-  return /^secrets\.[^.]+$/.test(path) || /^agents\.[^.]+\.env\.[^.]+$/.test(path);
+export function isAtomicPath(segments: readonly string[]): boolean {
+  // Decided by position, not by the dotted path: record keys (secret names, agent names, env
+  // variable names) may themselves contain dots or be empty.
+  return (
+    (segments.length === 2 && segments[0] === 'secrets') ||
+    (segments.length === 4 && segments[0] === 'agents' && segments[2] === 'env')
+  );
 }
 
 export interface ExplainEntry {
@@ -61,7 +66,13 @@ export function mergeConfig(
   const sources = new Map<string, { layer: LayerName; origin: string }[]>();
   const merged: Plain = {};
 
-  const apply = (target: Plain, value: Plain, layer: ConfigLayer, prefix: string) => {
+  const apply = (
+    target: Plain,
+    value: Plain,
+    layer: ConfigLayer,
+    prefix: string,
+    segments: readonly string[],
+  ) => {
     for (const key of Object.keys(value).sort()) {
       const v = value[key];
       if (v === undefined) continue;
@@ -75,13 +86,13 @@ export function mergeConfig(
         if (added.length > 0 || !sources.has(path)) {
           sources.set(path, [...(sources.get(path) ?? []), src]);
         }
-      } else if (isPlain(v) && !isAtomicPath(path)) {
+      } else if (isPlain(v) && !isAtomicPath([...segments, key])) {
         if (!isPlain(target[key])) {
           target[key] = {};
           for (const p of [...sources.keys()])
             if (p === path || p.startsWith(`${path}.`)) sources.delete(p);
         }
-        apply(target[key] as Plain, v, layer, path);
+        apply(target[key] as Plain, v, layer, path, [...segments, key]);
       } else {
         target[key] = structuredClone(v);
         for (const p of [...sources.keys()]) if (p.startsWith(`${path}.`)) sources.delete(p);
@@ -89,20 +100,20 @@ export function mergeConfig(
       }
     }
   };
-  for (const layer of all) apply(merged, layer.data as Plain, layer, '');
+  for (const layer of all) apply(merged, layer.data as Plain, layer, '', []);
 
   const explain: ExplainEntry[] = [];
-  const walk = (value: unknown, path: string) => {
-    if (isPlain(value) && !UNION_PATHS.has(path) && !isAtomicPath(path)) {
+  const walk = (value: unknown, path: string, segments: readonly string[]) => {
+    if (isPlain(value) && !UNION_PATHS.has(path) && !isAtomicPath(segments)) {
       const keys = Object.keys(value).sort();
       if (keys.length === 0 && path)
         explain.push({ path, value: {}, sources: sources.get(path) ?? [] });
-      for (const k of keys) walk(value[k], path ? `${path}.${k}` : k);
+      for (const k of keys) walk(value[k], path ? `${path}.${k}` : k, [...segments, k]);
     } else {
       explain.push({ path, value, sources: sources.get(path) ?? [] });
     }
   };
-  walk(merged, '');
+  walk(merged, '', []);
 
   const config = merged as TacetConfig;
   // Each layer was validated on its own; check the combination too, so a merge rule that
