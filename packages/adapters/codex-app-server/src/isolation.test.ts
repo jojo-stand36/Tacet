@@ -90,16 +90,31 @@ describe('Codex Worker isolation', () => {
     await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
     const start = tap.events.length;
     await a.send(h, { text: `RUN_CMD ${cmd}` });
-    const end = await tap.waitFor(
-      (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'error'),
-      60_000,
-      start + 1,
-    );
-    expect(end.event).toMatchObject({ state: 'idle' });
-    const output = api.requests
-      .slice(from)
-      .map((r) => r.toolOutput ?? '')
-      .join('\n');
+    // Codex asks for an approval when the sandbox denies a command it wants to retry outside it.
+    // Each is refused (never approved: that would run the command unsandboxed) and recorded, so
+    // a denial fails the test with its summary instead of hanging the turn.
+    const approvals: string[] = [];
+    let at = start + 1;
+    for (;;) {
+      const next = await tap.waitFor(
+        (e) =>
+          e.t === 'approval.request' ||
+          (e.t === 'status' && (e.state === 'idle' || e.state === 'error')),
+        60_000,
+        at,
+      );
+      at = next.index + 1;
+      if (next.event.t !== 'approval.request') {
+        expect(next.event).toMatchObject({ state: 'idle' });
+        break;
+      }
+      approvals.push(next.event.summary);
+      await a.respond(h, next.event.id, { kind: 'reject', persist: false });
+    }
+    const output = [
+      ...api.requests.slice(from).map((r) => r.toolOutput ?? ''),
+      ...approvals.map((x) => `APPROVAL REQUESTED: ${x}`),
+    ].join('\n');
     return { events: tap.events, output };
   }
 
@@ -145,6 +160,7 @@ describe('Codex Worker isolation', () => {
       a,
       h,
       [
+        'command -v git',
         'echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
         'git update-ref refs/heads/main HEAD && echo REF_MOVED',
         'git branch other && echo BRANCHED',
@@ -153,13 +169,13 @@ describe('Codex Worker isolation', () => {
       ].join('; '),
     );
     await a.close(h);
-    expect(output).toContain('COMMITTED');
+    expect(output, output).toContain('COMMITTED');
     for (const leak of ['REF_MOVED', 'BRANCHED', 'OBJECTS_WRITABLE', 'SHARED_WRITABLE']) {
       expect(output).not.toContain(leak);
     }
     // No approval was asked for. (Under `on-request` Codex does not ask on a sandbox denial, so
     // COMMITTED above is what proves the commit worked inside the sandbox.)
-    expect(events.some((e) => e.t === 'approval.request')).toBe(false);
+    expect(events.filter((e) => e.t === 'approval.request')).toEqual([]);
     // The shared .git is exactly as it was: no refs moved, no objects added or removed.
     expect(git(repo, 'for-each-ref')).toBe(refsBefore);
     expect(files(join(shared, 'objects'))).toEqual(objectsBefore);
@@ -297,7 +313,12 @@ describe('Codex Worker isolation', () => {
     const wt = addWorktree('resume');
     const a = adapter();
     const h = await a.start({ cwd: wt });
-    await run(a, h, 'echo one > a.txt && git add a.txt && git commit -qm one && echo FIRST');
+    const first = await run(
+      a,
+      h,
+      'echo one > a.txt && git add a.txt && git commit -qm one && echo FIRST',
+    );
+    expect(first.output, first.output).toContain('FIRST');
     await a.close(h);
     const id = h.vendorSessionId;
     if (!id) throw new Error('no thread id');
@@ -308,7 +329,7 @@ describe('Codex Worker isolation', () => {
       'echo two > b.txt && git add b.txt && git commit -qm two && echo SECOND',
     );
     await a.close(r);
-    expect(output).toContain('SECOND');
+    expect(output, output).toContain('SECOND');
   });
 
   it('ignores a commondir forged after the check, in git run outside the sandbox', async () => {
