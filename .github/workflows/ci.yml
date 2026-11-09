@@ -36,6 +36,8 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+      - name: Generated files are current
+        run: pnpm check:generated
       - run: pnpm lint
       - run: pnpm typecheck
-      - run: pnpm exec vitest run
+      - run: pnpm test
