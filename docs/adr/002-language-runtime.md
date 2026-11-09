@@ -15,7 +15,7 @@ What the choice has to support (from `docs/ARCHITECTURE.md` §1, §3, §5 and `d
 - An MCP server inside each mini-conductor, an A2A-shaped conductor↔mini channel and an AG-UI-style UI event stream (ADR-003).
 - A React web UI with live terminals (xterm.js) and an Ink TUI.
 - An append-only SQLite event log per mini-conductor.
-- macOS, Linux and Windows, local-first, installable into any repo.
+- macOS and Linux (Ubuntu) only, local-first, installable into any repo. Windows is not a target.
 
 ### SDK support matrix
 
@@ -35,15 +35,15 @@ Summary: every surface has an official TypeScript package. Python is covered for
 
 ### PTY support
 
-- **node-pty** (Microsoft, used by VS Code): "supports Linux, macOS and Windows". On Windows it uses ConPTY and requires Windows 10 1809 (build 18309) or later; winpty support was removed. Latest is 1.1.0 (2025-12-22), with 1.2.0 in beta. It is a native addon, so installs need a prebuilt binary or a C++ toolchain. Sources: https://github.com/microsoft/node-pty/blob/main/README.md, https://registry.npmjs.org/node-pty.
-- Python has `ptyprocess` (POSIX only) and `pywinpty` (Windows), so it needs two code paths. Sources: https://pypi.org/pypi/ptyprocess/json, https://pypi.org/pypi/pywinpty/json.
+- **node-pty** (Microsoft, used by VS Code): "supports Linux, macOS and Windows". Tacet targets macOS and Linux only, so the Windows (ConPTY) path is out of scope. Latest is 1.1.0 (2025-12-22), with 1.2.0 in beta. It is a native addon, so installs need a prebuilt binary or a C++ toolchain. Sources: https://github.com/microsoft/node-pty/blob/main/README.md, https://registry.npmjs.org/node-pty.
+- Python has `ptyprocess`, which covers macOS and Linux. Source: https://pypi.org/pypi/ptyprocess/json.
 
 ### Node vs Bun
 
 Bun 1.4.4 is the current release (https://registry.npmjs.org/bun/latest). From Bun's own compatibility page (https://github.com/oven-sh/bun/blob/main/docs/runtime/nodejs-compat.mdx, checked 2026-11-09):
 
 - `node:tty` and `node:sqlite` are marked fully implemented. `node:child_process` is partial: it is missing some IPC features, and a child's stdout/stderr cannot be passed as another child's stdio.
-- **node-pty on Bun is not reliable today.** Open issue oven-sh/bun#25822 ("node-pty: PTY spawns but onData callback never fires", last updated 2026-10-10). There have also been several recently closed crash and segfault reports: #28925, #29112, and #41414 (`tty.ReadStream` EAGAIN broke node-pty; closed 2026-09-20). Bun has its own `Bun.Terminal` PTY API (referenced in #43450), but it is Bun-only and its Windows behaviour has open issues. The API details of `Bun.Terminal` are **UNVERIFIED** (bun.sh docs were not reachable).
+- **node-pty on Bun is not reliable today.** Open issue oven-sh/bun#25822 ("node-pty: PTY spawns but onData callback never fires", last updated 2026-10-10). There have also been several recently closed crash and segfault reports: #28925, #29112, and #41414 (`tty.ReadStream` EAGAIN broke node-pty; closed 2026-09-20). Bun has its own `Bun.Terminal` PTY API (referenced in #43450), but it is Bun-only. The API details of `Bun.Terminal` are **UNVERIFIED** (bun.sh docs were not reachable).
 - **better-sqlite3 on Bun** has a long history of crash and dlopen reports (#23243, #23757, #24956; the canonical tracker is #4290, whose current state is **UNVERIFIED** because the GitHub API was rate-limited). Bun's answer is `bun:sqlite`, a different API. better-sqlite3 13.0.3 requires `node >=22`.
 - Bun's advantages (fast install, TS without a build step, single-file `bun build --compile`) are real. But the Claude Agent SDK docs note that `bun build --compile` cannot find its bundled binary without a workaround (`extractFromBunfs`).
 
@@ -53,10 +53,10 @@ Node LTS lines (https://github.com/nodejs/Release/blob/main/schedule.json): Node
 
 | Driver | TS on Node | TS on Bun | Python |
 |---|---|---|---|
-| Harness-agnostic | Every vendor SDK is first-class | Same SDKs, but PTY fallback and native addons are shaky | Most SDKs exist; Codex is weaker; PTY needs two backends |
+| Harness-agnostic | Every vendor SDK is first-class | Same SDKs, but PTY fallback and native addons are shaky | Most SDKs exist; Codex is weaker; PTY via `ptyprocess` on POSIX |
 | Local-first, secure | Mature `http`/`ws`, loopback binding is easy | Same | Same |
 | Token/cost efficiency | Neutral | Neutral | Neutral |
-| Contributor approachability | One language from daemon to UI; the most common stack in agent tooling | Smaller contributor base; Windows is less mature | Two languages (Python daemon + TS UI) |
+| Contributor approachability | One language from daemon to UI; the most common stack in agent tooling | Smaller contributor base | Two languages (Python daemon + TS UI) |
 | Speed to M1 | Fastest: no compatibility work | Risk of compatibility spikes on PTY and SQLite | Must bridge to the TS UI and write PTY glue |
 
 ## Decision
@@ -64,24 +64,33 @@ Node LTS lines (https://github.com/nodejs/Release/blob/main/schedule.json): Node
 Proposed:
 
 1. **Language: TypeScript**, `strict`, ESM, in a pnpm monorepo (as already planned in `AGENTS.md`).
-2. **Runtime: Node.js LTS.** Minimum `node >=24`. CI runs on Node 24 and Node 26 for macOS, Linux and Windows. `engines` in every published package states the minimum.
+2. **Runtime: Node.js LTS.** Minimum `node >=24`. CI runs on Node 24 and Node 26 on macOS and Ubuntu Linux. Windows is not a target platform. `engines` in every published package states the minimum.
 3. **Bun is not a supported runtime for the daemons (`conductor`, `mini`) or the CLI in v0.** Contributors may use Bun locally as a script runner, but nothing may depend on Bun-only APIs (`Bun.*`, `bun:*`), and CI does not test on Bun.
 4. **PTY:** `node-pty` behind the `pty` adapter, so the native addon is loaded only when the PTY fallback is used. Tier-1 and ACP adapters must work on a machine where `node-pty` failed to install (make it an optional dependency).
 5. **SQLite:** this ADR does not pick the driver. The event-log issue chooses between `better-sqlite3` and `node:sqlite` behind a small storage interface in `@tacet/core`. The deciding question is whether `node:sqlite` reaches Stable before M1.
 6. **Python is not used in core packages.** Python agents are still supported through their CLIs, ACP or MCP, which is all Tacet needs from them.
 
-**Why:** every integration surface Tacet depends on ships an official TypeScript SDK, and the UI is TypeScript anyway, so one language covers the whole system. Node is the runtime that node-pty and the native SQLite drivers are built and tested against on all three operating systems. Bun's known PTY bugs would land exactly on our universal fallback adapter.
+**Why:** every integration surface Tacet depends on ships an official TypeScript SDK, and the UI is TypeScript anyway, so one language covers the whole system. Node is the runtime that node-pty and the native SQLite drivers are built and tested against on both target operating systems (macOS and Linux). Bun's known PTY bugs would land exactly on our universal fallback adapter.
 
 **What would change this:**
-- Bun closes #25822, a spike shows node-pty (or a cross-platform PTY) and our SQLite driver working on Bun on macOS, Linux and Windows, and single-binary distribution becomes a priority. Then add Bun as a second tested runtime; do not switch.
+- Bun closes #25822, a spike shows node-pty (or a cross-platform PTY) and our SQLite driver working on Bun on macOS and Linux, and single-binary distribution becomes a priority. Then add Bun as a second tested runtime; do not switch.
 - ADR-001 chooses to build on Omnigent (Python). Then revisit this ADR as a whole.
 - A required vendor drops or deprecates its TypeScript SDK (no sign of that today).
+
+## Owner input (2026-11-09)
+
+The owner answered the open questions on 2026-11-09. The answers are recorded here and in the decision text above.
+
+- **Runtime:** TypeScript on Node 24 minimum (decision 2). Bun is excluded (decision 3).
+- **Platforms:** macOS and Linux (Ubuntu) only. Windows is removed from targets, the CI matrix and the ConPTY consequences.
+- **Status:** this ADR stays `proposed`. Acceptance waits on ADR-001 (Omnigent build-vs-extend, issue #2), because ADR-001 may revisit this decision.
+- **SQLite:** the driver choice is deferred to the event-log issue (#6), as recommended in decision 5.
 
 ## Consequences
 
 - `AGENTS.md` "pending ADR-002" text and `docs/RESEARCH.md` §8 ("Node (or Bun)") become stale once this is accepted. Update both in the PR that accepts this ADR.
-- The monorepo scaffold issue sets `engines.node: ">=24"`, adds `.nvmrc` / `.node-version` set to 24, and a CI matrix of {ubuntu, macos, windows} × {24, 26}.
-- `@tacet/adapter-pty` lists `node-pty` as an optional or peer dependency and degrades cleanly when it is missing. Its conformance tests run on Windows (ConPTY, Windows 10 1809+).
+- The monorepo scaffold issue sets `engines.node: ">=24"`, adds `.nvmrc` / `.node-version` set to 24, and a CI matrix of {ubuntu, macos} × {24, 26}.
+- `@tacet/adapter-pty` lists `node-pty` as an optional or peer dependency and degrades cleanly when it is missing. Its conformance tests run on macOS and Linux.
 - Follow-up issues:
   - Record the SDK matrix above in `docs/adapters/capability-matrix.md` (owned by the adapter-docs work).
   - Event-log storage driver choice (`better-sqlite3` vs `node:sqlite`).
@@ -96,12 +105,12 @@ See Decision. The cost of reversing it later is low for Bun (same language, same
 
 ### B. TypeScript on Bun
 - **Pros:** faster install and startup; TS runs without a build step; built-in SQLite and test runner; single-file executables.
-- **Cons:** open node-pty bug and a history of native-addon crashes; `bun:sqlite` is a different API from the Node drivers; some `child_process` gaps (we spawn many agent CLIs); the Claude Agent SDK needs a workaround inside compiled Bun binaries; Windows is less proven.
+- **Cons:** open node-pty bug and a history of native-addon crashes; `bun:sqlite` is a different API from the Node drivers; some `child_process` gaps (we spawn many agent CLIs); the Claude Agent SDK needs a workaround inside compiled Bun binaries.
 - **Reversal cost:** low if we never use `Bun.*` APIs, which is why decision 3 forbids them.
 
 ### C. Python
 - **Pros:** Omnigent (closest prior art) is Python; official Claude Agent SDK, MCP, ACP, A2A and AG-UI Python packages exist; strong in research and data workflows.
-- **Cons:** the UI is TypeScript anyway, so we would maintain two languages and duplicate schemas; there is no confirmed first-party Codex Python SDK; ACP and OpenCode Python packages are behind or alpha; PTY needs separate POSIX and Windows libraries; the per-repo package would need a Python environment in JS-heavy repos.
+- **Cons:** the UI is TypeScript anyway, so we would maintain two languages and duplicate schemas; there is no confirmed first-party Codex Python SDK; ACP and OpenCode Python packages are behind or alpha; the per-repo package would need a Python environment in JS-heavy repos.
 - **Reversal cost:** high.
 
 ### D. Polyglot (TypeScript UI + adapters, Python or Go daemon)

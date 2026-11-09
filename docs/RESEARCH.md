@@ -58,9 +58,9 @@ The hard engineering problem is controlling heterogeneous agents reliably. Four 
 
 | Boundary | Use | Why |
 |---|---|---|
-| Conductor ↔ UI | AG-UI-style typed event stream over WebSocket/SSE | AG-UI is an open event protocol for agent↔frontend (lifecycle, text, tool calls, state sync, human-in-the-loop). Adopting its event vocabulary gets interop with CopilotKit-style frontends for free. |
-| Conductor ↔ Mini-conductor | Small JSON-RPC over local WebSocket (v0); map cleanly onto **A2A** tasks so it can be exposed as A2A later | A2A (Linux Foundation, v1.0 in 2026) is the cross-vendor agent-to-agent standard; IBM's older "ACP" (Agent *Communication* Protocol) merged into it. Full A2A is overkill for localhost v0 but the task model is right. |
-| Agents ↔ tacet | **MCP server** exposed by each mini-conductor | Every agent already speaks MCP. Tools like `escalate(question, options, urgency)`, `report_progress`, `request_handoff`, `spawn_worker`, `read_task`, `record_decision` let *any* agent participate in the hierarchy without a custom adapter. This is the key trick. |
+| Conductor ↔ UI | AG-UI event subset over WebSocket (ADR-003 §5; an SSE endpoint is a later follow-up) | AG-UI is an open event protocol for agent↔frontend (lifecycle, text, tool calls, state sync, human-in-the-loop). Adopting its event vocabulary gets interop with CopilotKit-style frontends for free. |
+| Conductor ↔ Mini-conductor | Small JSON-RPC over local WebSocket (v0); map cleanly onto **A2A** tasks so it can be exposed as A2A later. The Conductor listens and minis dial in (ADR-003 §4). | A2A (Linux Foundation, v1.0 in 2026) is the cross-vendor agent-to-agent standard; IBM's older "ACP" (Agent *Communication* Protocol) merged into it. Full A2A is overkill for localhost v0 but the task model is right. |
+| Agents ↔ tacet | **MCP server** exposed by each mini-conductor | Every agent already speaks MCP. The v1 tools (ADR-003 §6) are `read_task`, `report_progress`, `escalate` (non-blocking), `get_decision`, `request_handoff`, `record_decision` and `search_decisions`. `spawn_worker` is dropped for v1. Together they let *any* agent participate in the hierarchy without a custom adapter. This is the key trick. |
 | Tacet ↔ editors | ACP (tacet as an ACP *agent*) | Lets Zed/JetBrains/Neovim users talk to their repo's mini-conductor as if it were one agent. Later milestone. |
 
 Naming collision to note in docs: "ACP" = Zed's Agent **Client** Protocol (editor↔agent). IBM's Agent **Communication** Protocol is a different thing and is now folded into A2A.
@@ -90,8 +90,12 @@ Evidence points the same way: lossy auto-compaction degrades long sessions; **fr
 
 ## 7. Auth, billing and terms (important constraint)
 
-- Anthropic's terms say OAuth tokens from Claude Free/Pro/Max plans may not be used in other products, tools or services, **including the Agent SDK**; enforcement began January 2026, was clarified in February, and third-party tools were cut off from subscription limits on April 4, 2026. In May 2026 Anthropic added separate monthly **Agent SDK credits** to paid plans for programmatic and third-party use, and `claude -p`/Agent SDK usage moved to that credit pool from June 15, 2026.
-- OpenAI has publicly endorsed using Codex subscriptions in third-party harnesses.
+- **Anthropic: products and credentials.** Anthropic does not permit third parties to offer Claude.ai login or route requests through plan credentials on users' behalf. Developers building on the Agent SDK should use API-key auth. An end user may still sign in to the unmodified Claude Code binary with their own subscription. Checked 2026-11-09 against the legal and compliance page and the Agent SDK overview. Details and links: [capability matrix §1](adapters/capability-matrix.md#claude-terms-relevant-to-tacets-hard-rule).
+- **Anthropic: billing for `claude -p` and the Agent SDK (corrected 2026-11-09).** An earlier draft of this section said this usage moved to a separate credit pool on 2026-06-15. The Anthropic help article says that change is **paused**, with no resume date. When signed in with a Claude plan, `claude -p` and the Agent SDK still draw from the plan's usage limits. Max, Ultra and Team plans include monthly API credits, but the SDK and `claude -p` can use them only through an API key from a linked Console organization. Pro and Enterprise eligibility is UNVERIFIED. Source: https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan (read 2026-11-09).
+- **Owner setup (2026-11-09).** The owner runs Workers on their own Claude subscription, signing in to the unmodified CLI personally. The owner also holds an Anthropic API key with a **$200/month** usage budget. Tacet never stores, proxies or copies tokens.
+- **Default auth routing (owner decision, 2026-11-09).** Prefer the API key for parallel or unattended Workers, and the subscription login for interactive or single sessions. The owner can override this in config. The budget default lives in the cost ledger issue (#35) and in `docs/ARCHITECTURE.md` §4.
+- **Open risk (needs-human).** Many parallel Workers on one subscription may exceed "ordinary individual usage" in Anthropic's terms. This is unresolved. It is tracked as a `needs-human` item in the capability matrix (Gaps, item 9).
+- **OpenAI (UNVERIFIED).** An earlier draft said OpenAI publicly endorses using Codex subscriptions in third-party harnesses. The primary page could not be read, so do not rely on this claim. See [capability matrix §2](adapters/capability-matrix.md#2-codex-app-server-json-rpc), Terms row.
 - **Design implication:** tacet never handles vendor OAuth tokens itself. It launches the vendor's own CLI/SDK under the user's own login or API key, supports API keys / gateways (OpenRouter, LiteLLM, local Ollama/vLLM) first-class, and documents per-vendor billing behaviour. Re-verify vendor terms before each release; this area moves fast.
 
 ## 8. Recommended technical direction
@@ -100,7 +104,7 @@ Evidence points the same way: lossy auto-compaction degrades long sessions; **fr
 - **Shape:** pnpm monorepo: `core` (types, event schema), `conductor` (daemon), `mini` (per-repo daemon + MCP server, published as the installable package), `adapters/*`, `web` (React + xterm.js), `tui` (Ink), `cli`.
 - **State:** append-only event log in SQLite per mini-conductor (event sourcing → replay, audit, UI timelines); Conductor keeps an aggregated index.
 - **Isolation:** git worktree per worker by default; optional sandbox (bubblewrap/seatbelt/containers) later.
-- **Local-first security:** bind to 127.0.0.1, per-install token, explicit opt-in for LAN/phone access.
+- **Local-first security:** bind to 127.0.0.1 and ::1, a token rotated on every daemon start, one-time codes for browsers, and explicit opt-in for LAN/phone access ([ADR-003 §3](adr/003-wire-protocols.md#3-auth-token-handshake-all-local-servers)).
 
 ## 9. Build-vs-extend decision (open)
 

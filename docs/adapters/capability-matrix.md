@@ -46,9 +46,23 @@ Two ways in: the Agent SDK (TS/Python, wraps the Claude Code binary) and the CLI
 | Branding | Products using the SDK must not be named "Claude Code" or mimic it; "Claude Agent" or "Powered by Claude" are allowed. Tacet should label the adapter "Claude" or "Claude Agent". | verified | https://code.claude.com/docs/en/agent-sdk/overview |
 | Subscription billing of `claude -p` / SDK | Help Center article (updated notes dated 2026-06-15 and 2026-10-07): when signed in with a Claude plan, `claude -p` and the Agent SDK still draw from the plan's usage limits. The June change that would have moved this to a separate credit pool is described as **paused**, with no resume date. Max/Ultra/Team plans have monthly API credits, but only usable by the SDK / `claude -p` through an API key from a linked Console organization. Pro and Enterprise not eligible per the search summary of a second help article (not fetched directly). Page shows only a relative "updated" time. | verified (article read) / second article UNVERIFIED | https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan , https://support.claude.com/en/articles/17154008-monthly-api-credits-for-max-ultra-and-team-plans |
 
-**Conflict flagged:** `docs/RESEARCH.md` section 7 says `claude -p` / Agent SDK usage moved to a separate credit pool from 2026-06-15. The primary help article now says that change is paused and subscription-login usage still draws from plan limits. RESEARCH section 7 is stale on this point and should be corrected (not done here).
+**Conflict (resolved 2026-11-09):** `docs/RESEARCH.md` section 7 said `claude -p` / Agent SDK usage moved to a separate credit pool from 2026-06-15. The primary help article now says that change is paused and subscription-login usage still draws from plan limits. RESEARCH section 7 was stale on this point and was corrected on 2026-11-09.
 
-**Design rule that follows:** Tacet never touches OAuth tokens. For Claude it launches the user's own `claude` (their login) or passes `ANTHROPIC_API_KEY` from the environment. Whether a Tacet-hosted multi-user service may run subscription logins is out of scope (Tacet is local-first, single user); a human should confirm the "ordinary, individual usage" language covers an orchestrator running many parallel Workers on one plan (UNVERIFIED, see Gaps).
+**Design rule that follows:** Tacet never touches OAuth tokens. For Claude it launches the user's own `claude` (their login) or passes `ANTHROPIC_API_KEY` from the environment. Whether a Tacet-hosted multi-user service may run subscription logins is out of scope (Tacet is local-first, single user); the owner's setup (own subscription login plus an API key with a $200/month budget) and the default routing are recorded in `docs/RESEARCH.md` section 7. Default: API key for parallel or unattended Workers, subscription login for interactive or single sessions, unless the owner overrides. Whether the "ordinary, individual usage" language covers many parallel Workers on one plan is still UNVERIFIED and `needs-human` (see Gaps, item 9).
+
+## 1b. MCP client facts (ADR-003 section 6)
+
+Facts the mini-conductor's MCP server depends on. Source: the "Verified protocol facts" table in [ADR-003](../adr/003-wire-protocols.md), checked 2026-11-09 from the MCP and Claude Code docs. Re-check before MCP work in M1.
+
+| Capability | Fact | Status | Source |
+|---|---|---|---|
+| MCP spec revision | Latest is `2026-07-28`. It is stateless: no `initialize` handshake and no `Mcp-Session-Id`. `server/discover` is mandatory, and each request carries its protocol version and capabilities in `_meta`. Tools keep `inputSchema`/`outputSchema`, `structuredContent`, `isError` and `annotations`. Roots, sampling and logging are deprecated. | verified (ADR-003 check) | https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/docs/specification/2026-07-28/changelog.mdx |
+| Claude Code transports | stdio, HTTP, SSE (deprecated) and WebSocket. `.mcp.json` `headers` support `${VAR}` expansion. | verified (ADR-003 check) | https://code.claude.com/docs/en/mcp |
+| Claude Code tool-call timeout | `MCP_TOOL_TIMEOUT` or per-server `timeout`; defaults to about 28 h. | verified (ADR-003 check) | https://code.claude.com/docs/en/mcp |
+| Claude Code idle timeout | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` defaults to 5 min for HTTP and 30 min for stdio. This is why `escalate` returns `pending` instead of blocking (ADR-003 section 6). | verified (ADR-003 check) | https://code.claude.com/docs/en/mcp |
+| Claude Code MCP protocol version | The v2 runtime negotiates `2026-07-28` with servers that support it. Otherwise it "connects as v1 does". | verified (ADR-003 check) | https://code.claude.com/docs/en/mcp |
+| Claude Agent SDK in-process MCP | TS: `createSdkMcpServer()` and `tool()` with zod schemas and `annotations`. | verified (ADR-003 check) | https://code.claude.com/docs/en/agent-sdk/typescript |
+| Codex, Gemini CLI, OpenCode MCP | Revisions spoken, per-session config injection (including headers) and idle or tool-call timeouts. | UNVERIFIED (roadmap spikes) | n/a |
 
 ## 2. Codex app-server (JSON-RPC)
 
@@ -159,6 +173,8 @@ Sketch in `docs/ARCHITECTURE.md` section 3. Not edited here; for the architect/A
 
 Titles are proposals; no GitHub issues have been created. Label suggestions follow `AGENTS.md` (`agent:claude` for research).
 
+Roadmap status (2026-11-09): items 1 to 7, 9, 10 and 11 are tracked in `roadmap/issues.json`, and the ADR-002 and ADR-003 UNVERIFIED items are added there too. Item 8 is done. GitHub issues are created by the owner.
+
 1. **Verify Codex approval decision enums and `turn/interrupt` payload from the installed schema** - run `codex app-server generate-json-schema` on a pinned version and record decision values for command, file-change and permissions approvals.
 2. **Pin and test a Codex version, and read the official app-server docs and auth/terms pages** - `developers.openai.com` was unreachable; confirm the commercial/hosted-use language and `chatgptAuthTokens` restriction from the primary page.
 3. **Capture OpenCode event types, permission SSE event and token/cost fields from `GET /doc`** - run `opencode serve`, dump the OpenAPI spec and the SSE event union, record versions.
@@ -166,7 +182,7 @@ Titles are proposals; no GitHub issues have been created. Label suggestions foll
 5. **Verify the Claude and Codex ACP adapters named in RESEARCH (Zed adapter, `codex-acp`)** - versions, which capabilities they pass through, whether they depend on subscription logins.
 6. **Gemini CLI: record `stats` field names, headless approval behaviour and ACP permission flow** - run the installed binary and capture fixtures; confirm status of free OAuth after the Antigravity CLI move.
 7. **Claude `claude -p --input-format stream-json` and `--permission-prompt-tool` contract** - page read did not document the CLI input format; confirm from the CLI reference and decide CLI vs SDK for the Claude adapter.
-8. **Correct `docs/RESEARCH.md` section 7 on the Agent SDK credit change** - primary help article says the 2026-06-15 change is paused and subscription logins still draw plan limits; re-check before each release.
-9. **Human decision (`needs-human`): is a Conductor running many parallel Claude Workers on one subscription within "ordinary, individual usage"?** - the legal page limits advertised limits to ordinary individual use; get a ruling or default Workers to API keys.
+8. **Done 2026-11-09: `docs/RESEARCH.md` section 7 corrected on the Agent SDK credit change.** Original note - primary help article says the 2026-06-15 change is paused and subscription logins still draw plan limits; re-check before each release.
+9. **Human decision (`needs-human`): is a Conductor running many parallel Claude Workers on one subscription within "ordinary, individual usage"?** - the legal page limits advertised limits to ordinary individual use; get a ruling. The owner set the default routing to API keys for parallel or unattended Workers on 2026-11-09, but the ruling is still open.
 10. **Add the shared adapter conformance fixtures plan** - record real-session fixtures per surface (stream, approval, interrupt, usage) so CI never calls vendors live.
 11. **Pin matrix versions in CI** - add a check that fails when a recorded "Checked" date is older than N days for surfaces under active development.

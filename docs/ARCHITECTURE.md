@@ -1,6 +1,6 @@
 # Architecture (draft v0)
 
-_This is a proposal to be ratified via ADRs in milestone M0._
+_This is a proposal to be ratified via ADRs in milestone M0. Wire protocols and local security follow [ADR-003](adr/003-wire-protocols.md) (accepted 2026-11-09). Language and runtime follow [ADR-002](adr/002-language-runtime.md) (proposed; waits on ADR-001, issue #2)._
 
 ## 1. Roles
 
@@ -30,6 +30,8 @@ _This is a proposal to be ratified via ADRs in milestone M0._
           └────────┘ └──────┘ └────────┘
 ```
 
+The Conductor listens on one local port and mini-conductors dial in over JSON-RPC/WebSocket, so there is one port and no per-repo port discovery. A mini-conductor that runs standalone serves the same methods on its own port for the CLI and UI ([ADR-003 §4](adr/003-wire-protocols.md#4-conductor--mini-conductor-a2a-shapes-over-a-json-rpc-websocket)).
+
 | Role | Lives | Owns | Talks to |
 |---|---|---|---|
 | **Conductor** | One per machine, `tacet up` | User attention, cross-repo plans, global policy, registry of mini-conductors, aggregated cost | User (UI/channels), mini-conductors |
@@ -47,7 +49,7 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 4. Results roll up as **summary packets**, never transcripts.
 
 ### 2.2 Escalation flow
-- Workers call MCP `escalate({question, options?, urgency, context_ref})`, or the adapter surfaces a permission/approval request.
+- Workers call MCP `escalate({question, options?, urgency, contextRef?})`. The call does not block on a human: if the gate does not resolve it within a few seconds, it returns `pending`, and the answer arrives as the worker's next message ([ADR-003 §6](adr/003-wire-protocols.md#6-workers--mini-conductor-mcp-tool-surface)). Adapters can also surface a permission or approval request.
 - Mini-conductor's **escalation gate** first tries to resolve it: repo policy, past decisions log, its own reasoning. Only unresolved items go up.
 - Conductor dedupes/batches across repos and puts them in the **decision inbox**, ranked by urgency × blocked-workers.
 - User answers once; the answer is recorded as a **decision** (reusable precedent) and flows back down.
@@ -84,6 +86,8 @@ type AgentEvent =
 
 All events go to an append-only **event log** (SQLite) → UI timelines, replay, audit, cost.
 
+Every state change is wrapped in an **event envelope** before it is stored or forwarded: `{v, id (ULID), ts, source, repo?, taskId?, sessionId?, correlationId?, causationId?, type, data}`. `AgentEvent` above is the payload of the `agent.*` envelope types (for example `agent.message.delta` and `agent.usage`). The other namespaces are `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `worker.*` and `budget.*`. Receivers ignore unknown fields and unknown event types. The full envelope is in [ADR-003 §1](adr/003-wire-protocols.md#1-one-transport-envelope-and-one-event-envelope).
+
 ## 4. Configuration layers
 
 ```
@@ -113,13 +117,14 @@ verify:
 budget:
   per_task_usd: 2.00
   per_day_usd: 25.00
+  api_key_per_month_usd: 200.00   # default monthly cap for API-key spend (owner decision, 2026-11-09)
 ```
 
 ## 5. Packages (monorepo)
 
 | Package | Purpose |
 |---|---|
-| `@tacet/core` | Types, event schema, HandoffPacket schema, config loader |
+| `@tacet/core` | Types, zod 4 protocol and event schemas ([ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)), HandoffPacket schema, config loader |
 | `@tacet/conductor` | Global daemon: registry, inbox, workflows, API for UI |
 | `@tacet/mini` | Per-repo daemon + MCP server; this is the "install into your repo" package |
 | `@tacet/adapter-*` | `claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty` |
@@ -128,7 +133,21 @@ budget:
 | `tacet` (cli) | `tacet up`, `tacet init`, `tacet status`, `tacet attach` |
 
 ## 6. Security & auth principles
-- Bind to 127.0.0.1 with a per-install token; LAN/remote access is explicit opt-in.
-- Never store or proxy vendor OAuth tokens; launch vendor CLIs/SDKs under the user's own auth or API keys.
+Local servers ([ADR-003 §3, §5, §6](adr/003-wire-protocols.md#3-auth-token-handshake-all-local-servers)):
+
+- **Binding.** The Conductor and each mini-conductor bind `127.0.0.1` and `::1` on an OS-assigned port. Remote or LAN access is an explicit opt-in (`remote: true` plus TLS) and is out of scope for v0.
+- **Token.** Each daemon generates a 256-bit token on start and rotates it on every start. The token is written, with the pid, port and protocol versions, to a runtime file in `~/.tacet/run/` that only the user can read (mode 0600 on POSIX). It is never inside a repo, and it is never logged or put in events.
+- **Browsers** never get the token. `tacet open` opens `http://127.0.0.1:<port>/#code=<one-time-code>`. The page exchanges the code (single use, 60 s lifetime) at `POST /auth/session` for an `HttpOnly; SameSite=Strict` session cookie.
+- **Host and Origin.** Requests are rejected unless `Host` is `127.0.0.1`, `[::1]` or `localhost` with the server port (DNS-rebinding defence). Browser requests must also match the served `Origin`.
+- **Hello.** The first frame on any socket must be `tacet/hello`. Any other method before hello closes the socket.
+- **Workers** get their own MCP token, bound to `{workerSessionId, taskId}` and revoked when the session closes. Tools take no `taskId` or `workerId` argument, and the token never appears in events ([ADR-003 §6](adr/003-wire-protocols.md#6-workers--mini-conductor-mcp-tool-surface)).
+
+Vendor auth and billing:
+
+- Never store, log, proxy or copy vendor OAuth or subscription tokens. Launch vendor CLIs and SDKs under the user's own login or API key.
+- **Default auth routing** (owner decision, 2026-11-09): prefer the API key for parallel or unattended Workers, and use the user's subscription login for interactive or single sessions. The owner can override this in config. Many parallel Workers on one subscription is an open risk; see [`docs/RESEARCH.md` §7](RESEARCH.md#7-auth-billing-and-terms-important-constraint).
+
+Other:
+
 - Worktree isolation by default; optional OS sandbox later.
 - All approvals and decisions are logged and attributable.

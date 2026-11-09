@@ -1,7 +1,8 @@
 # ADR-003: Wire protocols (conductor↔mini, UI events, MCP surface for workers)
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-09
+- Accepted by the owner on 2026-11-09.
 
 Resolves issue #4. Builds on ADR-002 (TypeScript on Node). It ratifies, with changes, the protocol table in `docs/RESEARCH.md` §4.
 
@@ -166,6 +167,20 @@ Exposing a mini as a real A2A agent later then only needs an HTTP binding and an
 - **Source of truth:** zod 4 schemas in `packages/core/src/schema/`. zod is already a dependency of the MCP TS SDK v2 and the Claude Agent SDK's `tool()`. JSON Schema 2020-12 files are generated into `packages/core/schema/v1/*.json` with `z.toJSONSchema`, committed, and checked in CI the same way `ROADMAP.md` is (`--check`).
 - **Files (v1):** `envelope`, `hello`, `task-ext` (the `urn:tacet:a2a-ext:task:v1` metadata), `escalation-ext`, `decision-ext`, `summary-packet`, `handoff-packet`, `agent-event` (the `AgentEvent` union), `ui-custom-events` (the `CUSTOM` payloads), and one input/output pair per MCP tool in §6. A2A and AG-UI types are **imported** from `@a2a-js/sdk` and `@ag-ui/core`, not redefined. Adding those runtime dependencies has to be justified in the scaffold PR, per the Conventions section of `AGENTS.md`.
 - **Contract tests:** a round-trip fixture per schema, plus a test that every `tacet/ui.event` payload validates against `@ag-ui/core`.
+
+## Owner answers (2026-11-09)
+
+The owner accepted this ADR in full on 2026-11-09. The ADR has no separate list of questions, so the answers below are mapped to the decision points they cover.
+
+- **Topology (§4):** the Conductor listens on one port and minis dial in. Accepted.
+- **Security model (§3, §6):** the token-file, one-time-code and per-worker MCP token model is accepted.
+- **Escalation (§6, `escalate`):** non-blocking `escalate` is accepted.
+- **MCP tool list (§6):** accepted as recommended.
+- **AG-UI subset (§5):** accepted as recommended. No reasoning events in v1. UI commands stay Tacet JSON-RPC.
+- **Defaults (§1, §2, §4, §7):** zod 4 schemas, the ids as written, the `-32010`…`-32019` error-code range, and the old-MCP-client question answered as recommended (the MCP server answers `2026-07-28` and, if the SDK allows, `2025-11-25`). The `2025-11-25` check is tracked as a roadmap spike.
+- **Note on §3.2:** the sentence about the token file on Windows predates the 2026-11-09 platform decision in ADR-002 (macOS and Linux only). It has no effect while Windows is out of scope. The decision text is left unchanged.
+
+Follow-ups for an accepted ADR, applied with this decision: `docs/ARCHITECTURE.md` (§1, §2.2, §3, §5, §6), `docs/RESEARCH.md` §4 and §8, the MCP and Claude Code timeout facts in `docs/adapters/capability-matrix.md`, and removal of Windows from the scaffold issue (#1) and the ADR-002 issue (#3). The schema follow-up is covered by issue #4. The local auth module follow-up has no roadmap issue yet.
 
 ## Consequences
 
