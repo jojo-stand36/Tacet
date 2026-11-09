@@ -1015,6 +1015,18 @@
         "agent:either"
       ],
       "body": "Follow-up from #11. Adapters scrub each emitted event of the session's literal secrets (MCP header values) and known key formats. A token the model echoes can arrive split across two `message.delta` events, and per-event scrubbing then misses it. Unlikely, since the model would have to echo the token, but the event log is durable.\n\n### Tasks\n- [ ] In the Claude adapter, hold back a short tail of each delta (the longest secret's length minus one) and scrub across the join before emitting; flush the tail at turn end\n- [ ] Move the helper to `@tacet/core` so every adapter (Codex, ACP, OpenCode, PTY) can use it\n- [ ] Keep delta latency bounded: the held-back tail is at most the longest secret's length\n\n### Acceptance criteria\n- A test streams a token split at every possible offset across two deltas; no emitted event contains it, and the concatenated text equals the original with the token replaced\n- Streaming still emits at least as many deltas for ordinary text (conformance `stream` probe passes)\n\n_See packages/adapters/claude-sdk/src/adapter.ts (`#emit`) and ADR-003 §1._"
+    },
+    {
+      "title": "Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Owner decision (2026-11-09), from the #12 review (PR #115). Builds on the Codex adapter once #115 is merged. One issue because all three change how the adapter launches Codex for a Worker.\n\n### Tasks\n- [ ] Verify the 0.167.0 config keys first (`verify-vendor-facts`): sandbox writable roots for `workspace-write` (e.g. `sandbox_workspace_write.writable_roots`) and how `thread/start` `config` or `-c` sets them; record in the capability matrix\n- [ ] Writable git dir: add the Worker's own worktree git dir (`git rev-parse --git-dir` in the worktree) to the writable roots, and nothing else; never the main repo's whole `.git`\n- [ ] Own `CODEX_HOME` for unattended Workers at `~/.tacet/state/<repo>/codex` (dir 0700, created on demand, `<repo>` as in the event log path); interactive sessions keep the user's `~/.codex`\n- [ ] `features.plugins = false` for unattended Workers (no GitHub plugin sync on start)\n- [ ] Document in the adapter README / capability matrix that the user's `config.toml` customisations do not apply to unattended Workers\n\n### Acceptance criteria\n- A Codex Worker in a git worktree can `git commit` without an approval request (test against the mock Responses API)\n- An unattended Worker's thread state lands under `~/.tacet/state/<repo>/codex`, never in `~/.codex` (test with an isolated HOME)\n- No `plugins-clone-*` directory is created for an unattended Worker\n- An interactive session still uses the user's `CODEX_HOME`\n\n_See docs/ARCHITECTURE.md §6 (Codex Worker isolation) and docs/adapters/capability-matrix.md §2._"
     }
   ]
 }

@@ -37,6 +37,11 @@ export interface AdapterCapabilities {
   modelSwitch: 'mid-session' | 'per-turn' | 'launch-only';
   /** `injectContext()` is implemented (Gas City `InjectContext`). */
   injectContext: boolean;
+  /**
+   * Where a reasoning-effort change takes effect (#110): `per-turn` honours `SendOptions.effort`,
+   * `per-session` only `SessionOptions.effort`. Absent: the adapter does not support effort.
+   */
+  effortSwitch?: 'per-turn' | 'per-session';
 }
 
 /** An MCP server the Worker session should connect to, e.g. the Mini-conductor's (ADR-003 §6). */
@@ -51,6 +56,8 @@ export interface SessionOptions {
   /** Working directory, normally the Worker's git worktree. */
   cwd: string;
   model?: string;
+  /** Reasoning effort, a vendor value such as `low` or `high`; see `effortSwitch`. */
+  effort?: string;
   systemPrompt?: string;
   /** Extra environment for the vendor process. Credentials come from the user's environment. */
   env?: Record<string, string>;
@@ -73,6 +80,8 @@ export interface UserInput {
 export interface SendOptions {
   /** Model for this and later turns, if `modelSwitch` allows it. */
   model?: string;
+  /** Reasoning effort for this and later turns, if `effortSwitch` is `per-turn`. */
+  effort?: string;
 }
 
 export interface InterruptResult {

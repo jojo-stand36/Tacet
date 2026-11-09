@@ -23,6 +23,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@openai/codex": "0.167.0",
     "@tacet/core": "workspace:*"
   }
 }

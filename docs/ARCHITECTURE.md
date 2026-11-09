@@ -200,4 +200,8 @@ Accepted residual risks (owner decision, 2026-11-09):
 Other:
 
 - Worktree isolation by default; optional OS sandbox later.
+- **Codex Worker isolation** (owner decision, 2026-11-09; #116):
+  - The Codex sandbox's writable roots gain the Worker's *own* worktree git directory (the one `git rev-parse --git-dir` names for that worktree), and no other, so `git commit` works without an escalation each time.
+  - Unattended Codex Workers get their own `CODEX_HOME` at `~/.tacet/state/<repo>/codex`; interactive sessions keep the user's `~/.codex`. The user's `config.toml` customisations (including their MCP servers) therefore do not apply to unattended Workers.
+  - Codex `features.plugins` is off for unattended Workers, so a Worker start never syncs plugins from GitHub.
 - All approvals and decisions are logged and attributable.
