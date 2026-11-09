@@ -97,6 +97,8 @@ interface Session {
   model: string | undefined;
   /** Effort requested for this session (launch or the last `send`), if any. */
   effort: EffortLevel | undefined;
+  /** Context window opted into at launch, if any. */
+  contextWindow: number | undefined;
   /** `supportedModels()`, fetched once when effort first needs checking. */
   models: Promise<ModelInfo[]> | undefined;
   /**
@@ -163,12 +165,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           `Claude supports only a ${CONTEXT_1M}-token window opt-in, not ${opts.contextWindow}`,
         );
       }
-      if (!opts.model || !CONTEXT_1M_MODELS.test(opts.model)) {
-        throw new ProfileRefusedError(
-          'contextWindow',
-          `the 1M-token window is documented for Sonnet 4 and 4.5 only, not ${opts.model ?? 'the default model'}`,
-        );
-      }
+      check1m(opts.model);
     }
     const id = randomUUID();
     const env = authEnv(this.#opts.authRoute ?? 'api_key', {
@@ -176,6 +173,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       ...opts.env,
       CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     });
+    // Tacet owns the effort: this variable overrides the `effort` option and later
+    // `applyFlagSettings` calls without any sign that it did.
+    delete env.CLAUDE_CODE_EFFORT_LEVEL;
 
     // A fresh session gets its vendor id up front, so the handle can be resumed even if it
     // closes before the first turn. A fork gets a new id; a plain resume keeps the old one.
@@ -253,6 +253,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       secrets: mcpHeaderSecrets(opts.mcpServers),
       model: opts.model,
       effort,
+      contextWindow: opts.contextWindow,
       models: undefined,
       costSoFar: opts.resume ? this.#costTotals.get(opts.resume.vendorSessionId) : 0,
       call: undefined,
@@ -284,14 +285,23 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     if (effort !== undefined && (effort !== s.effort || model !== s.model)) {
       await this.#checkEffort(s, model, effort);
     }
+    // The 1M beta stays on the session's requests, so a new model must take it too.
+    if (opts?.model && s.contextWindow === CONTEXT_1M) check1m(opts.model);
+    // Effort first, so a failed model switch can be rolled back to the previous state.
+    const effortChanged = effort !== undefined && effort !== s.effort;
+    if (effortChanged) await s.q.applyFlagSettings({ effortLevel: effort });
     if (opts?.model) {
-      await s.q.setModel(opts.model);
+      try {
+        await s.q.setModel(opts.model);
+      } catch (err) {
+        if (effortChanged) {
+          await s.q.applyFlagSettings({ effortLevel: s.effort ?? null }).catch(() => {});
+        }
+        throw err;
+      }
       s.model = opts.model;
     }
-    if (effort !== s.effort && effort !== undefined) {
-      await s.q.applyFlagSettings({ effortLevel: effort });
-      s.effort = effort;
-    }
+    if (effortChanged) s.effort = effort;
     const uuid = randomUUID();
     s.pending.set(uuid, input.text);
     s.inbox.push({
@@ -576,6 +586,16 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     }
     // Inputs sent during the turn run next.
     if (s.pending.size > 0) this.#setState(s, 'running');
+  }
+}
+
+/** Refuse the 1M window for models the SDK does not document it for. */
+function check1m(model: string | undefined): void {
+  if (!model || !CONTEXT_1M_MODELS.test(model)) {
+    throw new ProfileRefusedError(
+      'contextWindow',
+      `the 1M-token window is documented for Sonnet 4 and 4.5 only, not ${model ?? 'the default model'}`,
+    );
   }
 }
 

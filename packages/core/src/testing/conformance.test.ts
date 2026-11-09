@@ -25,6 +25,7 @@ const run = (opts?: MockAdapterOptions) => {
     ...scenario,
     altEffort: 'high',
     sentEffort: () => adapter.lastEffort,
+    contextWindow: { applied: () => adapter.lastContextWindow === 1_000_000 },
   });
 };
 const verdict = (results: ProbeResult[], id: string) => results.find((r) => r.id === id)?.verdict;
@@ -73,6 +74,32 @@ describe('conformance bench with the mock adapter', () => {
   it('checks effort at launch for a per-session adapter', async () => {
     const results = await run({ capabilities: { effortSwitch: 'per-session' } });
     expect(verdict(results, 'effort'), formatResults(results)).toBe('pass');
+  });
+
+  it('skips the effort probe when the vendor default already equals altEffort', async () => {
+    const adapter = new MockAdapter();
+    const results = await runConformance(adapter, {
+      ...scenario,
+      altEffort: 'high',
+      // A vendor whose default is `high` would make a no-op adapter look honest.
+      sentEffort: () => adapter.lastEffort ?? 'high',
+    });
+    expect(verdict(results, 'effort'), formatResults(results)).toBe('skip');
+  });
+
+  it('reports drift when a per-session adapter accepts a turn-level effort', async () => {
+    class Lax extends MockAdapter {
+      override capabilities() {
+        return { ...super.capabilities(), effortSwitch: 'per-session' as const };
+      }
+    }
+    const adapter = new Lax();
+    const results = await runConformance(adapter, {
+      ...scenario,
+      altEffort: 'high',
+      sentEffort: () => adapter.lastEffort,
+    });
+    expect(verdict(results, 'effort'), formatResults(results)).toBe('drift');
   });
 });
 

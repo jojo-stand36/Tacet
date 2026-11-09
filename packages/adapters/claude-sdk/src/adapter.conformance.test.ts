@@ -143,8 +143,15 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
       slowPrompt: 'SLOW',
       echoPrompt: 'WHO',
       altModel: 'claude-opus-5-5',
-      altEffort: 'high',
-      sentEffort: () => api.requests.at(-1)?.effort,
+      altEffort: 'low',
+      sentEffort: (p) => api.requests.findLast((r) => r.text.endsWith(p))?.effort,
+      contextWindow: {
+        session: { model: 'claude-sonnet-4-5' },
+        applied: (p) =>
+          api.requests
+            .findLast((r) => r.text.endsWith(p))
+            ?.betas.includes('context-1m-2025-08-07') ?? false,
+      },
       timeoutMs: 60_000,
     });
     console.log(formatResults(results));
@@ -170,7 +177,13 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     timeout: 180_000,
   }, async () => {
     // Launch effort reaches the API as output_config.effort.
-    const h = await adapter.start({ cwd: worktree, model: 'claude-sonnet-4-6', effort: 'low' });
+    // An inherited CLAUDE_CODE_EFFORT_LEVEL would override it silently; the adapter drops it.
+    const h = await adapter.start({
+      cwd: worktree,
+      model: 'claude-sonnet-4-6',
+      effort: 'low',
+      env: { CLAUDE_CODE_EFFORT_LEVEL: 'max' },
+    });
     expect(await turn(h, new EventTap(adapter.events(h)), 'SAY low')).toBe('You said low.');
     expect(api.requests.findLast((r) => r.text.endsWith('SAY low'))?.effort).toBe('low');
     // claude-sonnet-4-6 lists no xhigh: refused, not silently lowered.
@@ -202,6 +215,10 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     expect(api.requests.findLast((r) => r.text.endsWith('SAY big'))?.betas).toContain(
       'context-1m-2025-08-07',
     );
+    // The beta would follow the session to a model it is not offered for: refused.
+    await expect(
+      adapter.send(big, { text: 'SAY x' }, { model: 'claude-opus-5-5' }),
+    ).rejects.toMatchObject({ field: 'contextWindow' });
     await adapter.close(big);
     await expect(
       adapter.start({ cwd: worktree, model: 'claude-sonnet-5-5', contextWindow: 1_000_000 }),

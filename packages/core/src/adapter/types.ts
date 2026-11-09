@@ -64,7 +64,7 @@ export interface SessionOptions {
   cwd: string;
   model?: string;
   /** Reasoning effort; see `effortSwitch`. Refused (`ProfileRefusedError`, `./errors.ts`) if unsupported. */
-  effort?: Effort | (string & {});
+  effort?: Effort;
   /**
    * Context window in tokens, larger than the model's default; must be one of
    * `capabilities().contextSizes`, otherwise `start()` refuses it (#110).
@@ -92,8 +92,11 @@ export interface UserInput {
 export interface SendOptions {
   /** Model for this and later turns, if `modelSwitch` allows it. */
   model?: string;
-  /** Reasoning effort for this and later turns, if `effortSwitch` is `per-turn`. */
-  effort?: Effort | (string & {});
+  /**
+   * Reasoning effort for this and later turns, if `effortSwitch` is `per-turn`. Applies from the
+   * vendor's next model call: sent while a turn runs, it also reaches that turn's remaining calls.
+   */
+  effort?: Effort;
 }
 
 export interface InterruptResult {

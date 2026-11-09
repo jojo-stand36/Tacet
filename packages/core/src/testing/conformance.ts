@@ -1,6 +1,7 @@
 import type {
   AdapterCapabilities,
   AgentAdapter,
+  SendOptions,
   SessionHandle,
   SessionOptions,
 } from '../adapter/types.js';
@@ -39,10 +40,17 @@ export interface ConformanceScenario {
   /** An effort the scenario's model accepts, for the effort probe (#110). */
   altEffort?: string;
   /**
-   * The effort the vendor received in its most recent model request, e.g. read from a mock
-   * API's request log. Without it the effort probe is skipped: adapter events do not carry it.
+   * The effort the vendor received in its latest model request for `prompt`, e.g. read from a
+   * mock API's request log. Without it the effort probe is skipped: adapter events do not carry it.
    */
-  sentEffort?: () => unknown;
+  sentEffort?: (prompt: string) => unknown;
+  /**
+   * How to check that the first listed context window is applied, not only accepted. `session`
+   * is merged into `session` (e.g. a model the window is offered for); `applied(prompt)` says
+   * whether the vendor's latest request for `prompt` used it. Without it, only refusal of an
+   * unlisted window is checked.
+   */
+  contextWindow?: { session?: Partial<SessionOptions>; applied: (prompt: string) => boolean };
   minDeltas?: number;
   timeoutMs?: number;
 }
@@ -139,9 +147,9 @@ async function withSession<T>(
 }
 
 /** Send `text` and wait for the turn to end. Returns the events of that turn. */
-async function turn(ctx: Ctx, h: SessionHandle, tap: EventTap, text: string) {
+async function turn(ctx: Ctx, h: SessionHandle, tap: EventTap, text: string, opts?: SendOptions) {
   const from = tap.events.length;
-  await ctx.adapter.send(h, { text });
+  await ctx.adapter.send(h, { text }, opts);
   const running = await tap.waitFor(
     (e) => e.t === 'status' && e.state === 'running',
     ctx.timeout,
@@ -414,27 +422,43 @@ const PROBES: Probe[] = [
       const mode = ctx.caps.effortSwitch;
       if (!mode) return skip('no effortSwitch declared');
       const effort = ctx.sc.altEffort;
-      const sent = ctx.sc.sentEffort;
-      if (!effort || !sent) return skip('no altEffort/sentEffort in scenario');
+      const sentEffort = ctx.sc.sentEffort;
+      if (!effort || !sentEffort) return skip('no altEffort/sentEffort in scenario');
+      const prompt = ctx.sc.replyPrompt;
+      const sent = () => sentEffort(prompt);
+      // A baseline first, so an adapter that ignores effort cannot pass on the vendor's default.
+      const before = await withSession(ctx, async (h, tap) => {
+        await turn(ctx, h, tap, prompt);
+        return sent();
+      });
+      if (before === effort) {
+        return skip(`the vendor default is already ${effort}; choose another altEffort`);
+      }
       if (mode === 'per-session') {
-        // Applied at launch: start a session with it and check the first request.
+        // Applied at launch; a turn-level change must be refused, not ignored.
         return withSession(
           ctx,
           async (h, tap) => {
-            await turn(ctx, h, tap, ctx.sc.replyPrompt);
-            return sent() === effort ? pass('effort applied at launch') : drift('effort not sent');
+            await turn(ctx, h, tap, prompt);
+            if (sent() !== effort) return drift(`vendor got ${JSON.stringify(sent())} at launch`);
+            try {
+              await ctx.adapter.send(h, { text: prompt }, { effort: String(before ?? 'low') });
+              return drift('per-session adapter accepted a turn-level effort');
+            } catch (err) {
+              return isProfileRefusal(err)
+                ? pass('effort applied at launch; turn-level change refused')
+                : drift(`expected ProfileRefusedError, got ${String(err)}`);
+            }
           },
           { ...ctx.sc.session, effort },
         );
       }
       // per-turn: a turn-level change must reach the vendor on that turn.
       return withSession(ctx, async (h, tap) => {
-        const from = tap.events.length;
-        await ctx.adapter.send(h, { text: ctx.sc.replyPrompt }, { effort });
-        await tap.waitFor((e) => e.t === 'status' && e.state === 'running', ctx.timeout, from);
-        await tap.waitFor((e) => e.t === 'status' && TURN_END.has(e.state), ctx.timeout, from + 1);
+        await turn(ctx, h, tap, prompt);
+        await turn(ctx, h, tap, prompt, { effort });
         return sent() === effort
-          ? pass('effort applied on the turn')
+          ? pass(`effort changed from ${JSON.stringify(before)} to ${effort} on the turn`)
           : drift(`vendor got effort ${JSON.stringify(sent())}, not ${effort}`);
       });
     },
@@ -444,21 +468,42 @@ const PROBES: Probe[] = [
     priority: 'P1',
     run: async (ctx) => {
       // An adapter refuses a window it does not list instead of silently using the default.
-      const listed = new Set(ctx.caps.contextSizes ?? []);
+      const sizes = ctx.caps.contextSizes ?? [];
       let unlisted = 1_234_567;
-      while (listed.has(unlisted)) unlisted += 1;
+      while (sizes.includes(unlisted)) unlisted += 1;
       try {
         const h = await ctx.adapter.start({ ...ctx.sc.session, contextWindow: unlisted });
         await ctx.adapter.close(h).catch(() => {});
         return drift(`started with unlisted contextWindow ${unlisted}`);
       } catch (err) {
-        return err instanceof Error && err.name === 'ProfileRefusedError'
-          ? pass('unlisted context window refused')
-          : drift(`expected ProfileRefusedError, got ${String(err)}`);
+        if (!isProfileRefusal(err))
+          return drift(`expected ProfileRefusedError, got ${String(err)}`);
       }
+      // And one it lists is applied, not merely accepted.
+      const window = sizes[0];
+      const check = ctx.sc.contextWindow;
+      if (window === undefined) return pass('unlisted window refused; none listed');
+      if (!check)
+        return pass('unlisted window refused; listed window not checked (no scenario hook)');
+      const prompt = ctx.sc.replyPrompt;
+      return withSession(
+        ctx,
+        async (h, tap) => {
+          await turn(ctx, h, tap, prompt);
+          return check.applied(prompt)
+            ? pass(`unlisted window refused; ${window} applied`)
+            : drift(`started with contextWindow ${window} but the vendor did not use it`);
+        },
+        { ...ctx.sc.session, ...check.session, contextWindow: window },
+      );
     },
   },
 ];
+
+/** Matched by name, so a duplicate copy of `@tacet/core` still counts. */
+function isProfileRefusal(err: unknown): boolean {
+  return err instanceof Error && err.name === 'ProfileRefusedError';
+}
 
 /** Run every probe against `adapter`. Probes never throw; failures become verdicts. */
 export async function runConformance(

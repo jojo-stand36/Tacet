@@ -34,7 +34,7 @@ export interface MockLies {
   interrupt?: boolean;
   /** Accepts `effort` but never applies it. */
   effort?: boolean;
-  /** Starts with any `contextWindow`, even one it does not list. */
+  /** Starts with any `contextWindow`, even one it does not list, and never applies it. */
   contextWindow?: boolean;
 }
 
@@ -56,6 +56,7 @@ interface MockSession {
   interrupted: boolean;
   model: string;
   effort: string | undefined;
+  contextWindow: number | undefined;
   context: string[];
   approvals: Map<string, (d: ApprovalDecision) => void>;
 }
@@ -77,6 +78,8 @@ export class MockAdapter implements AgentAdapter {
   readonly #sessions = new Map<string, MockSession>();
   /** The effort in force for the last turn any session ran (what a vendor would have got). */
   lastEffort: string | undefined;
+  /** The context window in force for the last turn any session ran. */
+  lastContextWindow: number | undefined;
 
   constructor(opts: MockAdapterOptions = {}) {
     const caps: Record<string, unknown> = {
@@ -119,6 +122,7 @@ export class MockAdapter implements AgentAdapter {
       interrupted: false,
       model: opts.model ?? 'mock-model',
       effort: opts.effort,
+      contextWindow: this.#lie.contextWindow ? undefined : opts.contextWindow,
       context: [],
       approvals: new Map(),
     };
@@ -199,6 +203,7 @@ export class MockAdapter implements AgentAdapter {
       const text = s.queue.shift() ?? '';
       s.interrupted = false;
       this.lastEffort = s.effort;
+      this.lastContextWindow = s.contextWindow;
       this.#emit(s, { t: 'status', state: 'running' });
       const outcome = await this.#turn(s, text);
       if (!this.#sessions.has(s.handle.id)) break;

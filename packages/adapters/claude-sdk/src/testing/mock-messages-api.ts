@@ -9,7 +9,7 @@ import type { AddressInfo } from 'node:net';
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the requested model id.
- * Requests are recorded (model, last user text, and the effort, thinking and beta settings the
+ * Requests are recorded (model, last user text, and the effort and beta settings the
  * binary sent; never headers that carry credentials) for assertions.
  */
 export interface MockRequest {
@@ -18,8 +18,6 @@ export interface MockRequest {
   messages: number;
   /** `output_config.effort` as sent, if any. */
   effort?: unknown;
-  /** The `thinking` request field as sent, if any. */
-  thinking?: unknown;
   /** The `anthropic-beta` header values. */
   betas: string[];
 }
@@ -37,7 +35,6 @@ type Block =
 interface Body {
   model?: string;
   output_config?: { effort?: unknown };
-  thinking?: unknown;
   stream?: boolean;
   messages?: { role: string; content: string | { type: string; text?: string }[] }[];
 }
@@ -105,7 +102,6 @@ async function handle(
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
     ...(body.output_config?.effort !== undefined ? { effort: body.output_config.effort } : {}),
-    ...(body.thinking !== undefined ? { thinking: body.thinking } : {}),
     betas: (Array.isArray(beta) ? beta.join(',') : (beta ?? ''))
       .split(',')
       .map((b) => b.trim())

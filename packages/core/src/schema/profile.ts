@@ -1,14 +1,30 @@
 import { z } from 'zod';
-import { openEnum, TokenCount } from './common.js';
+import { TokenCount } from './common.js';
 
 /**
- * Reasoning effort a Worker session runs at (#110). The known values are the union of the
- * vendors' levels (Claude: `low`..`max`; Codex adds `minimal`). Adapters pass the value to the
- * vendor unchanged and refuse one their model cannot take, so the fallback only matters for
- * events from newer versions: an unknown level is read as `medium`.
+ * Effort levels the verified vendors use (capability matrix, #110). Claude: `low`..`max`;
+ * Codex adds `none`, `minimal`, `ultra` and `persistent`; OpenCode variants are named per model.
  */
-export const Effort = openEnum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'], 'medium');
-export type Effort = z.infer<typeof Effort>;
+export const KNOWN_EFFORTS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+  'persistent',
+] as const;
+
+/**
+ * Reasoning effort a Worker session runs at (#110). An open vocabulary kept verbatim: vendors
+ * advertise their levels per model (Codex `model/list`), and reading an unknown level as some
+ * fallback would misreport cost (`none` read as `medium`). Adapters refuse a level their model
+ * cannot take (`ProfileRefusedError`) rather than pass it on.
+ */
+export const Effort = z.string().min(1).max(64);
+export type Effort = (typeof KNOWN_EFFORTS)[number] | (string & {});
 
 /**
  * What a Worker session runs on (#110): the model, its reasoning effort and its context window.
