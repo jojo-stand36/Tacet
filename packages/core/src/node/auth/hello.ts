@@ -17,6 +17,11 @@ export type GateAction =
   | { kind: 'close'; code: number; reason: string; message?: JsonRpcError }
   | { kind: 'pass' };
 
+/** Hello params as passed to `onHello`: a UI hello's `sessionToken` is removed. */
+export type HelloInfo =
+  | Exclude<HelloParams, { role: 'ui' }>
+  | Omit<Extract<HelloParams, { role: 'ui' }>, 'sessionToken'>;
+
 export interface HelloGateOptions {
   /** Protocol majors this server supports. */
   versions: number[];
@@ -24,8 +29,25 @@ export interface HelloGateOptions {
   capabilities?: Record<string, unknown>;
   /** Mint the session id returned in the hello result. */
   newSessionId: () => string;
-  /** Called with the validated hello params once the handshake succeeds. */
-  onHello?: (params: HelloParams, protocolVersion: number) => void;
+  /**
+   * How this socket's upgrade request was authenticated, as decided by the daemon before the
+   * gate runs. `bearer`: the upgrade carried a valid daemon token (CLI, Mini-conductor); any role
+   * may hello. `none`: no credential on the upgrade (a browser, which cannot set headers on a
+   * WebSocket upgrade); only `role: "ui"` with a valid browser session token is accepted, so an
+   * unauthenticated local process cannot claim the `cli` or `mini` role.
+   */
+  upgradeAuth: 'bearer' | 'none';
+  /**
+   * Verify the browser session token of a `role: "ui"` hello (ADR-003 §3.4 addendum). Without
+   * it, every UI hello is refused. CLI and Mini-conductor clients authenticate with a bearer
+   * token on the upgrade request instead.
+   */
+  verifyBrowserSession?: (sessionToken: string) => boolean;
+  /**
+   * Called with the validated hello params once the handshake succeeds. A UI hello's
+   * `sessionToken` is removed first, so it cannot end up in logs by accident.
+   */
+  onHello?: (params: HelloInfo, protocolVersion: number) => void;
 }
 
 /**
@@ -74,6 +96,19 @@ export class HelloGate {
     const parsed = HelloParams.safeParse(params);
     if (!parsed.success) return this.#fail(rpcId, -32602, 'invalid tacet/hello params');
 
+    if (parsed.data.role !== 'ui' && this.#opts.upgradeAuth !== 'bearer') {
+      return this.#authFail(rpcId, 'this role needs a bearer token on the upgrade');
+    }
+    if (parsed.data.role === 'ui') {
+      // Fails closed: no verifier, a rejecting verifier or a throwing verifier all refuse.
+      let valid = false;
+      try {
+        valid = this.#opts.verifyBrowserSession?.(parsed.data.sessionToken) === true;
+      } catch {
+        valid = false;
+      }
+      if (!valid) return this.#authFail(rpcId, 'browser session not valid');
+    }
     const common = parsed.data.protocolVersions.filter((v) => this.#opts.versions.includes(v));
     if (common.length === 0) {
       this.#state = 'failed';
@@ -93,7 +128,14 @@ export class HelloGate {
     }
     const protocolVersion = Math.max(...common);
     try {
-      this.#opts.onHello?.(parsed.data, protocolVersion);
+      let info: HelloInfo;
+      if (parsed.data.role === 'ui') {
+        const { sessionToken: _redacted, ...rest } = parsed.data;
+        info = rest;
+      } else {
+        info = parsed.data;
+      }
+      this.#opts.onHello?.(info, protocolVersion);
     } catch {
       return this.#fail(rpcId, -32603, 'hello rejected');
     }
@@ -110,6 +152,16 @@ export class HelloGate {
           sessionId: this.#opts.newSessionId(),
         },
       },
+    };
+  }
+
+  #authFail(id: string | number | null, message: string): GateAction {
+    this.#state = 'failed';
+    return {
+      kind: 'close',
+      code: CLOSE_AUTH_FAILED,
+      reason: message,
+      message: { jsonrpc: '2.0', id, error: { code: -32600, message } },
     };
   }
 
