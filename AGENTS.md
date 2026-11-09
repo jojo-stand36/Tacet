@@ -14,7 +14,7 @@ Read before non-trivial work:
 
 ## Current status
 
-Planning stage (milestone **M0 · Foundations**). There is no application code yet. The planned stack is a TypeScript pnpm monorepo (`packages/core`, `conductor`, `mini`, `adapters/*`, `web`, `tui`, `cli`), pending ADR-002. Do not scaffold packages outside the issue that asks for it.
+Milestone **M0 · Foundations**. The monorepo is scaffolded (#1): TypeScript (`strict`, ESM) in a pnpm workspace with `packages/core`, `conductor`, `mini`, `adapters/*` (`claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty`), `web`, `tui` and `cli`, on Node.js 24 or later ([ADR-002](docs/adr/002-language-runtime.md)). The packages are placeholders until their roadmap issues land. Bun is not supported. Targets are macOS and Linux (Ubuntu) only. Do not add packages outside the issue that asks for it.
 
 ## Repo layout
 
@@ -27,6 +27,7 @@ AGENTS.md / CLAUDE.md         agent instructions (this file is canonical)
 docs/                         research, architecture, ADRs, hybrid workflow
 roadmap/issues.json           roadmap source of truth (milestones, labels, issues)
 ROADMAP.md                    GENERATED from roadmap/issues.json
+packages/                     pnpm workspace: core, conductor, mini, adapters/*, web, tui, cli
 scripts/                      repo tooling (node, no dependencies)
 ```
 
@@ -36,10 +37,12 @@ scripts/                      repo tooling (node, no dependencies)
 |---|---|
 | Regenerate ROADMAP.md | `node scripts/gen-roadmap.mjs` |
 | Regenerate Copilot agents | `node scripts/sync-agents.mjs` |
-| Check generated files are current (CI runs this) | `node scripts/gen-roadmap.mjs --check && node scripts/sync-agents.mjs --check` |
+| Check generated files are current (CI runs this) | `pnpm check:generated` (roadmap, Copilot agents, and `@tacet/core` JSON Schemas) |
+| Regenerate core JSON Schemas | `pnpm --filter @tacet/core gen:schemas` |
 | Create roadmap issues on GitHub | `scripts/create-issues.sh OWNER/REPO [--dry-run]` |
+| Install / lint / typecheck / test | `pnpm install`, `pnpm lint` (Biome), `pnpm typecheck` (`tsc -b`), `pnpm test` (Vitest) |
 
-Once packages exist, `pnpm install`, `pnpm test`, `pnpm lint` and `pnpm typecheck` must all pass before a PR is ready.
+`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. CI runs them on Ubuntu and macOS with Node 24 and 26.
 
 ## How to work an issue
 
@@ -61,6 +64,8 @@ Once packages exist, `pnpm install`, `pnpm test`, `pnpm lint` and `pnpm typechec
 ## Conventions
 
 - **Language:** TypeScript, `strict` mode, ESM. No `any` without a comment saying why.
+- **Runtime:** Node.js 24 or later (ADR-002). Do not use Bun-only APIs (`Bun.*`, `bun:*`). CI does not run Bun.
+- **Borrowed code:** borrow ideas freely. Port code only with attribution: keep the license header and add the entry to `NOTICE` (ADR-001).
 - **Commits:** Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`). Reference the issue: `feat(mini): worktree GC (#12)`.
 - **Naming:** use the project vocabulary exactly: Conductor, Mini-conductor, Worker, Adapter, Escalation, Decision, HandoffPacket, Task. Config lives in `.tacet/`; packages are `@tacet/*`.
 - **Dependencies:** prefer the platform and the official vendor SDKs. Justify every new runtime dependency in the PR.

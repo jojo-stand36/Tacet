@@ -1,0 +1,13 @@
+{
+  "id": "01JCX5Z9Q4W8E7R6T5Y4V3K2M3",
+  "escalationId": "01JCX5Z9Q4W8E7R6T5Y4V3K2M2",
+  "taskId": "task-42",
+  "repo": "api-service",
+  "topic": "rate limiter backend",
+  "decision": "redis",
+  "rationale": "Several API instances share limits",
+  "scope": "repo",
+  "source": "user",
+  "tags": ["rate-limiting", "infra"],
+  "decidedAt": "2026-11-09T12:00:00.000Z"
+}

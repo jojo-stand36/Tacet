@@ -1,0 +1,28 @@
+{
+  "name": "@tacet/adapter-opencode",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OpenCode adapter over the OpenCode HTTP + SSE server.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "@tacet/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*"
+  ],
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@tacet/core": "workspace:*"
+  }
+}

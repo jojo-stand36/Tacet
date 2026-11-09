@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "id": "01JCX5Z9Q4W8E7R6T5Y4V3K2M1",
+  "ts": "2026-11-09T12:00:00.000Z",
+  "source": {
+    "kind": "adapter",
+    "id": "claude-sdk"
+  },
+  "repo": "api-service",
+  "taskId": "task-42",
+  "sessionId": "sess-1",
+  "type": "agent.usage",
+  "data": {
+    "t": "usage",
+    "inputTokens": 1200,
+    "outputTokens": 80,
+    "contextUsed": 45000,
+    "contextMax": 200000,
+    "costUsd": 0.012,
+    "source": "reported"
+  }
+}

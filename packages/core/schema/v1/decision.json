@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:decision:v1",
+  "title": "Tacet Decision",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "escalationId": {
+      "description": "The escalation this answers, if any",
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "repo": {
+      "type": "string",
+      "minLength": 1
+    },
+    "topic": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The chosen option or answer"
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "scope": {
+      "enum": [
+        "task",
+        "repo"
+      ],
+      "x-tacet-fallback": "task",
+      "type": "string"
+    },
+    "source": {
+      "enum": [
+        "policy",
+        "precedent",
+        "mini",
+        "user",
+        "worker"
+      ],
+      "x-tacet-fallback": "mini",
+      "type": "string"
+    },
+    "tags": {
+      "default": [],
+      "description": "Precedent tags used to match future escalations",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "decidedAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+    },
+    "supersedes": {
+      "description": "An earlier decision this one replaces",
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    }
+  },
+  "required": [
+    "id",
+    "topic",
+    "decision",
+    "scope",
+    "source",
+    "decidedAt"
+  ]
+}

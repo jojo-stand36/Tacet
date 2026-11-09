@@ -16,6 +16,17 @@ Repo, decisions, schemas, spikes. Nothing runs agents yet.
 - [ ] **Event log: append-only SQLite store with replay** — `feature` `P0` `copilot`
 - [ ] **Config system: layered YAML (user → repo → local → task)** — `feature` `P0` `copilot`
 - [ ] **Spike: adapter capability matrix across Claude, Codex, OpenCode, Gemini, ACP** — `spike` `P0` `claude`
+- [ ] **Spike: Codex approval decision enums and turn/interrupt payloads** — `spike` `P0` `claude`
+- [ ] **Spike: read Codex app-server docs, auth and terms pages from primary sources** — `spike` `P0` `claude`
+- [ ] **Spike: OpenCode event names, permission events and token and cost fields** — `spike` `P2` `claude`
+- [ ] **Spike: verify ACP session semantics (cancel, stdio framing, fork, usage)** — `spike` `P1` `claude`
+- [ ] **Spike: verify the Claude ACP adapter and codex-acp** — `spike` `P1` `claude`
+- [ ] **Spike: Gemini CLI stats fields, headless approvals and ACP permission flow** — `spike` `P1` `claude`
+- [ ] **Spike: Claude CLI stream-json input and permission-prompt contract, CLI vs SDK** — `spike` `P0` `claude`
+- [ ] **Human decision: may many parallel Claude Workers run on one subscription?** — `docs` `P1` `claude + human`
+- [ ] **Spike: confirm who publishes the PyPI openai-codex-sdk package** — `spike` `P2` `claude`
+- [ ] **Spike: verify per-vendor MCP client facts (revisions, config injection, timeouts)** — `spike` `P1` `claude`
+- [ ] **Spike: confirm @modelcontextprotocol/server answers 2025-11-25 initialize clients** — `spike` `P0` `claude`
 
 ## M1 · Mini-conductor MVP
 
@@ -34,6 +45,10 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Verification pipeline: commands + reviewer agent** — `feature` `P1` `either`
 - [ ] **`tacet init` installer for repos** — `feature` `P0` `copilot`
 - [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `copilot`
+- [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
+- [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
+- [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
+- [ ] **Browser session via hello frame instead of cookie (ADR-003 §3.4 addendum)** — `feature` `P0` `claude`
 
 ## M2 · Conductor & escalation
 
@@ -46,6 +61,8 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Decision inbox: dedupe, batch, rank, answer, propagate** — `feature` `P0` `either`
 - [ ] **Summary packets (no transcripts upward)** — `feature` `P1` `either`
 - [ ] **Cross-project goals: split one goal into tasks across repos** — `feature` `P1` `either`
+- [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
+- [ ] **UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)** — `feature` `P2` `either`
 
 ## M3 · Context handoff & cost tiering
 
@@ -59,6 +76,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Escalation ladder: retry with stronger model before asking a human** — `feature` `P1` `either`
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
+- [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 
 ## M4 · Visual & terminal UI
 
@@ -88,10 +106,10 @@ Notifications, chat channels, phone access, non-code workflows and templates.
 Plugins, A2A/ACP exposure, sandboxing, evals, docs, release.
 
 - [ ] **Plugin system: adapters, channels, tools, workflows** — `feature` `P2` `either`
-- [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
 - [ ] **Expose conductor via A2A** — `feature` `P2` `claude`
 - [ ] **OS sandboxing for workers (bubblewrap / seatbelt / containers)** — `feature` `P2` `either`
 - [ ] **Evaluation harness: escalation quality, handoff fidelity, cost** — `feature` `P1` `either`
 - [ ] **Threat model + security review** — `docs` `P1` `claude + human`
 - [ ] **Docs site + quickstart + vendor auth/billing guide** — `docs` `P1` `either + human`
 - [ ] **v0.1 release: packaging (npm, Homebrew), installers, changelog** — `chore` `P1` `copilot`
+- [ ] **Re-check Bun when oven-sh/bun#25822 closes** — `spike` `P2` `claude`

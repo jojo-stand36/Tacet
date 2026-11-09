@@ -1,0 +1,50 @@
+{
+  "name": "@tacet/core",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared types and zod schemas for Tacet: AgentEvent, Task, Escalation, Decision, HandoffPacket and the event envelope, with JSON Schema exports.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "@tacet/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "@tacet/source": "./src/node/index.ts",
+      "types": "./dist/node/index.d.ts",
+      "default": "./dist/node/index.js"
+    },
+    "./testing": {
+      "@tacet/source": "./src/testing/index.ts",
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    },
+    "./schema/v1/*.json": "./schema/v1/*.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.test.*",
+    "schema",
+    "examples"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "gen:schemas": "tsc -b && node scripts/gen-schemas.mjs",
+    "check:schemas": "tsc -b && node scripts/gen-schemas.mjs --check"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "yaml": "2.9.1",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
+  }
+}

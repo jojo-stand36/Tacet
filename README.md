@@ -4,7 +4,7 @@
 
 *Tacet* (TAH-set) is the musical marking that tells an instrument to stay silent. Tacet's agents work quietly in the background and only interrupt you for the decisions that need you.
 
-**Status:** research & planning. No code yet. See the [roadmap](ROADMAP.md).
+**Status:** early development (M0). The monorepo is scaffolded; the packages are still placeholders. See the [roadmap](ROADMAP.md). Licensed under [Apache-2.0](LICENSE).
 
 ## The idea
 
@@ -45,4 +45,4 @@ scripts/create-issues.sh OWNER/REPO             # create labels, milestones, iss
 
 ## License
 
-TBD in M0 (Apache-2.0 or MIT).
+Apache-2.0, decided 2026-11-09 ([ADR-001](docs/adr/001-build-vs-extend.md)). The `LICENSE` and `NOTICE` files land with the scaffold issue (#1).

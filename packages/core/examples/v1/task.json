@@ -1,0 +1,11 @@
+{
+  "id": "task-42",
+  "goal": "Add rate limiting to the public API",
+  "acceptanceCriteria": ["429 after 100 requests per minute per key", "Tests cover the limiter"],
+  "budget": {
+    "usd": 2.0
+  },
+  "priority": "p1",
+  "contextId": "goal-7",
+  "createdAt": "2026-11-09T12:00:00.000Z"
+}

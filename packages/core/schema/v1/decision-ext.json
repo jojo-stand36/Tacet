@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:decision-ext:v1",
+  "title": "Tacet A2A decision extension (urn:tacet:a2a-ext:decision:v1)",
+  "type": "object",
+  "properties": {
+    "escalationId": {
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "choice": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rationale": {
+      "type": "string"
+    },
+    "scope": {
+      "enum": [
+        "task",
+        "repo"
+      ],
+      "x-tacet-fallback": "task",
+      "type": "string"
+    }
+  },
+  "required": [
+    "escalationId",
+    "choice",
+    "scope"
+  ]
+}

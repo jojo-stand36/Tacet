@@ -1,0 +1,7 @@
+packages:
+  - packages/*
+  - packages/adapters/*
+engineStrict: true
+catalog:
+  # One zod for the whole workspace; ADR-003 §7 relies on sharing it with the MCP and Claude SDKs.
+  zod: 4.6.7

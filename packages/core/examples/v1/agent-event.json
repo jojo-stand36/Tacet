@@ -1,0 +1,6 @@
+{
+  "t": "approval.request",
+  "id": "toolu_01",
+  "summary": "Run `pnpm install` in the worktree",
+  "toolName": "Bash"
+}

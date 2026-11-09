@@ -141,7 +141,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Set up the monorepo skeleton described in docs/ARCHITECTURE.md §5.\n\n### Tasks\n- [ ] pnpm workspaces with packages: core, conductor, mini, adapters/*, web, tui, cli\n- [ ] TypeScript strict, shared tsconfig, ESLint + Prettier (or Biome)\n- [ ] Vitest, GitHub Actions CI on Linux + macOS (+ Windows smoke)\n- [ ] LICENSE (decide: Apache-2.0 vs MIT), CONTRIBUTING, CODE_OF_CONDUCT, SECURITY\n\n### Acceptance criteria\n- `pnpm i && pnpm test` passes in CI on a clean checkout\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Set up the monorepo skeleton described in docs/ARCHITECTURE.md §5.\n\n### Tasks\n- [ ] pnpm workspaces with packages: core, conductor, mini, adapters/*, web, tui, cli\n- [ ] TypeScript strict, shared tsconfig, ESLint + Prettier (or Biome)\n- [ ] Vitest, GitHub Actions CI on Ubuntu Linux + macOS\n- [ ] `engines.node: \">=24\"`, `.nvmrc` and `.node-version` set to 24; CI matrix {ubuntu, macos} x {Node 24, Node 26} (ADR-002)\n- [ ] LICENSE: Apache-2.0 (decided 2026-11-09, ADR-001), CONTRIBUTING, CODE_OF_CONDUCT, SECURITY\n- [ ] NOTICE file for attribution of any ported ideas or code (ADR-001 policy: borrow ideas, port code only with attribution)\n\n### Acceptance criteria\n- `pnpm i && pnpm test` passes in CI on a clean checkout\n- `LICENSE` (Apache-2.0) and `NOTICE` are at the repo root\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "ADR-001: Build standalone vs extend Omnigent vs interop",
@@ -164,7 +164,7 @@
         "agent:claude",
         "needs-human"
       ],
-      "body": "Confirm runtime. Default recommendation: TypeScript on Node (all target SDKs are first-class in TS).\n\n### Tasks\n- [ ] Check SDK support matrix: Claude Agent SDK, Codex app-server TS schema, ACP SDK, OpenCode SDK, MCP SDK, AG-UI\n- [ ] Check node-pty / PTY support on macOS, Linux, Windows\n- [ ] Decide Node vs Bun\n\n### Acceptance criteria\n- ADR merged\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Confirm runtime. Default recommendation: TypeScript on Node (all target SDKs are first-class in TS).\n\nOwner answers recorded 2026-11-09: Node 24 minimum, Bun excluded, macOS and Linux only. The ADR stays proposed and waits on ADR-001 (#2).\n\n### Tasks\n- [ ] Check SDK support matrix: Claude Agent SDK, Codex app-server TS schema, ACP SDK, OpenCode SDK, MCP SDK, AG-UI\n- [ ] Check node-pty / PTY support on macOS and Linux\n- [ ] Decide Node vs Bun\n\n### Acceptance criteria\n- ADR merged\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "ADR-003: Wire protocols (conductor↔mini, UI events, MCP surface)",
@@ -187,7 +187,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Single source of truth for all shared types, with runtime validation (zod or JSON Schema).\n\n### Tasks\n- [ ] Task (id, goal, acceptance criteria, budget, priority, parent)\n- [ ] Normalized AgentEvent union (see ARCHITECTURE.md §3)\n- [ ] Escalation + Decision (with precedent tags)\n- [ ] HandoffPacket (goal, acceptance_criteria, state_summary, decisions, files_touched, commands_run, open_questions, next_action, verification, parent_session)\n- [ ] Export JSON Schema for non-TS consumers\n\n### Acceptance criteria\n- Schemas published from @tacet/core with tests and examples\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Single source of truth for all shared types, with runtime validation (zod or JSON Schema).\n\n### Tasks\n- [ ] Task (id, goal, acceptance criteria, budget, priority, parent)\n- [ ] Normalized AgentEvent union (see ARCHITECTURE.md §3)\n- [ ] Escalation + Decision (with precedent tags)\n- [ ] HandoffPacket (goal, acceptance_criteria, state_summary, decisions, files_touched, commands_run, open_questions, next_action, verification, parent_session)\n- [ ] Export JSON Schema for non-TS consumers\n- [ ] Borrow (ADR-001): Add `stale_after` and `max_reescalations` to the Escalation schema (Gas Town severity-routed escalation, `docs/design/escalation.md`)\n- [ ] Borrow (ADR-001): Add an optional Escalation `category` (`decision`, `help`, `blocked`, `failed`, `emergency`, `gate_timeout`, `lifecycle`) (Gas Town §Category Routing)\n\n### Acceptance criteria\n- Schemas published from @tacet/core with tests and examples\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Event log: append-only SQLite store with replay",
@@ -198,7 +198,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Event-sourced storage used by both mini-conductor and conductor.\n\n### Tasks\n- [ ] SQLite (better-sqlite3 or libsql) schema for events + projections\n- [ ] Append, query by task/session, replay into projections\n- [ ] Retention/compaction policy for old events\n\n### Acceptance criteria\n- Replay of a recorded session reproduces task state exactly\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Event-sourced storage used by both mini-conductor and conductor.\n\n### Tasks\n- [ ] SQLite schema for events + projections. Driver: choose between better-sqlite3 and node:sqlite behind a storage interface in @tacet/core (ADR-002 decision 5). Deciding question: is node:sqlite Stable before M1?\n- [ ] Append, query by task/session, replay into projections\n- [ ] Retention/compaction policy for old events\n\n### Acceptance criteria\n- Replay of a recorded session reproduces task state exactly\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Config system: layered YAML (user → repo → local → task)",
@@ -209,7 +209,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Implement config layering from ARCHITECTURE.md §4 with schema validation and helpful errors.\n\n### Tasks\n- [ ] ~/.tacet/config.yaml, <repo>/.tacet/tacet.yaml, <repo>/.tacet/local.yaml\n- [ ] Merge semantics documented; `tacet config explain` shows effective config + source of each value\n- [ ] Secrets referenced from env/keychain, never stored in repo config\n\n### Acceptance criteria\n- Effective config is deterministic and explainable\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Implement config layering from ARCHITECTURE.md §4 with schema validation and helpful errors.\n\n### Tasks\n- [ ] ~/.tacet/config.yaml, <repo>/.tacet/tacet.yaml, <repo>/.tacet/local.yaml\n- [ ] Merge semantics documented; `tacet config explain` shows effective config + source of each value\n- [ ] Secrets referenced from env/keychain, never stored in repo config\n- [ ] Borrow (ADR-001): Three-level policy model (task > repo `.tacet/` > user) with ALLOW/DENY/ASK, where DENY short-circuits and ASK becomes an Escalation (Omnigent `docs/POLICIES.md`); coordinate with #25\n- [ ] Borrow (ADR-001): Generic `acp:<slug>` agent registry in user config (Omnigent `docs/AGENT_YAML_SPEC.md` §Custom ACP agents); coordinate with #13\n- [ ] Borrow (ADR-001): Per-CLI agent presets as config (launch command, ready prompt, resume flag, process name), after Gas Town's provider presets (`docs/agent-provider-integration.md` §Tier 1); used by #15\n\n### Acceptance criteria\n- Effective config is deterministic and explainable\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Spike: adapter capability matrix across Claude, Codex, OpenCode, Gemini, ACP",
@@ -242,7 +242,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Define the adapter contract and a shared test bench every adapter must pass (inspired by Omnigent's harness test bench).\n\n### Tasks\n- [ ] Interface per ARCHITECTURE.md §3 with capability flags\n- [ ] Fake/mock adapter for tests\n- [ ] Conformance tests: start, stream, approval round-trip, interrupt, usage events, close\n\n### Acceptance criteria\n- Mock adapter passes the suite in CI\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Define the adapter contract and a shared test bench every adapter must pass (inspired by Omnigent's harness test bench).\n\n### Tasks\n- [ ] Record real-session fixtures per surface (stream, approval, interrupt, usage) so CI never calls vendors live (capability matrix gap 10)\n- [ ] Interface per ARCHITECTURE.md §3 with capability flags\n- [ ] Fake/mock adapter for tests\n- [ ] Conformance tests: start, stream, approval round-trip, interrupt, usage events, close\n- [ ] Borrow (ADR-001): Use Omnigent's harness test bench as the conformance checklist: capability probes, declared-vs-observed `DRIFT` verdicts, P0 probes gate CI and P1 only report (`docs/harness-bench-design.md`)\n- [ ] Borrow (ADR-001): Extend `AdapterCapabilities` with Omnigent executor flags (streaming, live message queue, tool-boundary interrupt) (`omnigent/inner/executor.py`)\n- [ ] Borrow (ADR-001): Cross-check `AgentAdapter` against Gas City's `AgentProvider` (Start / IsReady / SendMessage / GetStatus / InjectContext / Resume / Fork / Exec / GetUsage) and its `REQUIREMENTS.md` scenario ledger; add `isReady` and `injectContext` if missing\n\n### Acceptance criteria\n- Mock adapter passes the suite in CI\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: Claude Code (Agent SDK / stream-json)",
@@ -253,7 +253,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Drive Claude Code via the Agent SDK or `claude -p --input-format stream-json --output-format stream-json`.\n\n### Tasks\n- [ ] Multi-turn streaming input, canUseTool → approval events\n- [ ] Resume/fork by session id\n- [ ] Usage + context events\n- [ ] Auth: API key / cloud provider first; document subscription terms clearly\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Drive Claude Code through the Agent SDK (`@anthropic-ai/claude-agent-sdk`), per the #64 findings in `docs/adapters/capability-matrix.md`. Use `claude -p --input-format stream-json --output-format stream-json` only as a fallback.\n\n### Tasks\n- [ ] Multi-turn streaming input, canUseTool → approval events\n- [ ] Resume/fork by session id\n- [ ] Usage + context events\n- [ ] Auth routing (owner policy, RESEARCH §7): the user's own subscription login for interactive sessions; an API key for parallel or unattended Workers. Tacet never stores, proxies or copies tokens.\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Passes conformance suite\n- Auth mode selection follows the routing policy and is tested without real credentials\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: Codex app-server (JSON-RPC)",
@@ -264,7 +264,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Drive Codex via `codex app-server --stdio` using its generated TS schema.\n\n### Tasks\n- [ ] thread/start, turn/start, server-initiated approval requests\n- [ ] Map items → AgentEvent\n- [ ] Regenerate schema in CI against pinned Codex version\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Drive Codex via `codex app-server --stdio` using its generated TS schema.\n\n### Tasks\n- [ ] thread/start, turn/start, server-initiated approval requests\n- [ ] Map items → AgentEvent\n- [ ] Regenerate schema in CI against pinned Codex version\n- [ ] Use the #58 findings: `allow_always` defaults to session scope (`acceptForSession`), permissions requests take a granted subset, track `turnId` for `turn/steer`\n- [ ] Auth routing (owner policy, RESEARCH §7): API key for parallel or unattended Workers; the user's own Codex login only for interactive sessions. Never implement `chatgptAuthTokens`.\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Passes conformance suite\n- Auth mode selection follows the routing policy and is tested without real credentials\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: generic ACP client",
@@ -275,7 +275,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, Claude/Codex via adapters…).\n\n### Tasks\n- [ ] Use official ACP TS SDK\n- [ ] Capability negotiation → capability flags\n- [ ] Configurable command per agent\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "One adapter for every Agent Client Protocol agent (Gemini CLI, Goose, Devin, OpenCode, Claude/Codex via their ACP adapters). Implements ACP v1; v2 is tracked separately.\n\n### Tasks\n- [ ] Use official ACP TS SDK (`@agentclientprotocol/sdk`)\n- [ ] stdio transport: newline-delimited JSON-RPC, stderr captured to the Worker log\n- [ ] Capability negotiation → capability flags (fork only if `sessionCapabilities.fork`, marked unstable; live usage only if the agent sends `usage_update`)\n- [ ] Cancel flow: `session/cancel`, answer pending `session/request_permission` with `cancelled`, map `stopReason: cancelled` (or `-32800`) to a cancelled turn, not an error\n- [ ] Permission options → Decision (`allow_once`, `allow_always`, `reject_once`; Gemini's reject option id is `cancel`)\n- [ ] Model switch via the config option with category `model` (no `session/set_model`)\n- [ ] Per-session MCP injection via `session/new.mcpServers` with headers\n- [ ] Configurable command per agent\n- [ ] Auth default: API key only. Launch `@agentclientprotocol/claude-agent-acp` with `--hide-claude-auth` and `@agentclientprotocol/codex-acp` with `NO_BROWSER=1`; never call ACP `authenticate` with a subscription method (owner decision 2026-11-09; #65 stays open)\n- [ ] Keep the prompt-turn code isolated so an ACP v2 path can be added later\n- [ ] Borrow (ADR-001): Generic `acp:<slug>` registry so any ACP agent can be added by config (Omnigent `docs/AGENT_YAML_SPEC.md` §Custom ACP agents)\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Gemini CLI passes conformance suite over ACP\n- Cancel and permission flows are covered by recorded fixtures (see docs/adapters/spikes/61-acp, 63-gemini)\n- Subscription auth methods are never selected by default (test)\n\n_See docs/adapters/capability-matrix.md (ACP section), docs/adapters/spikes/61-acp, 62-acp-adapters, 63-gemini, and docs/ARCHITECTURE.md._"
     },
     {
       "title": "Adapter: OpenCode server (HTTP + SSE)",
@@ -286,7 +286,7 @@
         "priority:p2",
         "agent:copilot"
       ],
-      "body": "Drive OpenCode via `opencode serve` and its SDK.\n\n### Tasks\n- [ ] Session CRUD, message, SSE events → AgentEvent\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Drive OpenCode via `opencode serve` and its SDK.\n\n### Tasks\n- [ ] Session CRUD, message, SSE events → AgentEvent\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Passes conformance suite\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: PTY + hooks fallback (any CLI)",
@@ -297,7 +297,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n- [ ] Borrow (ADR-001): Run native PTY wrappers inside an OS sandbox (`bwrap` on Linux, `seatbelt` on macOS), as Omnigent does (`omnigent/sandbox/`); coordinate with #53\n- [ ] Borrow (ADR-001): Use Gas Town's agent preset schema (launch command, ready prompt, resume flag, process name) for per-CLI PTY config (`docs/agent-provider-integration.md` §Tier 1)\n- [ ] Borrow (ADR-001): Context-pressure injection through a `UserPromptSubmit` hook with a model id → window table, after Gas City (`cmd/gc/context_inject.go`); re-derive the table from vendor docs\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Worktree manager",
@@ -308,7 +308,7 @@
         "priority:p0",
         "agent:copilot"
       ],
-      "body": "Create/clean git worktrees per worker; branch naming; merge/rebase helpers; conflict detection.\n\n### Tasks\n- [ ] Create from base branch, setup script hook (install deps, copy .env)\n- [ ] GC of stale worktrees\n- [ ] Merge strategies: PR, squash-to-branch, manual\n\n### Acceptance criteria\n- 10 parallel workers without collisions on a sample repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Create/clean git worktrees per worker; branch naming; merge/rebase helpers; conflict detection.\n\n### Tasks\n- [ ] Create from base branch, setup script hook (install deps, copy .env)\n- [ ] GC of stale worktrees\n- [ ] Merge strategies: PR, squash-to-branch, manual\n- [ ] Borrow (ADR-001): Review Vibe Kanban's worktree manager crate for design ideas only (Apache-2.0, Rust, project sunsetting; `crates/worktree-manager`); no code port\n\n### Acceptance criteria\n- 10 parallel workers without collisions on a sample repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Mini-conductor daemon: task queue, planner, worker pool",
@@ -319,7 +319,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "The core loop: accept task → plan sub-tasks → schedule onto workers (concurrency limits) → collect results.\n\n### Tasks\n- [ ] Planner uses the mini tier model\n- [ ] Dependency-aware scheduling\n- [ ] Max concurrency per repo/adapter\n- [ ] Restart-safe (rehydrate from event log)\n\n### Acceptance criteria\n- Daemon restart mid-task resumes without losing work\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "The core loop: accept task → plan sub-tasks → schedule onto workers (concurrency limits) → collect results.\n\n### Tasks\n- [ ] Planner uses the mini tier model\n- [ ] Dependency-aware scheduling\n- [ ] Max concurrency per repo/adapter\n- [ ] Restart-safe (rehydrate from event log)\n- [ ] Borrow (ADR-001): Planner prompt after Omnigent's Polly: the lead writes no code, delegates to Workers in worktrees, and sends review to a different vendor (`examples/polly/config.yaml`)\n- [ ] Borrow (ADR-001): Worker health: heartbeat stuck-worker detection with nudge-or-handoff recovery, using one heartbeat store (Gas Town Witness, `docs/concepts/heartbeats.md`)\n- [ ] Borrow (ADR-001): Capacity governor for the worker pool, after Gas Town's scheduler `max_polecats` (`docs/design/scheduler.md`)\n\n### Acceptance criteria\n- Daemon restart mid-task resumes without losing work\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision…)",
@@ -330,7 +330,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\n### Tasks\n- [ ] Tools: escalate, report_progress, request_handoff, read_task, record_decision, spawn_worker (gated)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Expose tacet to every agent through MCP so any harness can participate in the hierarchy.\n\nCompatibility (required, per #68: Codex, Gemini CLI and OpenCode default to 2025-era MCP): the server answers MCP 2026-07-28 and 2025-era (2025-06-18, 2025-11-25) clients through SDK defaults. The core tools use no feature that exists only in 2026-07-28 (ADR-003, addendum 2026-11-09).\n\n### Tasks\n- [ ] Tools (ADR-003 §6): read_task, report_progress, escalate (non-blocking, returns pending), get_decision, request_handoff, record_decision, search_decisions. No spawn_worker in v1\n- [ ] Return a fast 404 for `/.well-known/*` (Codex probes OAuth discovery, #68)\n- [ ] Inject MCP config into worker sessions automatically\n- [ ] Per-tool policy gating\n- [ ] Three-client conformance test: an MCP SDK v2 client on 2026-07-28, an SDK v1 client on 2025-era, and Claude Code as a real vendor worker\n- [ ] Borrow (ADR-001): Interop: Omnigent and other agents call the Mini's MCP tools as an MCP `url` with a per-session bearer header (Omnigent `docs/AGENT_YAML_SPEC.md` L825–840; token scoping per ADR-003 §6)\n\n### Acceptance criteria\n- A Claude and a Codex worker both successfully call escalate\n- The three-client conformance test passes\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Verification pipeline: commands + reviewer agent",
@@ -341,7 +341,7 @@
         "priority:p1",
         "agent:either"
       ],
-      "body": "Run repo verify commands and an optional reviewer agent (cross-vendor by default) before a task is marked done.\n\n### Tasks\n- [ ] Run verify commands from config in worktree\n- [ ] Reviewer agent on a different vendor than author\n- [ ] Failure → feedback to worker, retry budget\n\n### Acceptance criteria\n- Failing tests block completion and loop back to the worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Run repo verify commands and an optional reviewer agent (cross-vendor by default) before a task is marked done.\n\n### Tasks\n- [ ] Run verify commands from config in worktree\n- [ ] Reviewer agent on a different vendor than author\n- [ ] Failure → feedback to worker, retry budget\n- [ ] Borrow (ADR-001): Cross-vendor review: the reviewer agent uses a different vendor from the Worker (Omnigent Polly pattern)\n\n### Acceptance criteria\n- Failing tests block completion and loop back to the worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "`tacet init` installer for repos",
@@ -353,7 +353,7 @@
         "good first issue",
         "agent:copilot"
       ],
-      "body": "Scaffold `.tacet/` in a repo with sensible defaults and detect available agent CLIs.\n\n### Tasks\n- [ ] Detect installed CLIs (claude, codex, gemini, opencode, goose…) and auth state\n- [ ] Write tacet.yaml + .gitignore entry for local.yaml\n- [ ] Idempotent re-run\n\n### Acceptance criteria\n- Works on a fresh clone in < 30s\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Scaffold `.tacet/` in a repo with sensible defaults and detect available agent CLIs.\n\n### Tasks\n- [ ] Detect installed CLIs (claude, codex, gemini, opencode, goose…) and auth state\n- [ ] Write tacet.yaml + .gitignore entry for local.yaml\n- [ ] Idempotent re-run\n- [ ] Borrow (ADR-001): A matching `tacet uninstall`: preview what will be removed first, `--purge` with a backup (Omnigent `docs/UNINSTALL_DESIGN.md`); Gas Town is criticised for being hard to remove\n\n### Acceptance criteria\n- Works on a fresh clone in < 30s\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "CLI: tacet run / status / attach / logs (standalone mode)",
@@ -409,7 +409,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Resolve what can be resolved locally (policy, precedent decisions, own reasoning); escalate the rest.\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Resolve what can be resolved locally (policy, precedent decisions, own reasoning); escalate the rest.\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n- [ ] Borrow (ADR-001): Three-level policy model with ALLOW/DENY/ASK where DENY short-circuits, mapped to task > repo `.tacet/` > user config; ASK becomes an Escalation (Omnigent `docs/POLICIES.md`)\n- [ ] Borrow (ADR-001): Severity-routed escalation where each tier resolves or forwards, plus stale re-escalation (Gas Town `docs/design/escalation.md`)\n- [ ] Borrow (ADR-001): Later (M2+): CEL for side-effect-free inline policy rules (Omnigent `policies/builtins/cel.py`); a TS CEL dependency must be justified\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Decision inbox: dedupe, batch, rank, answer, propagate",
@@ -420,7 +420,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n- [ ] Borrow (ADR-001): Per-severity notification routes and stale re-escalation (`stale_after`, max 2) for unanswered Decisions (Gas Town `docs/design/escalation.md`); coordinate with #45\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Summary packets (no transcripts upward)",
@@ -466,7 +466,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Normalize context used/max from every adapter (usage events, statusline/PreCompact hooks as fallback).\n\n### Tasks\n- [ ] Per-adapter extraction\n- [ ] Estimate when adapter lacks it\n- [ ] Expose in events + UI\n\n### Acceptance criteria\n- Usage within ±5% of vendor-reported for tier-1 adapters\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Normalize context used/max from every adapter (usage events, statusline/PreCompact hooks as fallback).\n\n### Tasks\n- [ ] Per-adapter extraction\n- [ ] Estimate when adapter lacks it\n- [ ] Expose in events + UI\n- [ ] Borrow (ADR-001): Detect compaction boundaries (Claude `isCompactSummary`, Codex `compacted.replacement_history`) as a signal that compaction happened anyway (Omnigent `docs/session-compaction.md`)\n- [ ] Borrow (ADR-001): Context-pressure computation from the transcript plus a model id → window table, after Gas City (`internal/modelwindow/`); re-derive from vendor docs\n\n### Acceptance criteria\n- Usage within ±5% of vendor-reported for tier-1 adapters\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Automatic handoff: thresholds, packet generation, validation, reseed",
@@ -477,7 +477,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Implement the handoff flow in ARCHITECTURE.md §2.3.\n\n### Tasks\n- [ ] warn/handoff/hard bands from config\n- [ ] Disable vendor auto-compaction where possible\n- [ ] Prompt worker for HandoffPacket; validate (reject if next_action missing)\n- [ ] Store in .tacet/handoffs/, start fresh session seeded with it\n- [ ] Optional model change on handoff\n\n### Acceptance criteria\n- Handoff preserves task progress in ≥ 90% of eval runs\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Implement the handoff flow in ARCHITECTURE.md §2.3.\n\n### Tasks\n- [ ] warn/handoff/hard bands from config\n- [ ] Disable vendor auto-compaction where possible\n- [ ] Prompt worker for HandoffPacket; validate (reject if next_action missing)\n- [ ] Store in .tacet/handoffs/, start fresh session seeded with it\n- [ ] Optional model change on handoff\n- [ ] Borrow (ADR-001): Use Gas Town handoff mail (`Context / Status / Next` plus the work id) as evidence for the HandoffPacket fields; `nextAction` stays required (`docs/design/mail-protocol.md` §HANDOFF)\n- [ ] Borrow (ADR-001): Use compaction-boundary detection (Omnigent) as a fallback trigger\n- [ ] Borrow (ADR-001): Later (M3+, with #32): a new session can ask its predecessor a question when the packet is not enough (Gas Town `gt seance`)\n\n### Acceptance criteria\n- Handoff preserves task progress in ≥ 90% of eval runs\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Conductor & mini-conductor self-handoff",
@@ -500,7 +500,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security → frontier)\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security → frontier)\n- [ ] Borrow (ADR-001): Capacity governor: a per-repo cap on concurrent workers, after Gas Town's scheduler `max_polecats` (`docs/design/scheduler.md`); coordinate with #17\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Escalation ladder: retry with stronger model before asking a human",
@@ -522,7 +522,7 @@
         "priority:p1",
         "agent:copilot"
       ],
-      "body": "Track spend from usage events; enforce soft/hard budget policies.\n\n### Tasks\n- [ ] Pricing table per model (config-driven, updatable)\n- [ ] Soft warn → escalate; hard cap → pause\n- [ ] Distinguish API-key spend vs subscription usage\n\n### Acceptance criteria\n- Budget caps enforced in tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Track spend from usage events; enforce soft/hard budget policies.\n\n### Tasks\n- [ ] Pricing table per model (config-driven, updatable)\n- [ ] Soft warn → escalate; hard cap → pause\n- [ ] Distinguish API-key spend vs subscription usage\n- [ ] Default API-key budget: $200/month (owner decision, 2026-11-09), config key `api_key_per_month_usd` (ARCHITECTURE §4)\n- [ ] Borrow (ADR-001): Soft `ask_thresholds_usd` (each becomes an Escalation) plus a hard cap, after Omnigent's cost policy (`omnigent/policies/builtins/cost.py`)\n\n### Acceptance criteria\n- Budget caps enforced in tests\n- The $200/month API-key default is enforced in tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Measure orchestration overhead",
@@ -634,7 +634,7 @@
         "priority:p1",
         "agent:copilot"
       ],
-      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n- [ ] Borrow (ADR-001): Per-severity notification routes, with stale re-escalation feeding the channels (Gas Town `docs/design/escalation.md`); coordinate with #26\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Chat channels: Slack / Discord / Telegram (two-way)",
@@ -668,7 +668,7 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Reusable multi-step workflows, including non-code folders as 'workspaces'.\n\n### Tasks\n- [ ] Template format (YAML)\n- [ ] Starter templates\n- [ ] Sequential + parallel steps\n\n### Acceptance criteria\n- 3 templates shipped and documented\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Reusable multi-step workflows, including non-code folders as 'workspaces'.\n\n### Tasks\n- [ ] Template format (YAML)\n- [ ] Starter templates\n- [ ] Sequential + parallel steps\n- [ ] Borrow (ADR-001): Later: workflow graphs as data, after Gas City formulas (TOML workflow graphs; gascity `README.md`, `docs/`)\n\n### Acceptance criteria\n- 3 templates shipped and documented\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Scheduled and triggered tasks",
@@ -679,7 +679,7 @@
         "priority:p2",
         "agent:copilot"
       ],
-      "body": "Cron/webhook/GitHub-event triggered tasks (e.g. nightly dependency triage).\n\n### Tasks\n- [ ] Scheduler\n- [ ] GitHub webhook trigger\n\n### Acceptance criteria\n- Nightly job demo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Cron/webhook/GitHub-event triggered tasks (e.g. nightly dependency triage).\n\n### Tasks\n- [ ] Scheduler\n- [ ] GitHub webhook trigger\n- [ ] Borrow (ADR-001): Later: scheduled or triggered runs, after Gas City orders (gascity `README.md`, `docs/`)\n\n### Acceptance criteria\n- Nightly job demo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Plugin system: adapters, channels, tools, workflows",
@@ -690,18 +690,18 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n- [ ] Borrow (ADR-001): Adapter package contract shaped like Omnigent's `HarnessContribution` (ids, aliases, install/login hints, labels) (`designs/harness-plugin-interface.md`)\n- [ ] Borrow (ADR-001): Later: CEL policy rules as a plugin (see #25)\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)",
-      "milestone": "M6 · Ecosystem & hardening",
+      "milestone": "M2 · Conductor & escalation",
       "labels": [
         "type:feature",
         "area:adapters",
         "priority:p2",
         "agent:claude"
       ],
-      "body": "Let editors talk to a repo's mini-conductor as a single agent.\n\n### Tasks\n- [ ] ACP agent server\n- [ ] Map escalations to ACP permission requests\n\n### Acceptance criteria\n- Works from Zed\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Let editors talk to a repo's mini-conductor as a single agent.\n\n### Tasks\n- [ ] ACP agent server\n- [ ] Map escalations to ACP permission requests\n- [ ] Borrow (ADR-001): Interop: register a Mini-conductor in Omnigent as `acp:tacet` (Omnigent `docs/AGENT_YAML_SPEC.md` L410–445, `docs/openclaw.md`)\n- [ ] Borrow (ADR-001): Interop: run as a Gas City worker through its `acp` session provider or `exec:` (gascity `docs/reference/config.md` §ACPSessionConfig)\n- [ ] Borrow (ADR-001): Prior art: Gas Town's Mayor over ACP as a headless proxy (`internal/acp/proxy.go`, `internal/cmd/mayor.go`)\n\n### Acceptance criteria\n- Works from Zed\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Expose conductor via A2A",
@@ -723,7 +723,7 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Optional stronger isolation than worktrees.\n\n### Tasks\n- [ ] Per-platform backends\n- [ ] Network egress policy\n- [ ] Borrow (ADR-001): OS sandbox wrappers for workers: `bwrap` on Linux, `seatbelt` on macOS, as Omnigent does (`omnigent/sandbox/`); coordinate with #15\n- [ ] Deny worker access to `~/.tacet/run` in the sandbox profile (bwrap/seatbelt); conformance test proves a worker can't read a daemon token (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Worker cannot write outside its worktree when enabled\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Evaluation harness: escalation quality, handoff fidelity, cost",
@@ -768,6 +768,206 @@
         "agent:copilot"
       ],
       "body": "First public release.\n\n### Tasks\n- [ ] npm publish\n- [ ] Homebrew tap\n- [ ] Release automation\n\n### Acceptance criteria\n- `npx tacet init` works on macOS and Linux\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Spike: Codex approval decision enums and turn/interrupt payloads",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "Close gap 1 in the capability matrix. The Codex adapter (#12) needs the exact decision values for command, file-change and permissions approvals, and the payload shapes of `turn/interrupt` and `turn/steer`. Both are only partly read.\n\n### Tasks\n- [ ] Pin a Codex version and run `codex app-server generate-json-schema` for it\n- [ ] Record the decision enum for command, file-change and permissions approvals\n- [ ] Record the `turn/interrupt` and `turn/steer` payload shapes\n- [ ] Update the Codex section of the matrix with the pinned version and date\n\n### Acceptance criteria\n- Approval and interrupt rows are `verified`, with the pinned version and schema path recorded\n- Decision values are mapped to Tacet's `allow_once | allow_always | reject | cancel` set (matrix section 7)\n\n_See docs/adapters/capability-matrix.md (gap 1) and docs/ARCHITECTURE.md §3 for context._"
+    },
+    {
+      "title": "Spike: read Codex app-server docs, auth and terms pages from primary sources",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "Close gap 2 in the capability matrix. developers.openai.com was unreachable during research, so the commercial and hosted-use language and the `chatgptAuthTokens` restriction are still unverified. The Codex adapter's auth design depends on them.\n\n### Tasks\n- [ ] Read the official app-server docs and the auth and terms pages (or record why they are unreachable)\n- [ ] Confirm whether built-in ChatGPT auth is allowed for commercial or hosted services\n- [ ] Confirm the restriction on `chatgptAuthTokens`\n- [ ] Record each fact with its link and date in the matrix\n\n### Acceptance criteria\n- The Codex terms row is `verified`, or it is marked UNVERIFIED with the reason\n- Any finding that limits ChatGPT-login use is raised as a `needs-human` follow-up\n\n_See docs/adapters/capability-matrix.md (gap 2, Codex section) for context._"
+    },
+    {
+      "title": "Spike: OpenCode event names, permission events and token and cost fields",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Close gap 3 in the capability matrix. The OpenCode adapter (#14) needs the SSE event union, how a permission ask is announced, the exact `response` enum, and whether token and cost fields exist. None of these are confirmed.\n\n### Tasks\n- [ ] Run `opencode serve` on a pinned version and dump `GET /doc` (OpenAPI 3.1)\n- [ ] Record the SSE event union from `GET /event` and `GET /global/event`\n- [ ] Record how a permission ask is announced and the `response` enum for `POST /session/:id/permissions/:permissionID`\n- [ ] Record whether message info carries token usage and cost\n\n### Acceptance criteria\n- The OpenCode event, approval, usage and cost rows are no longer UNVERIFIED, or each missing field is named\n- Sample payloads are kept in the matrix or a fixture file, with no secrets\n\n_See docs/adapters/capability-matrix.md (gap 3, OpenCode section) for context._"
+    },
+    {
+      "title": "Spike: verify ACP session semantics (cancel, stdio framing, fork, usage)",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Close gap 4 in the capability matrix. The ACP v1 schema has been read, but the prose docs have not. The generic ACP adapter (#13) needs the `session/cancel` flow, stdio framing, whether any unstable RFD adds fork or `session/set_model`, and which agents send `usage_update`.\n\n### Tasks\n- [ ] Read the ACP prose docs on agentclientprotocol.com (or record why they are unreachable)\n- [ ] Confirm stdio framing and the `session/cancel` flow\n- [ ] Check unstable RFDs for fork and `session/set_model`\n- [ ] List which agents send `usage_update` and `cost`\n\n### Acceptance criteria\n- The ACP rows are `verified`, or carry a stated reason\n- The ACP adapter (#13) has a documented cancel flow and framing\n\n_See docs/adapters/capability-matrix.md (gap 4, ACP section) for context._"
+    },
+    {
+      "title": "Spike: verify the Claude ACP adapter and codex-acp",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Close gap 5 in the capability matrix. RESEARCH §3 names Zed's Claude adapter and `codex-acp` as ACP routes. Their versions, the capabilities they pass through, and any dependence on subscription logins are unknown.\n\n### Tasks\n- [ ] Record the version and source for the Claude ACP adapter and for `codex-acp`\n- [ ] For each, list which ACP capabilities it passes through (usage, permissions, resume)\n- [ ] Check whether either depends on a subscription login, and record the terms\n\n### Acceptance criteria\n- Each adapter has a matrix row with version, source and date\n- Any subscription-login dependency is flagged `needs-human` in the matrix\n\n_See docs/adapters/capability-matrix.md (gap 5) for context._"
+    },
+    {
+      "title": "Spike: Gemini CLI stats fields, headless approvals and ACP permission flow",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Close gap 6 in the capability matrix. The Gemini adapter needs the field names in `stats`, the headless approval behaviour and the ACP permission flow, none of which is confirmed. The status of the free OAuth path after the Antigravity CLI move is also open.\n\n### Tasks\n- [ ] Install a pinned Gemini CLI and capture `stream-json` and `json` output as fixtures\n- [ ] Record the `stats` field names and per-model token usage\n- [ ] Test headless approval behaviour under each `--approval-mode`\n- [ ] Test the ACP permission flow with `--experimental-acp`\n- [ ] Confirm whether the free OAuth path still works\n\n### Acceptance criteria\n- Gemini rows are verified from the installed binary, with its version recorded\n- The auth status after the product change is recorded with link and date\n\n_See docs/adapters/capability-matrix.md (gap 6, Gemini section) for context._"
+    },
+    {
+      "title": "Spike: Claude CLI stream-json input and permission-prompt contract, CLI vs SDK",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "Close gap 7 in the capability matrix. The Claude adapter (#11) depends on `claude -p --input-format stream-json` and `--permission-prompt-tool`. The docs read so far do not document the CLI input format. This spike decides whether the adapter uses the CLI or the Agent SDK.\n\n### Tasks\n- [ ] Read the Claude Code CLI reference for `--input-format stream-json` and `--permission-prompt-tool`\n- [ ] Capture a real multi-turn session on a pinned CLI version as a fixture\n- [ ] Compare CLI and Agent SDK for multi-turn input, approvals, interrupt and resume\n- [ ] Write the recommendation and its reasons in the matrix\n\n### Acceptance criteria\n- Each CLI flag the adapter uses is verified against the pinned version, or the adapter uses the SDK instead\n- The CLI-vs-SDK decision is recorded in the matrix\n\n_See docs/adapters/capability-matrix.md (gap 7) and docs/RESEARCH.md §3 for context._"
+    },
+    {
+      "title": "Human decision: may many parallel Claude Workers run on one subscription?",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:docs",
+        "area:adapters",
+        "area:cost",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Gap 9 in the capability matrix. Anthropic's legal page limits advertised limits to ordinary individual use. It is unclear whether a Conductor running many parallel Workers on one subscription falls within that. The owner set the default on 2026-11-09: the API key for parallel or unattended Workers, and the subscription login for interactive or single sessions. This decision is still needed.\n\n### Tasks\n- [ ] Human reviews the Anthropic legal page and the usage-limit help article\n- [ ] Human decides whether parallel or unattended Workers may use a subscription login\n- [ ] Record the decision and its date in docs/RESEARCH.md §7 and the matrix\n- [ ] Update the default routing in docs/ARCHITECTURE.md §6 if the decision changes it\n\n### Acceptance criteria\n- A written decision exists\n- Until a decision exists, parallel and unattended Workers use the API key\n\n_See docs/adapters/capability-matrix.md (gap 9) and docs/RESEARCH.md §7 for context._"
+    },
+    {
+      "title": "Chore: fail CI when capability matrix dates are stale for active surfaces",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:core",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Gap 11 in the capability matrix. Matrix rows carry a checked date, and vendor surfaces under active development go stale quickly. A CI check should fail when a checked date for those surfaces is older than a configured number of days.\n\n### Tasks\n- [ ] Add a machine-readable checked date per surface in the matrix\n- [ ] Add a script in scripts/ that parses those dates and enforces the threshold\n- [ ] Mark which surfaces are under active development (Claude, Codex, OpenCode, Gemini, ACP)\n- [ ] Wire the check into CI next to the other `--check` scripts, and document how to refresh a row\n\n### Acceptance criteria\n- CI fails with a clear message when an active surface is older than the threshold\n- CI passes after the row is refreshed\n\n_See docs/adapters/capability-matrix.md and .github/instructions/adapters.instructions.md for context._"
+    },
+    {
+      "title": "Spike: confirm who publishes the PyPI openai-codex-sdk package",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from ADR-002. The PyPI package `openai-codex-sdk` (0.1.11) exists, but its publisher is UNVERIFIED. This matters only if Python is reconsidered, since ADR-002 decision 6 keeps Python out of core packages. It is also an input to ADR-001 (build vs extend).\n\n### Tasks\n- [ ] Check the PyPI project page, maintainers and linked source repository\n- [ ] Decide whether it is published by OpenAI or by a third party\n- [ ] Record the result with link and date in the Codex section of the matrix\n\n### Acceptance criteria\n- The publisher is recorded with a link and date\n- If it is third-party, the matrix says so and no code depends on it\n\n_See docs/adr/002-language-runtime.md (Consequences, follow-ups) for context._"
+    },
+    {
+      "title": "Spike: verify per-vendor MCP client facts (revisions, config injection, timeouts)",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Follow-up from ADR-003, UNVERIFIED list. Before M1 code depends on them, verify for Codex, Gemini CLI and OpenCode: the MCP revisions their clients speak, how each injects per-session MCP config including HTTP headers, and their idle and tool-call timeouts.\n\n### Tasks\n- [ ] Codex: MCP revision, and per-session config injection with headers (config overrides)\n- [ ] Gemini CLI: MCP revision, config injection with headers, idle and tool-call timeouts\n- [ ] OpenCode: MCP revision, config injection with headers, idle and tool-call timeouts\n- [ ] ACP: how `session/new` `mcpServers` carries HTTP headers\n- [ ] Record each fact in the MCP section of the matrix with version, link and date\n\n### Acceptance criteria\n- Every UNVERIFIED MCP row in the matrix is verified, or states that the fact is unknown and why\n- Adapter issues #12 to #15 can cite the matrix for MCP setup\n\n_See docs/adr/003-wire-protocols.md (Verified protocol facts, UNVERIFIED list) and docs/adapters/capability-matrix.md section 1b for context._"
+    },
+    {
+      "title": "Spike: confirm @modelcontextprotocol/server answers 2025-11-25 initialize clients",
+      "milestone": "M0 · Foundations",
+      "labels": [
+        "type:spike",
+        "area:mini",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "Follow-up from ADR-003. The accepted default is that the mini-conductor's MCP server answers 2026-07-28 and, if the SDK allows, 2025-11-25. It is UNVERIFIED whether `@modelcontextprotocol/server` v2 still answers clients that use the 2025-11-25 `initialize` handshake. The result sets the compatibility work for the MCP server (#18).\n\n### Tasks\n- [ ] Test @modelcontextprotocol/server v2 (2.4.0) with a minimal server and a 2025-11-25 `initialize` client in a scratch test\n- [ ] If it is unsupported, record the fallback option and its support window\n- [ ] Propose whether the MCP server must answer pre-2026-07-28 clients, based on the result (the owner decides)\n\n### Acceptance criteria\n- The result is recorded with SDK versions\n- Issue #18 has a clear compatibility requirement\n\n_See docs/adr/003-wire-protocols.md (Pinned external versions, follow-up 4) for context._"
+    },
+    {
+      "title": "Re-check Bun when oven-sh/bun#25822 closes",
+      "milestone": "M6 · Ecosystem & hardening",
+      "labels": [
+        "type:spike",
+        "area:core",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from ADR-002. Bun is excluded for v0 (ADR-002 decision 3). Re-check it when the node-pty bug oven-sh/bun#25822 closes. The check also covers the UNVERIFIED Bun.Terminal API details and the state of better-sqlite3 on Bun (#4290).\n\n### Tasks\n- [ ] Check the state of oven-sh/bun#25822 and the related crash reports\n- [ ] Read the Bun.Terminal API from primary docs and record its details\n- [ ] Check the state of better-sqlite3 on Bun (#4290) and `bun:sqlite` parity\n- [ ] Recommend whether Bun becomes a second tested runtime\n\n### Acceptance criteria\n- Findings are recorded in the ADR or matrix\n- The runtime does not change without an accepted ADR\n\n_See docs/adr/002-language-runtime.md (Node vs Bun, What would change this) for context._"
+    },
+    {
+      "title": "Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "Build the local auth module that every Tacet daemon (Conductor and Mini-conductors) uses. This is ADR-003 follow-up 2. It is security-sensitive, so it needs a reviewer pass before merge.\n\n### Tasks\n- [ ] Token file: 256-bit token from crypto.randomBytes, written with pid, port, protocolVersions and startedAt to `~/.tacet/run/` at mode 0600; rotated on every start; never logged or put in events\n- [ ] `tacet/hello` handshake: negotiate protocol versions (close with 4406 when none match); any other first method closes the socket with -32600\n- [ ] Host and Origin checks on every HTTP and WebSocket request (127.0.0.1, [::1] or localhost with the server port); failures close with 4401 or return 401/403\n- [ ] One-time-code browser login: `tacet open` passes `#code=`; `POST /auth/session` exchanges a single-use code (60 s lifetime) for an HttpOnly, SameSite=Strict session cookie\n- [ ] Per-worker MCP tokens bound to {workerSessionId, taskId}, injected into the worker's MCP config, revoked when the session closes\n- [ ] Bind 127.0.0.1 and ::1 on an OS-assigned port by default\n- [ ] Reviewer pass (`reviewer` agent) before the PR is opened\n\n### Acceptance criteria\n- A request with a wrong Host or Origin is rejected, including the DNS-rebinding case\n- A socket whose first frame is not `tacet/hello` is closed\n- A one-time code works once and expires after 60 s\n- A worker token cannot act on another task or session, and is rejected after revocation\n- No token value appears in logs, events or test snapshots\n\n_See docs/adr/003-wire-protocols.md §3, §5, §6 and docs/ARCHITECTURE.md §6._"
+    },
+    {
+      "title": "Merge queue: batch-then-bisect for parallel Worker branches",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Land the branches of parallel Worker sessions through a merge queue. The queue batches verified branches, runs verification on each batch, and bisects a failing batch to find the bad branch. The idea is borrowed from Gas Town's Refinery (`docs/design/architecture.md`, Merge Queue). Tacet reimplements it in TypeScript and does not port code (ADR-001). This is ADR-001 follow-up 5, and it relates to #19.\n\n### Tasks\n- [ ] Per-repo queue of verified Worker branches, in completion order\n- [ ] Batch branches onto the target branch in a scratch worktree and run the repo's verify commands from `.tacet/tacet.yaml`\n- [ ] On batch failure, bisect to isolate the failing branch and return it to its task as a verification failure\n- [ ] Record each queue step as events (`task.*` and `worker.*`), not ad-hoc state\n- [ ] Repo config for maximum batch size and verify timeout\n\n### Acceptance criteria\n- In a batch of three branches where one fails verification, the two good branches land and the bad one goes back to its task\n- In a batch of eight with one bad branch, bisection after the failed batch run isolates it in at most 3 verification runs\n- Queue state survives a mini-conductor restart (rebuilt from the event log)\n\n_See docs/adr/001-build-vs-extend.md (Consequences, follow-up 5) and docs/ARCHITECTURE.md §2.1._"
+    },
+    {
+      "title": "Track ACP v2: prompt ack + state_update lifecycle",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "ACP v2 (schema `2.0.0-alpha.14` on 2026-11-09) is a consolidation release: `session/prompt` only acknowledges acceptance, the turn's progress and stop reason arrive in `state_update` notifications, updates become upserts by id, the client filesystem/terminal/session-modes APIs are removed, and capabilities are reorganised. The ACP migration guide asks implementers to support v1 and v2 side by side. The generic ACP adapter (#13) implements v1; this issue tracks v2 until it stabilises.\n\n### Tasks\n- [ ] Watch the ACP v2 schema releases and RFD group; record the version when v2 leaves alpha\n- [ ] Check which agents Tacet supports (Gemini CLI, OpenCode, claude-agent-acp, codex-acp) advertise v2\n- [ ] Design the v2 prompt-turn path behind a flag in the ACP adapter (prompt ack + `state_update`)\n- [ ] Record findings in the ACP section of the capability matrix\n\n### Acceptance criteria\n- The matrix states the ACP v2 status with version and date\n- A go/no-go recommendation for v2 support in the ACP adapter (#13) is recorded\n\n_See docs/adapters/spikes/61-acp/README.md (ACP v2 section) and docs/adapters/capability-matrix.md._"
+    },
+    {
+      "title": "UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "ADR-003 §5 carries Tacet-specific UI items as AG-UI `CUSTOM` events with `name` ∈ `tacet.usage`, `tacet.escalation`, `tacet.decision`, `tacet.budget`, and §7 lists a `ui-custom-events` JSON Schema. #5 left it out because it needs `@ag-ui/core`. This issue adds those payload schemas to `@tacet/core`.\n\n### Tasks\n- [ ] Add `@ag-ui/core` (1.x, ADR-003 §2) to `@tacet/core`, justified in the PR, through the pnpm catalog\n- [ ] zod schemas for the four `CUSTOM` payloads, reusing `Usage`, `Escalation`, `Decision` and budget types; enums via `openEnum`\n- [ ] Export `ui-custom-events` to `packages/core/schema/v1/` with an example\n- [ ] Contract test: every `tacet/ui.event` payload validates against `@ag-ui/core` (ADR-003 §7)\n\n### Acceptance criteria\n- `pnpm check:generated` covers the new schema\n- The contract test passes for one example of each custom event\n\n_See docs/adr/003-wire-protocols.md §5 and §7._"
+    },
+    {
+      "title": "Browser session via hello frame instead of cookie (ADR-003 §3.4 addendum)",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "priority:p0",
+        "agent:claude"
+      ],
+      "body": "The owner decided on 2026-11-09 that browser auth must not use cookies: a cookie on 127.0.0.1 reaches every local server on that host, including dev servers a Worker starts (see the ADR-003 §3.4 addendum). This replaces the session cookie in the #77 auth module (`exchangeCode`, `sessionCookie`, `readSessionCookie`). Security-sensitive: a `reviewer` agent pass is required before the PR.\n\n### Tasks\n- [ ] `POST /auth/session` exchanges the one-time code for a browser session token (256-bit, stored as a hash, capped like today's sessions); no `Set-Cookie`\n- [ ] `HelloParams` for `role: \"ui\"` carries the browser session token; `HelloGate` validates it before opening\n- [ ] HTTP calls from the page use `Authorization: Bearer <session token>`; `checkHostAndOrigin` stays as-is\n- [ ] Remove the cookie helpers from `@tacet/core/node`; update ARCHITECTURE §6\n- [ ] Document for the web UI (M4) that the token lives in memory only, never `localStorage`\n- [ ] Reviewer pass (`reviewer` agent) before the PR is opened\n\n### Acceptance criteria\n- No code path emits `Set-Cookie` (test)\n- A hello without a valid browser session token is closed; a revoked token is rejected\n- The token never appears in logs, events or test snapshots\n\n_See docs/adr/003-wire-protocols.md §3.4 addendum and docs/ARCHITECTURE.md §6._"
     }
   ]
 }
