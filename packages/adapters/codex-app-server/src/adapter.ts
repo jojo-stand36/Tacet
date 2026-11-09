@@ -1,6 +1,15 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -863,15 +872,19 @@ function checkWorktree(cwd: string, repoRoot: string): WorkerWorktree | undefine
     fail('its git dir does not point back at it');
   }
   if (existsSync(join(gitDir, 'config.worktree'))) fail('it has a config.worktree');
+  // With this extension git reads `<git dir>/config.worktree`, which the Worker can write at any
+  // time (e.g. `core.sshCommand`), so no git run outside the sandbox would be safe.
+  if (worktreeConfigEnabled(commonDir)) {
+    fail('the repo sets extensions.worktreeConfig (e.g. sparse-checkout), not supported yet');
+  }
   return { gitDir, commonDir };
 }
 
 /**
  * Git environment of an unattended Worker in `wt` (#116): new objects go to the worktree's own
- * git dir, existing ones are read from the repo's shared store. The Mini-conductor integrates
- * outside the sandbox with this environment after checking the worktree again with
- * `workerWorktree`, and with `SAFE_GIT_ARGS`, e.g.
- * `git <SAFE_GIT_ARGS> push <repo> HEAD:refs/heads/tacet/<task>`.
+ * git dir, existing ones are read from the repo's shared store. Git run outside the sandbox on
+ * the worktree (the Mini-conductor's integration) uses `trustedGitEnv` and `SAFE_GIT_ARGS` after
+ * checking the worktree again with `workerWorktree`.
  */
 export function workerGitEnv(wt: WorkerWorktree): Record<string, string> {
   return {
@@ -880,41 +893,92 @@ export function workerGitEnv(wt: WorkerWorktree): Record<string, string> {
   };
 }
 
-/** For git commands run outside the sandbox on a Worker's worktree: no hooks, no fsmonitor. */
+/**
+ * For git commands run outside the sandbox on a Worker's worktree: no hooks, no fsmonitor, no
+ * reflog writes (the Worker could symlink `logs/HEAD` at any file), no commit-graph from the
+ * Worker's object store.
+ */
 export const SAFE_GIT_ARGS = [
   '-c',
   'core.hooksPath=/dev/null',
   '-c',
   'core.fsmonitor=false',
+  '-c',
+  'core.logAllRefUpdates=false',
+  '-c',
+  'core.commitGraph=false',
 ] as const;
 
 /**
- * Detach the worktree's HEAD at its current commit without a checkout: only `<git dir>/HEAD`
- * changes, so no hooks, filters or index updates run. Git sees only PATH and HOME (never the
- * API key). Throws when HEAD has no commit yet.
+ * Environment for a git command run outside the sandbox on a Worker's worktree: only PATH and
+ * HOME from `env`, the Worker's object store, and the git dirs given explicitly. `GIT_COMMON_DIR`
+ * makes git ignore the worktree's `commondir` file, which the Worker could rewrite between the
+ * `workerWorktree` check and the command.
  */
-function detachHead(cwd: string, wt: WorkerWorktree, env: Record<string, string>): void {
-  const gitEnv: Record<string, string> = {
+export function trustedGitEnv(
+  cwd: string,
+  wt: WorkerWorktree,
+  env: Record<string, string | undefined>,
+): Record<string, string> {
+  return {
     ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
     ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
     ...workerGitEnv(wt),
     GIT_DIR: wt.gitDir,
+    GIT_COMMON_DIR: wt.commonDir,
     GIT_WORK_TREE: cwd,
   };
-  const run = (args: string[]) =>
-    execFileSync('git', [...SAFE_GIT_ARGS, ...args], {
+}
+
+/** `extensions.worktreeConfig` from the repo's own (trusted) config file. */
+function worktreeConfigEnabled(commonDir: string): boolean {
+  try {
+    const out = execFileSync(
+      'git',
+      [
+        'config',
+        '--file',
+        join(commonDir, 'config'),
+        '--type=bool',
+        '--get',
+        'extensions.worktreeConfig',
+      ],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: process.env.PATH ?? '' },
+      },
+    ).trim();
+    return out === 'true';
+  } catch {
+    // Exit 1: not set.
+    return false;
+  }
+}
+
+/**
+ * Detach the worktree's HEAD at its current commit without a checkout, so no hooks, filters or
+ * index updates run. Git only resolves the commit (with `trustedGitEnv`: never the API key); the
+ * new HEAD is written here by temp file and rename, because git would follow a `logs/HEAD`
+ * symlink the Worker planted and append to its target. Throws when HEAD has no commit yet.
+ */
+function detachHead(cwd: string, wt: WorkerWorktree, env: Record<string, string>): void {
+  let sha: string;
+  try {
+    sha = execFileSync('git', [...SAFE_GIT_ARGS, 'rev-parse', '--verify', '-q', 'HEAD^{commit}'], {
       cwd,
-      env: gitEnv,
+      env: trustedGitEnv(cwd, wt, env),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
-  let sha: string;
-  try {
-    sha = run(['rev-parse', '--verify', '-q', 'HEAD^{commit}']);
   } catch {
     throw new Error(`worktree ${cwd} has no commit to start a Worker from`);
   }
-  run(['update-ref', '--no-deref', 'HEAD', sha]);
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sha)) throw new Error(`unexpected commit id ${sha}`);
+  const tmp = join(wt.gitDir, `HEAD.tacet-${randomUUID()}`);
+  // `wx`: never through a file or symlink that already exists at that name.
+  writeFileSync(tmp, `${sha}\n`, { flag: 'wx', mode: 0o644 });
+  renameSync(tmp, join(wt.gitDir, 'HEAD'));
 }
 
 /** Signal the process group `proc` leads (POSIX), or just `proc`. Already-gone is fine. */

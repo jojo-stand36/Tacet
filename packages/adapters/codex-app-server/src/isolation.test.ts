@@ -5,9 +5,11 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,7 +18,7 @@ import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, SAFE_GIT_ARGS, workerGitEnv, workerWorktree } from './adapter.js';
+import { CodexAppServerAdapter, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from './adapter.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
 /**
@@ -166,16 +168,17 @@ describe('Codex Worker isolation', () => {
     // It checks the worktree again first: the Worker could have rewritten its git dir.
     const wt = workerWorktree(worktree, repo);
     if (!wt) throw new Error('not a worktree');
-    const env = { ...gitEnv, ...workerGitEnv(wt) };
-    const sha = execFileSync('git', ['-C', worktree, 'rev-parse', 'HEAD'], {
+    const env = trustedGitEnv(worktree, wt, gitEnv);
+    const sha = execFileSync('git', [...SAFE_GIT_ARGS, 'rev-parse', 'HEAD'], {
+      cwd: worktree,
       env,
       encoding: 'utf8',
     }).trim();
-    execFileSync(
-      'git',
-      ['-C', worktree, ...SAFE_GIT_ARGS, 'push', '-q', repo, 'HEAD:refs/heads/tacet/task-1'],
-      { env, stdio: 'ignore' },
-    );
+    execFileSync('git', [...SAFE_GIT_ARGS, 'push', '-q', repo, 'HEAD:refs/heads/tacet/task-1'], {
+      cwd: worktree,
+      env,
+      stdio: 'ignore',
+    });
     expect(git(repo, 'rev-parse', 'tacet/task-1')).toBe(sha);
     expect(git(repo, 'log', '-1', '--format=%s', 'tacet/task-1')).toBe('work');
     expect(git(repo, 'rev-parse', 'main')).not.toBe(sha);
@@ -306,5 +309,78 @@ describe('Codex Worker isolation', () => {
     );
     await a.close(r);
     expect(output).toContain('SECOND');
+  });
+
+  it('ignores a commondir forged after the check, in git run outside the sandbox', async () => {
+    const wt = addWorktree('race');
+    // A Worker ran here (HEAD detached), and is still running when the Mini-conductor integrates.
+    const a = adapter();
+    await a.close(await a.start({ cwd: wt }));
+    const gitDir = join(repo, '.git', 'worktrees', 'race');
+    const checked = workerWorktree(wt, repo);
+    if (!checked) throw new Error('not a worktree');
+    // The Worker rewrites commondir between the check and the integration.
+    const evil = join(wt, 'evil');
+    const marker = join(root, 'race-escaped');
+    // A complete fake common dir, so git would accept it if it read the forged commondir.
+    for (const d of ['hooks', 'refs/heads']) mkdirSync(join(evil, d), { recursive: true });
+    writeFileSync(join(evil, 'HEAD'), 'ref: refs/heads/main\n');
+    symlinkSync(join(repo, '.git', 'objects'), join(evil, 'objects'));
+    writeFileSync(join(evil, 'config'), `[core]\n\thooksPath = ${join(evil, 'hooks')}\n`);
+    for (const h of ['pre-push', 'reference-transaction']) {
+      writeFileSync(join(evil, 'hooks', h), `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+    }
+    writeFileSync(join(gitDir, 'commondir'), evil);
+    // Without the explicit environment git would follow it and run the hook (control).
+    expect(
+      execFileSync('git', ['-C', wt, 'rev-parse', '--path-format=absolute', '--git-common-dir'], {
+        env: gitEnv,
+        encoding: 'utf8',
+      }).trim(),
+    ).toBe(evil);
+    // Pushed to a separate bare repo: pushing into `repo` itself would also trip over other
+    // tests' unintegrated worktrees (see ARCHITECTURE §6), which is not what this checks.
+    const target = join(root, 'race-target.git');
+    execFileSync('git', ['init', '-q', '--bare', target], { env: gitEnv });
+    const env = trustedGitEnv(wt, checked, gitEnv);
+    execFileSync('git', [...SAFE_GIT_ARGS, 'push', '-q', target, 'HEAD:refs/heads/out'], {
+      cwd: wt,
+      env,
+      stdio: 'ignore',
+    });
+    expect(existsSync(marker)).toBe(false);
+    expect(git(target, 'rev-parse', 'out')).toBe(git(repo, 'rev-parse', 'main'));
+    // Even without SAFE_GIT_ARGS, the explicit GIT_COMMON_DIR keeps the forged hooks out.
+    execFileSync('git', ['push', '-q', target, 'HEAD:refs/heads/out2'], {
+      cwd: wt,
+      env,
+      stdio: 'ignore',
+    });
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('refuses a repo with extensions.worktreeConfig', async () => {
+    const wt = addWorktree('wtcfg');
+    git(repo, 'config', 'extensions.worktreeConfig', 'true');
+    try {
+      await expect(adapter().start({ cwd: wt })).rejects.toThrow(/worktreeConfig/);
+    } finally {
+      git(repo, 'config', '--unset', 'extensions.worktreeConfig');
+    }
+  });
+
+  it('does not follow a logs/HEAD symlink when it detaches', async () => {
+    const wt = addWorktree('reflog');
+    const victim = join(root, 'victim.txt');
+    writeFileSync(victim, 'untouched\n');
+    const logs = join(repo, '.git', 'worktrees', 'reflog', 'logs');
+    mkdirSync(logs, { recursive: true });
+    rmSync(join(logs, 'HEAD'), { force: true });
+    symlinkSync(victim, join(logs, 'HEAD'));
+    const a = adapter();
+    const h = await a.start({ cwd: wt });
+    await a.close(h);
+    expect(readFileSync(victim, 'utf8')).toBe('untouched\n');
+    expect(() => git(wt, 'symbolic-ref', '-q', 'HEAD')).toThrow();
   });
 });

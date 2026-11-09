@@ -10,6 +10,7 @@ export {
   grantSubset,
   SAFE_GIT_ARGS,
   toCodexDecision,
+  trustedGitEnv,
   type WorkerWorktree,
   workerGitEnv,
   workerWorktree,
