@@ -100,14 +100,14 @@ Read from the `openai/codex` repo (source and generated schema), because `develo
 |---|---|---|---|
 | Run / transport | `opencode serve [--port --hostname --mdns --cors]`; default `127.0.0.1:4096`. HTTP basic auth via `OPENCODE_SERVER_PASSWORD` (username default `opencode`, override `OPENCODE_SERVER_USERNAME`). Tacet must set a password; unauthenticated by default is not acceptable under the 127.0.0.1-plus-token rule. | verified | https://raw.githubusercontent.com/sst/opencode/dev/packages/web/src/content/docs/server.mdx |
 | API description | `GET /doc` serves OpenAPI 3.1. JS SDK `@opencode-ai/sdk` (`createOpencode`, `createOpencodeClient({baseUrl})`); structured output only in `@opencode-ai/sdk/v2`. | verified | server.mdx , https://raw.githubusercontent.com/sst/opencode/dev/packages/web/src/content/docs/sdk.mdx |
-| Streaming events | `GET /event` (SSE; first event `server.connected`, then bus events) and `GET /global/event`. SDK `event.subscribe()` yields `{type, properties}`. Event type names and payloads NOT read. | PARTIAL (event names UNVERIFIED) | server.mdx , sdk.mdx |
-| Tool approval | `POST /session/:id/permissions/:permissionID` with `response` (+ optional `remember`). Permission rule actions: `allow`, `ask`, `deny`; UI answers are `once`, `always`, `reject`. How the ask is announced over SSE and the exact `response` enum on the endpoint are NOT confirmed. | PARTIAL | server.mdx , https://raw.githubusercontent.com/sst/opencode/dev/packages/web/src/content/docs/permissions.mdx |
+| Streaming events | `GET /event` (SSE; first event `server.connected`, seen live), `GET /global/event`. 1.19.5 `Event` union has 89 types; key ones: `message.part.delta {sessionID, messageID, partID, field, delta}`, `message.updated`, `message.part.updated`, `session.idle`, `session.status`, `session.error`, `permission.asked`, `permission.replied`. A newer `/api/*` surface with `session.next.*` events also exists (undocumented). | verified (1.19.5 OpenAPI, #60) | [spike #60](spikes/60-opencode/README.md) |
+| Tool approval | SSE `permission.asked {id, sessionID, permission, patterns, metadata, always, tool{messageID, callID}}` → `POST /permission/{requestID}/reply {reply: once|always|reject, message?}` → SSE `permission.replied`. The older `POST /session/{id}/permissions/{permissionID} {response}` is marked deprecated in 1.19.5. Rule actions: `allow`, `ask`, `deny`. | verified (1.19.5 OpenAPI, #60) | server.mdx , https://raw.githubusercontent.com/sst/opencode/dev/packages/web/src/content/docs/permissions.mdx |
 | Interrupt | `POST /session/:id/abort` returns a boolean. | verified | server.mdx |
 | Prompting | `POST /session/:id/message` (waits for reply) and `POST /session/:id/prompt_async` (204). | verified | server.mdx |
 | Resume / fork | Sessions persist server-side: `GET /session`, `GET /session/:id`, `POST /session/:id/fork` (optional `messageID`), `POST /session/:id/revert` / `unrevert`, `POST /session/:id/summarize`, `GET /session/status`. | verified | server.mdx |
-| Token / context usage | Not stated in the docs pages read. Likely on message info in the OpenAPI spec, but I could not read the spec. | **UNVERIFIED** | n/a |
+| Token / context usage | `AssistantMessage.tokens {total, input, output, reasoning, cache{read, write}}` and per-step on `step-finish` parts; context max from `Model.limit.context`. | verified (1.19.5 OpenAPI, #60) | [spike #60](spikes/60-opencode/README.md) |
 | Model switching | `model` object `{providerID, modelID}` on each prompt body; `/command` and `/shell` accept `model` too. So per-prompt switching. | verified | sdk.mdx , server.mdx |
-| Cost reporting | Not stated in the docs pages read. | **UNVERIFIED** | n/a |
+| Cost reporting | `AssistantMessage.cost` and `step-finish` `cost` (number; USD per OpenCode's ACP `usage_update`). | verified (1.19.5 OpenAPI, #60) | [spike #60](spikes/60-opencode/README.md) |
 | Auth modes | Provider credentials set via `PUT /auth/:id`, `GET /provider/auth`, OAuth authorize/callback endpoints; `/connect` in the TUI. Supports Anthropic Console API key, OpenAI via ChatGPT Plus/Pro browser login or API key, GitHub Copilot device login. | verified | server.mdx , https://raw.githubusercontent.com/sst/opencode/dev/packages/web/src/content/docs/providers.mdx |
 | Terms | OpenCode's own docs say plugins that use Claude Pro/Max models in OpenCode are explicitly prohibited by Anthropic, and the bundled plugins were removed as of 1.3.0. Tacet must not enable Claude subscription logins through OpenCode. | verified (as OpenCode's statement; consistent with the Anthropic terms above) | providers.mdx |
 
@@ -158,13 +158,13 @@ Derived from the tables above. Blank-free: `?` means UNVERIFIED.
 
 | Capability | Claude SDK | Codex app-server | OpenCode server | ACP (v1) | Gemini CLI |
 |---|---|---|---|---|---|
-| Structured stream | yes (`stream-json`, SDK msgs) | yes (JSON-RPC notifications) | yes (SSE, names ?) | yes (`session/update`) | yes (`stream-json`) |
+| Structured stream | yes (`stream-json`, SDK msgs) | yes (JSON-RPC notifications) | yes (SSE, 89 event types) | yes (`session/update`) | yes (`stream-json`) |
 | Mid-run approval round-trip | yes (`canUseTool`) | yes (server requests) | yes (POST permission) | yes (`session/request_permission`) | ACP only; headless none |
 | Interrupt | `interrupt()` with receipt | `turn/interrupt` | `POST abort` | `session/cancel` | kill process |
 | Resume | yes | yes | yes | if agent advertises | yes (`--resume`) |
 | Fork | yes | yes | yes (at message) | unstable only (`session/fork`) | no |
-| Context used + max live | `getContextUsage()` | `tokenUsage` + `modelContextWindow` | ? (HTTP); `usage_update` over ACP | `usage_update` (optional) | final stats only (headless); `usage_update` over ACP |
-| Cost USD | estimate on `result` | none found | ? | optional | none found |
+| Context used + max live | `getContextUsage()` | `tokenUsage` + `modelContextWindow` | message `tokens` + `Model.limit.context`; `usage_update` over ACP | `usage_update` (optional) | final stats only (headless); `usage_update` over ACP |
+| Cost USD | estimate on `result` | none found | `cost` on messages | optional | none found |
 | Switch model mid-session | `setModel()` | per `turn/start` | per prompt | config option (if offered) | launch only |
 | Runtime needs | Node, Bun or Deno; Python SDK too | any (stdio JSON-RPC; TS types generated) | any (HTTP; JS SDK) | TS/Python SDKs | any (spawn + parse JSONL) |
 
@@ -188,7 +188,7 @@ Roadmap status (2026-11-09): items 1 to 7, 9, 10 and 11 are tracked in `roadmap/
 
 1. **Done 2026-11-09 (#58): Codex approval enums and `turn/interrupt`/`turn/steer` payloads verified on 0.167.0.** Remaining: the permissions-deny reply and a live interrupted turn (needs a model or a mock Responses API), for #12. See [`spikes/58-codex/`](spikes/58-codex/README.md).
 2. **Partly done 2026-11-09 (#59):** the `chatgptAuthTokens` internal-only restriction is verified from the 0.167.0 schema. The commercial/hosted-use language is still UNVERIFIED because `developers.openai.com` and `help.openai.com` are blocked; needs-human (allow the hosts, or the owner reads the pages). See [`spikes/59-codex-terms/`](spikes/59-codex-terms/README.md).
-3. **Capture OpenCode event types, permission SSE event and token/cost fields from `GET /doc`** - run `opencode serve`, dump the OpenAPI spec and the SSE event union, record versions.
+3. **Done 2026-11-09 (#60): OpenCode 1.19.5 event union, permission round trip and token/cost fields recorded from `GET /doc`.** Payloads are from the spec, not live turns. See [`spikes/60-opencode/`](spikes/60-opencode/README.md).
 4. **Done 2026-11-09 (#61): ACP framing, cancel flow, fork (unstable), no `set_model`, `usage_update` senders recorded.** New: ACP v2 (`2.0.0-alpha.14`) changes the prompt lifecycle; implement v1 now and track v2. See [`spikes/61-acp/`](spikes/61-acp/README.md).
 5. **Done 2026-11-09 (#62): Claude and Codex ACP adapters recorded** (now under the `agentclientprotocol` org). Both optionally offer subscription logins: needs-human, default to API key with `--hide-claude-auth` / `NO_BROWSER=1`. See [`spikes/62-acp-adapters/`](spikes/62-acp-adapters/README.md).
 6. **Done 2026-11-09 (#63): Gemini 0.67.0 stats fields, headless approvals (none: ask = deny) and ACP permission flow verified with fixtures.** Free personal Google login status still UNVERIFIED. See [`spikes/63-gemini/`](spikes/63-gemini/README.md).
