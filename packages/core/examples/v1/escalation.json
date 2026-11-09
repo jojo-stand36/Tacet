@@ -1,0 +1,17 @@
+{
+  "id": "01JCX5Z9Q4W8E7R6T5Y4V3K2M2",
+  "taskId": "task-42",
+  "sessionId": "sess-1",
+  "repo": "api-service",
+  "question": "Use Redis or an in-memory limiter?",
+  "options": ["redis", "in-memory"],
+  "urgency": "high",
+  "category": "decision",
+  "contextRef": ".tacet/handoffs/task-42/1.json",
+  "blockedWorkers": 1,
+  "status": "pending",
+  "createdAt": "2026-11-09T12:00:00.000Z",
+  "staleAfterSeconds": 14400,
+  "maxReescalations": 2,
+  "reescalations": 0
+}

@@ -1,0 +1,30 @@
+{
+  "v": 1,
+  "taskId": "task-42",
+  "parentSession": "sess-1",
+  "createdAt": "2026-11-09T12:00:00.000Z",
+  "goal": "Add rate limiting to the public API",
+  "acceptanceCriteria": ["429 after 100 requests per minute per key", "Tests cover the limiter"],
+  "stateSummary": "Middleware written and wired into the router; Redis client added. Two tests pass; the burst test is not written yet.",
+  "decisions": [
+    {
+      "topic": "rate limiter backend",
+      "decision": "redis",
+      "scope": "repo"
+    }
+  ],
+  "filesTouched": ["src/middleware/rate-limit.ts", "src/router.ts", "test/rate-limit.test.ts"],
+  "commandsRun": [
+    {
+      "command": "pnpm test rate-limit",
+      "exitCode": 0,
+      "summary": "2 passed"
+    }
+  ],
+  "openQuestions": ["Should internal service keys be exempt?"],
+  "nextAction": "Write the burst test in test/rate-limit.test.ts, then run pnpm test.",
+  "verification": {
+    "status": "partial",
+    "commands": ["pnpm test", "pnpm lint"]
+  }
+}

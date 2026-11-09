@@ -1,0 +1,17 @@
+{
+  "acceptanceCriteria": ["429 after 100 requests per minute per key"],
+  "budget": {
+    "usd": 2.0,
+    "tokens": 2000000
+  },
+  "priority": "p1",
+  "autonomy": "medium",
+  "tiers": {
+    "worker": {
+      "adapter": "codex-app-server",
+      "model": "gpt-codex-mini",
+      "effort": "low"
+    }
+  },
+  "deadline": "2026-11-10T18:00:00.000Z"
+}

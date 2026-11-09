@@ -74,15 +74,18 @@ interface AgentAdapter {
   events(h: SessionHandle): AsyncIterable<AgentEvent>; // normalized
 }
 
-type AgentEvent =
+type AgentEvent =                     // zod source: packages/core/src/schema/agent-event.ts
   | { t: "message.delta"; text: string }
-  | { t: "tool.call"; name: string; input: unknown }
-  | { t: "tool.result"; id: string; ok: boolean }
-  | { t: "approval.request"; id: string; summary: string }
-  | { t: "usage"; inputTokens: number; outputTokens: number; contextUsed: number; contextMax: number; costUsd?: number }
-  | { t: "status"; state: "running" | "idle" | "waiting_input" | "error" | "done" }
+  | { t: "tool.call"; id: string; name: string; input: unknown }   // input redacted
+  | { t: "tool.result"; id: string; ok: boolean; summary?: string }
+  | { t: "approval.request"; id: string; summary: string; toolName?: string }
+  | { t: "usage"; inputTokens: number; outputTokens: number; contextUsed?: number; contextMax?: number;
+      costUsd?: number; model?: string; source: "reported" | "estimated" }
+  | { t: "status"; state: "running" | "idle" | "waiting_input" | "cancelled" | "error" | "done"; message?: string }
   | { t: "escalation"; question: string; options?: string[]; urgency: Urgency };
 ```
+
+The shared schemas (`AgentEvent`, `Task`, `Escalation`, `Decision`, `HandoffPacket`, the event envelope and the A2A extension metadata) are zod 4 schemas in `@tacet/core`, exported as JSON Schema 2020-12 in `packages/core/schema/v1/` (#5, [ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)). Context and cost fields on `usage` are optional because not every vendor reports them ([capability matrix §7](adapters/capability-matrix.md)).
 
 All events go to an append-only **event log** (SQLite) → UI timelines, replay, audit, cost.
 

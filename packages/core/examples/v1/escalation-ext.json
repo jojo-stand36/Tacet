@@ -1,0 +1,6 @@
+{
+  "escalationId": "01JCX5Z9Q4W8E7R6T5Y4V3K2M2",
+  "options": ["redis", "in-memory"],
+  "urgency": "high",
+  "blockedWorkers": 1
+}
