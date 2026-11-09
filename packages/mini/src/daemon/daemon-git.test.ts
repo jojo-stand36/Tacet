@@ -1,14 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newUlid, tasksProjection } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { GitIntegrator, taskBranch } from '../git/integrate.js';
+import { GitIntegrator, resultBranch, taskBranch } from '../git/integrate.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
-import type { Workspace, Workspaces } from './ports.js';
+import type { Planner, ProposedSubtask, Workspace, Workspaces } from './ports.js';
 import { ScriptedAdapter } from './testing.js';
 
 /**
@@ -32,10 +32,10 @@ describe('MiniConductor with git worktrees', () => {
   /** Detached worktrees with their own object store, as the Codex adapter prepares them. */
   class GitWorkspaces implements Workspaces {
     readonly #all = new Map<string, Workspace>();
-    async create(workerId: string): Promise<Workspace> {
+    async create(workerId: string, base?: string): Promise<Workspace> {
       const id = `ws-${workerId.replace(/[^\w.-]/g, '_')}`;
       const path = join(root, 'worktrees', id);
-      git(repo, ['worktree', 'add', '-q', '--detach', path, 'main']);
+      git(repo, ['worktree', 'add', '-q', '--detach', path, base ?? 'main']);
       const wt = workerWorktree(path, repo);
       if (wt) mkdirSync(join(wt.gitDir, 'objects'), { recursive: true });
       const ws = { id, path };
@@ -75,9 +75,12 @@ describe('MiniConductor with git worktrees', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function start(script: (cwd: string) => void) {
-    const fake = new ScriptedAdapter('fake', (_input, s) => {
-      script(s.opts.cwd);
+  function start(
+    script: (cwd: string, input: string) => void,
+    planner: Planner = new SingleStepPlanner(),
+  ) {
+    const fake = new ScriptedAdapter('fake', (input, s) => {
+      script(s.opts.cwd, input);
       return { do: 'reply', text: 'done' };
     });
     daemon = new MiniConductor({
@@ -86,7 +89,7 @@ describe('MiniConductor with git worktrees', () => {
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
       workspaces: new GitWorkspaces(),
       integrator: new GitIntegrator(repo, env),
-      planner: new SingleStepPlanner(),
+      planner,
       mcp: {
         workerConfig: () => ({
           config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
@@ -99,13 +102,29 @@ describe('MiniConductor with git worktrees', () => {
     return daemon;
   }
 
-  const commitAsWorker = (cwd: string) => {
+  const commitFiles = (cwd: string, files: Record<string, string>) => {
     const wt = workerWorktree(cwd, repo);
     if (!wt) throw new Error('not a worktree');
-    writeFileSync(join(cwd, 'work.txt'), 'work\n');
-    git(cwd, ['add', 'work.txt'], workerGitEnv(wt));
-    git(cwd, ['commit', '-qm', 'work'], workerGitEnv(wt));
+    for (const [f, text] of Object.entries(files)) writeFileSync(join(cwd, f), text);
+    git(cwd, ['add', ...Object.keys(files)], workerGitEnv(wt));
+    git(cwd, ['commit', '-qm', Object.keys(files).join(' ')], workerGitEnv(wt));
   };
+  const commitAsWorker = (cwd: string) => commitFiles(cwd, { 'work.txt': 'work\n' });
+
+  /** Two independent sub-tasks and a third that depends on both (#134). */
+  const diamond: Planner = {
+    async plan() {
+      const subtasks: ProposedSubtask[] = [
+        { key: 'a', goal: 'write [a]', acceptanceCriteria: ['ok'] },
+        { key: 'b', goal: 'write [b]', acceptanceCriteria: ['ok'] },
+        { key: 'c', goal: 'write [c]', acceptanceCriteria: ['ok'], dependsOn: ['a', 'b'] },
+      ];
+      return { subtasks, rationale: 'diamond', planner: { adapter: 'test' } };
+    },
+  };
+  const tasks = () => store.replay(tasksProjection).tasks;
+  const data = <T>(taskId: string, type: string) =>
+    store.query({ taskId, typePrefix: type }).map((e) => e.envelope.data as T);
 
   it('integrates the Worker commit after its turn and reports it in the result', async () => {
     const d = start(commitAsWorker);
@@ -225,5 +244,84 @@ describe('MiniConductor with git worktrees', () => {
       .toBe('input_required');
     expect(store.query({ taskId: sub, typePrefix: 'worker.integrated' })).toHaveLength(1);
     git(repo, ['gc', '-q']);
+  });
+
+  it('starts a dependent sub-task from the combined work of its dependencies', async () => {
+    const seen: string[] = [];
+    const d = start((cwd, input) => {
+      if (input.includes('[a]')) commitFiles(cwd, { 'a.txt': 'a\n' });
+      else if (input.includes('[b]')) commitFiles(cwd, { 'b.txt': 'b\n' });
+      else if (input.includes('[c]')) {
+        seen.push(...['a.txt', 'b.txt'].filter((f) => existsSync(join(cwd, f))));
+        commitFiles(cwd, { 'c.txt': 'c\n' });
+      }
+    }, diamond);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(seen).toEqual(['a.txt', 'b.txt']);
+    const base = data<{ baseCommit?: string }>(`${id}/3`, 'worker.started')[0]?.baseCommit;
+    expect(base).toMatch(/^[0-9a-f]{40}$/);
+    // The merge the checkout started from is not reported as the Worker's own commit.
+    const cCommits = data<{ commits: string[] }>(`${id}/3`, 'task.result').at(-1)?.commits;
+    expect(cCommits).toHaveLength(1);
+    expect(cCommits?.[0]).not.toBe(base);
+    // The parent's branch holds every sub-task's work.
+    const result = resultBranch(id);
+    for (const f of ['a.txt', 'b.txt', 'c.txt']) git(repo, ['cat-file', '-e', `${result}:${f}`]);
+    expect(data<{ commits: string[] }>(id, 'task.result').at(-1)?.commits).toContain(
+      git(repo, ['rev-parse', result]),
+    );
+    expect(data<{ summary: string }>(id, 'task.result').at(-1)?.summary).toContain(
+      `tacet/${id}/result`,
+    );
+    git(repo, ['gc', '-q']);
+  });
+
+  it('asks the user when the dependencies conflict, and runs nothing until answered', async () => {
+    const inputs: string[] = [];
+    const d = start((cwd, input) => {
+      if (input.includes('[a]')) commitFiles(cwd, { 'x.txt': 'from a\n' });
+      else if (input.includes('[b]')) commitFiles(cwd, { 'x.txt': 'from b\n' });
+      else if (input.includes('[c]')) {
+        inputs.push(input);
+        commitFiles(cwd, { 'c.txt': 'c\n' });
+      }
+    }, diamond);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const c = `${id}/3`;
+    await expect.poll(() => tasks()[c]?.state, { timeout: 5000 }).toBe('input_required');
+    const raised = data<{ id: string; question: string; contextRef: string; category: string }>(
+      c,
+      'escalation.raised',
+    );
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.question).toContain('x.txt');
+    expect(raised[0]?.question).not.toContain(root);
+    expect(raised[0]?.category).toBe('blocked');
+    expect(data(c, 'worker.started')).toHaveLength(0);
+    expect(tasks()[id]?.state).toBe('input_required');
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'conductor', id: 'test' },
+      taskId: c,
+      type: 'escalation.resolved',
+      data: { escalationId: raised[0]?.id, answer: 'keep the a version' },
+    });
+    await d.settled();
+    expect(tasks()[c]?.state).toBe('completed');
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toMatch(/merge these commits/);
+    expect(inputs[0]).toContain('keep the a version');
+    const a = data<{ commits: string[] }>(`${id}/1`, 'task.result').at(-1)?.commits?.[0];
+    expect(data<{ baseCommit?: string }>(c, 'worker.started')[0]?.baseCommit).toBe(a);
+    // c did not merge b, so the whole task cannot be combined: said, not hidden.
+    const parent = data<{ openQuestions: string[] }>(id, 'task.result').at(-1);
+    expect(parent?.openQuestions.join('\n')).toMatch(/conflicts \(x\.txt\)/);
+    expect(() => git(repo, ['rev-parse', '--verify', '-q', resultBranch(id)])).toThrow();
   });
 });
