@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  authorizeSessionRequest,
   BrowserSessions,
   CLOSE_NO_COMMON_VERSION,
   CLOSE_POLICY_VIOLATION,
@@ -28,10 +29,10 @@ import {
   OneTimeCodes,
   openUrl,
   readRuntimeFile,
-  readSessionCookie,
   removeRuntimeFile,
+  SESSION_RESPONSE_HEADERS,
   Secret,
-  sessionCookieName,
+  sessionResponseBody,
   WorkerTokens,
   writeRuntimeFile,
 } from '../index.js';
@@ -192,20 +193,129 @@ describe('Host and Origin checks', () => {
     ['other loopback port', 'http://127.0.0.1:4101'],
   ])('rejects Origin: %s', (_label, origin) => {
     expect(checkHostAndOrigin({ host, origin }, port, 'bearer').ok).toBe(false);
-    expect(checkHostAndOrigin({ host, origin }, port, 'cookie').ok).toBe(false);
+    expect(checkHostAndOrigin({ host, origin }, port, 'browser').ok).toBe(false);
+    expect(checkHostAndOrigin({ host, origin }, port, 'session', 'GET').ok).toBe(false);
   });
 
   it.each(['http://127.0.0.1:4100', 'http://[::1]:4100', 'HTTP://LOCALHOST:4100'])(
     'accepts Origin %s',
     (origin) => {
-      expect(checkHostAndOrigin({ host, origin }, port, 'cookie').ok).toBe(true);
+      expect(checkHostAndOrigin({ host, origin }, port, 'browser').ok).toBe(true);
     },
   );
 
-  it('requires an Origin on cookie requests, not on bearer requests', () => {
-    expect(checkHostAndOrigin({ host }, port, 'cookie').ok).toBe(false);
-    expect(checkHostAndOrigin({ host, origin: '' }, port, 'cookie').ok).toBe(false);
+  it('requires an Origin on browser requests, not on bearer requests', () => {
+    expect(checkHostAndOrigin({ host }, port, 'browser').ok).toBe(false);
+    expect(checkHostAndOrigin({ host, origin: '' }, port, 'browser').ok).toBe(false);
     expect(checkHostAndOrigin({ host }, port, 'bearer').ok).toBe(true);
+  });
+
+  it('lets session-token GET and HEAD omit Origin, nothing else', () => {
+    for (const method of ['GET', 'HEAD']) {
+      expect(checkHostAndOrigin({ host }, port, 'session', method).ok).toBe(true);
+    }
+    for (const method of ['get', 'POST', 'PUT', 'DELETE', 'PATCH', undefined]) {
+      expect(checkHostAndOrigin({ host }, port, 'session', method)).toMatchObject({
+        ok: false,
+        reason: 'origin required',
+      });
+    }
+    // The Host check still applies, so a rebinding hostname cannot use the exemption.
+    expect(checkHostAndOrigin({ host: 'evil.example:4100' }, port, 'session', 'GET').ok).toBe(
+      false,
+    );
+    // A `method` header is not the method: only the argument counts.
+    const spoofed = { host, method: 'GET' } as { host: string };
+    expect(checkHostAndOrigin(spoofed, port, 'session').ok).toBe(false);
+    // The WebSocket upgrade is also a GET but uses `browser`, which never exempts.
+    expect(checkHostAndOrigin({ host }, port, 'browser', 'GET').ok).toBe(false);
+  });
+
+  it('authorizeSessionRequest checks the token, then Origin with the real method', () => {
+    const sessions = new BrowserSessions();
+    const authorization = `Bearer ${sessions.create().reveal()}`;
+    const req = (method: string, headers: Record<string, string>) => ({
+      method,
+      headers: { host, ...headers },
+    });
+    expect(authorizeSessionRequest(req('GET', { authorization }), port, sessions).ok).toBe(true);
+    expect(authorizeSessionRequest(req('GET', {}), port, sessions)).toMatchObject({
+      ok: false,
+      httpStatus: 401,
+    });
+    expect(
+      authorizeSessionRequest(req('GET', { authorization: 'Bearer forged' }), port, sessions),
+    ).toMatchObject({ ok: false, httpStatus: 401 });
+    expect(authorizeSessionRequest(req('POST', { authorization }), port, sessions)).toMatchObject({
+      ok: false,
+      reason: 'origin required',
+    });
+    expect(
+      authorizeSessionRequest(
+        req('POST', { authorization, origin: `http://127.0.0.1:${port}` }),
+        port,
+        sessions,
+      ).ok,
+    ).toBe(true);
+    expect(
+      authorizeSessionRequest(
+        req('GET', { authorization, origin: 'http://attacker.example' }),
+        port,
+        sessions,
+      ).ok,
+    ).toBe(false);
+    // A rebinding Host is refused before the token is looked at.
+    expect(
+      authorizeSessionRequest(
+        { method: 'GET', headers: { host: 'evil.example:4100', authorization: 'Bearer forged' } },
+        port,
+        sessions,
+      ),
+    ).toMatchObject({ ok: false, httpStatus: 403, reason: 'host not allowed' });
+    // An upgrade never takes the session path, even with a valid token.
+    expect(
+      authorizeSessionRequest(req('GET', { authorization, upgrade: 'websocket' }), port, sessions)
+        .ok,
+    ).toBe(false);
+  });
+
+  it('authorizeSessionRequest ignores a spoofed method header on a real server', async () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const listener = await listenLoopback(() =>
+      http.createServer((req, res) => {
+        const check = authorizeSessionRequest(req, listener.port, sessions);
+        res.writeHead(check.ok ? 200 : check.httpStatus).end();
+      }),
+    );
+    const send = (method: string, headers: Record<string, string>) =>
+      new Promise<number>((resolve, reject) => {
+        const r = request(
+          {
+            host: '127.0.0.1',
+            port: listener.port,
+            method,
+            path: '/',
+            headers: {
+              host: `127.0.0.1:${listener.port}`,
+              authorization: `Bearer ${token}`,
+              ...headers,
+            },
+          },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        r.on('error', reject);
+        r.end();
+      });
+    try {
+      expect(await send('GET', {})).toBe(200);
+      expect(await send('POST', { method: 'GET', 'x-http-method-override': 'GET' })).toBe(403);
+    } finally {
+      await listener.close();
+    }
   });
 
   it('rejects a DNS-rebinding request against a real loopback server', async () => {
@@ -299,6 +409,7 @@ describe('tacet/hello gate', () => {
       versions: [1],
       serverInfo: { name: 'conductor', version: '0' },
       newSessionId: () => 's1',
+      upgradeAuth: 'bearer',
     });
   const hello = (versions: number[], extra: Record<string, unknown> = {}) =>
     JSON.stringify({
@@ -365,6 +476,7 @@ describe('tacet/hello gate', () => {
       versions: [1],
       serverInfo: { name: 'c', version: '0' },
       newSessionId: () => 's',
+      upgradeAuth: 'bearer',
       onHello: () => {
         throw new Error('unknown repo');
       },
@@ -374,11 +486,109 @@ describe('tacet/hello gate', () => {
     expect(g.handle(hello([1]))).toMatchObject({ kind: 'close' });
   });
 
+  it('opens a UI hello only with a valid browser session token, and hides the token', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const seen: unknown[] = [];
+    const uiGate = () =>
+      new HelloGate({
+        versions: [1],
+        serverInfo: { name: 'c', version: '0' },
+        newSessionId: () => 's',
+        upgradeAuth: 'none',
+        verifyBrowserSession: (t) => sessions.validate(t),
+        onHello: (p) => seen.push(p),
+      });
+    const uiHello = (sessionToken?: string) =>
+      hello([1], { role: 'ui', ...(sessionToken === undefined ? {} : { sessionToken }) });
+
+    const ok = uiGate();
+    expect(ok.handle(uiHello(token))).toMatchObject({ kind: 'reply' });
+    expect(JSON.stringify(seen)).not.toContain(token);
+    expect(seen[0]).toMatchObject({ role: 'ui' });
+
+    for (const [label, frame] of [
+      ['forged', uiHello('forged')],
+      ['missing', uiHello()],
+    ] as const) {
+      const action = uiGate().handle(frame);
+      expect(action.kind, label).toBe('close');
+      expect(JSON.stringify(action), label).not.toContain(token);
+    }
+    expect(uiGate().handle(uiHello('forged'))).toMatchObject({ kind: 'close', code: 4401 });
+
+    sessions.revoke(token);
+    expect(uiGate().handle(uiHello(token))).toMatchObject({ kind: 'close', code: 4401 });
+  });
+
+  it('on an unauthenticated upgrade, refuses every role except ui (no cli/mini spoofing)', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const noAuth = () =>
+      new HelloGate({
+        versions: [1],
+        serverInfo: { name: 'c', version: '0' },
+        newSessionId: () => 's',
+        upgradeAuth: 'none',
+        verifyBrowserSession: (t) => sessions.validate(t),
+      });
+    expect(noAuth().handle(hello([1]))).toMatchObject({ kind: 'close', code: 4401 });
+    const miniHello = hello([1], {
+      role: 'mini',
+      repoId: 'r',
+      repoPath: '/r',
+      adapters: [],
+      miniVersion: '0',
+    });
+    expect(noAuth().handle(miniHello)).toMatchObject({ kind: 'close', code: 4401 });
+    expect(noAuth().handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'reply',
+    });
+  });
+
+  it('checks the browser session before the protocol version, and fails closed if the verifier throws', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    const make = (verify: (t: string) => boolean) =>
+      new HelloGate({
+        versions: [1],
+        serverInfo: { name: 'c', version: '0' },
+        newSessionId: () => 's',
+        upgradeAuth: 'none',
+        verifyBrowserSession: verify,
+      });
+    expect(make(() => false).handle(hello([9], { role: 'ui', sessionToken: token }))).toMatchObject(
+      {
+        code: 4401,
+      },
+    );
+    const throwing = make(() => {
+      throw new Error('db down');
+    });
+    expect(throwing.handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'close',
+      code: 4401,
+    });
+    expect(throwing.handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'close',
+    });
+  });
+
+  it('refuses every UI hello when no browser-session verifier is configured', () => {
+    const sessions = new BrowserSessions();
+    const token = sessions.create().reveal();
+    expect(gate().handle(hello([1], { role: 'ui', sessionToken: token }))).toMatchObject({
+      kind: 'close',
+      code: 4401,
+    });
+  });
+
   it('answers a valid hello with the highest common version, then passes frames through', () => {
     const g = new HelloGate({
       versions: [1, 2],
       serverInfo: { name: 'c', version: '0' },
       newSessionId: () => 's9',
+      upgradeAuth: 'bearer',
     });
     expect(g.handle(hello([1, 2, 3]))).toMatchObject({
       kind: 'reply',
@@ -393,23 +603,85 @@ describe('tacet/hello gate', () => {
 describe('one-time code browser login', () => {
   const port = 4100;
 
-  it('works once, then never again, and sets a per-port HttpOnly SameSite=Strict cookie', () => {
+  it('works once, then never again, and returns a session token in the body, never a cookie', () => {
     const codes = new OneTimeCodes();
     const sessions = new BrowserSessions();
     const code = codes.issue();
-    const first = exchangeCode(codes, sessions, code.reveal(), port);
-    expect(first.ok).toBe(true);
-    expect(exchangeCode(codes, sessions, code.reveal(), port)).toEqual({
-      ok: false,
-      httpStatus: 401,
-    });
+    const first = exchangeCode(codes, sessions, code.reveal());
+    expect(exchangeCode(codes, sessions, code.reveal())).toEqual({ ok: false, httpStatus: 401 });
     if (!first.ok) throw new Error('unreachable');
-    expect(first.setCookie.startsWith(`${sessionCookieName(port)}=`)).toBe(true);
-    expect(first.setCookie).toMatch(/; HttpOnly; SameSite=Strict; Path=\/$/);
-    const cookie = `other=1; ${first.setCookie.split(';')[0]}`;
-    expect(sessions.validate(readSessionCookie(cookie, port))).toBe(true);
-    expect(readSessionCookie(cookie, 4101)).toBeUndefined();
+    expect(first).not.toHaveProperty('setCookie');
+    expect(inspect(first)).not.toContain(first.token.reveal());
+    expect(JSON.stringify(first)).not.toContain(first.token.reveal());
+    const { sessionToken } = JSON.parse(sessionResponseBody(first.token)) as {
+      sessionToken: string;
+    };
+    expect(first.token.equals(sessionToken)).toBe(true);
+    expect(sessions.validate(sessionToken)).toBe(true);
+    expect(sessions.validateHeader(`Bearer ${sessionToken}`)).toBe(true);
+    expect(sessions.validateHeader(`Bearer forged`)).toBe(false);
     expect(sessions.validate('forged')).toBe(false);
+    expect(Object.keys(SESSION_RESPONSE_HEADERS).map((h) => h.toLowerCase())).not.toContain(
+      'set-cookie',
+    );
+    expect(SESSION_RESPONSE_HEADERS['cache-control']).toBe('no-store');
+    expect(inspect(sessions)).not.toContain(sessionToken);
+  });
+
+  it('never sends Set-Cookie over HTTP, and the token authenticates hello and Bearer calls', async () => {
+    const codes = new OneTimeCodes();
+    const sessions = new BrowserSessions();
+    const code = codes.issue();
+    const listener = await listenLoopback(() =>
+      http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/auth/session') {
+          const r = exchangeCode(codes, sessions, req.headers['x-code'] as string | undefined);
+          if (!r.ok) return void res.writeHead(r.httpStatus).end();
+          return void res
+            .writeHead(200, SESSION_RESPONSE_HEADERS)
+            .end(sessionResponseBody(r.token));
+        }
+        res.writeHead(sessions.validateHeader(req.headers.authorization) ? 200 : 401).end();
+      }),
+    );
+    const call = (method: string, path: string, headers: Record<string, string>) =>
+      new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>(
+        (resolve, reject) => {
+          const req = request(
+            { host: '127.0.0.1', port: listener.port, method, path, headers },
+            (res) => {
+              let body = '';
+              res.on('data', (c) => {
+                body += c;
+              });
+              res.on('end', () =>
+                resolve({ status: res.statusCode ?? 0, headers: res.headers, body }),
+              );
+            },
+          );
+          req.on('error', reject);
+          req.end();
+        },
+      );
+    try {
+      const login = await call('POST', '/auth/session', { 'x-code': code.reveal() });
+      expect(login.status).toBe(200);
+      expect(login.headers['set-cookie']).toBeUndefined();
+      const { sessionToken } = JSON.parse(login.body) as { sessionToken: string };
+      const replay = await call('POST', '/auth/session', { 'x-code': code.reveal() });
+      expect(replay.status).toBe(401);
+      expect(replay.headers['set-cookie']).toBeUndefined();
+      expect((await call('GET', '/api', { authorization: `Bearer ${sessionToken}` })).status).toBe(
+        200,
+      );
+      expect((await call('GET', '/api', {})).status).toBe(401);
+      sessions.revoke(sessionToken);
+      expect((await call('GET', '/api', { authorization: `Bearer ${sessionToken}` })).status).toBe(
+        401,
+      );
+    } finally {
+      await listener.close();
+    }
   });
 
   it('expires after 60 s', () => {
