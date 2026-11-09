@@ -1,0 +1,1 @@
+{"protocolVersion":1,"agentInfo":{"name":"OpenCode","version":"1.19.5"},"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true},"promptCapabilities":{"embeddedContext":true,"image":true},"sessionCapabilities":{"close":{},"fork":{},"list":{},"resume":{}}}}
