@@ -332,14 +332,15 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     });
 
     it('fails the start, scrubbed, when the source cannot be read', async () => {
-      const token = 'sk-live-header-value-0123456789';
+      // No secret pattern matches it, so only the header-literal scrub can remove it.
+      const token = 'tacet-hdr-0123456789abcdef';
       const adapter = make('read-fail', {
         baseEnv: {
           PATH: process.env.PATH,
           HOME: root,
           OPENAI_API_KEY: FAKE_KEY,
           FAKE_MODE: 'read-fail',
-          FAKE_ERROR: `no such thread (headers: ${token})`,
+          FAKE_ERROR: `no such thread (header value ${token})`,
           FAKE_LOG: join(root, 'log.jsonl'),
         },
       });
