@@ -380,6 +380,30 @@ describe('MiniConductor', () => {
     expect(other.sessions.some((s) => s.opts.resume)).toBe(false);
   });
 
+  it('discards a session whose resume failed (#153)', async () => {
+    const d1 = make({
+      planner: new FixedPlanner([{ key: 'long', goal: 'long [hold]', acceptanceCriteria: ['ok'] }]),
+    });
+    await d1.start();
+    const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('worker.vendor_session', `${id}/1`).length, { timeout: 5000 })
+      .toBe(1);
+    const vendor = (
+      ofType('worker.vendor_session', `${id}/1`)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
+    d1.crashForTest();
+    fake = new ScriptedAdapter('fake', () => ({ do: 'reply', text: 'done afresh' }));
+    fake.failResumes = true;
+    const d2 = make();
+    await d2.start();
+    await d2.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    // The failed resume's session, then the fresh one once it finished. (This scripted adapter
+    // numbers its sessions afresh, so the fresh one reuses the id: count both.)
+    expect(fake.discarded.map((x) => x.vendorSessionId)).toEqual([vendor, vendor]);
+  });
+
   it('resumes after a crash mid-task without redoing finished work', async () => {
     const d1 = make({
       planner: new FixedPlanner([

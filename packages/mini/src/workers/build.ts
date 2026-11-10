@@ -23,6 +23,8 @@ export class WorkerConfigError extends Error {
 }
 
 export interface BuildWorkerAdaptersOptions {
+  /** The repo the Workers work on: keys per-repo adapter state (the Claude PTY sessions, #153). */
+  repoRoot?: string;
   /**
    * The user's environment: what Workers get an allowlist of, and where `{ env }` secret
    * references are read. One snapshot for both. Default `process.env`.
@@ -37,10 +39,7 @@ export interface BuildWorkerAdaptersOptions {
   claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr'>;
-  /**
-   * For the built-in `pty:claude` (Claude Code in a terminal). Pass `repoRoot` (and the resolved
-   * `events.state_dir`), so its sessions' state is kept per repo, not per checkout.
-   */
+  /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
   ptyCli?: Pick<PtyCliAdapterOptions, 'spawn' | 'quietMs' | 'startTimeoutMs' | 'killTimeoutMs'>;
@@ -122,6 +121,7 @@ export function buildWorkerAdapters(
       const days = config.events?.retention?.transcript_days;
       return new PtyAdapter({
         ...(days !== undefined ? { retentionDays: days } : {}),
+        ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.claudePty,
         ...common,
       });

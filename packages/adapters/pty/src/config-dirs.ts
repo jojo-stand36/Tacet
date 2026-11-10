@@ -1,5 +1,5 @@
-import { lstatSync, readdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 
 /** Session directories are named by the session's UUID; nothing else under the root is ours. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -37,10 +37,15 @@ export function sweepClaudeConfigDirs(
   for (const name of names) {
     if (!UUID.test(name) || keep.has(name)) continue;
     const dir = join(root, name);
-    if (!ownDir(dir)) continue;
-    if (now - newestMtime(dir) < maxAgeMs) continue;
-    rmSync(dir, { recursive: true, force: true });
-    removed++;
+    // One directory that cannot be read (or is removed meanwhile) never stops the others.
+    try {
+      if (!ownDir(dir)) continue;
+      if (now - newestMtime(dir) < maxAgeMs) continue;
+      rmSync(dir, { recursive: true, force: true });
+      removed++;
+    } catch {
+      // Left for the next sweep.
+    }
   }
   return removed;
 }
@@ -54,7 +59,10 @@ function ownDir(path: string): boolean {
   }
 }
 
-/** The newest modification time in a directory tree (symlinks not followed), in ms. */
+/**
+ * The newest modification time in a directory tree (symlinks not followed), in ms. Claude Code's
+ * transcripts sit about three levels down; the depth cap only bounds a pathological tree.
+ */
 function newestMtime(dir: string, depth = 0): number {
   let newest = lstatSync(dir).mtimeMs;
   if (depth > 6) return newest;
@@ -64,4 +72,21 @@ function newestMtime(dir: string, depth = 0): number {
     if (t > newest) newest = t;
   }
   return newest;
+}
+
+/**
+ * The repo a working directory belongs to, for keying per-repo state: for a linked git worktree
+ * (a `.git` file pointing into `<repo>/.git/worktrees/<name>`), the main checkout; otherwise the
+ * directory itself. Read from git's own pointer files, without running git.
+ */
+export function repoOf(cwd: string): string {
+  try {
+    const pointer = /^gitdir: (.+)$/m.exec(readFileSync(join(cwd, '.git'), 'utf8'))?.[1]?.trim();
+    if (!pointer) return cwd;
+    const gitDir = resolve(cwd, pointer);
+    const common = resolve(gitDir, readFileSync(join(gitDir, 'commondir'), 'utf8').trim());
+    return basename(common) === '.git' ? dirname(common) : cwd;
+  } catch {
+    return cwd;
+  }
 }

@@ -7,10 +7,13 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ProfileRefusedError } from '@tacet/core';
+import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PtyAdapter, promptText } from './adapter.js';
@@ -232,6 +235,7 @@ describe('PtyAdapter (fake claude)', () => {
     await expect(make({ ANTHROPIC_API_KEY: 'short-key-0123' }).start({ cwd })).rejects.toThrow(
       /too short/,
     );
+    expect(configDirs()).toEqual([]);
     const ok = make();
     await expect(ok.start({ cwd, effort: 'high' })).rejects.toThrow(ProfileRefusedError);
     const id = randomUUID();
@@ -538,8 +542,12 @@ describe('PtyAdapter (fake claude)', () => {
   it('discards a closed session it will never resume, and never an open one', async () => {
     const adapter = make();
     const cwd = join(root, 'wt');
-    const h = await adapter.start({ cwd });
-    const vendor = h.vendorSessionId as string;
+    const first = await adapter.start({ cwd });
+    const vendor = first.vendorSessionId as string;
+    await adapter.close(first);
+    // Closed but not discarded: it resumes, in the same directory.
+    const h = await adapter.start({ cwd, resume: { vendorSessionId: vendor } });
+    expect(h.vendorSessionId).toBe(vendor);
     expect(configDirs()).toEqual([vendor]);
     await expect(adapter.discard(vendor, cwd)).rejects.toThrow(/still open/);
     await adapter.close(h);
@@ -549,6 +557,27 @@ describe('PtyAdapter (fake claude)', () => {
       /no PTY session/,
     );
     await expect(adapter.discard('../escape', cwd)).rejects.toThrow(/UUID/);
+  });
+
+  it('sweeps session directories older than the retention when it first starts', async () => {
+    const cwd = join(root, 'wt');
+    const claudePty = join(repoStateDir(cwd, join(root, 'state')), 'claude-pty');
+    const stale = randomUUID();
+    const recent = randomUUID();
+    for (const [id, days] of [
+      [stale, 10],
+      [recent, 1],
+    ] as const) {
+      mkdirSync(join(claudePty, id), { recursive: true });
+      writeFileSync(join(claudePty, id, '.claude.json'), '{}');
+      const t = (Date.now() - days * 24 * 60 * 60 * 1000) / 1000;
+      utimesSync(join(claudePty, id, '.claude.json'), t, t);
+      utimesSync(join(claudePty, id), t, t);
+    }
+    const adapter = make({}, { retentionDays: 7 });
+    const h = await adapter.start({ cwd });
+    expect(configDirs().sort()).toEqual([recent, h.vendorSessionId].sort());
+    await adapter.close(h);
   });
 
   it('reports a crash as an error, once', async () => {

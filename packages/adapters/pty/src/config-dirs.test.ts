@@ -10,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { removeClaudeConfigDir, sweepClaudeConfigDirs } from './config-dirs.js';
+import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
@@ -43,6 +43,18 @@ function session(id: string, daysAgo: number, fresh?: string): string {
 }
 
 describe('Claude config directories (#153)', () => {
+  it('keys a git worktree by its main checkout, anything else by itself', () => {
+    const repo = join(root, 'repo');
+    const wt = join(root, 'wt');
+    mkdirSync(join(repo, '.git', 'worktrees', 'wt'), { recursive: true });
+    mkdirSync(wt);
+    writeFileSync(join(repo, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+    writeFileSync(join(wt, '.git'), `gitdir: ${join(repo, '.git', 'worktrees', 'wt')}\n`);
+    expect(repoOf(wt)).toBe(repo);
+    expect(repoOf(repo)).toBe(repo);
+    expect(repoOf(join(root, 'gone'))).toBe(join(root, 'gone'));
+  });
+
   it('removes one session directory, named by its UUID only', () => {
     const dir = session(A, 0);
     expect(removeClaudeConfigDir(root, A)).toBe(true);

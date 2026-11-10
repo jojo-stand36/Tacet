@@ -42,7 +42,7 @@ import {
   prepareClaudeConfigDir,
   preToolUseDecision,
 } from './claude.js';
-import { removeClaudeConfigDir, sweepClaudeConfigDirs } from './config-dirs.js';
+import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
@@ -77,7 +77,10 @@ export interface PtyAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
-  /** The repo the Workers belong to; keys the state directory. Default: the session's cwd. */
+  /**
+   * The repo the Workers belong to; keys the state directory. Default: the repo of the session's
+   * cwd (the main checkout, for a git worktree), else the cwd itself.
+   */
   repoRoot?: string;
   /** Tacet's state directory. Default `~/.tacet/state`. */
   stateDir?: string;
@@ -241,7 +244,8 @@ export class PtyAdapter implements AgentAdapter {
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
     const cwd = realpathSync(opts.cwd);
-    const home = env.HOME ?? homedir();
+    // From the user's environment, not the Worker's: where state lives never depends on a session.
+    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
     const root = this.#configRoot(cwd, home);
     const configDir = join(root, vendorSessionId);
     if (!this.#sweptRoots.has(root)) {
@@ -543,7 +547,10 @@ export class PtyAdapter implements AgentAdapter {
   /** Where the sessions' Claude config directories live: `<repo state dir>/claude-pty`. */
   #configRoot(cwd: string, home: string): string {
     return join(
-      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
+      repoStateDir(
+        this.#opts.repoRoot ?? repoOf(cwd),
+        this.#opts.stateDir ?? defaultStateDir(home),
+      ),
       'claude-pty',
     );
   }

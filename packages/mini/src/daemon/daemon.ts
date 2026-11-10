@@ -850,7 +850,9 @@ export class MiniConductor {
     // A session stopped for a restart that is not resumed after all (another adapter or
     // checkout now) never will be: its adapter may drop what it kept for that (#153).
     if (!resume && last?.ended === 'restart' && last.vendorSessionId && last.adapter) {
-      await this.#discard(last.adapter, last.vendorSessionId, existing?.path ?? workspace.path);
+      // Its own checkout, refused or not, locates its state; the new one only if that is gone.
+      const old = last.workspaceId ? await this.#o.workspaces.get(last.workspaceId) : undefined;
+      await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
       if (!this.#live(gen)) return;
     }
     // Intent first: a crash after this leaves a record of the session and its checkout.
@@ -912,6 +914,8 @@ export class MiniConductor {
           sessionId,
         ),
       );
+      // A resume that failed is not tried again (the next run starts afresh): drop its state.
+      if (resume) await this.#discard(tier.adapter, resume.vendorSessionId, workspace.path);
       this.#afterFailure(subtaskId);
       return;
     }
