@@ -86,6 +86,19 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
     for (const [i, t] of screens.entries()) {
       if (i >= screens.length - 3) console.log(`--- screen of session ${i}:\n${plain(t)}`);
     }
+    // What reached the model: tells a prompt never sent from hooks that never came back.
+    console.log(
+      `--- last mock API requests:\n${api.requests
+        .slice(-6)
+        .map((r) =>
+          JSON.stringify({
+            text: r.text.slice(0, 80),
+            tools: r.tools.length,
+            out: r.toolOutput?.slice(0, 300),
+          }),
+        )
+        .join('\n')}`,
+    );
     if (process.env.TACET_PTY_SCREENS) {
       writeFileSync(process.env.TACET_PTY_SCREENS, JSON.stringify(screens));
     }
