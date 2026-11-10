@@ -352,6 +352,30 @@ describe('AcpAdapter (fake ACP agent)', () => {
     });
   });
 
+  it("scrubs the agent's configured secrets and its API key from events and stderr", async () => {
+    const lines: string[] = [];
+    const spec = customAcpAgent('goose', {
+      command: ['goose', 'acp'],
+      env: { FAKE_STDERR: 'debug: preset-secret-1234 and key-of-the-user' },
+      apiKeyEnv: ['GOOSE_KEY'],
+    });
+    const adapter = make(
+      spec,
+      { GOOSE_KEY: 'key-of-the-user' },
+      { secrets: ['preset', 'preset-secret-1234'], stderr: (t: string) => lines.push(t) },
+    );
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    // The fake replies with the prompt's text.
+    await adapter.send(h, { text: 'echo preset-secret-1234 key-of-the-user' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    await until(() => lines.join('').includes('\n'));
+    await adapter.close(h);
+    const text = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : [])).join('');
+    expect(text).toBe('echo [redacted] [redacted]');
+    expect(lines.join('')).toContain('debug: [redacted] and [redacted]');
+  });
+
   it('keeps the error type when a profile is refused at start', async () => {
     const adapter = make(customAcpAgent('plain', { command: ['plain'] }));
     await expect(adapter.start({ cwd: join(root, 'wt'), model: 'm' })).rejects.toThrow(

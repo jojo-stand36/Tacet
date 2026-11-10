@@ -12,7 +12,11 @@ const NonEmpty = z.string().min(1);
 
 export const TierConfig = z.strictObject({
   adapter: NonEmpty,
-  model: NonEmpty,
+  /**
+   * Required by adapters that choose a model per session (`claude-sdk`, `codex-app-server`); left
+   * out for `acp:<slug>` and `pty:<slug>` agents, whose command fixes it (#149).
+   */
+  model: NonEmpty.optional(),
   effort: z.enum(['low', 'medium', 'high']).optional(),
   cross_vendor: z.boolean().optional(),
 });

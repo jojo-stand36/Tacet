@@ -1,7 +1,7 @@
 // A line-based interactive CLI for PTY adapter tests (#15): shows `fake> `, answers each line.
 // `SLOW` prints for about five seconds; Ctrl-C drops it and shows the prompt again. `ENV` prints
 // the names (never values) of its environment variables. `EXIT` exits with code 3. `PRINT_SECRET`
-// prints the value of FAKE_SECRET. With FAKE_SLOW_CANCEL set, Ctrl-C takes a second: the turn
+// prints the value of FAKE_SECRET, `PRINT_VAR <NAME>` that of any variable. With FAKE_SLOW_CANCEL set, Ctrl-C takes a second: the turn
 // goes on printing meanwhile, and lines typed meanwhile are ignored, as a busy CLI might.
 import { createInterface } from 'node:readline';
 
@@ -29,8 +29,9 @@ rl.on('SIGINT', () => {
 });
 rl.on('line', (line) => {
   if (cancelling) return;
-  if (line === 'PRINT_SECRET') {
-    console.log(`value: ${process.env.FAKE_SECRET}`);
+  if (line === 'PRINT_SECRET' || line.startsWith('PRINT_VAR ')) {
+    const name = line === 'PRINT_SECRET' ? 'FAKE_SECRET' : line.slice('PRINT_VAR '.length);
+    console.log(`value: ${process.env[name]}`);
     rl.prompt();
     return;
   }
