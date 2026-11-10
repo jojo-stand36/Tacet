@@ -159,10 +159,10 @@ describe('tacet init (#20)', () => {
     const asked: string[] = [];
     const prompt = async (q: string) => {
       asked.push(q);
-      return '  picked-model ';
+      return q.startsWith('Model') ? '  picked-model ' : '';
     };
     expect((await tacet(['init'], { prompt })).code).toBe(0);
-    expect(asked).toHaveLength(1);
+    expect(asked).toHaveLength(2);
     const { config } = loadConfig({ repoRoot: repo, userDir: join(home, '.tacet') });
     expect(config.tiers?.worker?.model).toBe('picked-model');
   });
@@ -238,13 +238,79 @@ describe('tacet init (#20)', () => {
   });
 });
 
+describe('tacet init: merged worktree cleanup (#210)', () => {
+  const cleanup = () =>
+    loadConfig({ repoRoot: repo, userDir: join(home, '.tacet') }).config.worktrees?.remove_merged;
+  const written = () => readFileSync(join(repo, '.tacet', 'tacet.yaml'), 'utf8');
+
+  it('defaults to removing, and writes only a comment for the default', async () => {
+    expect((await tacet(['init', '--model', 'm'])).code).toBe(0);
+    expect(cleanup()).toBe(true);
+    expect(written()).toContain('# worktrees:\n#   remove_merged: false');
+    expect(written()).not.toMatch(/^worktrees:/m);
+  });
+
+  it('writes the opt-out with --keep-merged-worktrees, and loadConfig takes it', async () => {
+    const r = await tacet(['init', '--model', 'm', '--keep-merged-worktrees', '--json']);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.out).removeMerged).toBe(false);
+    expect(written()).toMatch(/^worktrees:\n {2}remove_merged: false$/m);
+    expect(cleanup()).toBe(false);
+  });
+
+  it('asks on a terminal, once more after an answer it cannot read', async () => {
+    const answers = ['maybe', 'n'];
+    const asked: string[] = [];
+    const prompt = async (q: string) => {
+      asked.push(q);
+      return answers.shift() ?? '';
+    };
+    expect((await tacet(['init', '--model', 'm'], { prompt })).code).toBe(0);
+    expect(asked).toEqual([
+      'Remove worktrees automatically after their work is merged? [Y/n] ',
+      'Remove worktrees automatically after their work is merged? [Y/n] ',
+    ]);
+    expect(cleanup()).toBe(false);
+  });
+
+  it('takes the default after two answers it cannot read, and never asks with the flag', async () => {
+    let asked = 0;
+    const prompt = async () => {
+      asked += 1;
+      return 'what';
+    };
+    expect((await tacet(['init', '--model', 'm'], { prompt })).code).toBe(0);
+    expect(asked).toBe(2);
+    expect(cleanup()).toBe(true);
+  });
+
+  it('does not ask when the flag is given', async () => {
+    let asked = 0;
+    const prompt = async () => {
+      asked += 1;
+      return 'y';
+    };
+    await tacet(['init', '--model', 'm', '--keep-merged-worktrees'], { prompt });
+    expect(asked).toBe(0);
+    expect(cleanup()).toBe(false);
+  });
+});
+
 describe('tacet init: every adapter it offers (#20)', () => {
   for (const worker of Object.keys(WORKER_ADAPTERS)) {
     it(`writes a config tacet run can build Workers from: ${worker}`, async () => {
       const needsModel = WORKER_ADAPTERS[worker as keyof typeof WORKER_ADAPTERS].needsModel;
-      const r = await tacet(['init', '--worker', worker, ...(needsModel ? ['--model', 'm'] : [])]);
+      const r = await tacet([
+        'init',
+        '--worker',
+        worker,
+        ...(needsModel ? ['--model', 'm'] : []),
+        // With the cleanup setting active, so loadConfig is seen to accept it (#210).
+        '--keep-merged-worktrees',
+      ]);
       expect(r.code).toBe(0);
       const { config } = loadConfig({ repoRoot: repo, userDir: join(home, '.tacet') });
+      expect(config.worktrees?.remove_merged).toBe(false);
       expect(Object.keys(buildWorkerAdapters(config, { baseEnv: {}, repoRoot: repo }))).toEqual([
         worker,
       ]);
@@ -305,7 +371,8 @@ describe('tacet init: input and failure paths (#20)', () => {
   it('says so when --worker or --model would change an existing config', async () => {
     await tacet(['init', '--model', 'm']);
     const r = await tacet(['init', '--worker', 'codex-app-server', '--model', 'x']);
-    expect(r.err).toContain('--worker and --model are ignored');
+    expect(r.err).toContain('--worker, --model and --keep-merged-worktrees are ignored');
+    expect((await tacet(['init', '--keep-merged-worktrees'])).err).toContain('are ignored');
     expect((await tacet(['init'])).err).not.toContain('ignored');
   });
 

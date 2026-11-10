@@ -50,3 +50,28 @@ export const TaskExt = z.object({
 export type TaskExt = z.infer<typeof TaskExt>;
 
 export const TASK_EXT_URI = 'urn:tacet:a2a-ext:task:v1';
+
+/** How a task's result reached its target branch. Unknown values fall back to `merge`. */
+export const LandedHow = openEnum(['merge', 'squash'], 'merge');
+export type LandedHow = z.infer<typeof LandedHow>;
+
+/**
+ * Payload of `task.landed` (#210): the task's published result has landed in the branch its work
+ * started from, by a merge (the target contains the commit) or a squash merge (one target commit
+ * makes the same change). The envelope's `taskId` is the task, and `causationId` its `task.result`.
+ * Once recorded, worktree cleanup may treat the result commit as kept (`worktrees.remove_merged`).
+ */
+export const TaskLanded = z.object({
+  commit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .describe('The published result commit (SummaryPacket.published.commit)'),
+  target: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
+  how: LandedHow,
+  landedAs: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .optional()
+    .describe('The target commit that makes the same change, for a squash merge'),
+});
+export type TaskLanded = z.infer<typeof TaskLanded>;
