@@ -1325,19 +1325,19 @@ export class MiniConductor {
 
   /**
    * Verification rounds this attempt already had (each recorded its commands under one round):
-   * this session's, and those of the sessions it resumed after a restart (same checkout), so a
-   * restart does not buy fix rounds.
+   * those of every session started under the same attempt number, so a restart (which resumes
+   * without counting as a failed attempt) does not buy fix rounds, while a retry after a failed
+   * attempt starts afresh even in the same checkout.
+   * A round a restart cut short (its commands `aborted`) counts too: the restart re-checks.
    */
   #verifyRounds(run: Run): number {
+    const started = this.#o.store
+      .query({ taskId: run.subtaskId, typePrefix: 'worker.started' })
+      .map((e) => e.envelope.data as { sessionId?: string; attempt?: number });
+    const attempt = started.find((d) => d.sessionId === run.sessionId)?.attempt;
     const sessions = new Set([run.sessionId]);
-    for (const s of this.#state().sessions.values()) {
-      if (
-        s.taskId === run.subtaskId &&
-        s.workspaceId === run.workspace.id &&
-        s.ended === 'restart'
-      ) {
-        sessions.add(s.sessionId);
-      }
+    for (const d of started) {
+      if (d.sessionId && attempt !== undefined && d.attempt === attempt) sessions.add(d.sessionId);
     }
     const rounds = new Set<string>();
     for (const e of this.#o.store.query({

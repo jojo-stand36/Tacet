@@ -226,12 +226,15 @@ export class CommandVerifier implements Verifier {
     let killTimer: NodeJS.Timeout | undefined;
     // What the command started and left running (a dev server, a watcher, a daemon in a session
     // of its own) carries the marker: ended with the group whenever the command ends.
-    const sweep = () => endMarkedProcesses([ctx.marker], { graceMs: 2000 }).catch(() => undefined);
+    const sweep = (graceMs: number) =>
+      endMarkedProcesses([ctx.marker], { graceMs }).catch(() => undefined);
+    let early: Promise<unknown> | undefined;
     const stop = (why: 'timed_out' | 'aborted') => {
       if (ended) return;
       ended = why;
       group('SIGTERM');
-      void sweep();
+      // The shell carries the marker too: it gets the same grace as the group.
+      early = sweep(this.#o.killGraceMs ?? 5000);
       killTimer = setTimeout(() => group('SIGKILL'), this.#o.killGraceMs ?? 5000);
     };
     const timer = setTimeout(() => stop('timed_out'), this.#o.timeoutMs ?? 600_000);
@@ -250,7 +253,7 @@ export class CommandVerifier implements Verifier {
     if (killTimer) clearTimeout(killTimer);
     ctx.signal.removeEventListener('abort', onAbort);
     group('SIGKILL');
-    await sweep();
+    await Promise.all([early, sweep(2000)]);
     // Its pipes close once nothing holds them; whatever still does is gone or ignored now.
     await new Promise<void>((resolve) => {
       if (child.stdout?.closed !== false && child.stderr?.closed !== false) return resolve();

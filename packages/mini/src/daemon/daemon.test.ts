@@ -205,7 +205,8 @@ describe('MiniConductor', () => {
       fake = new ScriptedAdapter('fake', (input) =>
         input.startsWith('Verification failed') ? { do: 'hold' } : script(input),
       );
-      const d1 = make({ config: VERIFY, verifier });
+      const RETRY = { ...VERIFY, workers: { ...VERIFY.workers, max_attempts: 2 } };
+      const d1 = make({ config: RETRY, verifier });
       await d1.start();
       const id = d1.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
       await expect
@@ -217,7 +218,7 @@ describe('MiniConductor', () => {
           ? { do: 'reply', text: 'fixed' }
           : script(input),
       );
-      const d2 = make({ config: VERIFY, verifier });
+      const d2 = make({ config: RETRY, verifier });
       await d2.start();
       await d2.settled();
       // One fix round in all (verify_fix_attempts: 1): the resumed session's failure fails the
@@ -228,6 +229,9 @@ describe('MiniConductor', () => {
       expect(
         ofType('task.result', `${id}/1`).map((e) => (e.data as { outcome: string }).outcome)[0],
       ).toBe('failed');
+      // The next attempt reuses the checkout but not the spent budget (re-review S2).
+      const retry = fake.sessions.find((s) => s !== resumed && !s.opts.resume);
+      expect(retry?.inputs.filter((x) => x.startsWith('Verification failed'))).toHaveLength(1);
     });
 
     it('records the process marker while it runs, and stops a run when the Mini-conductor stops', async () => {

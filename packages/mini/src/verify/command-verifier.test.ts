@@ -10,6 +10,13 @@ import { CommandVerifier, commandVerifierFromConfig } from './command-verifier.j
 
 const TASK = { id: 't/1' } as Task;
 
+/**
+ * A shell command that leaves `sleep 60` running in a session of its own, holding the command's
+ * output, and writes its pid to `pidFile`. Portable: macOS has no setsid(1).
+ */
+const detachedSleep = (pidFile: string): string =>
+  `"${process.execPath}" -e "const c=require('node:child_process').spawn('sleep',['60'],{detached:true,stdio:'inherit'});require('node:fs').writeFileSync(process.argv[1],String(c.pid));c.unref()" "${pidFile}"`;
+
 describe('CommandVerifier (#19)', () => {
   let root: string;
   let repo: string;
@@ -138,8 +145,8 @@ describe('CommandVerifier (#19)', () => {
 
   it('ends a server a passing command left running in the background', async () => {
     const pidFile = join(root, 'pid');
-    // setsid: out of the command's process group, like a daemon; the marker still finds it.
-    const r = await verifier([`setsid sleep 60 > /dev/null 2>&1 & echo $! > ${pidFile}`]).verify(
+    // Out of the command's process group, like a daemon; the marker still finds it.
+    const r = await verifier([`${detachedSleep(pidFile)} > /dev/null 2>&1`]).verify(
       TASK,
       ws(),
       ctx(),
@@ -151,10 +158,13 @@ describe('CommandVerifier (#19)', () => {
   });
 
   it('does not wait on children that hold its output, in its group or out of it (review B1)', async () => {
-    for (const cmd of ['sleep 60 & exit 0', 'setsid sleep 60 & exit 0']) {
-      const pidFile = join(root, 'pid');
+    const pidFile = join(root, 'pid');
+    for (const cmd of [
+      `sleep 60 & echo $! > ${pidFile}; exit 0`,
+      `${detachedSleep(pidFile)}; exit 0`,
+    ]) {
       const t0 = Date.now();
-      const r = await verifier([`${cmd.replace(' & exit 0', ` & echo $! > ${pidFile}; exit 0`)}`], {
+      const r = await verifier([cmd], {
         timeoutMs: 20_000,
       }).verify(TASK, ws(), ctx());
       const pid = Number(readFileSync(pidFile, 'utf8'));
