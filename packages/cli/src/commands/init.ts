@@ -343,6 +343,7 @@ function reportState(
   if (result) {
     // What was done, which may differ from the preview (a checkout made since).
     for (const path of result.removed) io.out(`removed checkout ${terminalSafe(path)}`);
+    for (const ref of result.refs) io.out(`deleted ${terminalSafe(ref)}`);
     io.out(`removed run state ${terminalSafe(state.dir)}`);
     for (const w of result.warnings) io.err(`warning: ${terminalSafe(w)}`);
   } else {
@@ -356,6 +357,7 @@ function reportState(
         io.out(`would remove ${what}${c.kept ? ' (forced)' : ''}${held}`);
       }
     }
+    for (const ref of state.refs) io.out(`would delete ${terminalSafe(ref)}`);
     io.out(
       `would remove run state ${terminalSafe(state.dir)}${state.events ? ' (with the event log)' : ''}: ${state.entries.map(terminalSafe).join(', ')}`,
     );

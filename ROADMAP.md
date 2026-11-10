@@ -58,6 +58,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
 - [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
 - [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
+- [ ] **Delete a task's pinned-target ref once its result lands** — `feature` `P2` `claude`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 - [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
 - [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude + human`

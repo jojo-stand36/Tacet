@@ -639,6 +639,17 @@
       "body": "#146 lets a built-in ACP spec declare `fork: 'native'` (with `resume`), and the adapter forks by the unstable `session/fork` only when the session's `initialize` advertises it. No built-in agent declares either yet. Gemini 0.67.0 does not advertise fork, and `claude-acp` / `codex-acp` declare no `resume` through this adapter. Both vendor adapters advertise `sessionCapabilities.resume` and `fork` (spike #62; `claude-agent-acp` 0.101.0 `unstable_forkSession` copies the transcript under a new id and passes `_meta` to the new session).\n\nDeclaring them needs a live check: the source suggests the following, but does not prove it.\n\n### Tasks\n- [ ] Live, against the mock Messages API (claude-agent-acp) and the mock Responses API (codex-acp), check that a resumed and a forked Worker session keep the Worker options:\n  - claude-acp: `settingSources: []`, `strictMcpConfig`, and the file-tools-only set (#181, #206);\n  - codex-acp: its isolated `CODEX_HOME` and the never-authenticate setup.\n- [ ] Check that Tacet re-pins `sessionMode` after a resume or fork (a fork starts with the permission mode it records), and that the source session is left untouched.\n- [ ] Check that sessions resume across processes: `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are kept per repo.\n- [ ] Declare `resume: true` and `fork: 'native'` on the specs that pass, with tests, and record it in the capability matrix (`verify-vendor-facts`).\n\n### Acceptance criteria\n- A resumed and a forked `acp:claude-acp` Worker run with the same restrictions as a new one, shown live against the mock API.\n- The capability matrix records the versions checked and the date.\n\n_See #146, #181, #206, docs/adapters/spikes/62-acp-adapters and docs/adapters/capability-matrix.md §4._"
     },
     {
+      "title": "Delete a task's pinned-target ref once its result lands",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #236 (PR #243). The Mini-conductor writes `refs/tacet/<task>/target` to keep a task's pinned target commit safe from `git gc`. Today only `tacet uninstall --purge` deletes it, so every task leaves one ref behind for good. The ref is cheap, but they pile up.\n\n### Tasks\n- [ ] Delete the task's `refs/tacet/<task>/target` (compare-and-swap on the pinned commit) in the landed sweep (#210), once `task.landed` is recorded and the task's checkouts are removed or none are left\n- [ ] Decide whether a task that ends without landing (failed, canceled, or a result never merged) also drops its ref, and when\n- [ ] Update docs/ARCHITECTURE.md §2.4\n\n### Acceptance criteria\n- After a task's result lands and the sweep runs, `refs/tacet/<task>/target` is gone, and other tasks' refs are untouched (test)\n- A task that has not finished keeps its ref (test)\n\n_See #219, #236 and docs/ARCHITECTURE.md §2.4._"
+    },
+    {
       "title": "Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
