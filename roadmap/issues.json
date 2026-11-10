@@ -1164,7 +1164,7 @@
         "priority:p1",
         "agent:either"
       ],
-      "body": "`MiniConductorOptions.adapters` takes ready-made adapter instances, and only tests construct them today. Startup (`tacet up` / the Mini-conductor entry point) has to build each adapter from the effective config: the auth route (`auth.*`), `agents.*` presets as `acp:<slug>` agents with their resolved `env` secret references, and the Worker environment policy (`workerEnvPolicy(config)` from `@tacet/core`, #147).\n\n### Tasks\n- [ ] Composition root that builds the Claude, Codex and ACP adapters from `TacetConfig`\n- [ ] Pass `workers.env.pass` to every adapter as `envPolicy`; log dropped variable names at debug level only\n- [ ] Resolve `agents.*.env` secret references into the agent's fixed environment without logging values\n\n### Acceptance criteria\n- A test starts a Mini-conductor from a config file and shows a Worker gets exactly the allowlisted environment plus `workers.env.pass`\n\n_See docs/ARCHITECTURE.md §4 and §6, and #147._"
+      "body": "`MiniConductorOptions.adapters` takes ready-made adapter instances, and only tests construct them today.\n\nAt startup (`tacet up` or the Mini-conductor entry point), each adapter has to be built from the effective config:\n- the auth route (`auth.*`);\n- `agents.*` presets, as `acp:<slug>` or `pty:<slug>` agents with their `env` secret references resolved;\n- the Worker environment policy (`workerEnvPolicy(config)` from `@tacet/core`, #147).\n\n### Tasks\n- [ ] Composition root that builds the Claude, Codex and ACP adapters from `TacetConfig`\n- [ ] Pass `workers.env.pass` to every adapter as `envPolicy`; log dropped variable names at debug level only\n- [ ] Resolve `agents.*.env` secret references into the agent's fixed environment without logging values\n- [ ] Build `agents.*` presets of kind `pty` as `PtyCliAdapter` (`pty:<slug>`, #156): `command`, `env`, `ready_prompt` → `readyPrompt`, and the values resolved from secret references passed as `PtyPreset.secrets` so they are scrubbed from events\n\n### Acceptance criteria\n- A test starts a Mini-conductor from a config file and shows a Worker gets exactly the allowlisted environment plus `workers.env.pass`\n- A `kind: pty` preset with a secret reference yields a `pty:<slug>` adapter whose events never contain the resolved value\n\n_See docs/ARCHITECTURE.md §4 and §6, #147 and #15._"
     },
     {
       "title": "Keep vendor keys out of Workers' tool subprocesses",
@@ -1187,6 +1187,30 @@
         "agent:either"
       ],
       "body": "The PTY adapter (#15) gives every Claude Code session its own `CLAUDE_CONFIG_DIR` under `~/.tacet/state/<repo-hash>/claude-pty/<session id>`, which holds the session's transcript (needed to resume it) and Claude Code's `.claude.json`. Nothing removes these directories, also when `start()` fails.\n\n### Tasks\n- [ ] Remove a session's directory when its sub-task is finished and it can no longer be resumed (Mini-conductor decides), and when `start()` fails before the session existed\n- [ ] Sweep directories older than the event log's transcript retention (`events.retention.transcript_days`)\n- [ ] Tests for both\n\n### Acceptance criteria\n- After a failed start or a finished sub-task, no `claude-pty/<id>` directory remains; resume of a live session still works\n\n_See docs/ARCHITECTURE.md §6 (PTY hook tokens) and #15._"
+    },
+    {
+      "title": "PTY presets: use resume_flag and process_name, or drop them",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #15 (#156). The `agents.<slug>` preset schema for `kind: pty` accepts `resume_flag` and `process_name` (after Gas Town's agent presets), but `PtyCliAdapter` uses neither: generic presets report `resume: false` and refuse `start({ resume })`.\n\n### Tasks\n- [ ] Decide per field whether it is useful for a generic CLI; verify the flags of at least one real CLI first (`verify-vendor-facts`)\n- [ ] Either support resume through `resume_flag` (and report `resume` in the capabilities only when it is set), or remove the field from the schema and the docs\n- [ ] Either use `process_name` (e.g. to tell a CLI's own exit from a wrapper's), or remove it\n\n### Acceptance criteria\n- No preset field is accepted by the schema without being used\n- If resume is supported, a test resumes a fake CLI's session through `resume_flag`\n\n_See packages/adapters/pty/src/cli-adapter.ts, packages/core/src/config/schema.ts and docs/ARCHITECTURE.md §3._"
+    },
+    {
+      "title": "Core: modelSwitch 'none' for adapters that cannot choose a model",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Follow-up from #15 (#156). `AdapterCapabilities.modelSwitch` has no value for an adapter that cannot choose a model at all. Generic PTY presets (`pty:<slug>`) report `launch-only` as an interim: the preset's command fixes the model, and `start({ model })` is refused with `ProfileRefusedError`, never ignored. A router reading `launch-only` may still believe it can pick a model. Human decision: add `'none'` to core, or keep `launch-only` and document the refusal.\n\n### Tasks\n- [ ] Decision recorded on this issue\n- [ ] If `'none'`: add it to the core type and schema, set it for `PTY_CLI_CAPABILITIES`, and make routing skip model choice for such adapters\n- [ ] Conformance probe: an adapter with `modelSwitch: 'none'` refuses `start({ model })` with `ProfileRefusedError`\n\n### Acceptance criteria\n- The probe passes for `pty:<slug>` and fails for an adapter that ignores the model\n\n_See packages/core/src/adapter/types.ts, packages/core/src/testing/conformance.ts and docs/ARCHITECTURE.md §3._"
     }
   ]
 }
