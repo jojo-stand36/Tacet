@@ -313,7 +313,7 @@ describe('MiniConductor', () => {
     expect(profiles).toHaveLength(1);
     expect(profiles[0]?.data).toMatchObject({
       contextWindow: 1_000_000,
-      reasons: expect.arrayContaining([expect.stringMatching(/cannot be handed off cleanly/)]),
+      reasons: { contextWindow: expect.stringMatching(/cannot be handed off cleanly/) },
     });
     expect(
       ofType('worker.profile', `${id}/1`).map((e) => (e.data as { effort: string }).effort),
@@ -346,11 +346,63 @@ describe('MiniConductor', () => {
       refused: { field: 'effort', message: 'no high here' },
     });
     expect(profiles[2]).not.toHaveProperty('effort');
-    expect(profiles[2]?.reasons).toContain("effort: the model's default; the adapter refused high");
+    expect(profiles[2]).toMatchObject({
+      reasons: { effort: expect.stringMatching(/^the model's default; the adapter refused high/) },
+    });
     // Not a failed attempt.
     expect(ofType('worker.ended').map((e) => (e.data as { reason: string }).reason)).not.toContain(
       'failed',
     );
+  });
+
+  it('drops a refused context window and fails at once on a refused model (#110)', async () => {
+    class Picky extends ScriptedAdapter {
+      starts = 0;
+      override async start(opts: SessionOptions) {
+        this.starts++;
+        if (opts.model === 'nope') throw new ProfileRefusedError('model', 'no such model');
+        if (opts.contextWindow !== undefined) {
+          throw new ProfileRefusedError('contextWindow', 'not for this model');
+        }
+        return super.start(opts);
+      }
+    }
+    const picky = new Picky('fake', script);
+    fake = picky;
+    const window = make({
+      config: {
+        ...CONFIG,
+        tiers: { worker: { adapter: 'fake', model: 'cheap', max_context_window: 1_000_000 } },
+      },
+      planner: new FixedPlanner([
+        { key: 'read', goal: 'one long read', acceptanceCriteria: ['ok'], indivisible: true },
+      ]),
+    });
+    await window.start();
+    const id = window.submit({ goal: 'window', acceptanceCriteria: ['ok'] });
+    await window.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(picky.sessions.map((x) => x.opts.contextWindow)).toEqual([undefined]);
+    const last = ofType('worker.profile').at(-1)?.data as { reasons: { contextWindow: string } };
+    expect(last.reasons.contextWindow).toMatch(/refused 1000000; hand off at the threshold/);
+    await window.stop();
+
+    // A refused model: one start, then the sub-task fails without using up its retries.
+    picky.starts = 0;
+    const model = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'nope' } } },
+    });
+    await model.start();
+    const id2 = model.submit({ goal: 'bad model', acceptanceCriteria: ['ok'] });
+    await model.settled();
+    expect(picky.starts).toBe(1);
+    expect(tasks()[`${id2}/1`]?.state).toBe('failed');
+    expect(ofType('task.status', `${id2}/1`).at(-1)?.data).toMatchObject({
+      message: expect.stringMatching(/session profile refused: the adapter refused the model/),
+    });
+    expect(
+      ofType('worker.profile', `${id2}/1`).map((e) => (e.data as { refused?: unknown }).refused),
+    ).toEqual([undefined, { field: 'model', message: 'no such model' }]);
   });
 
   it('fails a sub-task whose profile is outside the bounds, before any session (#110)', async () => {
@@ -662,6 +714,12 @@ describe('planning', () => {
       ).subtasks.map((s) => s.key),
     ).toEqual(['a', 'b']);
     expect(() => parseProposal('Here is my plan')).toThrow(/not JSON/);
+    // `indivisible` is kept only when true (#110).
+    expect(
+      parseProposal(
+        '{"subtasks":[{"key":"a","goal":"g","acceptanceCriteria":["c"],"indivisible":true},{"key":"b","goal":"h","acceptanceCriteria":["d"],"indivisible":false}]}',
+      ).subtasks.map((s) => s.indivisible),
+    ).toEqual([true, undefined]);
     expect(() =>
       parseProposal(
         '{"subtasks":[{"key":"a","goal":"g","acceptanceCriteria":["c"],"dependsOn":["a"]}]}',

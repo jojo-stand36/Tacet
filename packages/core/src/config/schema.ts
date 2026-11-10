@@ -22,8 +22,9 @@ export const TierConfig = z.strictObject({
   effort: z.enum(EFFORT_LEVELS).optional(),
   cross_vendor: z.boolean().optional(),
   /**
-   * Bounds on what the session-profile policy may choose for this tier (#110). A profile outside
-   * them is refused before launch. The task layer may not set them.
+   * Bounds on what the session-profile policy may choose for a Worker tier (`worker`, `review`;
+   * #110). A profile outside them is refused before launch. The task layer may not set them. The
+   * planner's `mini` tier does not go through the policy and takes no bounds.
    */
   models: z
     .array(NonEmpty)
@@ -35,7 +36,7 @@ export const TierConfig = z.strictObject({
     .boolean()
     .optional()
     .describe(
-      'Raise effort one level per failed attempt, up to max_effort. Off by default; the retry policy itself is #34',
+      'Raise effort one level per failed attempt, up to max_effort (required with it). Off by default; the retry policy itself is #34',
     ),
   max_context_window: z
     .number()
@@ -220,6 +221,19 @@ export function validateEffective(config: TacetConfig): string[] {
     const max = t.max_effort !== undefined ? effortRank(t.max_effort) : undefined;
     if (effort !== undefined && max !== undefined && effort > max) {
       errors.push(`tiers.${role}.effort: ${t.effort} is above tiers.${role}.max_effort`);
+    }
+    if (t.escalate_effort_on_retry && t.max_effort === undefined) {
+      errors.push(`tiers.${role}.escalate_effort_on_retry: needs tiers.${role}.max_effort`);
+    }
+    if (role === 'mini') {
+      for (const key of [
+        'models',
+        'max_effort',
+        'max_context_window',
+        'escalate_effort_on_retry',
+      ] as const) {
+        if (t[key] !== undefined) errors.push(`tiers.mini.${key}: only Worker tiers take bounds`);
+      }
     }
   }
   const w = config.workers;

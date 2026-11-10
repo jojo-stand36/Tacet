@@ -24,22 +24,39 @@
       "maximum": 9007199254740991
     },
     "reasons": {
-      "minItems": 1,
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contextWindow": {
+          "type": "string",
+          "minLength": 1
+        }
       },
-      "description": "Why each part was chosen, in order"
+      "required": [
+        "model",
+        "effort",
+        "contextWindow"
+      ]
     },
     "refused": {
       "description": "The adapter refused this profile (ProfileRefusedError)",
       "type": "object",
       "properties": {
         "field": {
-          "type": "string",
-          "minLength": 1,
-          "description": "model, effort or contextWindow"
+          "enum": [
+            "model",
+            "effort",
+            "contextWindow"
+          ],
+          "x-tacet-fallback": "model",
+          "type": "string"
         },
         "message": {
           "type": "string"

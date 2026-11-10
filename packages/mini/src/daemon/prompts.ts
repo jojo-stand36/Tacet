@@ -20,9 +20,10 @@ Rules:
 - Set "indivisible": true only on a sub-task that cannot be split or handed over part-way, such as
   one long read of a large file. It may then get a larger context window, which costs more.
 
-Reply with JSON only, no prose and no code fences, in exactly this shape:
+Reply with JSON only, no prose and no code fences, in exactly this shape ("kind", "dependsOn" and
+"indivisible" are optional):
 {"rationale": "...", "subtasks": [{"key": "short-id", "goal": "...", "acceptanceCriteria": ["..."],
-"kind": "implement", "dependsOn": ["other-key"]}]}`;
+"kind": "implement", "dependsOn": ["other-key"], "indivisible": false}]}`;
 
 export function plannerPrompt(task: Task): string {
   return safePrompt([

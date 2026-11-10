@@ -142,12 +142,7 @@ export function mergeConfig(
   };
 }
 
-/**
- * The Worker pool is repo-wide, so a task may only lower `workers.*`, never raise it (owner
- * decision on #125, 2026-11-09). A raise is an error. A `per_adapter` cap the layers below do not
- * set is compared with `workers.max`.
- */
-/** Tier bounds (#110) are the user's and the repo's to set: a task may not widen them. */
+/** Tier bounds (#110) are the user's and the repo's to set: a task may not set them, to widen or to narrow. */
 function taskSetsTierBounds(layer: ConfigLayer): string[] {
   const errors: string[] = [];
   for (const [role, t] of Object.entries(layer.data.tiers ?? {})) {
@@ -160,6 +155,11 @@ function taskSetsTierBounds(layer: ConfigLayer): string[] {
   return errors;
 }
 
+/**
+ * The Worker pool is repo-wide, so a task may only lower `workers.*`, never raise it (owner
+ * decision on #125, 2026-11-09). A raise is an error. A `per_adapter` cap the layers below do not
+ * set is compared with `workers.max`.
+ */
 function taskRaisesWorkers(merged: Plain, layer: ConfigLayer): string[] {
   const w = layer.data.workers;
   if (!w) return [];

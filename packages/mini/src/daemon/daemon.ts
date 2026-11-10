@@ -8,6 +8,7 @@ import {
   type EventEnvelope,
   newUlid,
   type Priority,
+  type ProfileField,
   redactSecrets,
   type SessionHandle,
   type SummaryPacket,
@@ -41,7 +42,7 @@ import {
   type Workspaces,
   WorktreeRefusedError,
 } from './ports.js';
-import { type ChosenProfile, chooseProfile } from './profile.js';
+import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
 import { RESUME_PROMPT, safePrompt, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
 
@@ -900,6 +901,8 @@ export class MiniConductor {
     ]);
     let revoke = () => {};
     let mcpServerName = '';
+    /** Set when the adapter refused a part with no fallback: the sub-task fails, no retry. */
+    let profileRefused: string | undefined;
     let handle: SessionHandle;
     // Recorded before the vendor process exists, so a crash at any point after this leaves it
     // findable (#127).
@@ -921,33 +924,34 @@ export class MiniConductor {
           ...(resume ? { resume } : {}),
           env: { [WORKER_MARKER_VAR]: marker },
         });
-      try {
-        handle = await launch(profile);
-      } catch (err) {
-        // The model cannot take the effort (#110): record the refusal and run once more at the
-        // model's default effort, rather than fail the attempt over a cost lever.
-        if (profile.effort === undefined || !isEffortRefusal(err) || !this.#live(gen)) throw err;
-        const message = redactSecrets((err as Error).message);
-        const { effort, ...rest } = profile;
-        this.#o.store.append(
-          this.#env(
-            subtaskId,
-            'worker.profile',
-            { sessionId, ...profile, refused: { field: 'effort', message } },
-            sessionId,
-          ),
-        );
-        profile = {
-          ...rest,
-          reasons: [
-            ...profile.reasons.filter((r) => !r.startsWith('effort:')),
-            `effort: the model's default; the adapter refused ${effort}`,
-          ],
-        };
-        this.#o.store.append(
-          this.#env(subtaskId, 'worker.profile', { sessionId, ...profile }, sessionId),
-        );
-        handle = await launch(profile);
+      // A refused part (#110) is logged and dropped or lowered, and the session started again:
+      // a cost lever is not worth a failed attempt. A refused model has no fallback.
+      for (;;) {
+        try {
+          handle = await launch(profile);
+          break;
+        } catch (err) {
+          const field = refusedField(err);
+          if (field === undefined || !this.#live(gen)) throw err;
+          const message = redactSecrets((err as Error).message);
+          this.#o.store.append(
+            this.#env(
+              subtaskId,
+              'worker.profile',
+              { sessionId, ...profile, refused: { field, message } },
+              sessionId,
+            ),
+          );
+          const next = afterRefusal(profile, field, tier.role, tier);
+          if (!next) {
+            profileRefused = `the adapter refused the ${field}: ${message}`;
+            throw err;
+          }
+          profile = next;
+          this.#o.store.append(
+            this.#env(subtaskId, 'worker.profile', { sessionId, ...profile }, sessionId),
+          );
+        }
       }
     } catch (err) {
       revoke();
@@ -969,6 +973,17 @@ export class MiniConductor {
       );
       // A resume that failed is not tried again (the next run starts afresh): drop its state.
       if (resume) await this.#discard(tier.adapter, resume.vendorSessionId, workspace.path);
+      if (profileRefused !== undefined) {
+        // The same profile would be refused every time: fail now instead of using up retries.
+        this.#o.store.append(
+          this.#env(subtaskId, 'task.status', {
+            state: 'failed',
+            message: `session profile refused: ${profileRefused}`,
+          }),
+        );
+        this.#kick();
+        return;
+      }
       this.#afterFailure(subtaskId);
       return;
     }
@@ -1602,13 +1617,11 @@ export class MiniConductor {
   }
 }
 
-/** An adapter's `ProfileRefusedError` for effort; matched by name, as across package copies. */
-function isEffortRefusal(err: unknown): boolean {
-  return (
-    err instanceof Error &&
-    err.name === 'ProfileRefusedError' &&
-    (err as { field?: unknown }).field === 'effort'
-  );
+/** The part an adapter's `ProfileRefusedError` names; matched by name, as across package copies. */
+function refusedField(err: unknown): ProfileField | undefined {
+  if (!(err instanceof Error) || err.name !== 'ProfileRefusedError') return undefined;
+  const field = (err as { field?: unknown }).field;
+  return field === 'model' || field === 'effort' || field === 'contextWindow' ? field : undefined;
 }
 
 function answerText(x: EscalationRecord): string {

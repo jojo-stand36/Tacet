@@ -28,7 +28,9 @@ export type Effort = (typeof KNOWN_EFFORTS)[number] | (string & {});
 
 /**
  * The known levels from least to most effort, for config bounds such as `max_effort` (#110).
- * Codex's `persistent` is left out: where it sits in that order is not documented.
+ * The order across vendors is a Tacet convention, not a vendor fact: no model offers both
+ * Claude's `max` and Codex's `ultra`. Codex's `persistent` is left out: where it sits is not
+ * documented. A model may lack some levels; adapters refuse those.
  */
 export const EFFORT_LEVELS = [
   'none',

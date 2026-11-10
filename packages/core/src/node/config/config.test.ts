@@ -423,6 +423,25 @@ describe('loadConfig', () => {
         ),
       ]),
     );
+    // Raising effort needs a ceiling; the planner's tier takes no bounds.
+    const noCeiling = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: {
+          tiers: {
+            worker: { adapter: 'x', effort: 'low', escalate_effort_on_retry: true },
+            mini: { adapter: 'x', max_effort: 'high' },
+          },
+        },
+      },
+    ]);
+    expect(noCeiling.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/escalate_effort_on_retry: needs tiers\.worker\.max_effort/),
+        expect.stringMatching(/tiers\.mini\.max_effort: only Worker tiers take bounds/),
+      ]),
+    );
     // Effort names outside the known levels are a config error, as for any enum in config.
     const typo = mergeConfig([
       {

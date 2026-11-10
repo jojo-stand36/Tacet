@@ -1,11 +1,18 @@
-import { type AdapterCapabilities, EFFORT_LEVELS, effortRank, type TierConfig } from '@tacet/core';
+import {
+  type AdapterCapabilities,
+  EFFORT_LEVELS,
+  effortRank,
+  type ProfileField,
+  type ProfileReasons,
+  type TierConfig,
+} from '@tacet/core';
 
 /** What the policy chose for one Worker session, and why (the `worker.profile` event). */
 export interface ChosenProfile {
   model?: string;
   effort?: string;
   contextWindow?: number;
-  reasons: string[];
+  reasons: ProfileReasons;
 }
 
 export interface ProfileInput {
@@ -40,20 +47,21 @@ export class ProfileOutOfBoundsError extends Error {
 export function chooseProfile(i: ProfileInput): ChosenProfile {
   const { role, tier } = i;
   const at = `tiers.${role}`;
-  const reasons: string[] = [];
-  const out: ChosenProfile = { reasons };
+  const out: Omit<ChosenProfile, 'reasons'> = {};
 
+  let modelWhy: string;
   const model = tier.model ?? tier.models?.[0];
   if (model !== undefined) {
     if (tier.models && !tier.models.includes(model)) {
       throw new ProfileOutOfBoundsError(`model ${model} is not in ${at}.models`);
     }
     out.model = model;
-    reasons.push(`model: ${tier.model !== undefined ? `${at}.model` : `first of ${at}.models`}`);
+    modelWhy = tier.model !== undefined ? `${at}.model` : `first of ${at}.models`;
   } else {
-    reasons.push("model: the adapter's default");
+    modelWhy = "the adapter's default";
   }
 
+  let effortWhy: string;
   const max = tier.max_effort !== undefined ? effortRank(tier.max_effort) : undefined;
   if (tier.effort !== undefined) {
     const base = effortRank(tier.effort);
@@ -62,13 +70,13 @@ export function chooseProfile(i: ProfileInput): ChosenProfile {
       throw new ProfileOutOfBoundsError(`effort ${tier.effort} is above ${at}.max_effort`);
     }
     let rank = base;
-    let why = `${at}.effort`;
+    effortWhy = `${at}.effort`;
     if (tier.escalate_effort_on_retry && i.failedAttempts > 0) {
       if (max === undefined) {
-        why += `; not raised after ${i.failedAttempts} failed attempt(s): no ${at}.max_effort`;
+        effortWhy += `; not raised after ${i.failedAttempts} failed attempt(s): no ${at}.max_effort`;
       } else {
         rank = Math.min(base + i.failedAttempts, max);
-        why =
+        effortWhy =
           rank > base
             ? `raised from ${tier.effort} after ${i.failedAttempts} failed attempt(s) (${at}.max_effort ${tier.max_effort})`
             : `${at}.effort; already at ${at}.max_effort`;
@@ -77,31 +85,80 @@ export function chooseProfile(i: ProfileInput): ChosenProfile {
     const effort = EFFORT_LEVELS[rank] as string;
     if (i.capabilities.effortSwitch) {
       out.effort = effort;
-      reasons.push(`effort: ${effort}, ${why}`);
     } else {
-      reasons.push(`effort: none; the adapter cannot set effort (${effort} not sent)`);
+      effortWhy = `none; the adapter cannot set effort (${effort} not sent)`;
     }
   } else {
-    reasons.push("effort: the model's default");
+    effortWhy = "the model's default";
   }
 
+  let windowWhy: string;
   if (!i.indivisible) {
-    reasons.push('contextWindow: default; hand off at the threshold');
+    windowWhy = 'default; hand off at the threshold';
   } else if (tier.max_context_window === undefined) {
-    reasons.push(`contextWindow: default; indivisible, but ${at}.max_context_window is not set`);
+    windowWhy = `default; indivisible, but ${at}.max_context_window is not set`;
   } else {
     const cap = tier.max_context_window;
     const fits = (i.capabilities.contextSizes ?? []).filter((n) => n <= cap);
     if (fits.length === 0) {
-      reasons.push(
-        `contextWindow: default; indivisible, but the adapter offers no window up to ${cap}`,
-      );
+      windowWhy = `default; indivisible, but the adapter offers no window up to ${cap}`;
     } else {
       out.contextWindow = Math.max(...fits);
-      reasons.push(
-        `contextWindow: ${out.contextWindow}, the sub-task cannot be handed off cleanly (${at}.max_context_window ${cap})`,
-      );
+      windowWhy = `the sub-task cannot be handed off cleanly (${at}.max_context_window ${cap})`;
     }
   }
-  return out;
+  return { ...out, reasons: { model: modelWhy, effort: effortWhy, contextWindow: windowWhy } };
+}
+
+/**
+ * The profile to try after the adapter refused `field` of `p` (`ProfileRefusedError`), or
+ * `undefined` when there is none: a refused model is not something a retry can fix.
+ *
+ * - Effort: the next lower level, down to the tier's own `effort`, so a refused raise falls back
+ *   within the bounds. When even that is refused, the model's default effort: a cost lever is not
+ *   worth failing the sub-task over. That default is the vendor's and is not checked against
+ *   `max_effort`.
+ * - Context window: the default; Tacet hands off at the threshold instead.
+ */
+export function afterRefusal(
+  p: ChosenProfile,
+  field: ProfileField,
+  role: string,
+  tier: TierConfig,
+): ChosenProfile | undefined {
+  const at = `tiers.${role}`;
+  if (field === 'effort' && p.effort !== undefined) {
+    const { effort: refused, ...rest } = p;
+    const rank = effortRank(refused);
+    const floor = tier.effort !== undefined ? effortRank(tier.effort) : undefined;
+    if (rank !== undefined && floor !== undefined && rank > floor) {
+      const lower = EFFORT_LEVELS[rank - 1] as string;
+      return {
+        ...rest,
+        effort: lower,
+        reasons: {
+          ...p.reasons,
+          effort: `${lower}; the adapter refused ${refused} (floor ${at}.effort)`,
+        },
+      };
+    }
+    return {
+      ...rest,
+      reasons: {
+        ...p.reasons,
+        effort: `the model's default; the adapter refused ${refused}, and nothing lower is within ${at}`,
+      },
+    };
+  }
+  if (field === 'contextWindow' && p.contextWindow !== undefined) {
+    const { contextWindow: refused, ...rest } = p;
+    return {
+      ...rest,
+      reasons: {
+        ...p.reasons,
+        contextWindow: `default; the adapter refused ${refused}; hand off at the threshold`,
+      },
+    };
+  }
+  return undefined;
 }

@@ -1,6 +1,11 @@
 import type { AdapterCapabilities, TierConfig } from '@tacet/core';
 import { describe, expect, it } from 'vitest';
-import { chooseProfile, type ProfileInput, ProfileOutOfBoundsError } from './profile.js';
+import {
+  afterRefusal,
+  chooseProfile,
+  type ProfileInput,
+  ProfileOutOfBoundsError,
+} from './profile.js';
 
 const caps: AdapterCapabilities = {
   streaming: true,
@@ -31,11 +36,11 @@ describe('chooseProfile (#110)', () => {
     expect(p).toEqual({
       model: 'm1',
       effort: 'medium',
-      reasons: [
-        'model: tiers.worker.model',
-        'effort: medium, tiers.worker.effort',
-        'contextWindow: default; hand off at the threshold',
-      ],
+      reasons: {
+        model: 'tiers.worker.model',
+        effort: 'tiers.worker.effort',
+        contextWindow: 'default; hand off at the threshold',
+      },
     });
   });
 
@@ -43,7 +48,7 @@ describe('chooseProfile (#110)', () => {
     expect(chooseProfile(input({ adapter: 'x', models: ['a', 'b'] })).model).toBe('a');
     const none = chooseProfile(input({ adapter: 'x' }));
     expect(none.model).toBeUndefined();
-    expect(none.reasons).toContain("model: the adapter's default");
+    expect(none.reasons.model).toBe("the adapter's default");
   });
 
   it('refuses a profile outside the bounds before launch', () => {
@@ -62,13 +67,13 @@ describe('chooseProfile (#110)', () => {
     expect(chooseProfile(input(on, { failedAttempts: 1 })).effort).toBe('medium');
     const capped = chooseProfile(input(on, { failedAttempts: 5 }));
     expect(capped.effort).toBe('high');
-    expect(capped.reasons[1]).toMatch(/raised from low after 5 failed attempt/);
+    expect(capped.reasons.effort).toMatch(/raised from low after 5 failed attempt/);
     // Without a ceiling it is never raised.
     const noMax = chooseProfile(
       input({ adapter: 'x', effort: 'low', escalate_effort_on_retry: true }, { failedAttempts: 1 }),
     );
     expect(noMax.effort).toBe('low');
-    expect(noMax.reasons[1]).toMatch(/not raised .* no tiers\.worker\.max_effort/);
+    expect(noMax.reasons.effort).toMatch(/not raised .* no tiers\.worker\.max_effort/);
   });
 
   it('sends no effort to an adapter that declares none, and says so', () => {
@@ -77,7 +82,7 @@ describe('chooseProfile (#110)', () => {
       input({ adapter: 'x', effort: 'high' }, { capabilities: noEffort as AdapterCapabilities }),
     );
     expect(p.effort).toBeUndefined();
-    expect(p.reasons[1]).toMatch(/cannot set effort/);
+    expect(p.reasons.effort).toMatch(/cannot set effort/);
   });
 
   it('opts into a larger window only for an indivisible sub-task that config allows', () => {
@@ -85,18 +90,40 @@ describe('chooseProfile (#110)', () => {
     // Not by default: the cap is absent.
     const off = chooseProfile(input({ adapter: 'x' }, { indivisible: true }));
     expect(off.contextWindow).toBeUndefined();
-    expect(off.reasons[2]).toMatch(/max_context_window is not set/);
+    expect(off.reasons.contextWindow).toMatch(/max_context_window is not set/);
     // Not for work that can be handed off.
     expect(chooseProfile(input(allowed)).contextWindow).toBeUndefined();
     // Allowed and indivisible: the largest listed size within the cap, with the reason.
     const on = chooseProfile(input(allowed, { indivisible: true }));
     expect(on.contextWindow).toBe(1_000_000);
-    expect(on.reasons[2]).toMatch(/cannot be handed off cleanly/);
+    expect(on.reasons.contextWindow).toMatch(/cannot be handed off cleanly/);
     // A cap below every listed size keeps the default.
     const small = chooseProfile(
       input({ adapter: 'x', max_context_window: 500_000 }, { indivisible: true }),
     );
     expect(small.contextWindow).toBeUndefined();
-    expect(small.reasons[2]).toMatch(/offers no window up to 500000/);
+    expect(small.reasons.contextWindow).toMatch(/offers no window up to 500000/);
+  });
+
+  it('falls back within the bounds when the adapter refuses a part', () => {
+    const tier: TierConfig = { adapter: 'x', model: 'm', effort: 'medium', max_effort: 'max' };
+    const raised = chooseProfile(
+      input({ ...tier, escalate_effort_on_retry: true }, { failedAttempts: 3 }),
+    );
+    expect(raised.effort).toBe('max');
+    // A refused raise steps down one level, never below the tier's own effort.
+    const once = afterRefusal(raised, 'effort', 'worker', tier);
+    expect(once?.effort).toBe('xhigh');
+    expect(once?.reasons.effort).toMatch(/refused max/);
+    const atBase = { ...raised, effort: 'medium' };
+    const dropped = afterRefusal(atBase, 'effort', 'worker', tier);
+    expect(dropped).not.toHaveProperty('effort');
+    expect(dropped?.reasons.effort).toMatch(/the model's default; the adapter refused medium/);
+    // A refused window drops to the default; a refused model has no fallback.
+    const big = { ...raised, contextWindow: 1_000_000 };
+    const small = afterRefusal(big, 'contextWindow', 'worker', tier);
+    expect(small).not.toHaveProperty('contextWindow');
+    expect(small?.reasons.contextWindow).toMatch(/refused 1000000; hand off/);
+    expect(afterRefusal(raised, 'model', 'worker', tier)).toBeUndefined();
   });
 });

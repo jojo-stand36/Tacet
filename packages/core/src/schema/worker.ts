@@ -34,6 +34,21 @@ export const WorkerStarted = z.object({
 });
 export type WorkerStarted = z.infer<typeof WorkerStarted>;
 
+/** A part of a session profile. Unknown values fall back to `model`, the one a retry cannot fix. */
+export const ProfileField = openEnum(['model', 'effort', 'contextWindow'], 'model');
+export type ProfileField = z.infer<typeof ProfileField>;
+
+/**
+ * Why each part of a profile was chosen, keyed by part so a reader never parses free text: the
+ * config path or rule it came from, or why a part was left at the vendor's default.
+ */
+export const ProfileReasons = z.object({
+  model: z.string().min(1),
+  effort: z.string().min(1),
+  contextWindow: z.string().min(1),
+});
+export type ProfileReasons = z.infer<typeof ProfileReasons>;
+
 /**
  * Payload of `worker.profile`: the session profile the Mini-conductor's policy chose for a Worker
  * session, and why (#110). Written with `worker.started`, before the session starts. If the
@@ -45,12 +60,9 @@ export const WorkerProfile = z.object({
   model: z.string().min(1).optional(),
   effort: Effort.optional(),
   contextWindow: TokenCount.positive().optional(),
-  reasons: z.array(z.string().min(1)).min(1).describe('Why each part was chosen, in order'),
+  reasons: ProfileReasons,
   refused: z
-    .object({
-      field: z.string().min(1).describe('model, effort or contextWindow'),
-      message: z.string(),
-    })
+    .object({ field: ProfileField, message: z.string() })
     .optional()
     .describe('The adapter refused this profile (ProfileRefusedError)'),
 });
