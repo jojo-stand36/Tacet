@@ -1,5 +1,5 @@
-import { lstatSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { type Dirent, lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { redactSecrets } from '@tacet/core';
 
 /**
@@ -91,8 +91,11 @@ const FILE_TOOLS: Record<string, FileTool> = {
  * Agent, editor, hook and package-manager config a Worker may not write (owner decision on #200,
  * 2026-11-10). Tacet's own sessions never load them (no setting sources, a strict MCP config,
  * git hooks off), but the user's tools would, once the user opens or merges the branch: a hook,
- * an MCP server command or a task there runs code. Matched at any depth and in any letter case,
- * on the path after symlinks are resolved. A task that needs one of these escalates. The list
+ * an MCP server command or a task there runs code. Tacet's own `.tacet/` config is loaded by the
+ * next `tacet run` on the merged branch (#227). Matched at any depth and in any letter case, on
+ * the path as written and on the path after symlinks are resolved; a symlink in a protected name
+ * at the checkout's root, or inside a protected directory there, protects its target too (a
+ * committed `.tacet` symlink to `config/tacet` is still Tacet's config; `linkedConfig`). A task that needs one of these escalates. The list
  * cannot be complete (`package.json` scripts and a `Makefile` run code too, but are the work
  * itself); it covers the files that run without the user choosing to build or test.
  * Directories: anything inside them. Files: that name anywhere.
@@ -104,6 +107,8 @@ const PROTECTED_DIRS: readonly string[][] = [
   ['.codex'],
   ['.husky'],
   ['.github', 'workflows'],
+  // Tacet's own config: `verify` commands, agent commands and tiers apply once merged (#227).
+  ['.tacet'],
 ];
 const PROTECTED_FILES: readonly string[] = [
   '.mcp.json',
@@ -200,6 +205,13 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   } catch {
     return refuse('the Worker checkout is gone');
   }
+  // Where protected config really is when a symlink is involved; null when that cannot be told.
+  const linked = spec.writes ? linkedConfig(root) : [];
+  if (linked === null) {
+    return refuse(
+      `${name}: agent, hook or tool config in this checkout is a symlink that cannot be resolved inside it; escalate`,
+    );
+  }
   const targets: string[] = [];
   /** Where each path key landed: a glob is resolved from its tool's `path` (#213 review). */
   const landed: Record<string, string> = {};
@@ -209,7 +221,10 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     if (typeof v !== 'string' || v === '') return refuse(`${name}: ${f} is not a path`);
     const at = inside(root, worktree, v, spec.writes);
     if (typeof at !== 'string') return refuse(`${name}: ${at.why}`);
-    if (spec.writes && protectedConfig(at)) {
+    if (
+      spec.writes &&
+      (protectedConfig(at) || protectedConfig(lexical(root, worktree, v)) || within(at, linked))
+    ) {
       return refuse(
         `${name}: agent, hook and tool config is not open to Workers; escalate if the task needs it`,
       );
@@ -287,6 +302,134 @@ function segmentMatches(rawSeg: string, name: string): boolean {
   } catch {
     return true;
   }
+}
+
+/** Entries a protected directory may hold before `linkedConfig` stops looking and fails closed. */
+const LINK_WALK_LIMIT = 2000;
+
+/**
+ * Where protected config really is when a symlink is involved, as folded segments relative to the
+ * real root (#227 review): a root-level protected name with a symlink at any of its components
+ * (`.tacet -> config/tacet`, `.github -> ci/github`), and every symlink inside a protected
+ * directory at the root, at any depth and through linked directories (`.tacet/tacet.yaml ->
+ * ../cfg.yaml`). What is written at a target is still read as that config, and a dangling link's
+ * target is protected before it exists. A target outside the checkout needs nothing: writes there
+ * are refused anyway. Null, so every write is refused, when that cannot be told: a link that
+ * cannot be followed (a loop), a link to the checkout root, or a walk over the entry limit.
+ */
+function linkedConfig(root: string): string[][] | null {
+  const out: string[][] = [];
+  /** Records `real` if it is inside the checkout; false when it is the root itself. */
+  const add = (real: string): boolean => {
+    const r = relative(root, real);
+    if (r === '') return false;
+    if (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) out.push(r.split(sep).map(fold));
+    return true;
+  };
+  const names = [
+    ...PROTECTED_DIRS,
+    ...PROTECTED_FILES.map((f) => [f]),
+    ...PROTECTED_IN.map(([d, f]) => [d, f]),
+  ];
+  const stack: string[] = [];
+  for (const segs of names) {
+    const given = join(root, ...segs);
+    const real = landing(given);
+    if (real === null) return null;
+    if (real !== given && !add(real)) return null;
+    stack.push(real);
+  }
+  // Symlinks inside the protected directories, following linked directories inside the checkout.
+  const visited = new Set<string>();
+  let seen = 0;
+  for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
+    if (visited.has(dir)) continue;
+    visited.add(dir);
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue; // Not there, a file, or not readable: nothing inside to follow.
+    }
+    for (const e of entries) {
+      if (++seen > LINK_WALK_LIMIT) return null;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isSymbolicLink()) {
+        const t = landing(p);
+        if (t === null || !add(t)) return null;
+        const r = relative(root, t);
+        if (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) stack.push(t);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Where a write to `p` (absolute) would land after symlinks, even where the target does not
+ * exist yet (a dangling link, a missing parent): the real path of the deepest existing prefix and
+ * the rest lexically. Null when that cannot be told (a symlink loop, an unreadable link).
+ */
+function landing(p: string, depth = 0): string | null {
+  if (depth > 40) return null;
+  try {
+    return realpathSync.native(p);
+  } catch {
+    // Missing, or a link that does not resolve: worked out below.
+  }
+  let link: boolean;
+  try {
+    link = lstatSync(p).isSymbolicLink();
+  } catch {
+    const parent = dirname(p);
+    if (parent === p) return null;
+    const at = landing(parent, depth + 1);
+    return at === null ? null : join(at, basename(p));
+  }
+  if (!link) return null;
+  let to: string;
+  try {
+    to = readlinkSync(p);
+  } catch {
+    return null;
+  }
+  const from = landing(dirname(p), depth + 1);
+  if (from === null) return null;
+  // One segment at a time, as the kernel does: `..` after a linked directory leaves its target.
+  let cur = isAbsolute(to) ? sep : from;
+  for (const seg of to.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      cur = dirname(cur); // `cur` is real, or missing below a real prefix: no link to leave.
+      continue;
+    }
+    const next = landing(join(cur, seg), depth + 1);
+    if (next === null) return null;
+    cur = next;
+  }
+  return cur;
+}
+
+/** Whether `at` (relative to the real root) is one of `targets` or inside one, names folded. */
+function within(at: string, targets: string[][]): boolean {
+  const a = at.split(sep).map(fold);
+  return targets.some((t) => t.length <= a.length && t.every((s, j) => a[j] === s));
+}
+
+/**
+ * `p` relative to the checkout as written, before symlinks: `inside` has already refused `..`,
+ * paths elsewhere and odd names, so this only joins its plain segments.
+ */
+function lexical(root: string, given: string, p: string): string {
+  const segs = p.split('/').filter((s) => s !== '' && s !== '.');
+  if (!isAbsolute(p)) return segs.join(sep);
+  const abs = `${sep}${segs.join(sep)}`;
+  for (const r of [root, given]) {
+    const rel = relative(r, abs);
+    if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return rel;
+  }
+  return '';
 }
 
 /** Whether `s` has a C0 or C1 control character (NEL included) or DEL. */
