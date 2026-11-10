@@ -7,6 +7,8 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
+ *   without asking for a file in its working directory.
  * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
  *   its shell's pid to `background.pid` and then becomes `sleep 600`; with `ESCALATE` in the same first message,
  *   it then escalates as below.
@@ -113,6 +115,12 @@ function plan(body: Body): Block[] {
         name: 'Bash',
         input: { command: 'touch tool-ran.txt', description: 'create a file' },
       },
+    ];
+  }
+  const read = /READ_TOOL (\S+)/.exec(text);
+  if (read) {
+    return [
+      { type: 'tool_use', id: `toolu_mock_${++n}`, name: 'Read', input: { file_path: read[1] } },
     ];
   }
   if (/ESCALATE/.test(text)) {

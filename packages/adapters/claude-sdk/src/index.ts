@@ -7,7 +7,13 @@ export {
   type ClaudeSdkAdapterOptions,
   toPermissionResult,
 } from './adapter.js';
-export { AuthRoutingError, authEnv, type ClaudeAuthRoute, chooseAuthRoute } from './auth.js';
+export {
+  AuthRoutingError,
+  authEnv,
+  type ClaudeAuthRoute,
+  chooseAuthRoute,
+  claudeEnvAllow,
+} from './auth.js';
 export {
   defaultMcpConfigDir,
   ownerDirName,

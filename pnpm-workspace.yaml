@@ -5,8 +5,11 @@ engineStrict: true
 catalog:
   # One zod for the whole workspace; ADR-003 §7 relies on sharing it with the MCP and Claude SDKs.
   zod: 4.6.7
-# Native builds pulled in by @google/gemini-cli (a test-only dependency of @tacet/adapter-acp):
-# not needed to run it over ACP, so they stay off.
+# Native builds. @google/gemini-cli (a test-only dependency of @tacet/adapter-acp) pulls in
+# keytar and node-pty 1.0.0, not needed to run it over ACP, so they stay off. node-pty 1.1.0 is
+# the PTY adapter's optional dependency (ADR-002 decision 4): it ships no Linux prebuilds, so it
+# is compiled on install there.
 allowBuilds:
   "@github/keytar": false
-  node-pty: false
+  node-pty@1.0.0: false
+  node-pty@1.1.0: true

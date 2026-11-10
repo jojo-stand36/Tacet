@@ -23,6 +23,14 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@tacet/core": "workspace:*"
+    "@tacet/core": "workspace:*",
+    "@tacet/adapter-claude-sdk": "workspace:*",
+    "zod": "catalog:"
+  },
+  "optionalDependencies": {
+    "node-pty": "1.1.0"
+  },
+  "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.319"
   }
 }
