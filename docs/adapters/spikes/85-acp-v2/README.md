@@ -69,4 +69,4 @@ Revisit, and build the design above, when any of these holds:
 - a registered agent stops answering v1;
 - v2 brings something Tacet needs.
 
-#85 stays open as the tracker for this. Once the capability-matrix freshness check (#66) lands, the ACP surface also comes up for re-checking whenever its date gets old.
+#85 stays open as the tracker for this. The capability-matrix freshness check (#66) also brings the ACP surface up for re-checking: it warns a week before the surface's date is 30 days old and fails after that.
