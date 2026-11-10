@@ -346,6 +346,23 @@ describe('tacet uninstall (#20)', () => {
     expect(readdirSync(join(repo, '.tacet')).sort()).toEqual(['local.yaml', 'tacet.yaml']);
   });
 
+  it('keeps committed files, even unchanged, unless --purge (owner decision on #209)', async () => {
+    await tacet(['init', '--model', 'm']);
+    const git = (...args: string[]) => execFileSync('git', ['-C', repo, ...args]);
+    git('add', '.tacet/tacet.yaml');
+    git('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'tacet');
+    const yaml = join(repo, '.tacet', 'tacet.yaml');
+    const r = await tacet(['uninstall', '--apply']);
+    expect(r.out).toContain(`kept ${yaml} (committed to git)`);
+    expect(r.out).toContain(`removed ${join(repo, '.tacet', '.gitignore')}`);
+    expect(readdirSync(join(repo, '.tacet'))).toEqual(['tacet.yaml']);
+
+    const json = JSON.parse((await tacet(['uninstall', '--json'])).out);
+    expect(json.committed).toEqual([yaml]);
+    expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(0);
+    expect(existsSync(join(repo, '.tacet'))).toBe(false);
+  });
+
   it('--purge backs .tacet/ up to ~/.tacet/backups, then removes it', async () => {
     await tacet(['init', '--model', 'm']);
     writeFileSync(join(repo, '.tacet', 'local.yaml'), 'mine\n');

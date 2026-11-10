@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   accessSync,
@@ -193,7 +194,8 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
 
 /**
  * `tacet uninstall` (#20). A preview by default; `--apply` acts. Without `--purge` it removes only
- * the files `tacet init` wrote that are still unchanged, then `.tacet/` if that leaves it empty.
+ * the files `tacet init` wrote that are still unchanged and not committed (owner decision on #209),
+ * then `.tacet/` if that leaves it empty.
  * `--purge` removes the whole `.tacet/` after copying it to
  * `<user dir>/backups/<repo>-<hash>/uninstall-<time>/`. Run state outside the repo is not touched.
  */
@@ -205,6 +207,7 @@ export function uninstall(io: Io, o: UninstallOptions): number {
     const tacetDir = join(root, '.tacet');
     const removals: string[] = [];
     const kept: string[] = [];
+    const committed: string[] = [];
     if (pathExists(tacetDir)) {
       requireDirectory(tacetDir, '.tacet');
       if (o.purge) {
@@ -217,10 +220,14 @@ export function uninstall(io: Io, o: UninstallOptions): number {
           `uninstall-${new Date().toISOString().replaceAll(/[:.]/g, '-')}`,
         );
       } else {
+        // Committed files are the team's, not this checkout's: only --purge removes them.
+        const tracked = trackedIn(root, '.tacet');
         for (const name of readdirSync(tacetDir).sort()) {
           const path = join(tacetDir, name);
-          (isUnchangedInitFile(path) ? removals : kept).push(path);
+          if (tracked.has(name)) committed.push(path);
+          else (isUnchangedInitFile(path) ? removals : kept).push(path);
         }
+        kept.push(...committed);
         if (kept.length === 0) removals.push(tacetDir);
       }
     }
@@ -257,6 +264,7 @@ export function uninstall(io: Io, o: UninstallOptions): number {
           applied: Boolean(o.apply),
           removals,
           kept,
+          committed,
           ...(backup ? { backup } : {}),
         }),
       );
@@ -265,8 +273,12 @@ export function uninstall(io: Io, o: UninstallOptions): number {
     if (removals.length === 0) io.out('nothing to remove');
     for (const path of removals)
       io.out(`${o.apply ? 'removed' : 'would remove'} ${terminalSafe(path)}`);
-    for (const path of kept)
-      io.out(`kept ${terminalSafe(path)} (not written by tacet init, or changed)`);
+    for (const path of kept) {
+      const why = committed.includes(path)
+        ? 'committed to git'
+        : 'not written by tacet init, or changed';
+      io.out(`kept ${terminalSafe(path)} (${why})`);
+    }
     if (backup) io.out(`${o.apply ? 'backed up to' : 'would back up to'} ${terminalSafe(backup)}`);
     if (!o.apply && removals.length > 0) io.err('preview only: add --apply to remove');
     if (kept.length > 0 && !o.purge) io.err('--purge removes all of .tacet/ (after a backup)');
@@ -275,6 +287,28 @@ export function uninstall(io: Io, o: UninstallOptions): number {
     const code = failed(io, err);
     if (backedUp && backup !== undefined) io.err(`the backup is at ${terminalSafe(backup)}`);
     return code;
+  }
+}
+
+/**
+ * Names of the entries directly under `dir` (relative to the repo `root`) that git tracks. If git
+ * cannot answer, every entry counts as tracked, so nothing is removed on a guess.
+ */
+function trackedIn(root: string, dir: string): { has(name: string): boolean } {
+  try {
+    const out = execFileSync('git', ['-C', root, 'ls-files', '-z', '--', dir], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const names = new Set(
+      out
+        .split('\0')
+        .filter(Boolean)
+        .map((f) => f.slice(dir.length + 1).split('/')[0] as string),
+    );
+    return names;
+  } catch {
+    return { has: () => true };
   }
 }
 
