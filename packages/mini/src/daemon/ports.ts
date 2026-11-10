@@ -91,6 +91,8 @@ export interface Integrator {
    * Throws `MergeConflictError` when they conflict.
    */
   combine(commits: readonly string[]): Promise<string | undefined>;
+  /** Which of `paths` `commit` (a commit the repo has) has, as any kind of entry (#263). */
+  tracked?(commit: string, paths: readonly string[]): Promise<Set<string>>;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
   /**

@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-claude-sdk/launch';
 import {
   type AgentEvent,
   type Decision,
@@ -242,6 +243,9 @@ function withReview(v: VerifyResult, r: ReviewResult): VerifyResult {
   return { ...v, status: v.status === 'not_run' ? 'partial' : v.status, review };
 }
 
+/** Adapters whose Workers run in Claude Code's sandbox, which leaves placeholders (#263). */
+const CLAUDE_SANDBOXED: ReadonlySet<string> = new Set(['claude-sdk', 'pty:claude']);
+
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
@@ -330,6 +334,8 @@ export class MiniConductor {
     }
     // Under the lock, before a checkout is looked up: the registry catches up with the disk.
     await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#errors.push(err));
+    // Before any session resumes in them: what crashed Claude sessions left in their checkouts.
+    await this.#removeCrashPlaceholders();
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -2214,6 +2220,31 @@ export class MiniConductor {
     } catch (err) {
       rmSync(tmp, { force: true });
       this.#errors.push(err);
+    }
+  }
+
+  /**
+   * Remove the empty placeholders Claude Code's sandbox left in the checkouts of sessions that
+   * never closed (a crash), which their adapter removes only at a close (#263). Only for those
+   * adapters, after the sessions' processes are ended, and never a path the checkout's base
+   * commit has: what is removed is each `SANDBOX_PLACEHOLDERS` entry that is still an empty file
+   * or directory (`removeSandboxPlaceholders`), as the adapter's close would have.
+   */
+  async #removeCrashPlaceholders(): Promise<void> {
+    const tracked = this.#o.integrator?.tracked?.bind(this.#o.integrator);
+    if (!tracked) return;
+    for (const s of this.#state().sessions.values()) {
+      if (s.ended !== undefined || !s.adapter || !CLAUDE_SANDBOXED.has(s.adapter)) continue;
+      // Without a base, what the checkout had to begin with is unknown: nothing is removed.
+      if (!s.workspaceId || s.baseCommit === undefined) continue;
+      try {
+        const ws = await this.#o.workspaces.get(s.workspaceId);
+        if (!ws) continue;
+        const keep = await tracked(s.baseCommit, SANDBOX_PLACEHOLDERS);
+        removeSandboxPlaceholders(ws.path, keep);
+      } catch (err) {
+        this.#errors.push(err);
+      }
     }
   }
 

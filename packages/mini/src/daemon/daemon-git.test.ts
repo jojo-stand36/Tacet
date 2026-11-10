@@ -80,6 +80,7 @@ describe('MiniConductor with git worktrees', () => {
     script: (cwd: string, input: string) => unknown,
     planner: Planner = new SingleStepPlanner(),
     verify?: string[],
+    opts: { workspaces?: Workspaces } = {},
   ) {
     const fake = new ScriptedAdapter('fake', (input, s) => {
       return (script(s.opts.cwd, input) as Script | undefined) ?? { do: 'reply', text: 'done' };
@@ -101,7 +102,7 @@ describe('MiniConductor with git worktrees', () => {
           }
         : {}),
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
-      workspaces: new GitWorkspaces(),
+      workspaces: opts.workspaces ?? new GitWorkspaces(),
       integrator: new GitIntegrator(repo, env),
       planner,
       mcp: {
@@ -387,6 +388,47 @@ describe('MiniConductor with git worktrees', () => {
     const parent = data<{ openQuestions: string[] }>(id, 'task.result').at(-1);
     expect(parent?.openQuestions.join('\n')).toMatch(/conflicts \(x\.txt\)/);
     expect(() => git(repo, ['rev-parse', '--verify', '-q', resultBranch(id)])).toThrow();
+  });
+
+  it('removes the sandbox placeholders a crashed Claude session left, never a tracked one (#263)', async () => {
+    // The base tracks an empty .npmrc: that one stays, empty or not.
+    writeFileSync(join(repo, '.npmrc'), '');
+    git(repo, ['add', '.npmrc']);
+    git(repo, ['commit', '-qm', 'npmrc']);
+    const base = git(repo, ['rev-parse', 'main']);
+    const workspaces = new GitWorkspaces();
+    const crashed = async (sessionId: string, adapter: string) => {
+      const ws = await workspaces.create(sessionId, base);
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'test' },
+        taskId: `task-${sessionId}`,
+        sessionId,
+        type: 'worker.started',
+        data: { sessionId, adapter, workspaceId: ws.id, baseCommit: base },
+      });
+      // What the sandbox left, and what the Worker made.
+      for (const f of ['package.json', '.env', 'yarn.lock']) writeFileSync(join(ws.path, f), '');
+      mkdirSync(join(ws.path, 'node_modules', '.bin'), { recursive: true });
+      writeFileSync(join(ws.path, '.gitmodules'), 'not empty\n');
+      return ws.path;
+    };
+    const claude = await crashed('s1', 'claude-sdk');
+    const codex = await crashed('s2', 'codex-app-server');
+    const d = start(() => undefined, undefined, undefined, { workspaces });
+    await d.start();
+    for (const f of ['package.json', '.env', 'yarn.lock', 'node_modules']) {
+      expect(existsSync(join(claude, f))).toBe(false);
+      // Not a Claude sandbox: nothing of it is a placeholder.
+      expect(existsSync(join(codex, f))).toBe(true);
+    }
+    expect(existsSync(join(claude, '.npmrc'))).toBe(true);
+    expect(existsSync(join(claude, '.gitmodules'))).toBe(true);
+    const wt = workerWorktree(claude, repo);
+    if (!wt) throw new Error('not a worktree');
+    expect(git(claude, ['status', '--porcelain'], workerGitEnv(wt))).toBe('?? .gitmodules');
   });
 
   it('carries work through a sub-task that commits nothing', async () => {
