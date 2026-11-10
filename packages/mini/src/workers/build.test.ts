@@ -1,8 +1,24 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
 import type { TacetConfig } from '@tacet/core';
-import { type EventStore, loadConfig, openEventStore } from '@tacet/core/node';
+import {
+  defaultStateDir,
+  type EventStore,
+  loadConfig,
+  openEventStore,
+  repoStateDir,
+} from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MiniConductor } from '../daemon/daemon.js';
@@ -222,6 +238,61 @@ describe('buildWorkerAdapters', () => {
       { baseEnv: {} },
     );
     expect(Object.keys(built)).toEqual(['claude-sdk']);
+  });
+});
+
+describe('a Codex Worker built from config (#186)', () => {
+  it('starts in a linked worktree of the repo, with a CODEX_HOME keyed by the repo root', {
+    timeout: 120_000,
+  }, async () => {
+    const api = await startMockResponsesApi();
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-build-codex-')));
+    try {
+      const home = join(root, 'home');
+      const repo = join(root, 'repo');
+      const wt = join(root, 'worktrees', 'task-1');
+      mkdirSync(home);
+      mkdirSync(repo);
+      const gitEnv = {
+        PATH: process.env.PATH ?? '',
+        HOME: home,
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_AUTHOR_NAME: 'Tacet Test',
+        GIT_AUTHOR_EMAIL: 'test@example.invalid',
+        GIT_COMMITTER_NAME: 'Tacet Test',
+        GIT_COMMITTER_EMAIL: 'test@example.invalid',
+      };
+      const git = (...args: string[]) =>
+        execFileSync('git', ['-C', repo, ...args], { env: gitEnv, stdio: 'ignore' });
+      git('init', '-q', '-b', 'main');
+      git('commit', '-q', '--allow-empty', '-m', 'init');
+      git('worktree', 'add', '-q', wt, '-b', 'tacet/task-1');
+      const built = buildWorkerAdapters(
+        { tiers: { worker: { adapter: 'codex-app-server', model: 'gpt-5.5' } } },
+        {
+          repoRoot: repo,
+          baseEnv: { ...gitEnv, OPENAI_API_KEY: 'placeholder-not-a-real-key' },
+          codex: { apiBaseUrl: api.url },
+        },
+      );
+      const adapter = built['codex-app-server']?.adapter;
+      if (!adapter) throw new Error('no codex adapter');
+      const h = await adapter.start({ cwd: wt });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'SAY built' });
+      const end = await tap.waitFor(
+        (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'error'),
+        60_000,
+        1,
+      );
+      await adapter.close(h);
+      expect(end.event).toMatchObject({ state: 'idle' });
+      expect(api.requests.some((r) => r.text === 'SAY built')).toBe(true);
+      expect(existsSync(join(repoStateDir(repo, defaultStateDir(home)), 'codex'))).toBe(true);
+    } finally {
+      await api.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

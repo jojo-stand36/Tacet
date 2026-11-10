@@ -1246,6 +1246,18 @@
         "agent:claude"
       ],
       "body": "Follow-up from #168. On Linux, interactive codex-cli 0.167.0 starts a managed daemon (`codex app-server --listen unix:// --analytics-default-enabled --managed-daemon`, plus `codex app-server daemon pid-update-loop`; feature `daemon_auto_start`, stable and on by default) that outlives the PTY session: after `PtyCliAdapter.close` it keeps running, re-parented to PID 1. That breaks the adapters rule \"never leave orphaned PTYs/processes\". `-c features.daemon_auto_start=false` prevents it for Codex (verified live, `docs/adapters/spikes/168-resume-scope/`), but any CLI run as a `pty:<slug>` preset could detach a helper the same way.\n\n### Tasks\n- [ ] Recommend `-c features.daemon_auto_start=false` in Codex preset examples, and say why\n- [ ] Decide how the adapter limits detached processes: its own process group or session for the CLI and signalling the group on close (a `setsid` child escapes that), a cgroup or `prctl(PR_SET_CHILD_SUBREAPER)`-style subreaper, or documenting it per preset; verify what node-pty already does (the PTY child is a session leader)\n- [ ] Check whether the Codex daemon sends telemetry during a run (`--analytics-default-enabled`)\n\n### Acceptance criteria\n- A test or recorded live run shows no process a preset's CLI started is left running after `close()`, or the docs state the limit per platform\n\n_See packages/adapters/pty/src/cli-adapter.ts, .github/instructions/adapters.instructions.md and docs/adapters/capability-matrix.md (\"Generic PTY presets: resume\")._"
+    },
+    {
+      "title": "buildWorkerAdapters: pass repoRoot to the Codex adapter",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Found in the review of #181 (PR #185). `buildWorkerAdapters` (`packages/mini/src/workers/build.ts`) passes `opts.repoRoot` to the ACP and PTY adapters but not to `CodexAppServerAdapter`. An unattended Codex Worker in a git checkout needs it (`workerRepoRoot`, #116): it keys the Worker's own `CODEX_HOME`, checks the worktree against the repo root before any git command, and is where #181 marks the repo untrusted. Without it, every `codex-app-server` Worker built from config refuses to start in a git checkout (\"unattended Codex Workers in a git checkout need the repoRoot option\"). It fails closed, but Codex Workers cannot run.\n\n### Tasks\n- [ ] Pass `opts.repoRoot` to the Codex adapter in `buildWorkerAdapters`.\n- [ ] Test that a Codex Worker built from config starts in a git worktree of the repo.\n\n### Acceptance criteria\n- A `codex-app-server` Worker built by `buildWorkerAdapters` with `repoRoot` starts a session in a linked worktree of that repo (real Codex against the mock Responses API), and its `CODEX_HOME` is keyed by the repo root.\n\n_See packages/mini/src/workers/build.ts, docs/ARCHITECTURE.md §6 (Codex Worker isolation) and #116._"
     }
   ]
 }
