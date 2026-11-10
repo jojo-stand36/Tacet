@@ -67,6 +67,11 @@ export interface Integrator {
     commit: string,
     target: string,
   ): Promise<{ how: 'merge' | 'squash'; landedAs?: string } | undefined>;
+  /**
+   * Whether `later` replaces `earlier` as an amend does: the same first parent (#210). Without it,
+   * no integrated commit counts as superseded.
+   */
+  replaces?(earlier: string, later: string): Promise<boolean>;
 }
 
 /** Commits that cannot be combined without a person: `files` conflict. */

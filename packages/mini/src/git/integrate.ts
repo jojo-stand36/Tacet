@@ -23,7 +23,7 @@ import {
   workerWorktree,
 } from '@tacet/core/node';
 import { type Integrator, type Workspace, WorktreeRefusedError } from '../daemon/ports.js';
-import { detectLanded, type Landed } from './landed.js';
+import { branchTip, detectLanded, isReplacement, type Landed } from './landed.js';
 import { combineCommits, setTaskBranch } from './merge.js';
 
 export { WorktreeRefusedError };
@@ -571,8 +571,23 @@ export class GitIntegrator implements Integrator {
     return combineCommits(commits, { repoRoot: this.#repoRoot, env: this.#env });
   }
 
-  landed(commit: string, target: string): Promise<Landed | undefined> {
-    return detectLanded({ repoRoot: this.#repoRoot, commit, target, env: this.#env });
+  /** Results found not landed, by result and target, with the target tip they were checked at. */
+  readonly #notLanded = new Map<string, string>();
+
+  async landed(commit: string, target: string): Promise<Landed | undefined> {
+    const o = { repoRoot: this.#repoRoot, target, env: this.#env };
+    const key = `${commit} ${target}`;
+    const tip = await branchTip(o);
+    // Nothing new on the target since the last look: still not landed, without a scan.
+    if (tip === undefined || this.#notLanded.get(key) === tip) return undefined;
+    const landed = await detectLanded({ ...o, commit });
+    if (landed) this.#notLanded.delete(key);
+    else this.#notLanded.set(key, tip);
+    return landed;
+  }
+
+  replaces(earlier: string, later: string): Promise<boolean> {
+    return isReplacement({ repoRoot: this.#repoRoot, env: this.#env }, earlier, later);
   }
 
   async publish(taskId: string, commit: string): Promise<string> {

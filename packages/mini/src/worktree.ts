@@ -37,7 +37,7 @@ export interface RemoveWorktreeOptions {
   /**
    * Commits that landed in their target (#210): the event log records the task's published result
    * as merged or squash-merged. Work they contain counts as kept, as if a branch held them. Each
-   * must be a full commit id in the repository, or the worktree is kept.
+   * must be a full commit id (else the worktree is kept); one not in the repository covers nothing.
    */
   landed?: readonly string[];
 }
@@ -804,9 +804,8 @@ export class WorktreeManager implements Workspaces {
       throw unverifiable('a landed commit is not a full commit id');
     }
     const shared = await this.commitsInSharedStore([...candidates, ...privateCommits, ...landed]);
-    if (landed.some((commit) => !shared.has(commit))) {
-      throw unverifiable('a landed commit is not in the repository');
-    }
+    // One that is gone (pruned by git gc) covers nothing, and keeps nothing either.
+    const covering = landed.filter((commit) => shared.has(commit));
     if (privateCommits.some((commit) => !shared.has(commit))) {
       // Integration copies only what HEAD reaches: commits left behind by an amend or a reset
       // can never be integrated, so say how to let them go.
@@ -841,7 +840,7 @@ export class WorktreeManager implements Workspaces {
     const unique = (
       await this.git(
         ['rev-list', '--max-count=1', '--stdin'],
-        `${[...candidates, ...[...others, ...landed].map((tip) => `^${tip}`)].join('\n')}\n`,
+        `${[...candidates, ...[...others, ...covering].map((tip) => `^${tip}`)].join('\n')}\n`,
       )
     ).trim();
     if (unique) {

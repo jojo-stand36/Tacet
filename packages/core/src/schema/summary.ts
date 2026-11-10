@@ -1,9 +1,8 @@
 import { z } from 'zod';
 import { Id, openEnum, Timestamp } from './common.js';
+import { Verification } from './handoff.js';
 
 const CommitId = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id');
-
-import { Verification } from './handoff.js';
 
 /**
  * How a (sub-)task ended. `completed` is written only with `verification.status: passed` (the

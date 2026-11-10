@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { detectLanded } from './landed.js';
+import { detectLanded, isReplacement } from './landed.js';
 
 describe('detectLanded (#210)', () => {
   let root: string;
@@ -115,5 +115,76 @@ describe('detectLanded (#210)', () => {
     await expect(
       detectLanded({ repoRoot: repo, commit: tip, target: 'refs/heads/a..b', env }),
     ).rejects.toThrow(/branch ref/);
+  });
+
+  it('finds a squash merge of a change with a rename, whatever the user config says', async () => {
+    git(['config', 'diff.renames', 'copies']);
+    const lines = Array.from({ length: 20 }, (_, i) => `line ${i}`).join('\n');
+    commitFile('README', `${lines}\n`);
+    git(['checkout', '-qb', 'work']);
+    git(['mv', 'README', 'README.md']);
+    writeFileSync(join(repo, 'README.md'), `${lines}\nmore\n`);
+    git(['commit', '-qam', 'rename and edit']);
+    const tip = git(['rev-parse', 'HEAD']);
+    git(['checkout', '-q', 'main']);
+    git(['merge', '-q', '--squash', 'work']);
+    git(['commit', '-qm', 'squashed']);
+    expect(await detect(tip)).toMatchObject({ how: 'squash' });
+  });
+
+  it('accepts any valid branch name as the target', async () => {
+    const tip = work();
+    git(['branch', 'feat+x@y', 'main']);
+    git(['checkout', '-q', 'feat+x@y']);
+    git(['merge', '-q', '--squash', 'work']);
+    git(['commit', '-qm', 'squashed']);
+    expect(
+      await detectLanded({ repoRoot: repo, commit: tip, target: 'refs/heads/feat+x@y', env }),
+    ).toMatchObject({ how: 'squash' });
+  });
+
+  it('never looks in a partial clone, where diffing would fetch from the remote', async () => {
+    const tip = work();
+    git(['merge', '-q', '--squash', 'work']);
+    git(['commit', '-qm', 'squashed']);
+    git(['config', 'uploadpack.allowFilter', 'true']);
+    const clone = join(root, 'clone');
+    execFileSync(
+      'git',
+      ['clone', '-q', '--filter=blob:none', '--no-checkout', `file://${repo}`, clone],
+      { env },
+    );
+    const packs = () =>
+      execFileSync('git', ['-C', clone, 'count-objects', '-v'], { env, encoding: 'utf8' });
+    const before = packs();
+    execFileSync('git', ['-C', clone, 'fetch', '-q', 'origin', 'work:work'], { env });
+    const workTip = execFileSync('git', ['-C', clone, 'rev-parse', 'work'], {
+      env,
+      encoding: 'utf8',
+    }).trim();
+    expect(workTip).toBe(tip);
+    const fetched = packs();
+    expect(
+      await detectLanded({ repoRoot: clone, commit: tip, target: 'refs/heads/main', env }),
+    ).toBeUndefined();
+    expect(packs()).toBe(fetched);
+    expect(before).toBeTruthy();
+  });
+
+  it('tells an amend from unrelated work after a reset', async () => {
+    git(['checkout', '-qb', 'work']);
+    const first = commitFile('a.txt', 'one\n');
+    git(['commit', '-q', '--amend', '-m', 'amended']);
+    const amended = git(['rev-parse', 'HEAD']);
+    git(['reset', '-q', '--hard', 'main']);
+    const unrelatedBase = commitFile('c.txt', 'c\n');
+    const unrelated = commitFile('d.txt', 'd\n');
+    const o = { repoRoot: repo, env };
+    expect(await isReplacement(o, first, amended)).toBe(true);
+    expect(await isReplacement(o, first, unrelated)).toBe(false);
+    // A single commit straight on the same parent reads as an amend: the shape cannot tell.
+    expect(await isReplacement(o, first, unrelatedBase)).toBe(true);
+    expect(await isReplacement(o, first, first)).toBe(false);
+    expect(await isReplacement(o, first, 'HEAD')).toBe(false);
   });
 });

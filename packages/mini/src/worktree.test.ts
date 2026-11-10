@@ -999,11 +999,15 @@ describe('WorktreeManager', () => {
       const commit = await workerCommit(worktree.path, 'bad.txt');
       expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
 
-      for (const landed of [['--all'], ['HEAD'], ['f'.repeat(40)]]) {
+      for (const landed of [['--all'], ['HEAD'], [`^${commit}`]]) {
         await expect(manager.remove(worktree.id, { landed })).rejects.toThrow(
           'unable to verify Worker commits',
         );
       }
+      // A commit the repository does not have covers nothing.
+      await expect(manager.remove(worktree.id, { landed: ['f'.repeat(40)] })).rejects.toThrow(
+        'Worker has commits no other ref contains',
+      );
       expect(await manager.get(worktree.id)).toBeDefined();
       expect(commit).toMatch(/^[0-9a-f]{40}$/);
     });

@@ -206,6 +206,27 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(landedEvents(id)).toHaveLength(1);
     });
 
+    it('keeps the checkout when a fix round replaced the work with unrelated work after a reset', async () => {
+      const { id, published } = await runTask(
+        (cwd, input) => {
+          if (!input.startsWith('Verification failed')) return commitWork(cwd);
+          // Not an amend: approach X is thrown away and two unrelated commits take its place.
+          workerGit(cwd, ['reset', '-q', '--hard', 'HEAD~1']);
+          for (const file of ['other.txt', 'fixed.txt']) {
+            writeFileSync(join(cwd, file), `${file}\n`);
+            workerGit(cwd, ['add', file]);
+            workerGit(cwd, ['commit', '-qm', file]);
+          }
+        },
+        undefined,
+        ['test -f fixed.txt'],
+      );
+      squashIntoMain(published.commit);
+      await vi.waitFor(() => expect(landedEvents(id)).toHaveLength(1), { timeout: 3_000 });
+      await severalSweeps();
+      expect(await manager.list()).toHaveLength(1);
+    });
+
     it('keeps the checkout for a commit only the reflog reached, never integrated', async () => {
       const { id, published } = await runTask((cwd) => {
         commitWork(cwd);

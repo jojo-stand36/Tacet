@@ -240,8 +240,12 @@ export class MiniConductor {
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
   #sweepTimer: NodeJS.Timeout | undefined;
-  /** The landed sweep in flight, so a slow one is never started twice. */
-  #sweeping: Promise<void> | undefined;
+  /** The generation whose landed sweep is in flight, so a slow one is never started twice. */
+  #sweepingGen: number | undefined;
+  /** Landed-sweep problems already reported, so a slow timer does not grow `errors` forever. */
+  readonly #sweepErrors = new Set<string>();
+  /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
+  readonly #closing = new Set<string>();
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -772,13 +776,15 @@ export class MiniConductor {
   // ---- landed results (#210) ------------------------------------------------------------
 
   #sweep(): void {
-    if (this.#sweeping || !this.#started) return;
+    // One per generation: a sweep left over from before a stop exits at its next liveness check.
+    if (!this.#started || this.#sweepingGen === this.#gen) return;
     const gen = this.#gen;
-    const run = this.#sweepLanded(gen).finally(() => {
-      this.#sweeping = undefined;
-    });
-    this.#sweeping = run;
-    this.#track(run);
+    this.#sweepingGen = gen;
+    this.#track(
+      this.#sweepLanded(gen).finally(() => {
+        if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
+      }),
+    );
   }
 
   /**
@@ -794,7 +800,8 @@ export class MiniConductor {
     const integrator = this.#o.integrator;
     if (!integrator?.landed) return;
     const v = this.#state();
-    const inUse = new Set([...this.#runs.values()].map((r) => r.workspace.id));
+    const inUse = () =>
+      new Set([...[...this.#runs.values()].map((r) => r.workspace.id), ...this.#closing]);
     for (const root of Object.values(v.tasks)) {
       if (!this.#live(gen)) return;
       if (root.task.parentId || root.state !== 'completed') continue;
@@ -809,9 +816,10 @@ export class MiniConductor {
           .map((t) => t.task.id),
       );
       const sessions = [...v.sessions.values()].filter((s) => subs.has(s.taskId));
+      const busy = inUse();
       const workspaceIds = [
         ...new Set(sessions.flatMap((s) => (s.workspaceId ? [s.workspaceId] : []))),
-      ].filter((id) => !inUse.has(id));
+      ].filter((id) => !busy.has(id));
       const left: string[] = [];
       for (const id of workspaceIds) if (await this.#o.workspaces.get(id)) left.push(id);
       if (left.length === 0 || !this.#live(gen)) continue;
@@ -828,7 +836,11 @@ export class MiniConductor {
         try {
           landed = await integrator.landed(published.commit, target);
         } catch (err) {
-          this.#errors.push(err);
+          const key = `${root.task.id} ${(err as Error).message}`;
+          if (!this.#sweepErrors.has(key)) {
+            this.#sweepErrors.add(key);
+            this.#errors.push(err);
+          }
           continue;
         }
         if (!landed || !this.#live(gen)) continue;
@@ -842,24 +854,42 @@ export class MiniConductor {
           causationId: result.id,
         });
       }
-      // Owner decision on #210: a commit this task integrated and then replaced with a later
-      // integration of the same sub-task (an amend in a fix round) counts as covered once the task
-      // landed. Reflog reachability alone never does: the manager still keeps anything else.
-      const superseded: string[] = [];
-      for (const sub of subs) {
-        const integrated = this.#o.store
-          .query({ taskId: sub, typePrefix: 'worker.integrated' })
-          .map((e) => (e.envelope.data as { commit?: unknown }).commit)
-          .filter((c): c is string => typeof c === 'string');
-        superseded.push(...integrated.slice(0, -1));
-      }
-      const landedCommits = [...new Set([published.commit, ...superseded])];
       for (const id of left) {
-        if (!this.#live(gen)) return;
+        if (!this.#live(gen) || inUse().has(id)) continue;
+        const superseded = await this.#supersededIn(id, sessions);
+        if (!this.#live(gen) || inUse().has(id)) continue;
         // Kept (local files, or work none of these contain) until the user forces it.
-        await this.#o.workspaces.remove(id, { landed: landedCommits }).catch(() => {});
+        await this.#o.workspaces
+          .remove(id, { landed: [published.commit, ...superseded] })
+          .catch(() => {});
       }
     }
+  }
+
+  /**
+   * Owner decision on #210: a commit integrated and then replaced by a later integration counts as
+   * covered once its task landed. Narrowed so it never frees work that did not land: only commits
+   * of a session that ran in this checkout, replaced by that same session's next integration, and
+   * only as an amend does (the same first parent), never unrelated work after a reset. Reflog
+   * reachability alone never counts.
+   */
+  async #supersededIn(workspaceId: string, sessions: readonly SessionRecord[]): Promise<string[]> {
+    const replaces = this.#o.integrator?.replaces?.bind(this.#o.integrator);
+    if (!replaces) return [];
+    const superseded: string[] = [];
+    for (const s of sessions) {
+      if (s.workspaceId !== workspaceId) continue;
+      const integrated = this.#o.store
+        .query({ sessionId: s.sessionId, typePrefix: 'worker.integrated' })
+        .map((e) => e.envelope.data as { sessionId?: unknown; commit?: unknown })
+        .filter((d) => d.sessionId === s.sessionId && typeof d.commit === 'string')
+        .map((d) => d.commit as string);
+      for (let i = 0; i + 1 < integrated.length; i += 1) {
+        const [earlier, later] = [integrated[i], integrated[i + 1]] as [string, string];
+        if (await replaces(earlier, later).catch(() => false)) superseded.push(earlier);
+      }
+    }
+    return superseded;
   }
 
   /**
@@ -1778,6 +1808,21 @@ export class MiniConductor {
     if (this.#runs.get(run.subtaskId) !== run) return;
     // A verification still running for it stops (its result is not used).
     run.verifyAbort?.abort();
+    // Until it is closed and discarded below, the landed sweep must not take its checkout.
+    this.#closing.add(run.workspace.id);
+    try {
+      await this.#endRun(run, reason, message, extra);
+    } finally {
+      this.#closing.delete(run.workspace.id);
+    }
+  }
+
+  async #endRun(
+    run: Run,
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled',
+    message: string | undefined,
+    extra: { workspaceRefused?: boolean },
+  ): Promise<void> {
     this.#runs.delete(run.subtaskId);
     run.revoke();
     this.#o.store.append(
