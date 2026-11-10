@@ -89,6 +89,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
+- [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **Pin a task's target branch so its sub-tasks never start from different branches** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation

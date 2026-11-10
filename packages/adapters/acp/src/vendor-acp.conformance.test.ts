@@ -17,7 +17,14 @@ import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from './adapter.js';
-import { type AcpAgentSpec, CLAUDE_ACP_AGENT, CODEX_ACP_AGENT, codexAcpConfig } from './agents.js';
+import {
+  type AcpAgentSpec,
+  CLAUDE_ACP_AGENT,
+  CLAUDE_ACP_WORKER_OPTIONS,
+  CODEX_ACP_AGENT,
+  claudeAcpWorkerSpec,
+  codexAcpConfig,
+} from './agents.js';
 
 const require = createRequire(import.meta.url);
 const bin = (pkg: string) => join(dirname(require.resolve(`${pkg}/package.json`)), 'dist/index.js');
@@ -191,6 +198,35 @@ for (const c of CASES) {
       expect(own.filter((p) => /(^|\/)(auth\.json|\.credentials\.json)$/.test(p))).toEqual([]);
       expect(own.some((p) => p.includes('/.tmp/plugins/'))).toBe(false);
     });
+
+    it.runIf(c.name === 'claude-agent-acp')(
+      'offers a Worker the file tools only, and no shell (#206)',
+      { timeout: 120_000 },
+      async () => {
+        const worker = new AcpAdapter({
+          agent: claudeAcpWorkerSpec(c.agent(api.url)),
+          executable: [process.execPath, c.bin],
+          killTimeoutMs: 2000,
+          stateDir: state,
+          baseEnv: { PATH: process.env.PATH, HOME: home, ...c.env(api.url) },
+        });
+        const cwd = join(root, 'wt-206');
+        mkdirSync(cwd, { recursive: true });
+        const h = await worker.start({ cwd });
+        const tap = new EventTap(worker.events(h));
+        await worker.send(h, { text: 'SAY tools206' });
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+        await worker.close(h);
+        const req = (api.requests as { text?: string; tools?: string[] }[]).findLast(
+          (r) => r.text === 'SAY tools206',
+        );
+        // Exactly the allowlist (MCP tools and the SDK's placeholder aside).
+        const builtins = (req?.tools ?? []).filter(
+          (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
+        );
+        expect(builtins.sort()).toEqual([...CLAUDE_ACP_WORKER_OPTIONS.tools].sort());
+      },
+    );
 
     it.runIf(c.name === 'claude-agent-acp')(
       'runs tools unasked without its session mode: the control for the approval probe',
