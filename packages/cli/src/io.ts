@@ -1,5 +1,6 @@
 import type { WslProbe } from '@tacet/core/node';
 import type { StandaloneOptions } from '@tacet/mini/standalone';
+import type { SpawnDetached } from './commands/detach.js';
 
 /** What the `tacet` command reads from and writes to; replaced in tests. */
 export interface Io {
@@ -23,6 +24,10 @@ export interface Io {
   pollMs?: number;
   /** Tests only: overrides for the standalone Mini-conductor. */
   standalone?: Partial<StandaloneOptions>;
+  /** Tests only: how `tacet run --detach` starts its background run (#201). */
+  spawnDetached?: SpawnDetached;
+  /** Tests only: how long `tacet run --detach` waits for it to start, in ms. Default 60000. */
+  detachStartTimeoutMs?: number;
   /** Tests only: what the WSL checks read (#193). Default: this machine's. */
   wslProbe?: WslProbe;
 }
