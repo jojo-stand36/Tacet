@@ -142,6 +142,8 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
       expect.arrayContaining(['tool.call', 'tool.result', 'message.delta']),
     );
     expect(existsSync(join(cwd, 'tool-ran.txt'))).toBe(true);
+    // A viewer sees the terminal: the prompt that was typed is on it.
+    expect(adapter.terminal(h).scrollback()).toContain('RUN_TOOL');
     // The next turn starts from idle again.
     const next = await turn(h, tap, 'SAY again');
     expect(next.end).toMatchObject({ state: 'idle' });
