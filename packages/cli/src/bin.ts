@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { createInterface } from 'node:readline/promises';
+import { cappedLog } from './capped-log.js';
+import { DETACHED_CHILD } from './commands/detach.js';
 import { main } from './main.js';
 
 const abort = new AbortController();
@@ -27,9 +29,13 @@ const prompt = interactive
     }
   : undefined;
 
+// The background run of `tacet run --detach` (#201): its output is its log, kept under a cap
+// (#273). Standard output and error are the same file there.
+const log = process.argv.includes(DETACHED_CHILD) ? cappedLog(2) : undefined;
+
 process.exitCode = await main(process.argv.slice(2), {
-  out: (t) => process.stdout.write(`${t}\n`),
-  err: (t) => process.stderr.write(`${t}\n`),
+  out: log ?? ((t) => process.stdout.write(`${t}\n`)),
+  err: log ?? ((t) => process.stderr.write(`${t}\n`)),
   cwd: process.cwd(),
   signal: abort.signal,
   ...(prompt ? { prompt } : {}),
