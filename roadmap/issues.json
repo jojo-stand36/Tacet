@@ -1420,8 +1420,8 @@
         "agent:either"
       ],
       "body": "Standalone mode (#21) can run, resume and answer, but cannot cancel a task. The task state `canceled` exists in the projection, but nothing records it.\n\n### Tasks\n- [ ] `MiniConductor.cancel(taskId)`: end the task's open Worker sessions, record `task.status canceled` for the task and its sub-tasks, and start nothing more for it.\n- [ ] `tacet cancel <task>`: cancel in the running process (Ctrl-C, then `tacet cancel`, then `tacet run --resume` continues the rest), or through the control port once it exists.\n\n### Acceptance criteria\n- After `tacet cancel <task>`, `tacet status` shows the task and its sub-tasks as canceled, no Worker of it is running, and `tacet run --resume` does not pick it up.\n\n_See #21._"
-      },
-      {
+    },
+    {
       "title": "ReDoS: quadratic fence-stripping regex on reviewer and planner replies",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1432,6 +1432,18 @@
         "agent:claude"
       ],
       "body": "CodeQL (polynomial-regex) flagged `packages/mini/src/review/adapter-reviewer.ts:45-48`, as reported in a Copilot comment on #103. It is real.\n\n`parseReview` strips a code fence from the reviewer's reply with `.replace(/^```(?:json)?\\s*/i, '')` and `.replace(/\\s*```$/, '')`. The second pattern is quadratic on a long run of whitespace that is not followed by a fence: the engine retries the `\\s*` run from every start position. Timed on Node 24 with `\"x\" + \" \".repeat(n) + \"y\"`:\n\n| n | time |\n|---|---|\n| 10,000 | 42 ms |\n| 20,000 | 196 ms |\n| 40,000 | 809 ms |\n| 400,000 | about 80 s (extrapolated) |\n\n**Reachable:** the input is the reviewer model's whole reply, and the reviewer reads a diff the Worker wrote (#19). A Worker that gets the reviewer to emit a long whitespace run, or a reviewer that misbehaves on its own, blocks the Mini-conductor's event loop and so stalls every Worker. The planner's `parseProposal` (`packages/mini/src/daemon/planner.ts:37-38`) uses the same two regexes on the planner's reply.\n\n### Tasks\n- [ ] One shared fence-stripping helper with linear time (string operations, no backtracking regex), used by `parseReview` and `parseProposal`.\n- [ ] Cap the reply length that is parsed at 256 KB. A longer reply is an invalid reply, as for invalid JSON.\n- [ ] Review `packages/mini/` for other regexes applied to model- or Worker-controlled text.\n\n### Acceptance criteria\n- A reply of 1 MB of whitespace, with or without a fence, is handled in well under a second, and the test fails on the old code.\n- The existing parse tests (with and without a fence) still pass.\n\n_See packages/mini/src/review/adapter-reviewer.ts, packages/mini/src/daemon/planner.ts and #19._"
+    },
+    {
+      "title": "Remove worktrees automatically once their task's work is merged (setting)",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:config",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up to #16 (PR #103). The worktree manager keeps a worktree until its work is contained in another branch, tag or remote ref, or until `remove(id, { force: true })`. Work that landed by squash or rebase merge is never contained by ancestry, so `gc` keeps those worktrees forever. Owner decision (2026-11-10): removing merged worktrees becomes a setting. `tacet init` asks for it, the user can change it later in config, and it defaults to on.\n\n**What \"merged\" means:** the event log records that the task's work was integrated and landed in the target branch (merged, or squash-merged). Only then may `gc` and `remove` delete the worktree without `force`, even when ancestry does not show the commit as contained. Abandoned worktrees, whose commits were amended or reset away and never integrated, stay kept until forced; the setting does not cover them.\n\n### Tasks\n- [ ] Config key `worktrees.remove_merged` (boolean, default `true`), settable in `tacet.yaml` or `local.yaml`, with its schema in `@tacet/core`\n- [ ] An event-log signal that a task's work landed in its target, and a way for the Mini-conductor to map a worktree to that task\n- [ ] `WorktreeManager` accepts that signal: with the setting on, a landed worktree is removable without `force`. Local or ignored files and private commits that were never integrated still keep it\n- [ ] `tacet init` asks once (\"Remove worktrees automatically after their work is merged? [Y/n]\"), writes the answer, and has a non-interactive flag. Coordinate with the owner of init (#209)\n- [ ] Update docs/ARCHITECTURE.md §2.4\n\n### Acceptance criteria\n- With the setting on, a squash-merged task's worktree is removed by `gc`\n- With the setting off, the same worktree is kept\n- An abandoned worktree (commits amended or reset away, never integrated) is kept with the setting on or off\n- A worktree whose commits are not contained anywhere, with no event-log record that its task landed, is kept\n- `tacet init` writes the chosen value, and its non-interactive flag sets it without a prompt\n\n_See docs/ARCHITECTURE.md §2.4, packages/mini/src/worktree.ts and #103._"
     }
   ]
 }

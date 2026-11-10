@@ -86,6 +86,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
+- [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation
 
