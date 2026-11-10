@@ -349,6 +349,39 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await adapter.close(h);
     });
 
+    it("sends the spec's sessionMeta as _meta on session/new, load and resume (#181)", async () => {
+      const meta = { claudeCode: { options: { settingSources: [], strictMcpConfig: true } } };
+      const spec = { ...GEMINI_AGENT, sessionMeta: meta };
+      const env = { GEMINI_API_KEY: 'placeholder' };
+      const run = async (caps: object, resume?: string) => {
+        const a = make(spec, { ...env, FAKE_CAPS: JSON.stringify(caps) });
+        const h = await a.start({
+          cwd: join(root, 'wt'),
+          ...(resume ? { resume: { vendorSessionId: resume } } : {}),
+        });
+        await a.close(h);
+      };
+      await run({});
+      await run({ loadSession: true }, 'old-load');
+      await run({ sessionCapabilities: { resume: {} } }, 'old-resume');
+      const opened = methods().filter((m) =>
+        ['session/new', 'session/load', 'session/resume'].includes(m.method ?? ''),
+      );
+      expect(opened.map((m) => m.method)).toEqual([
+        'session/new',
+        'session/load',
+        'session/resume',
+      ]);
+      for (const m of opened) expect(m.params, m.method).toMatchObject({ _meta: meta });
+      // A spec without it sends none.
+      const plainAdapter = make(GEMINI_AGENT, env);
+      await plainAdapter.close(await plainAdapter.start({ cwd: join(root, 'wt') }));
+      const plain = methods()
+        .filter((m) => m.method === 'session/new')
+        .at(-1);
+      expect(plain?.params).not.toHaveProperty('_meta');
+    });
+
     it('prefers session/resume when the agent offers it, and refuses a resume it cannot do', async () => {
       const caps = { loadSession: true, sessionCapabilities: { resume: {} } };
       const adapter = gemini({ FAKE_CAPS: JSON.stringify(caps) });

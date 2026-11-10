@@ -189,6 +189,10 @@ describe('Gemini Worker tool environment', () => {
         mcp: existsSync(mcpRan),
       };
     };
+    // Folder trust is on by default in 0.67.0; the Worker settings say so, so a changed default
+    // cannot trust a checkout.
+    const settings = JSON.parse(GEMINI_AGENT.home?.files['.gemini/settings.json'] ?? '{}');
+    expect(settings.security?.folderTrust?.enabled).toBe(true);
     // The Worker spec: the checkout is untrusted, so neither loads.
     expect(await run(GEMINI_AGENT, {}, 'isolated')).toEqual({
       sent: true,

@@ -72,6 +72,8 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Resolve keychain secret references in config** — `feature` `P2` `claude`
 - [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
 - [ ] **PTY adapters: don't leave a CLI's detached background processes running** — `feature` `P2` `claude`
+- [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
+- [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 
 ## M2 · Conductor & escalation
 

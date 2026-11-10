@@ -480,5 +480,28 @@ describe('Codex Worker isolation', () => {
     );
     expect(config).toContain(`[projects.${JSON.stringify(hostile)}]\ntrust_level = "untrusted"`);
     expect(config).not.toContain('"trusted"');
+
+    // Control: an interactive session (a CODEX_HOME Tacet does not manage) lets Codex trust the
+    // repo, and then all of it loads, so the checks above can see it.
+    const ctl = adapter({
+      repoRoot: hostile,
+      mode: 'interactive',
+      baseEnv: {
+        ...gitEnv,
+        OPENAI_API_KEY: 'placeholder-not-a-real-key',
+        CODEX_HOME: join(root, 'control-codex-home'),
+      },
+    });
+    const h = await ctl.start({ cwd: wt });
+    const tap = new EventTap(ctl.events(h));
+    await ctl.send(h, { text: 'SAY control' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+    // The MCP server starts with the thread; give a slow start time to show.
+    await new Promise((r) => setTimeout(r, 1000));
+    await ctl.close(h);
+    const raw = api.requests.findLast((r) => r.text === 'SAY control')?.raw ?? '';
+    expect(raw).toContain('AGENTSMD-MARKER-181');
+    expect(raw).toContain('CONFIG-MARKER-181');
+    expect(existsSync(mcpRan)).toBe(true);
   });
 });

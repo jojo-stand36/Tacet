@@ -85,7 +85,9 @@ export interface ClaudeSdkAdapterOptions {
    * `settingSources` defaults to `[]` (#181): no user, project or local settings and no CLAUDE.md,
    * so a checkout a Worker wrote cannot add hooks, permissions, environment or instructions to a
    * later session. Passing it here is the explicit opt-in, e.g. `['project']` for an interactive
-   * session in the user's own repo. Never opt in for a session in a Worker's checkout.
+   * session in the user's own repo. Never opt in for a session in a Worker's checkout. MCP servers
+   * come only from Tacet's config either way (`strictMcpConfig` is always on), never from the
+   * user's or the project's settings or `.mcp.json`.
    */
   sdkOptions?: Pick<
     Options,

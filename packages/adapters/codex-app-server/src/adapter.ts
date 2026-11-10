@@ -1001,6 +1001,8 @@ export function configArgs(
 /**
  * Mark `paths` (and their real paths) `untrusted` in a Codex `config.toml` Tacet owns, replacing
  * any entry Codex wrote for them. Other content is kept. Written with a rename, mode 0600.
+ * The editor is line-based: it recognises the `[projects."<path>"]` tables Codex writes, not
+ * other TOML spellings of them (a duplicate table would make Codex refuse the file: fails closed).
  */
 export function untrustProjects(file: string, paths: readonly string[]): void {
   const keys = new Set<string>();
@@ -1014,7 +1016,10 @@ export function untrustProjects(file: string, paths: readonly string[]): void {
   let text = '';
   try {
     text = readFileSync(file, 'utf8');
-  } catch {}
+  } catch (err) {
+    // Only a missing file starts empty: any other read error must not drop its content.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
   // Drop each table for these paths: its header line up to the next table header.
   const kept: string[] = [];
   let dropping = false;
@@ -1025,8 +1030,9 @@ export function untrustProjects(file: string, paths: readonly string[]): void {
   }
   const body = kept.join('\n').replace(/\n*$/, '');
   const tables = [...headers].map((h) => `${h}\ntrust_level = "untrusted"\n`).join('\n');
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${body ? `${body}\n\n` : ''}${tables}`, { mode: 0o600 });
+  // A fresh name, created exclusively: never a planted file or symlink at a guessable path.
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, `${body ? `${body}\n\n` : ''}${tables}`, { mode: 0o600, flag: 'wx' });
   renameSync(tmp, file);
 }
 

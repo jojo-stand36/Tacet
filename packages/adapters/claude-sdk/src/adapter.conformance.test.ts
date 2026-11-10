@@ -298,7 +298,7 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     await run(optIn, 'trusting');
     expect(existsSync(ran)).toBe(true);
     expect(reached()).toBe(true);
-    // Recorded, not asserted: whether an opted-in session starts the project's MCP server.
-    console.info(`project .mcp.json started with ['project']: ${existsSync(mcpRan)}`);
+    // strictMcpConfig stays on for an opted-in session: the project's MCP server never starts.
+    expect(existsSync(mcpRan)).toBe(false);
   });
 });

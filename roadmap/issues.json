@@ -1246,6 +1246,32 @@
         "agent:claude"
       ],
       "body": "Follow-up from #168. On Linux, interactive codex-cli 0.167.0 starts a managed daemon (`codex app-server --listen unix:// --analytics-default-enabled --managed-daemon`, plus `codex app-server daemon pid-update-loop`; feature `daemon_auto_start`, stable and on by default) that outlives the PTY session: after `PtyCliAdapter.close` it keeps running, re-parented to PID 1. That breaks the adapters rule \"never leave orphaned PTYs/processes\". `-c features.daemon_auto_start=false` prevents it for Codex (verified live, `docs/adapters/spikes/168-resume-scope/`), but any CLI run as a `pty:<slug>` preset could detach a helper the same way.\n\n### Tasks\n- [ ] Recommend `-c features.daemon_auto_start=false` in Codex preset examples, and say why\n- [ ] Decide how the adapter limits detached processes: its own process group or session for the CLI and signalling the group on close (a `setsid` child escapes that), a cgroup or `prctl(PR_SET_CHILD_SUBREAPER)`-style subreaper, or documenting it per preset; verify what node-pty already does (the PTY child is a session leader)\n- [ ] Check whether the Codex daemon sends telemetry during a run (`--analytics-default-enabled`)\n\n### Acceptance criteria\n- A test or recorded live run shows no process a preset's CLI started is left running after `close()`, or the docs state the limit per platform\n\n_See packages/adapters/pty/src/cli-adapter.ts, .github/instructions/adapters.instructions.md and docs/adapters/capability-matrix.md (\"Generic PTY presets: resume\")._"
+    },
+    {
+      "title": "codex-acp Workers trust the checkout: refuse, accept or patch",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Found in #181 (verified live on codex-acp 2.6.0 with Codex 0.166.0, mock Responses API): `createSessionConfig` sets `trust_level: \"trusted\"` for every session root after merging any config Tacet can pass (`CODEX_CONFIG`, its own `CODEX_HOME/config.toml`). So a checkout's `.codex/config.toml` (an `[mcp_servers]` command ran, `developer_instructions` reached the model) and `AGENTS.md` apply to an `acp:codex-acp` Worker: files any Worker can write. Native `codex-app-server` Workers are fixed in #181 (an explicit `untrusted` entry); codex-acp overrides that.\n\nAlso noted: the `CODEX_` prefix allowlist passes the user's own `CODEX_CONFIG` and `CODEX_PATH` into codex-acp; set or deny them in the spec.\n\n### Tasks\n- [ ] Owner decision: refuse `acp:codex-acp` for unattended Workers, drop it from the built-in agents, accept the risk, or patch or ask upstream for a way to keep a session root untrusted.\n- [ ] Implement the decision (e.g. `buildWorkerAdapters` refuses it in a Worker tier) and update ARCHITECTURE §6 and the capability matrix.\n- [ ] Set or deny `CODEX_CONFIG` and `CODEX_PATH` in the codex-acp spec.\n\n### Acceptance criteria\n- Either an unattended Worker cannot run on `acp:codex-acp`, or a test against the real agent with a hostile checkout shows its `.codex/config.toml` and `AGENTS.md` do not load.\n- The user's `CODEX_CONFIG` and `CODEX_PATH` never reach codex-acp unless the spec sets them.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (codex-acp, #181)._"
+    },
+    {
+      "title": "Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Found in #181 (verified live on Gemini CLI 0.67.0 over ACP): a Gemini Worker's checkout is untrusted (Tacet never passes `GEMINI_CLI_TRUST_WORKSPACE`, folder trust is on), which keeps the checkout's `.gemini/settings.json`, `GEMINI.md`, skills, agents and `.gemini/.env` out. But in an untrusted folder Gemini also never contacts the MCP server Tacet passes in `session/new` (no request at all; one once trusted), so Gemini Workers cannot use `escalate`, `report_progress` or the other Mini-conductor tools. Trusting the checkout would load everything above; no flag trusts a folder for MCP only.\n\n### Tasks\n- [ ] Owner decision: Gemini Workers without Mini-conductor tools (escalation through ACP permission requests only), trust the checkout and accept what it loads, or find or ask upstream for an MCP-only trust.\n- [ ] Implement it, with a test against the real CLI, and update ARCHITECTURE §6 and the capability matrix.\n\n### Acceptance criteria\n- A Gemini Worker either reaches Tacet's MCP server with none of the checkout's project files loaded (real-CLI test with a hostile checkout), or its missing tools are declared and handled so a Gemini Worker never waits on a tool it cannot call.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (Gemini, #181)._"
     }
   ]
 }
