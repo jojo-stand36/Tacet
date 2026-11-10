@@ -11,7 +11,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export function removeClaudeConfigDir(root: string, vendorSessionId: string): boolean {
   if (!UUID.test(vendorSessionId)) throw new Error('a Claude session is named by its UUID');
   const dir = join(root, vendorSessionId);
-  if (!ownDir(dir)) return false;
+  if (!isOwnDir(dir)) return false;
   rmSync(dir, { recursive: true, force: true });
   return true;
 }
@@ -39,7 +39,7 @@ export function sweepClaudeConfigDirs(
     const dir = join(root, name);
     // One directory that cannot be read (or is removed meanwhile) never stops the others.
     try {
-      if (!ownDir(dir)) continue;
+      if (!isOwnDir(dir)) continue;
       if (now - newestMtime(dir) < maxAgeMs) continue;
       rmSync(dir, { recursive: true, force: true });
       removed++;
@@ -50,7 +50,8 @@ export function sweepClaudeConfigDirs(
   return removed;
 }
 
-function ownDir(path: string): boolean {
+/** A real directory (not a symlink) of the current user. */
+export function isOwnDir(path: string): boolean {
   try {
     const st = lstatSync(path);
     return st.isDirectory() && (!process.getuid || st.uid === process.getuid());

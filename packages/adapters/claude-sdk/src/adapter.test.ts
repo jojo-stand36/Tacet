@@ -432,6 +432,29 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
       await adapter.close(h);
     });
 
+    it('removes a fresh dir when the session is refused or its MCP config cannot be written', async () => {
+      // Effort is checked against `supportedModels()`, which this stub lacks: refused.
+      const stub = stubQuery();
+      const adapter = make(stub);
+      await expect(adapter.start({ cwd: root, effort: 'high' })).rejects.toThrow();
+      expect(readdirSync(configRoot())).toEqual([]);
+      // A refused resume keeps the session's dir: it can be resumed again without the effort.
+      const h = await adapter.start({ cwd: root });
+      await adapter.close(h);
+      const v = h.vendorSessionId as string;
+      await expect(
+        adapter.start({ cwd: root, resume: { vendorSessionId: v }, effort: 'high' }),
+      ).rejects.toThrow();
+      expect(readdirSync(configRoot())).toEqual([v]);
+      // An MCP config dir that is a file: the write fails, and the fresh dir goes with it.
+      writeFileSync(join(root, 'not-a-dir'), '');
+      const bad = make(stubQuery(), { mcpConfigDir: join(root, 'not-a-dir') });
+      await expect(
+        bad.start({ cwd: root, mcpServers: [{ name: 't', url: 'http://127.0.0.1:1' }] }),
+      ).rejects.toThrow();
+      expect(readdirSync(configRoot())).toEqual([v]);
+    });
+
     it('removes the dir of a fresh session that failed to start', async () => {
       const adapter = new ClaudeSdkAdapter({
         query: (() => {

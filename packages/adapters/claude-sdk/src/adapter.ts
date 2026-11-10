@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { cpSync, lstatSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -36,7 +36,7 @@ import {
 } from '@tacet/core';
 import { defaultStateDir, repoStateDir } from '@tacet/core/node';
 import { authEnv, type ClaudeAuthRoute, claudeEnvAllow } from './auth.js';
-import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
+import { isOwnDir, removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
 
 /** Vendor session ids are UUIDs: they name each session's config directory. */
@@ -223,8 +223,6 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   #swept = false;
   /** Config roots already swept by this adapter (#237). */
   readonly #sweptRoots = new Set<string>();
-  /** Vendor ids being resumed or forked from by a `start()` in progress: never swept or discarded. */
-  readonly #starting = new Map<string, number>();
 
   constructor(opts: ClaudeSdkAdapterOptions = {}) {
     this.#opts = opts;
@@ -310,25 +308,25 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           }
           // The fork resumes the source's transcript in a copy of its directory, so the source's
           // own stays as it is and each can be removed alone. Links are copied as links.
-          cpSync(source, configDir, {
-            recursive: true,
-            errorOnExist: true,
-            verbatimSymlinks: true,
-          });
+          // Set first: a copy that fails partway is removed too.
+          madeConfigDir = true;
+          try {
+            cpSync(source, configDir, {
+              recursive: true,
+              errorOnExist: true,
+              verbatimSymlinks: true,
+            });
+          } catch (err) {
+            rmSync(configDir, { recursive: true, force: true });
+            throw err;
+          }
         } else {
           mkdirSync(configDir, { mode: 0o700 });
+          madeConfigDir = true;
         }
-        madeConfigDir = true;
       }
       env.CLAUDE_CONFIG_DIR = configDir;
     }
-    if (claimed !== undefined) this.#starting.set(claimed, (this.#starting.get(claimed) ?? 0) + 1);
-    const unclaim = () => {
-      if (claimed === undefined) return;
-      const n = (this.#starting.get(claimed) ?? 1) - 1;
-      if (n > 0) this.#starting.set(claimed, n);
-      else this.#starting.delete(claimed);
-    };
     // A session that never started leaves nothing to resume.
     const unmake = () => {
       if (madeConfigDir && configDir) rmSync(configDir, { recursive: true, force: true });
@@ -345,13 +343,20 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         // Tried again by the next Mini-conductor that starts.
       }
     }
-    const mcpConfigPath = opts.mcpServers?.length
-      ? writeMcpConfig(opts.mcpServers, {
-          sessionId: id,
-          worktree: opts.cwd,
-          ...(this.#opts.mcpConfigDir !== undefined ? { dir: this.#opts.mcpConfigDir } : {}),
-        })
-      : undefined;
+    let mcpConfigPath: string | undefined;
+    try {
+      mcpConfigPath = opts.mcpServers?.length
+        ? writeMcpConfig(opts.mcpServers, {
+            sessionId: id,
+            worktree: opts.cwd,
+            ...(this.#opts.mcpConfigDir !== undefined ? { dir: this.#opts.mcpConfigDir } : {}),
+          })
+        : undefined;
+    } catch (err) {
+      // Nothing started: the dir made above is removed with it.
+      unmake();
+      throw err;
+    }
 
     const inbox = new AsyncQueue<SDKUserMessage>();
     const handle: SessionHandle = { id, vendorSessionId };
@@ -451,7 +456,6 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     } catch (err) {
       if (mcpConfigPath) removeMcpConfig(mcpConfigPath);
       unmake();
-      unclaim();
       throw err;
     }
 
@@ -480,7 +484,6 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       loop: Promise.resolve(),
     };
     this.#sessions.set(id, s);
-    unclaim();
     this.#setState(s, 'idle');
     s.loop = this.#read(s);
     if (effort !== undefined) {
@@ -578,11 +581,11 @@ export class ClaudeSdkAdapter implements AgentAdapter {
    * The closed session `vendorSessionId` will never be resumed (#153, #237): remove its config
    * directory under Tacet's state dir, its transcript included. Only on the API-key route, where
    * Tacet made that directory; never the user's own `~/.claude`. Refused while that session is
-   * open, or being resumed or forked from.
+   * open.
    */
   async discard(vendorSessionId: string, cwd: string): Promise<void> {
-    if (!UUID.test(vendorSessionId)) throw new Error('a Claude session is named by its UUID');
     if (!this.#ownConfigDirs) return;
+    if (!UUID.test(vendorSessionId)) throw new Error('a Claude session is named by its UUID');
     if (this.#liveIds().has(vendorSessionId)) {
       throw new Error(`Claude session ${vendorSessionId} is still open`);
     }
@@ -614,9 +617,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     );
   }
 
-  /** Vendor ids of the sessions open, or being resumed or forked from, in this adapter. */
+  /** Vendor ids of the sessions open in this adapter. */
   #liveIds(): Set<string> {
-    const ids = new Set(this.#starting.keys());
+    const ids = new Set<string>();
     for (const s of this.#sessions.values()) {
       if (s.handle.vendorSessionId !== undefined) ids.add(s.handle.vendorSessionId);
     }
@@ -924,14 +927,4 @@ export function toPermissionResult(
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/** A real directory (not a symlink) of the current user. */
-function isOwnDir(path: string): boolean {
-  try {
-    const st = lstatSync(path);
-    return st.isDirectory() && (!process.getuid || st.uid === process.getuid());
-  } catch {
-    return false;
-  }
 }
