@@ -55,10 +55,14 @@ export function readState(store: EventStore): TasksState {
   return store.replay(tasksProjection);
 }
 
-/** Open escalations of a task and its sub-tasks: id, the task it is on, the question. */
+/**
+ * Open escalations of a task and its sub-tasks: id, the task it is on, the question. Those of a
+ * sub-task or task that has ended (canceled, failed, completed) are left out: an answer to them
+ * would never reach a Worker, so nobody waits on it (#202).
+ */
 export function pendingEscalations(state: TasksState, root: string) {
   return Object.values(state.tasks)
-    .filter((t) => isSubtaskOf(t.task.id, root))
+    .filter((t) => isSubtaskOf(t.task.id, root) && !DONE_STATES.has(t.state))
     .flatMap((t) =>
       Object.entries(t.escalations)
         .filter(([, x]) => x.status === 'pending')
