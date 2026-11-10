@@ -629,24 +629,11 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
             await new Promise((r) => setTimeout(r, 25));
           }
         }
-        const running = (() => {
-          try {
-            const stat = readFileSync(`/proc/${childPid}/stat`, 'utf8');
-            return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
-          } catch {
-            try {
-              process.kill(childPid as number, 0);
-              return process.platform !== 'linux';
-            } catch {
-              return false;
-            }
-          }
-        })();
-        expect(running).toBe(false);
+        expect(running(childPid)).toBe(false);
       } finally {
         // Never leave the SIGTERM-ignoring child running on the test machine.
         try {
-          if (childPid) process.kill(childPid, 'SIGKILL');
+          if (childPid && running(childPid)) process.kill(childPid, 'SIGKILL');
         } catch {}
       }
     },
@@ -677,9 +664,13 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
         expect(alive).toBe(false);
         // Ended at once, though: nothing more can be sent to it while its group is reaped.
         await expect(adapter.send(h, { text: 'again' })).rejects.toThrow('has ended');
+        // close() after it waits on that one reap: the group, seen empty, is never polled again.
+        const before = Date.now();
+        await adapter.close(h);
+        expect(Date.now() - before).toBeLessThan(250);
       } finally {
         try {
-          if (childPid) process.kill(childPid, 'SIGKILL');
+          if (childPid && running(childPid)) process.kill(childPid, 'SIGKILL');
         } catch {}
       }
     },

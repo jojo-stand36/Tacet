@@ -180,6 +180,12 @@ interface Session {
   deltas?: DeltaScrubber;
   exited: Promise<void>;
   /**
+   * Resolves once the process has exited and its whole group is gone: the one reap of the group
+   * (#198). `close()` waits on it rather than polling the group again, since an id seen empty
+   * may belong to another group by then.
+   */
+  gone?: Promise<void>;
+  /**
    * Set synchronously on exit; after that the process group is signalled only right after a
    * running member was seen (`#terminate`), never blindly: its id could be reused once empty.
    */
@@ -554,23 +560,24 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.#sessions.set(handle.id, session);
     // Ended at once, so nothing more is sent to it; reported only once its whole process group is
     // gone, so nothing of it still runs (or writes into the worktree) after the error (#198).
-    void exited
-      .then(() => {
-        this.#exited(session);
-        return this.#reapGroup(proc);
-      })
-      .then(() => this.#onExit(session));
+    session.gone = exited.then(() => {
+      this.#exited(session);
+      return this.#reapGroup(proc);
+    });
+    void session.gone.then(() => this.#onExit(session));
 
     // The own-login route needs the user to have logged in to Codex; say so instead of failing
     // on the first turn.
     if (route === 'subscription') {
       const account = await rpc.request<Obj>('account/read', {}).catch(() => undefined);
+      // Exited meanwhile: its error is reported once its group is gone, not an `idle` first.
+      if (session.ended) return handle;
       if (account && account.account === null && account.requiresOpenaiAuth === true) {
         this.#setState(session, 'auth_required', 'log in with `codex login` first');
         return handle;
       }
     }
-    this.#setState(session, 'idle');
+    if (!session.ended) this.#setState(session, 'idle');
     return handle;
   }
 
@@ -665,7 +672,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // End of input asks app-server to finish; then SIGTERM (forwarded by the npm wrapper to
     // the native binary), then SIGKILL.
     s.proc.stdin?.end();
-    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined);
+    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined, s.gone);
     this.#setState(s, 'done');
     s.events.end();
     this.#sessions.delete(h.id);
@@ -685,7 +692,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
    * group and SIGKILLs what is left. The group is signalled only while it has a running member
    * (the process itself, or a member seen just before), so a reused group id is never signalled.
    */
-  async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
+  async #terminate(
+    proc: ChildProcess,
+    exited: Promise<void>,
+    hasExited: () => boolean,
+    gone?: Promise<void>,
+  ) {
     const within = (ms: number) =>
       Promise.race([
         exited.then(() => true),
@@ -703,14 +715,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // servers: not verified) got SIGTERM when it exited, but may still be shutting down and
     // writing into the Worker's CODEX_HOME or checkout: wait for the whole group (#191). A child
     // that starts a group or session of its own is not covered.
-    await this.#reapGroup(proc);
+    // A registered session's group is reaped once, by its exit handler: wait for that.
+    await (gone ?? this.#reapGroup(proc));
   }
 
   /**
    * Once the leader has exited (and its group had SIGTERM), wait for the rest of the group, then
    * SIGKILL what is left. SIGKILL only right after seeing a running member, synchronously: a pid
    * is not reused while it is the id of a group with members, so this cannot reach a reused group
-   * id.
+   * id. Called once per process: never again once its group has been seen empty.
    */
   async #reapGroup(proc: ChildProcess): Promise<void> {
     const timeout = this.#opts.killTimeoutMs ?? 5000;
