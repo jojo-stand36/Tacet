@@ -1,4 +1,4 @@
-import type { Task } from '@tacet/core';
+import { assertSafePrompt, type Task } from '@tacet/core';
 
 /**
  * Prompts for the planner and for Workers. The planner role follows the idea of Omnigent's Polly
@@ -23,11 +23,11 @@ Reply with JSON only, no prose and no code fences, in exactly this shape:
 "kind": "implement", "dependsOn": ["other-key"]}]}`;
 
 export function plannerPrompt(task: Task): string {
-  return [
+  return safePrompt([
     `Task: ${task.goal}`,
     'Acceptance criteria:',
     ...task.acceptanceCriteria.map((c) => `- ${c}`),
-  ].join('\n');
+  ]);
 }
 
 export const WORKER_SYSTEM_PROMPT = `You are a Worker agent run by a Tacet Mini-conductor. You work alone in
@@ -38,13 +38,22 @@ report_progress at milestones, escalate when you are blocked on a decision only 
 When the sub-task is done, end your turn with a short summary of what you did.`;
 
 export function workerPrompt(subtask: Task, feedback?: string, context: string[] = []): string {
-  return [
+  return safePrompt([
     `Sub-task: ${subtask.goal}`,
     'Acceptance criteria:',
     ...subtask.acceptanceCriteria.map((c) => `- ${c}`),
     ...(feedback ? ['', `The previous attempt did not succeed: ${feedback}`] : []),
     ...(context.length > 0 ? ['', ...context] : []),
-  ].join('\n');
+  ]);
+}
+
+/**
+ * Join lines into a prompt. Every prompt the Mini-conductor sends goes through here or
+ * `assertSafePrompt`: none may start with a character an interactive Worker CLI runs as a
+ * command (`/`, `!`; #15).
+ */
+export function safePrompt(lines: string[], sep = '\n'): string {
+  return assertSafePrompt(lines.join(sep));
 }
 
 export const RESUME_PROMPT =
