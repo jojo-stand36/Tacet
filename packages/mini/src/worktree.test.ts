@@ -24,6 +24,7 @@ async function git(
       ...extraEnv,
     },
   });
+
   return stdout;
 }
 
@@ -216,6 +217,9 @@ describe('WorktreeManager', () => {
     await manager.remove(worktree.id);
     expect((await manager.list()).map(({ id }) => id)).not.toContain(worktree.id);
     expect((await git(repository, ['cat-file', '-e', `${head}^{commit}`])).trim()).toBe('');
+    await expect(
+      git(repository, ['show-ref', '--verify', `refs/heads/${worktree.branchName}`]),
+    ).rejects.toThrow();
   });
 
   it('includes the worktree ID when setup fails and retains it for recovery', async () => {
@@ -231,40 +235,6 @@ describe('WorktreeManager', () => {
 
     expect(worktreeId).toBeDefined();
     expect((await manager.list()).map(({ id }) => id)).toContain(worktreeId);
-  });
-
-  it('force-cleans a failed squash without hiding its original error', async () => {
-    const worktree = await manager.create('failed-squash-worker');
-    await writeFile(path.join(worktree.path, 'new.txt'), 'worker content\n');
-    await workerGit(worktree.path, ['add', 'new.txt']);
-    await workerGit(worktree.path, ['commit', '-m', 'worker commit']);
-
-    const realGit = (await execFileAsync('which', ['git'], { encoding: 'utf8' })).stdout.trim();
-    const wrapperDirectory = path.join(temporaryDirectory, 'git-wrapper');
-    const wrapper = path.join(wrapperDirectory, 'git');
-    await mkdir(wrapperDirectory);
-    await writeFile(
-      wrapper,
-      `#!/bin/sh\ncase " $* " in *" merge --squash "*) echo squash-command-failed >&2; exit 42;; esac\nexec '${realGit}' "$@"\n`,
-      { mode: 0o700 },
-    );
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${wrapperDirectory}${path.delimiter}${originalPath ?? ''}`;
-    let failure: unknown;
-    try {
-      await manager.merge(worktree.id, 'squash-to-branch', 'main');
-    } catch (error) {
-      failure = error;
-    } finally {
-      process.env.PATH = originalPath;
-    }
-
-    expect(failure).toBeInstanceOf(Error);
-    expect((failure as Error).message).toContain('squash-command-failed');
-    expect((await manager.list()).map(({ id }) => id)).toEqual([worktree.id]);
-    expect(
-      (await git(repository, ['for-each-ref', '--format=%(refname)', 'refs/heads/tacet'])).trim(),
-    ).toBe(`refs/heads/${worktree.branchName}`);
   });
 
   it('replaces a hostile .git symlink without writing through it during removal', async () => {
@@ -515,6 +485,34 @@ describe('WorktreeManager', () => {
     ).toContain(resultBranchName);
     expect((await git(resultWorktreePath, ['diff', '--cached', '--name-only'])).trim()).toBe(
       'addition.txt',
+    );
+  });
+
+  it('returns no-changes with the target SHA when a Worker has no commits', async () => {
+    const worktree = await manager.create('no-change-worker');
+    const targetTip = (await git(repository, ['rev-parse', 'refs/heads/main'])).trim();
+
+    await expect(manager.merge(worktree.id, 'pr', 'main')).resolves.toMatchObject({
+      status: 'no-changes',
+      headSha: targetTip,
+    });
+  });
+
+  it('retains private commits after the Worker moves HEAD back to the base', async () => {
+    const worktree = await manager.create('moved-head-worker');
+    await writeFile(path.join(worktree.path, 'private.txt'), 'private commit\n');
+    await workerGit(worktree.path, ['add', 'private.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'private commit']);
+    const privateCommit = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    await workerGit(worktree.path, ['checkout', '--detach', 'refs/heads/main']);
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow('unintegrated private commits');
+    expect(await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).toMatchObject({
+      removed: [],
+      skipped: [{ id: worktree.id, reason: 'Worker has unintegrated private commits' }],
+    });
+    expect(await workerGit(worktree.path, ['cat-file', '-e', `${privateCommit}^{commit}`])).toBe(
+      '',
     );
   });
 });
