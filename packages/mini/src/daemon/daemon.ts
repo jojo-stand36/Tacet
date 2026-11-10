@@ -878,6 +878,8 @@ export class MiniConductor {
     const replaces = this.#o.integrator?.replaces?.bind(this.#o.integrator);
     if (!replaces) return [];
     const superseded: string[] = [];
+    const workspace = await this.#o.workspaces.get(workspaceId);
+    if (!workspace) return [];
     for (const s of sessions) {
       if (s.workspaceId !== workspaceId) continue;
       const integrated = this.#o.store
@@ -887,7 +889,9 @@ export class MiniConductor {
         .map((d) => d.commit as string);
       for (let i = 0; i + 1 < integrated.length; i += 1) {
         const [earlier, later] = [integrated[i], integrated[i + 1]] as [string, string];
-        if (await replaces(earlier, later).catch(() => false)) superseded.push(earlier);
+        if (await replaces(earlier, later, workspace).catch(() => false)) {
+          superseded.push(earlier);
+        }
       }
     }
     return superseded;

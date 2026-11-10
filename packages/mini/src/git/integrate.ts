@@ -23,7 +23,7 @@ import {
   workerWorktree,
 } from '@tacet/core/node';
 import { type Integrator, type Workspace, WorktreeRefusedError } from '../daemon/ports.js';
-import { branchTip, detectLanded, isReplacement, type Landed } from './landed.js';
+import { amendedInReflog, branchTip, detectLanded, isReplacement, type Landed } from './landed.js';
 import { combineCommits, setTaskBranch } from './merge.js';
 
 export { WorktreeRefusedError };
@@ -586,8 +586,17 @@ export class GitIntegrator implements Integrator {
     return landed;
   }
 
-  replaces(earlier: string, later: string): Promise<boolean> {
-    return isReplacement({ repoRoot: this.#repoRoot, env: this.#env }, earlier, later);
+  async replaces(earlier: string, later: string, workspace: Workspace): Promise<boolean> {
+    if (!(await isReplacement({ repoRoot: this.#repoRoot, env: this.#env }, earlier, later))) {
+      return false;
+    }
+    let wt: WorkerWorktree | undefined;
+    try {
+      wt = workerWorktree(workspace.path, this.#repoRoot);
+    } catch {
+      return false;
+    }
+    return wt ? amendedInReflog(join(wt.gitDir, 'logs', 'HEAD'), later) : false;
   }
 
   async publish(taskId: string, commit: string): Promise<string> {

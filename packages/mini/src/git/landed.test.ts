@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { detectLanded, isReplacement } from './landed.js';
+import { amendedInReflog, detectLanded, isReplacement } from './landed.js';
 
 describe('detectLanded (#210)', () => {
   let root: string;
@@ -186,5 +186,24 @@ describe('detectLanded (#210)', () => {
     expect(await isReplacement(o, first, unrelatedBase)).toBe(true);
     expect(await isReplacement(o, first, first)).toBe(false);
     expect(await isReplacement(o, first, 'HEAD')).toBe(false);
+  });
+
+  it('reads an amend or a rebase squash from the reflog, never a commit after a reset', () => {
+    const later = 'a'.repeat(40);
+    const reflog = join(root, 'reflog');
+    const line = (message: string) =>
+      `${'0'.repeat(40)} ${later} Tacet Test <test@example.invalid> 1700000000 +0000\t${message}\n`;
+    for (const [message, amended] of [
+      ['commit (amend): work, fixed', true],
+      ['rebase -i (squash): work', true],
+      ['rebase (fixup): work', true],
+      ['commit: unrelated fix', false],
+      ['reset: moving to HEAD~1', false],
+    ] as const) {
+      writeFileSync(reflog, line(message));
+      expect(amendedInReflog(reflog, later), message).toBe(amended);
+    }
+    expect(amendedInReflog(join(root, 'missing'), later)).toBe(false);
+    expect(amendedInReflog(reflog, 'HEAD')).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
-import { SAFE_GIT_ARGS } from '@tacet/core/node';
+import { readWorkerFile, SAFE_GIT_ARGS } from '@tacet/core/node';
 
 const COMMIT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 /** A branch ref: no whitespace or characters git refuses in a ref, never `..` or `@{`. */
@@ -132,6 +132,29 @@ export async function isReplacement(
     (await git(['rev-parse', '--verify', '--quiet', `${commit}^1`]).catch(() => '')).trim();
   const [a, b] = await Promise.all([parent(earlier), parent(later)]);
   return COMMIT_ID.test(a) && a === b;
+}
+
+/**
+ * Whether the Worker's HEAD reflog (`logs/HEAD` in its git dir, read as data) made `later` by
+ * amending (`commit (amend)`) or by squashing or fixing up in a rebase, never by a plain commit
+ * after a reset (#210). False on any doubt: no reflog, a symlink, an unreadable or huge file.
+ */
+export function amendedInReflog(reflogPath: string, later: string): boolean {
+  if (!COMMIT_ID.test(later)) return false;
+  let text: string;
+  try {
+    text = readWorkerFile(reflogPath, 4 * 1024 * 1024);
+  } catch {
+    return false;
+  }
+  for (const line of text.split('\n')) {
+    const match = /^[0-9a-f]+ ([0-9a-f]+) [^\t]*\t(.*)$/.exec(line);
+    if (match?.[1] !== later) continue;
+    const message = match[2] ?? '';
+    if (/^commit \(amend\):/.test(message)) return true;
+    if (/^rebase( -i| -m)? \((squash|fixup)\):/.test(message)) return true;
+  }
+  return false;
 }
 
 /**

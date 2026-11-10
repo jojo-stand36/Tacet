@@ -68,10 +68,11 @@ export interface Integrator {
     target: string,
   ): Promise<{ how: 'merge' | 'squash'; landedAs?: string } | undefined>;
   /**
-   * Whether `later` replaces `earlier` as an amend does: the same first parent (#210). Without it,
-   * no integrated commit counts as superseded.
+   * Whether `later` is an amend of `earlier` in `workspace` (#210): the same first parent, and the
+   * Worker's own reflog made `later` by amending or squashing, not by a commit after a reset.
+   * Without it, no integrated commit counts as superseded.
    */
-  replaces?(earlier: string, later: string): Promise<boolean>;
+  replaces?(earlier: string, later: string, workspace: Workspace): Promise<boolean>;
 }
 
 /** Commits that cannot be combined without a person: `files` conflict. */
