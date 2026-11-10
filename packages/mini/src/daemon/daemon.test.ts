@@ -349,6 +349,61 @@ describe('MiniConductor', () => {
     ]);
   });
 
+  it('discards a session stopped for a restart that is then not resumed (#153)', async () => {
+    const d1 = make({
+      planner: new FixedPlanner([{ key: 'long', goal: 'long [hold]', acceptanceCriteria: ['ok'] }]),
+    });
+    await d1.start();
+    const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('worker.vendor_session', `${id}/1`).length, { timeout: 5000 })
+      .toBe(1);
+    const vendor = (
+      ofType('worker.vendor_session', `${id}/1`)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
+    d1.crashForTest();
+    expect(fake.discarded).toEqual([]);
+    // Restarted with Workers on another adapter: the old session is never resumed.
+    const oldFake = fake;
+    other = new ScriptedAdapter('other', () => ({ do: 'reply', text: 'done elsewhere' }));
+    const d2 = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'other', model: 'x' } } },
+      adapters: {
+        fake: { adapter: oldFake, authRoute: 'api_key' },
+        other: { adapter: other, authRoute: 'api_key' },
+      },
+    });
+    await d2.start();
+    await d2.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(oldFake.discarded.map((x) => x.vendorSessionId)).toEqual([vendor]);
+    expect(other.sessions.some((s) => s.opts.resume)).toBe(false);
+  });
+
+  it('discards a session whose resume failed (#153)', async () => {
+    const d1 = make({
+      planner: new FixedPlanner([{ key: 'long', goal: 'long [hold]', acceptanceCriteria: ['ok'] }]),
+    });
+    await d1.start();
+    const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('worker.vendor_session', `${id}/1`).length, { timeout: 5000 })
+      .toBe(1);
+    const vendor = (
+      ofType('worker.vendor_session', `${id}/1`)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
+    d1.crashForTest();
+    fake = new ScriptedAdapter('fake', () => ({ do: 'reply', text: 'done afresh' }));
+    fake.failResumes = true;
+    const d2 = make();
+    await d2.start();
+    await d2.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    // The failed resume's session, then the fresh one once it finished. (This scripted adapter
+    // numbers its sessions afresh, so the fresh one reuses the id: count both.)
+    expect(fake.discarded.map((x) => x.vendorSessionId)).toEqual([vendor, vendor]);
+  });
+
   it('resumes after a crash mid-task without redoing finished work', async () => {
     const d1 = make({
       planner: new FixedPlanner([
@@ -393,6 +448,11 @@ describe('MiniConductor', () => {
     // It resumed the same vendor session in the same checkout, told that it restarted.
     const resumed = fake.sessions.find((s) => s.opts.resume);
     expect(resumed?.opts.resume?.vendorSessionId).toBe(vendor);
+    // Once it finished, it will never be resumed again: discarded (#153), the crash's restart not.
+    // (This scripted adapter numbers its sessions afresh, so match the checkout too.)
+    expect(
+      fake.discarded.filter((x) => x.vendorSessionId === vendor && x.cwd === resumed?.opts.cwd),
+    ).toHaveLength(1);
     // With the restarted Mini-conductor's MCP config: a token minted for the new session (#128).
     const resumedSession = (
       ofType('worker.started', `${id}/2`).at(-1)?.data as { sessionId: string } | undefined

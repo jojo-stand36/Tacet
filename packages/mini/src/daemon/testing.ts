@@ -64,8 +64,12 @@ export class ScriptedAdapter implements AgentAdapter {
     return structuredClone(MOCK_CAPABILITIES);
   }
 
+  /** Make every resume fail, as for a vendor session that can no longer be found. */
+  failResumes = false;
+
   async start(opts: SessionOptions): Promise<SessionHandle> {
     if (this.startDelayMs > 0) await new Promise((r) => setTimeout(r, this.startDelayMs));
+    if (this.failResumes && opts.resume) throw new Error('no such session to resume');
     const n = ++this.#n;
     const handle: SessionHandle = {
       id: `${this.id}-${n}`,
@@ -119,6 +123,13 @@ export class ScriptedAdapter implements AgentAdapter {
 
   events(h: SessionHandle): AsyncIterable<AgentEvent> {
     return this.#get(h).events;
+  }
+
+  /** Sessions the Mini-conductor said will never be resumed (#153). */
+  readonly discarded: { vendorSessionId: string; cwd: string }[] = [];
+
+  async discard(vendorSessionId: string, cwd: string): Promise<void> {
+    this.discarded.push({ vendorSessionId, cwd });
   }
 
   status(h: SessionHandle): SessionState {
