@@ -1,4 +1,4 @@
-import { TaskTarget } from '@tacet/core';
+import { statusEntries, TaskTarget } from '@tacet/core';
 import type { EventStore, StoredEvent } from '@tacet/core/node';
 import type { Io } from '../io.js';
 import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
