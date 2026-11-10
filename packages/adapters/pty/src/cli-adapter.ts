@@ -27,8 +27,8 @@ import { plainText, TerminalBuffer } from './terminal.js';
 /**
  * What a CLI with no structured interface supports through the PTY adapter (#15). Its state is
  * read from its output: the turn ends when the CLI shows its ready prompt again (or goes quiet),
- * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals, and
- * it is not resumed. `modelSwitch` is `launch-only` because the preset's command fixes the model:
+ * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals. It is
+ * resumed only if its preset has `resumeArgs` (`resume` is then reported). `modelSwitch` is `launch-only` because the preset's command fixes the model:
  * `start({ model })` is refused, never ignored.
  */
 export const PTY_CLI_CAPABILITIES: AdapterCapabilities = {
@@ -61,7 +61,19 @@ export interface PtyPreset {
    * a CLI that can think silently for longer than that.
    */
   readyPrompt?: string;
+  /**
+   * Arguments added to `command` to continue the CLI's most recent session in the working
+   * directory (#157), e.g. `['resume', '--last']` for Codex, whose `--last` picks among the
+   * sessions of the current directory (codex-cli 0.167.0 `resume --help`), or `['--resume',
+   * 'latest']` for Gemini CLI, whose sessions are per project (0.67.0 `--help`). Tacet resumes a
+   * Worker only in the checkout it ran in, so "the last session here" is that Worker's. A generic
+   * CLI has no session id Tacet can read, so the session's `vendorSessionId` is a marker.
+   */
+  resumeArgs?: string[];
 }
+
+/** `vendorSessionId` of a session whose CLI resumes by `resumeArgs`: there is no real id. */
+export const PTY_LAST_SESSION = 'pty:last-in-checkout';
 
 export interface PtyCliAdapterOptions {
   /** The preset's slug: the adapter is `pty:<slug>`. */
@@ -156,12 +168,19 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.preset.command.length === 0 || opts.preset.command.some((a) => a === '')) {
       throw new Error(`pty:${opts.slug}: command must be a non-empty list of strings`);
     }
+    const resume = opts.preset.resumeArgs;
+    if (resume !== undefined && (resume.length === 0 || resume.some((a) => a === ''))) {
+      throw new Error(`pty:${opts.slug}: resume arguments must be a non-empty list of strings`);
+    }
     this.#opts = opts;
     this.id = `pty:${opts.slug}`;
   }
 
   capabilities(): AdapterCapabilities {
-    return structuredClone(PTY_CLI_CAPABILITIES);
+    return {
+      ...structuredClone(PTY_CLI_CAPABILITIES),
+      resume: this.#opts.preset.resumeArgs !== undefined,
+    };
   }
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
@@ -174,7 +193,9 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.contextWindow !== undefined) {
       throw new ProfileRefusedError('contextWindow', `${this.id} does not set a context size`);
     }
-    if (opts.resume) throw new Error(`${this.id} does not resume sessions`);
+    const resumeArgs = this.#opts.preset.resumeArgs;
+    if (opts.resume && !resumeArgs) throw new Error(`${this.id} does not resume sessions`);
+    if (opts.resume?.fork) throw new Error(`${this.id} cannot fork a session`);
     if (opts.mcpServers?.length) {
       throw new Error(
         `${this.id} cannot be given MCP servers: a generic CLI has no known way to take them`,
@@ -209,13 +230,18 @@ export class PtyCliAdapter implements AgentAdapter {
       .sort((a, b) => b.length - a.length);
     const cols = this.#opts.cols ?? 200;
     const rows = this.#opts.rows ?? 50;
-    const [file, ...args] = preset.command as [string, ...string[]];
+    const [file, ...command] = preset.command as [string, ...string[]];
+    const args = opts.resume && resumeArgs ? [...command, ...resumeArgs] : command;
     const pty = spawn(file, args, { cwd: realpathSync(opts.cwd), env, cols, rows });
     let resolveExit!: () => void;
     const exited = new Promise<void>((r) => {
       resolveExit = r;
     });
-    const handle: SessionHandle = { id: randomUUID() };
+    const handle: SessionHandle = {
+      id: randomUUID(),
+      // Resumable: the daemon records a vendor session only when there is one to resume.
+      ...(resumeArgs ? { vendorSessionId: PTY_LAST_SESSION } : {}),
+    };
     const s: Session = {
       handle,
       pty,

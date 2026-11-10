@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { PtyCliAdapter, stripEcho } from './cli-adapter.js';
+import { PTY_LAST_SESSION, PtyCliAdapter, stripEcho } from './cli-adapter.js';
 import { loadPty, type Pty, type PtySpawnOptions } from './pty.js';
 
 const FAKE = join(import.meta.dirname, 'testing', 'fake-cli.mjs');
@@ -46,6 +46,9 @@ describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
     adapter = make();
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const reply = (events: { t: string; text?: string }[]) =>
+    events.map((e) => (e.t === 'message.delta' ? e.text : '')).join('');
 
   async function turn(a: PtyCliAdapter, h: SessionHandle, tap: EventTap, text: string) {
     const from = tap.events.length;
@@ -120,6 +123,44 @@ describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
     expect(names).not.toContain('OPENAI_API_KEY');
     expect(dropped).toEqual([['OPENAI_API_KEY']]);
     await a.close(h);
+  });
+
+  it('resumes the last session in the checkout through the preset resume arguments (#157)', {
+    timeout: 60_000,
+  }, async () => {
+    expect(adapter.capabilities().resume).toBe(false);
+    const cwd = realpathSync(mkdtempSync(join(root, 'wt-')));
+    const resumable = make({
+      preset: {
+        command: [process.execPath, FAKE],
+        readyPrompt: 'fake>',
+        resumeArgs: ['--continue-last'],
+      },
+    });
+    expect(resumable.capabilities().resume).toBe(true);
+    const first = await resumable.start({ cwd });
+    expect(first.vendorSessionId).toBe(PTY_LAST_SESSION);
+    const tap1 = new EventTap(resumable.events(first));
+    await turn(resumable, first, tap1, 'REMEMBER blue');
+    await resumable.close(first);
+
+    // A new session starts empty; a resumed one continues the last one in that checkout.
+    const fresh = await resumable.start({ cwd });
+    const tap2 = new EventTap(resumable.events(fresh));
+    expect(reply((await turn(resumable, fresh, tap2, 'RECALL')).events)).toContain('(nothing)');
+    await resumable.close(fresh);
+    const resumed = await resumable.start({
+      cwd,
+      resume: { vendorSessionId: PTY_LAST_SESSION },
+    });
+    const tap3 = new EventTap(resumable.events(resumed));
+    expect(reply((await turn(resumable, resumed, tap3, 'RECALL')).events)).toContain(
+      'recalled: blue',
+    );
+    await expect(
+      resumable.start({ cwd, resume: { vendorSessionId: PTY_LAST_SESSION, fork: true } }),
+    ).rejects.toThrow(/fork/);
+    await resumable.close(resumed);
   });
 
   it('refuses what a generic CLI cannot do, and reports a crash once', {

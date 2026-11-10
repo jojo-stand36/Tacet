@@ -145,7 +145,7 @@ budget:
 auth:
   unattended: api_key      # default: API key for parallel or unattended Workers
   interactive: subscription
-agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt; resume_flag and process_name are not used yet; the built-in Claude preset is pty:claude)
+agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt, resume_flag = argument(s) that continue the CLI's last session in the Worker's checkout, e.g. [resume, --last]; the built-in Claude preset is pty:claude)
   goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
   # a tier on such an agent: tiers.worker: { adapter: "acp:goose" } (no model: its command fixes it)
 policies:

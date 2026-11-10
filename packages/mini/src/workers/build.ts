@@ -154,6 +154,7 @@ export function buildWorkerAdapters(
           env,
           secrets: Object.values(env),
           ...(preset.ready_prompt !== undefined ? { readyPrompt: preset.ready_prompt } : {}),
+          ...(preset.resume_flag !== undefined ? { resumeArgs: [preset.resume_flag].flat() } : {}),
         },
       });
     }
