@@ -1500,6 +1500,17 @@
       "body": "Found in the #210 design review. A sub-task with no dependencies starts its checkout from whichever branch the user has checked out at that moment (`workspaces.create(sessionId, undefined)` resolves the repo's current branch). If the user switches branch while a task runs, its sub-tasks start from different branches: their work is combined across unrelated bases, and #210's landed sweep cannot tell which branch the task targets, so it keeps every checkout of the task.\n\n### Tasks\n- [ ] Record the task's target branch once, when it is created or planned (an event field), and start every sub-task without dependencies from that branch's commit at that time, or from the branch itself\n- [ ] Use the recorded target in the landed sweep instead of agreeing `worker.started.baseBranch`\n- [ ] Say in `tacet status` which branch a task targets\n\n### Acceptance criteria\n- Switching the main checkout's branch while a task runs does not change where its later sub-tasks start\n- A task whose sub-tasks all started from the recorded target is checked by the landed sweep against that target\n\n_See packages/mini/src/daemon/daemon.ts, packages/mini/src/worktree.ts, #210 and docs/ARCHITECTURE.md §2.4._"
     },
     {
+      "title": "Declare resume and fork for claude-acp and codex-acp after a live check",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "#146 lets a built-in ACP spec declare `fork: 'native'` (with `resume`), and the adapter forks by the unstable `session/fork` only when the session's `initialize` advertises it. No built-in agent declares either yet. Gemini 0.67.0 does not advertise fork, and `claude-acp` / `codex-acp` declare no `resume` through this adapter. Both vendor adapters advertise `sessionCapabilities.resume` and `fork` (spike #62; `claude-agent-acp` 0.101.0 `unstable_forkSession` copies the transcript under a new id and passes `_meta` to the new session).\n\nDeclaring them needs a live check: the source suggests the following, but does not prove it.\n\n### Tasks\n- [ ] Live, against the mock Messages API (claude-agent-acp) and the mock Responses API (codex-acp), check that a resumed and a forked Worker session keep the Worker options:\n  - claude-acp: `settingSources: []`, `strictMcpConfig`, and the file-tools-only set (#181, #206);\n  - codex-acp: its isolated `CODEX_HOME` and the never-authenticate setup.\n- [ ] Check that Tacet re-pins `sessionMode` after a resume or fork (a fork starts with the permission mode it records), and that the source session is left untouched.\n- [ ] Check that sessions resume across processes: `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are kept per repo.\n- [ ] Declare `resume: true` and `fork: 'native'` on the specs that pass, with tests, and record it in the capability matrix (`verify-vendor-facts`).\n\n### Acceptance criteria\n- A resumed and a forked `acp:claude-acp` Worker run with the same restrictions as a new one, shown live against the mock API.\n- The capability matrix records the versions checked and the date.\n\n_See #146, #181, #206, docs/adapters/spikes/62-acp-adapters and docs/adapters/capability-matrix.md §4._"
+    },
+    {
       "title": "pty:claude Workers: an @path in a prompt may read files unasked",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [

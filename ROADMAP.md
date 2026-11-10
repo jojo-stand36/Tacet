@@ -92,6 +92,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **ACP adapter: close() after a self-exit must not poll the reaped process group again** — `chore` `P2` `claude`
 - [ ] **Pin a task's target branch so its sub-tasks never start from different branches** — `feature` `P2` `claude`
+- [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
 
