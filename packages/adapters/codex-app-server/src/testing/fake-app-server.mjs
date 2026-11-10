@@ -23,6 +23,13 @@ if (mode === 'child') {
   const child = spawn('sleep', ['60'], { stdio: 'ignore' });
   log({ childPid: child.pid });
 }
+if (mode === 'child-term') {
+  // A child that ignores SIGTERM, like a tool or MCP server still shutting down (#191).
+  const child = spawn('sh', ['-c', 'trap "" TERM; while :; do sleep 0.1; done'], {
+    stdio: 'ignore',
+  });
+  log({ childPid: child.pid });
+}
 
 const complete = (turnId, status, extra = {}) => {
   send({
