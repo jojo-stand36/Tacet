@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync, statSync } from 'node:fs';
+import { type Dirent, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { redactSecrets } from '@tacet/core';
 
@@ -93,8 +93,9 @@ const FILE_TOOLS: Record<string, FileTool> = {
  * git hooks off), but the user's tools would, once the user opens or merges the branch: a hook,
  * an MCP server command or a task there runs code. Tacet's own `.tacet/` config is loaded by the
  * next `tacet run` on the merged branch (#227). Matched at any depth and in any letter case, on
- * the path as written and on the path after symlinks are resolved (a committed `.tacet` symlink
- * to `config/tacet` is still Tacet's config). A task that needs one of these escalates. The list
+ * the path as written and on the path after symlinks are resolved; a symlink in a protected name
+ * at the checkout's root, or inside a protected directory there, protects its target too (a
+ * committed `.tacet` symlink to `config/tacet` is still Tacet's config; `linkedConfig`). A task that needs one of these escalates. The list
  * cannot be complete (`package.json` scripts and a `Makefile` run code too, but are the work
  * itself); it covers the files that run without the user choosing to build or test.
  * Directories: anything inside them. Files: that name anywhere.
@@ -204,6 +205,13 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   } catch {
     return refuse('the Worker checkout is gone');
   }
+  // Where protected config really is when a symlink is involved; null when that cannot be told.
+  const linked = spec.writes ? linkedConfig(root) : [];
+  if (linked === null) {
+    return refuse(
+      `${name}: agent, hook or tool config in this checkout is a symlink that cannot be resolved inside it; escalate`,
+    );
+  }
   const targets: string[] = [];
   /** Where each path key landed: a glob is resolved from its tool's `path` (#213 review). */
   const landed: Record<string, string> = {};
@@ -215,9 +223,7 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     if (typeof at !== 'string') return refuse(`${name}: ${at.why}`);
     if (
       spec.writes &&
-      (protectedConfig(at) ||
-        protectedConfig(lexical(root, worktree, v)) ||
-        linkedConfig(root).some((l) => at === l || at.startsWith(`${l}${sep}`)))
+      (protectedConfig(at) || protectedConfig(lexical(root, worktree, v)) || within(at, linked))
     ) {
       return refuse(
         `${name}: agent, hook and tool config is not open to Workers; escalate if the task needs it`,
@@ -298,29 +304,85 @@ function segmentMatches(rawSeg: string, name: string): boolean {
   }
 }
 
+/** Entries a protected directory may hold before `linkedConfig` stops looking and fails closed. */
+const LINK_WALK_LIMIT = 2000;
+
 /**
- * Where protected config at the checkout's root really is when it is a symlink to elsewhere in
- * the checkout (`.tacet -> config/tacet`): what is written there is still read as that config.
- * Root-level names only, where Tacet and most tools load them; relative to the real root.
+ * Where protected config really is when a symlink is involved, as folded segments relative to the
+ * real root (#227 review): a root-level protected name with a symlink at any of its components
+ * (`.tacet -> config/tacet`, `.github -> ci/github`), and every symlink inside a protected
+ * directory at the root (`.tacet/tacet.yaml -> ../cfg.yaml`). What is written at a target is
+ * still read as that config. Null, so every write is refused, when that cannot be told: a dangling
+ * link (a write could create its target), a link to the checkout root, or a protected directory
+ * too big to walk. A target outside the checkout needs nothing: writes there are refused anyway.
  */
-function linkedConfig(root: string): string[] {
-  const out: string[] = [];
+function linkedConfig(root: string): string[][] | null {
+  const out: string[][] = [];
+  /** False when the target is the root itself. */
+  const add = (real: string): boolean => {
+    const r = relative(root, real);
+    if (r === '') return false;
+    if (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) out.push(r.split(sep).map(fold));
+    return true;
+  };
   const names = [
-    ...PROTECTED_DIRS.map((d) => d.join(sep)),
-    ...PROTECTED_FILES,
-    ...PROTECTED_IN.map(([d, f]) => join(d, f)),
+    ...PROTECTED_DIRS,
+    ...PROTECTED_FILES.map((f) => [f]),
+    ...PROTECTED_IN.map(([d, f]) => [d, f]),
   ];
-  for (const name of names) {
-    const p = join(root, name);
+  let seen = 0;
+  for (const segs of names) {
+    // The deepest existing prefix of the name, and whether a symlink is on the way to it.
+    let link = false;
+    let i = 0;
+    for (; i < segs.length; i++) {
+      try {
+        if (lstatSync(join(root, ...segs.slice(0, i + 1))).isSymbolicLink()) link = true;
+      } catch {
+        break;
+      }
+    }
+    if (i === 0) continue;
+    let real: string;
     try {
-      if (!lstatSync(p).isSymbolicLink()) continue;
-      const r = relative(root, realpathSync.native(p));
-      if (r !== '' && r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) out.push(r);
+      real = realpathSync.native(join(root, ...segs.slice(0, i)));
     } catch {
-      // Not there, or a dangling link: nothing to protect beyond the name itself.
+      return null;
+    }
+    if (link && !add(join(real, ...segs.slice(i)))) return null;
+    if (i < segs.length) continue;
+    // Symlinks inside a protected directory, at any depth; links are not followed.
+    const stack = [real];
+    for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
+      let entries: Dirent[];
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue; // A file, or not readable: nothing inside to follow.
+      }
+      for (const e of entries) {
+        if (++seen > LINK_WALK_LIMIT) return null;
+        const p = join(dir, e.name);
+        if (e.isDirectory()) stack.push(p);
+        else if (e.isSymbolicLink()) {
+          let t: string;
+          try {
+            t = realpathSync.native(p);
+          } catch {
+            return null;
+          }
+          if (!add(t)) return null;
+        }
+      }
     }
   }
   return out;
+}
+
+/** Whether `at` (relative to the real root) is one of `targets` or inside one, names folded. */
+function within(at: string, targets: string[][]): boolean {
+  const a = at.split(sep).map(fold);
+  return targets.some((t) => t.length <= a.length && t.every((s, j) => a[j] === s));
 }
 
 /**
