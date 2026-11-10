@@ -1341,6 +1341,18 @@
         "agent:claude"
       ],
       "body": "The ACP adapter reports a session it ends itself (the agent crashing or exiting) only once the agent's whole process group is gone (fixed on branch `claude/macos-acp-close`; it caused the macOS CI ENOTEMPTY after #185). The Codex adapter still has the gap: when app-server exits by itself, `#onExit` reports the error and ends the events as soon as the leader has exited (`void exited.then(() => this.#onExit(session))`), while a member of its group (a shell command, an MCP server) may still run and write into the worktree. A caller that cleans up on the error can then race it. `close()` already waits for the group (#191); only the self-exit path does not.\n\n### Tasks\n- [ ] On a self-exit, SIGTERM the group, wait for it (`processGroupGone`), SIGKILL what is left, and only then report the error and end the events, as the ACP adapter does.\n- [ ] A regression test with the fake app-server's SIGTERM-ignoring child (`child-term`): after a crash, the child is gone when the error is seen. The liveness check must not count a zombie as running on macOS (`ps -o stat=`, as the ACP test does).\n\n### Acceptance criteria\n- After app-server exits by itself, no member of its process group is running when the error status is emitted, on Linux and macOS.\n\n_See packages/adapters/acp/src/adapter.ts (`#reapGroup`), packages/core/src/node/process-group.ts and #191._"
+    },
+    {
+      "title": "ReDoS: quadratic fence-stripping regex on reviewer and planner replies",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "area:mini",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "CodeQL (polynomial-regex) flagged `packages/mini/src/review/adapter-reviewer.ts:45-48`, as reported in a Copilot comment on #103. It is real.\n\n`parseReview` strips a code fence from the reviewer's reply with `.replace(/^```(?:json)?\\s*/i, '')` and `.replace(/\\s*```$/, '')`. The second pattern is quadratic on a long run of whitespace that is not followed by a fence: the engine retries the `\\s*` run from every start position. Timed on Node 24 with `\"x\" + \" \".repeat(n) + \"y\"`:\n\n| n | time |\n|---|---|\n| 10,000 | 42 ms |\n| 20,000 | 196 ms |\n| 40,000 | 809 ms |\n| 400,000 | about 80 s (extrapolated) |\n\n**Reachable:** the input is the reviewer model's whole reply, and the reviewer reads a diff the Worker wrote (#19). A Worker that gets the reviewer to emit a long whitespace run, or a reviewer that misbehaves on its own, blocks the Mini-conductor's event loop and so stalls every Worker. The planner's `parseProposal` (`packages/mini/src/daemon/planner.ts:37-38`) uses the same two regexes on the planner's reply.\n\n### Tasks\n- [ ] One shared fence-stripping helper with linear time (string operations, no backtracking regex), used by `parseReview` and `parseProposal`.\n- [ ] Cap the reply length that is parsed at 256 KB. A longer reply is an invalid reply, as for invalid JSON.\n- [ ] Review `packages/mini/` for other regexes applied to model- or Worker-controlled text.\n\n### Acceptance criteria\n- A reply of 1 MB of whitespace, with or without a fence, is handled in well under a second, and the test fails on the old code.\n- The existing parse tests (with and without a fence) still pass.\n\n_See packages/mini/src/review/adapter-reviewer.ts, packages/mini/src/daemon/planner.ts and #19._"
     }
   ]
 }

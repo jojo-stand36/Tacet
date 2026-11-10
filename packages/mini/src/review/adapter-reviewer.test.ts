@@ -34,6 +34,14 @@ const CHANGES = JSON.stringify({
 });
 
 describe('parseReview', () => {
+  it('refuses a hostile reply in linear time, and an over-long one at once (#203)', () => {
+    const t0 = performance.now();
+    expect(() => parseReview(`x${' '.repeat(200_000)}y`)).toThrow(/not JSON/);
+    expect(() => parseReview(`\`\`\`json\n${' '.repeat(200_000)}`)).toThrow(/not JSON/);
+    expect(() => parseReview(' '.repeat(300 * 1024))).toThrow(/longer than/);
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+
   it('reads a verdict, with or without a code fence', () => {
     expect(parseReview(APPROVE)).toEqual({ verdict: 'approve', findings: [] });
     expect(parseReview(`\`\`\`json\n${CHANGES}\n\`\`\``).findings).toHaveLength(2);
