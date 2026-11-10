@@ -410,9 +410,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.notify('initialized');
       // Checked before the thread starts, since `thread/start` takes any level without a word.
       // Without a model named, the thread's model (config may choose it) is checked below.
-      if (opts.effort !== undefined) {
+      // The read is awaited where it starts: one left pending across `thread/start` would be an
+      // unhandled rejection if it failed meanwhile, and that ends the host process.
+      if (opts.effort !== undefined && opts.model !== undefined) {
         models = listModels(rpc);
-        if (opts.model !== undefined) checkEffort(await catalog(models), opts.model, opts.effort);
+        checkEffort(await catalog(models), opts.model, opts.effort);
       }
       const threadParams = {
         cwd: opts.cwd,
@@ -451,8 +453,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
       const threadId = str(thread.id);
       if (!threadId) throw new Error('app-server returned no thread id');
       const threadModel = str(result.model) ?? opts.model;
-      if (opts.effort !== undefined && opts.model === undefined && models) {
+      if (opts.effort !== undefined && opts.model === undefined) {
         // No model call has been made yet, so refusing here is still before launch.
+        models = listModels(rpc);
         checkEffort(await catalog(models), threadModel, opts.effort);
       }
       handle.vendorSessionId = threadId;
@@ -552,6 +555,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
     const s = this.#live(h);
+    // Sends still waiting on an effort check are queued first, so the receipt lists them too.
+    if (s.sending) await s.sending;
     const stillQueued = s.queue.map((q) => q.text);
     const turn = s.turn;
     if (!turn) return { stillQueued };

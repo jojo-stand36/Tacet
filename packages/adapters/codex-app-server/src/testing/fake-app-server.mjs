@@ -58,7 +58,7 @@ rl.on('line', async (line) => {
     if (mode === 'models-fail-once' && modelLists === 1) {
       return send({ id: m.id, error: { code: -32603, message: 'catalog unavailable' } });
     }
-    if (mode === 'models-slow') await sleep(200);
+    if (mode === 'models-slow' || mode === 'slow-both') await sleep(200);
     const levels = ['low', 'high'].map((reasoningEffort) => ({ reasoningEffort }));
     return send({
       id: m.id,
@@ -99,7 +99,8 @@ rl.on('line', async (line) => {
       send({ id: 900, method: 'account/chatgptAuthTokens/refresh', params: {} });
       return;
     }
-    if (mode === 'slow-start') return; // Stays running until interrupted.
+    // Stays running until interrupted.
+    if (mode === 'slow-start' || mode === 'slow-both') return;
     if (mode === 'approval' && turns === 1) {
       send({
         id: 901,

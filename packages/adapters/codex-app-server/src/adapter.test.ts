@@ -259,6 +259,33 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     expect(turnTexts()).toEqual(['C']);
   });
 
+  it('refuses, without an unhandled rejection, when model/list fails at start', async () => {
+    // No model named: the catalog is read after thread/start, against the thread's model.
+    const adapter = make('models-fail-once');
+    await expect(adapter.start({ cwd: root, effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    // Named model: checked before thread/start, which then never runs.
+    rmSync(join(root, 'log.jsonl'), { force: true });
+    await expect(
+      make('models-fail-once').start({ cwd: root, model: 'fake-model', effort: 'low' }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError' });
+    expect(clientLog().some((m) => m.method === 'thread/start')).toBe(false);
+  });
+
+  it('lists a send still waiting on the effort check in the interrupt receipt', async () => {
+    const adapter = make('slow-both');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'A' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const b = adapter.send(h, { text: 'B' }, { effort: 'low' });
+    expect(await adapter.interrupt(h)).toEqual({ stillQueued: ['B'] });
+    await b;
+    await adapter.close(h);
+  });
+
   it('stops paging model/list when the cursor repeats', async () => {
     const adapter = make('models-loop');
     const h = await adapter.start({ cwd: root, model: 'fake-model', effort: 'low' });
