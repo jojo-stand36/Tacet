@@ -723,10 +723,13 @@ describe('AcpAdapter (fake ACP agent)', () => {
         { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }) },
         { stateDir: state, repoRoot: join(root, 'repo'), retentionDays: 7 },
       );
-      const h = await adapter.start({
+      const starting = adapter.start({
         cwd: join(root, 'wt'),
         resume: { vendorSessionId: 'resumed-1' },
       });
+      // Claimed before its first await: a discard meanwhile is refused.
+      await expect(adapter.discard('resumed-1', join(root, 'wt'))).rejects.toThrow(/still open/);
+      const h = await starting;
       expect(existsSync(join(home, 'projects/-wt/old-1.jsonl'))).toBe(false);
       expect(existsSync(join(home, 'projects/-wt/resumed-1.jsonl'))).toBe(true);
       expect(existsSync(join(home, 'projects/-wt/new-1.jsonl'))).toBe(true);

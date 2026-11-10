@@ -49,9 +49,7 @@ function session(id: string, project = '-repo-wt'): void {
   put(`projects/${project}/${id}/subagents/agent-1.jsonl`);
   put(`projects/${project}/${id}/tool-results/r.txt`);
   put(`file-history/${id}/f@v1`);
-  put(`session-env/${id}/hook-0.sh`);
   put(`debug/${id}.txt`);
-  put(`todos/${id}-agent-${id}.json`);
 }
 
 function age(path: string, days: number): void {
@@ -84,7 +82,7 @@ describe('session files (#232)', () => {
     session(A);
     session(B);
     session(A, '-repo-other');
-    expect(removeSessionFiles(home, PATTERNS, A)).toBe(8);
+    expect(removeSessionFiles(home, PATTERNS, A)).toBe(6);
     expect(files(home).filter((f) => f.includes(A))).toEqual([]);
     expect(files(home)).toEqual(
       [
@@ -93,9 +91,7 @@ describe('session files (#232)', () => {
         `projects/-repo-wt/${B}/subagents/agent-1.jsonl`,
         `projects/-repo-wt/${B}/tool-results/r.txt`,
         `file-history/${B}/f@v1`,
-        `session-env/${B}/hook-0.sh`,
         `debug/${B}.txt`,
-        `todos/${B}-agent-${B}.json`,
       ].sort(),
     );
   });
@@ -105,7 +101,7 @@ describe('session files (#232)', () => {
     for (const bad of ['', '.', '..', '../x', 'a/b', '*', '{id}', `${A}*`]) {
       expect(() => removeSessionFiles(home, PATTERNS, bad), bad).toThrow(/not a session id/);
     }
-    expect(files(home).filter((f) => f.includes(A))).toHaveLength(7);
+    expect(files(home).filter((f) => f.includes(A))).toHaveLength(5);
   });
 
   it('never follows a symlink out of the home', () => {
@@ -116,12 +112,21 @@ describe('session files (#232)', () => {
     writeFileSync(join(outside, A, 'keep'), 'not ours');
     mkdirSync(join(home, 'projects'), { recursive: true });
     symlinkSync(join(outside, 'proj'), join(home, 'projects', 'linked'));
+    put(`projects/-repo-wt/${A}.jsonl`);
     mkdirSync(join(home, 'file-history'));
     symlinkSync(join(outside, A), join(home, 'file-history', A));
     removeSessionFiles(home, PATTERNS, A);
     expect(files(outside)).toEqual([`${A}/keep`, `proj/${A}.jsonl`]);
     // The link itself, named by the session, is removed; its target is not.
     expect(existsSync(join(home, 'file-history', A))).toBe(false);
+  });
+
+  it('removes nothing for an id without a transcript, such as a shared directory', () => {
+    session(A);
+    put(`file-history/memory/f@v1`);
+    expect(removeSessionFiles(home, PATTERNS, 'memory')).toBe(0);
+    expect(files(home)).toContain('projects/-repo-wt/memory/MEMORY.md');
+    expect(files(home)).toContain('file-history/memory/f@v1');
   });
 
   it('removes nothing from a home without the session', () => {
@@ -145,8 +150,8 @@ describe('session files (#232)', () => {
     expect(sweepSessionFiles(home, PATTERNS, 30 * DAY, new Set([C]))).toBe(1);
     const left = files(home);
     expect(left.filter((f) => f.includes(A))).toEqual([]);
-    expect(left.filter((f) => f.includes(B))).toHaveLength(8);
-    expect(left.filter((f) => f.includes(C))).toHaveLength(7);
+    expect(left.filter((f) => f.includes(B))).toHaveLength(6);
+    expect(left.filter((f) => f.includes(C))).toHaveLength(5);
     expect(left).toContain(`file-history/${D}/f@v1`);
     for (const f of shared) expect(left).toContain(f);
   });

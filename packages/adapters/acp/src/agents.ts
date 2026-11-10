@@ -171,19 +171,12 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
   verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
   home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
-  // A session's own files in its config dir (#232), read from the Agent SDK 0.3.319 binary
-  // claude-agent-acp 0.101.0 runs: the transcript `projects/<encoded cwd>/<id>.jsonl` (seen live),
+  // A session's own files in its config dir (#232), read from the Agent SDK 0.3.318 binary that
+  // claude-agent-acp 0.101.0 pins: the transcript `projects/<encoded cwd>/<id>.jsonl` (seen live),
   // its subagent and tool-result directory `projects/<encoded cwd>/<id>/`, and the per-session
-  // `file-history/<id>/`, `session-env/<id>/`, `debug/<id>.txt` and `todos/<id>-agent-*.json`.
-  // The project directory is matched, not computed: its encoding of the cwd is Claude Code's own.
-  sessionFiles: [
-    'projects/*/{id}.jsonl',
-    'projects/*/{id}',
-    'file-history/{id}',
-    'session-env/{id}',
-    'debug/{id}.txt',
-    'todos/{id}-agent-*.json',
-  ],
+  // `file-history/<id>/` and `debug/<id>.txt`. The project directory is matched, not computed:
+  // its encoding of the cwd is Claude Code's own.
+  sessionFiles: ['projects/*/{id}.jsonl', 'projects/*/{id}', 'file-history/{id}', 'debug/{id}.txt'],
   // Never a subscription or gateway token, whatever the user passes through (#145).
   envDeny: ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
   // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`

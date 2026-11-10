@@ -79,15 +79,29 @@ export function findSessionFiles(
   return found;
 }
 
-/** Remove one session's files under `home` (#232). Returns how many paths were removed. */
+/**
+ * Remove one session's files under `home` (#232), only if it has the first pattern's file (its
+ * transcript): an id that names a shared directory (`memory`) is no session, and nothing of it is
+ * removed. The transcript goes last, so an interrupted removal can be retried. Returns how many
+ * paths were removed.
+ */
 export function removeSessionFiles(home: string, patterns: readonly string[], id: string): number {
-  let removed = 0;
-  for (const path of findSessionFiles(home, patterns, id).get(id) ?? []) {
-    // A symlink is removed itself; a directory with its contents, symlinks not followed.
-    rmSync(path, { recursive: true, force: true });
-    removed++;
-  }
-  return removed;
+  const transcripts = findSessionFiles(home, patterns.slice(0, 1), id).get(id) ?? [];
+  if (transcripts.length === 0) return 0;
+  const rest = (findSessionFiles(home, patterns.slice(1), id).get(id) ?? []).filter(
+    (p) => !transcripts.includes(p),
+  );
+  for (const path of [...rest, ...transcripts]) remove(path);
+  return rest.length + transcripts.length;
+}
+
+/**
+ * A symlink is removed itself; a directory with its contents, symlinks not followed. Between the
+ * walk and this, a process of the same user could swap a parent for a symlink; a Worker can
+ * already write anywhere the user can until the sandbox (#53), so that is accepted.
+ */
+function remove(path: string): void {
+  rmSync(path, { recursive: true, force: true });
 }
 
 /**
@@ -112,7 +126,7 @@ export function sweepSessionFiles(
     // One session that cannot be read (or is removed meanwhile) never stops the others.
     try {
       if (now - Math.max(...paths.map((p) => newestMtime(p))) < maxAgeMs) continue;
-      for (const p of paths) rmSync(p, { recursive: true, force: true });
+      for (const p of paths) remove(p);
       removed++;
     } catch {
       // Left for the next sweep.
