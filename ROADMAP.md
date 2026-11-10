@@ -95,6 +95,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
+- [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
 - [ ] **pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments** — `feature` `P1` `claude`
 - [ ] **PtyCliAdapter: @path expansion in Gemini, Codex and claude presets** — `feature` `P1` `claude`
 
