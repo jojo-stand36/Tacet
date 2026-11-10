@@ -132,6 +132,7 @@ describe('loadConfig', () => {
       stuck_after_s: 300,
       nudge_grace_s: 900,
       max_attempts: 3,
+      max_handoffs: 3,
       verify_timeout_s: 600,
       verify_fix_attempts: 2,
     });
@@ -145,6 +146,8 @@ describe('loadConfig', () => {
       max_attempts: 3,
     });
     write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max: 0, maximum: 3 }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(ConfigError);
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max_handoffs: 0 }\n');
     expect(() => loadConfig({ userDir, repoRoot })).toThrow(ConfigError);
     // A typo in an adapter id is an error, not a silent no-op.
     write(

@@ -70,6 +70,7 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 - Context usage tracked per session; at the `handoff` band the worker is asked for a typed **HandoffPacket** (see RESEARCH.md §5).
 - Packet validated → stored in `.tacet/handoffs/<task>/<n>.json` → session closed → new session seeded with it (model may change per policy).
 - The same packet type is used for mini→conductor summaries and for the Conductor's own self-handoff.
+- Today (#129) a Worker hands off itself with the MCP tool `request_handoff`; the threshold-driven request is #31. The Mini-conductor first checks that the session is running, its turn is not being checked, its task has not ended and the sub-task is under `workers.max_handoffs` (default 3); a refused request records nothing. An accepted one is recorded (`handoff.requested`), the session ends at once (`worker.ended`, `handoff`, not counted as an attempt) and a successor starts in the same checkout with the same Worker restrictions. It is never a resume of the old vendor session: its first message tells it to call `read_task`, whose `handoff` field holds the latest packet, so a later retry of the sub-task sees it too. The successor records `handoff.accepted` once it has that first message; until then the handoff stays pending, so a failed start or a crash leaves it to the next session, and a session found running at restart with a pending handoff ends as `handoff`, not `restart`.
 
 ### 2.4 Worker worktrees
 - The Mini-conductor creates each Worker at a detached HEAD in a dedicated worktree outside the repository. `WorktreeManager` implements the daemon's `Workspaces` port. A checkout starts at a full commit id or a local branch (default: the checked-out branch); unattended Workers write new objects only to their private per-worktree object store.
@@ -179,6 +180,7 @@ workers:                    # Worker pool (#17); defaults shown
   stuck_after_s: 300        # silent this long: nudge
   nudge_grace_s: 900        # still silent this much later: replace the session
   max_attempts: 3           # failed or stuck runs (or an unknown end reason) before a sub-task fails; restarts, handoffs and cancels do not count (owner decision)
+  max_handoffs: 3           # handoffs one sub-task may request before request_handoff is refused (#129)
   verify_timeout_s: 600     # one verify command may run this long (#19)
   verify_fix_attempts: 2    # a failed verification goes back to the same Worker this many times before the attempt fails
   # env: { pass: [MYAPP_*, NPM_TOKEN] }   # more of your environment for Workers (#147); see §6
