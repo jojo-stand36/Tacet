@@ -12,6 +12,7 @@ export type * from './adapter/types.js';
 export * from './adapter/vendor.js';
 export * from './config/index.js';
 export * from './events/projection.js';
+export * from './events/status.js';
 export * from './schema/index.js';
 export { allJsonSchemas, type JsonSchemaDocument, toJsonSchema } from './schema/json-schema.js';
 export * from './util/async-queue.js';

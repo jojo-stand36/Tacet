@@ -239,3 +239,18 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 - **MCP tasks extension for escalations.** Promising, but client support is unverified. Revisit later.
 - **Adapter-only (no MCP).** Works for tier-1 adapters, but loses "any MCP-speaking agent can join the hierarchy", which is the key trick in `RESEARCH.md` §4.
 - **Token in tool arguments instead of transport auth.** Leaks into transcripts and logs. Rejected.
+
+### Addendum (2026-11-10): the standalone control port (#201)
+
+Status of this addendum: **accepted** on 2026-11-10, approved by the owner, together with the `ws` runtime dependency.
+
+A standalone Mini-conductor serves the §4 methods on its own port to the CLI (§4, "Topology"). Building it (#201) needs two decisions beyond the text above.
+
+1. **A status extension.** `tacet status` shows a task's sub-tasks, active Workers, usage and open escalations. An A2A `Task` carries none of them, since sub-tasks stay internal in v0 (§4, task mapping). `GetTask` and `ListTasks` add them in `Task.metadata["urn:tacet:a2a-ext:status:v1"]`, a new Tacet extension with its schema in `@tacet/core` and the generated `schema/v1/status-ext.json`, alongside the task, escalation and decision extensions. This adds a file to the §7 list. It is additive under §2 and needs no protocol bump. A Tacet-only method (`tacet/status`) was the alternative; it would keep A2A tasks bare but give the CLI and a future Conductor two ways to read a task.
+2. **A2A shapes defined in Tacet, checked against the reference SDK.** §7 says A2A types are imported from `@a2a-js/sdk`. Version 1.3.0's TypeScript types are its in-memory protobuf objects: numeric enums, `{$case, value}` oneofs, empty strings for absent fields. They are not the JSON on the wire (`"TASK_STATE_WORKING"`, `{"text": …}`), so typing the wire with them would be wrong, and converting would load the SDK at runtime. Instead, `@tacet/core` has zod schemas for the A2A 1.0 JSON subset Tacet speaks. A contract test round-trips every shape through the SDK's own JSON codecs (`fromJSON`, then `toJSON`) and requires it unchanged. The SDK stays a devDependency (pinned 1.3.0), and a guard test fails if shipped code imports it.
+
+Also recorded:
+- **WebSocket library.** The port uses the `ws` package (pinned 8.22.1, no dependencies). Node 24 has a WebSocket client but no server. It is configured with `noServer` (Host, Origin and bearer checks run on the HTTP upgrade before a socket exists), no compression and 1 MiB frames.
+- **What the CLI may do.** A standalone Mini-conductor's port serves `cli` hellos only: a `ui` hello is refused until browser sessions are served there, and a `mini` hello is refused because Mini-conductors dial the Conductor, not each other. `SendMessage` without `taskId` answers `-32004`: new tasks still start with `tacet run`.
+- **Paging.** `ListTasks` pages with an opaque `pageToken` (an offset today).
+- **Answering.** `tacet answer <id> <text>` is the CLI verb for an answer to a live run.
