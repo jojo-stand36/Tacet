@@ -4,19 +4,19 @@ Checked 2026-11-10. Follows [spike #61](../61-acp/README.md) ("ACP v2 is coming"
 
 ## Sources
 
-- `agentclientprotocol/agent-client-protocol` at `3961af9` (2026-11-10):
+- `agentclientprotocol/agent-client-protocol` at `3961af9` (2026-11-10), https://github.com/agentclientprotocol/agent-client-protocol/tree/3961af9:
   - `schema/v2/Cargo.toml` (version `2.0.0-alpha.14`);
   - `schema/v2/CHANGELOG.md` (alpha.14 dated 2026-11-09, alpha.13 2026-11-02, alpha.12 2026-10-31);
   - `schema/v2/schema.json`;
   - `docs/protocol/v2/migration.mdx`.
 - `schema/v1/Cargo.toml` is `1.30.0`.
-- npm `@agentclientprotocol/sdk`: `latest` is 2.5.0 (2026-11-09). Tacet pins 2.4.0. It exports v2 only as `./experimental/v2`, and `AgentProtocolRouter` (v1 + v2 side by side) is marked `@experimental`.
+- npm `@agentclientprotocol/sdk` (https://www.npmjs.com/package/@agentclientprotocol/sdk): `latest` is 2.5.0 (2026-11-09). Tacet pins 2.4.0. Both versions export v2 only as `./experimental/v2`, and `AgentProtocolRouter` (v1 + v2 side by side) is marked `@experimental`.
 - Live: `probe-initialize.mjs` in this directory sends one `initialize` to each installed agent. It runs them in an empty temporary home, sends no prompt and calls no model API.
 
 ## Status
 
 **v2 is still a draft.**
-- The schema is `2.0.0-alpha.14`, with a new alpha roughly every week.
+- The schema is `2.0.0-alpha.14`. New alphas have been coming several times a week lately: 10-27, 10-30, 10-31, 11-02 and 11-09.
 - The migration guide says: "v2 as a whole is still labeled draft, so gate v2 support behind explicit version negotiation and feature flags until it stabilizes."
 - The unstable v2 schema layers features on top of the stable v2 baseline. Negotiating `protocolVersion: 2` does not imply support for them.
 
@@ -27,7 +27,7 @@ Checked 2026-11-10. Follows [spike #61](../61-acp/README.md) ("ACP v2 is coming"
 | Gemini CLI 0.67.0 (`gemini --acp`) | answers `protocolVersion: 1` | 1 |
 | claude-agent-acp 0.101.0 | answers **2**, with v2 `info` and capability groups `session`, `providers` | 1 |
 | codex-acp 2.6.0 | answers **2**, with `auth`, `providers`, `session` | 1 |
-| OpenCode | not installed here: UNVERIFIED | |
+| OpenCode | not installed here: UNVERIFIED (to re-check under #85) | |
 
 - claude-agent-acp and codex-acp validate a v2 `initialize` strictly. Without `info` they answer `-32602`.
 - Tacet's adapter offers v1, so today all three answer v1 (verified, and the conformance runs pass on v1).
@@ -36,7 +36,7 @@ Checked 2026-11-10. Follows [spike #61](../61-acp/README.md) ("ACP v2 is coming"
 
 From `migration.mdx`, against what `packages/adapters/acp` does today:
 
-- **Turns.** The `session/prompt` response only acknowledges, and returns a `messageId`. Progress and the end of a turn come as `state_update` (`running`, `requires_action`, `idle` with `stopReason`, and `error` for a failure after acceptance). `#runTurns` would end a turn on the idle `state_update`, not on the response. Cancellation is confirmed by an idle `state_update` with `stopReason: "cancelled"`. End-turn usage moves to that update (unstable schema).
+- **Turns.** The `session/prompt` response only acknowledges, and returns a `messageId`. Progress and the end of a turn come as `state_update`: `running`, `requires_action`, or `idle` with a `stopReason`, which is `error` for a failure after acceptance. `#runTurns` would end a turn on the idle `state_update`, not on the response. Cancellation is confirmed by an idle `state_update` with `stopReason: "cancelled"`. End-turn usage moves to that update (unstable schema).
 - **Updates are upserts by id.** `tool_call` is removed, and the first `tool_call_update` for an id creates the call. `updateToEvents` would emit `tool.call` on the first update it sees for an id.
 - **Session modes are removed** (`modes`, `session/set_mode`, `current_mode_update`). Mode is a config option of category `mode`.
   - The option's id field is renamed `configId`.
@@ -64,9 +64,9 @@ Do not add v2 support to the ACP adapter yet:
 - Gemini CLI, one of the three registered agents, speaks only v1.
 - The two that speak v2 also speak v1, and the v1 path passes conformance with them. So v2 gains Tacet nothing today, and costs a second turn path that would chase alpha changes.
 
-Revisit, and build the design above, when all of these hold:
-- `schema/v2` publishes a non-alpha `2.0.0`;
-- the SDK exports v2 outside `experimental`;
-- a registered agent stops answering v1, or v2 brings something Tacet needs.
+Revisit, and build the design above, when any of these holds:
+- `schema/v2` publishes a non-alpha `2.0.0` **and** the SDK exports v2 outside `experimental`;
+- a registered agent stops answering v1;
+- v2 brings something Tacet needs.
 
-The capability-matrix freshness check (#66) makes the ACP surface come up for re-checking every 30 days, which covers the watching.
+#85 stays open as the tracker for this. Once the capability-matrix freshness check (#66) lands, the ACP surface also comes up for re-checking whenever its date gets old.

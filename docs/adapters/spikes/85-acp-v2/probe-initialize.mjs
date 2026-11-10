@@ -3,7 +3,7 @@
 // v2 needs `info`; v1 takes `clientCapabilities`. The agent runs in an empty temporary home, so
 // no login or config of the user's is read. No prompt is sent and no model API is called.
 import { spawn } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,11 +17,16 @@ const params =
     : { protocolVersion: 1, clientCapabilities: {} };
 let buf = '';
 const timer = setTimeout(() => finish({ timeout: true }), 20_000);
+let done = false;
 function finish(result) {
+  if (done) return;
+  done = true;
   clearTimeout(timer);
   console.log(JSON.stringify({ offered: Number(offer), ...result }));
   p.kill();
 }
+p.on('error', (e) => finish({ error: e.message }));
+p.on('exit', () => rmSync(home, { recursive: true, force: true }));
 p.stdout.on('data', (d) => {
   buf += d;
   const lines = buf.split('\n');
