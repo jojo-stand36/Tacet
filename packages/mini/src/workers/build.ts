@@ -114,7 +114,7 @@ export function buildWorkerAdapters(
     }
     const ptySlug = PTY_ID.exec(id)?.[1];
     if (ptySlug === 'claude') {
-      noShadow(ptySlug, true, 'PTY preset');
+      noShadow(ptySlug, true, 'pty', 'PTY preset');
       return new PtyAdapter({ ...opts.claudePty, ...common });
     }
     if (ptySlug !== undefined) {
@@ -146,9 +146,9 @@ export function buildWorkerAdapters(
     throw new WorkerConfigError(`${where}: ${id} cannot be built`);
   }
 
-  /** A preset under a built-in name would be ambiguous: refuse it. */
-  function noShadow(slug: string, builtin: boolean, what: string): void {
-    if (builtin && config.agents?.[slug]) {
+  /** A preset of the same kind under a built-in name would be ambiguous: refuse it. */
+  function noShadow(slug: string, builtin: boolean, kind: 'acp' | 'pty', what: string): void {
+    if (builtin && config.agents?.[slug]?.kind === kind) {
       throw new WorkerConfigError(
         `agents.${slug}: "${slug}" is a built-in ${what}; give your agent another name`,
       );
@@ -175,7 +175,7 @@ export function buildWorkerAdapters(
   function acpAgent(slug: string, where: string): { agent: AcpAgentSpec; secrets: string[] } {
     const preset = config.agents?.[slug];
     const builtin = BUILTIN_ACP_AGENTS[slug];
-    noShadow(slug, builtin !== undefined, 'ACP agent');
+    noShadow(slug, builtin !== undefined, 'acp', 'ACP agent');
     if (builtin) return { agent: builtin, secrets: [] };
     if (!preset) {
       throw new WorkerConfigError(

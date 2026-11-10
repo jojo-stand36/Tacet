@@ -17,7 +17,7 @@ const FAKE_AGENT = join(
   '../../../adapters/acp/src/testing/fake-acp-agent.mjs',
 );
 const SECRET = 'agent-secret-value-1234';
-/** The PTY adapter's fake line-based CLI: `PRINT_SECRET` prints the value of FAKE_SECRET. */
+/** The PTY adapter's fake line-based CLI: `PRINT_VAR <NAME>` prints a variable's value. */
 const FAKE_CLI = join(import.meta.dirname, '../../../adapters/pty/src/testing/fake-cli.mjs');
 
 const mcp: WorkerMcp = {
@@ -281,7 +281,8 @@ describe('a PTY preset built from config (#149)', () => {
             fake: {
               kind: 'pty',
               command: [process.execPath, FAKE_CLI],
-              env: { FAKE_SECRET: { env: 'MY_CLI_SECRET' } },
+              // A name that does not look secret: only the resolved reference marks it as one.
+              env: { CLI_ENDPOINT: { env: 'MY_CLI_SECRET' } },
               ready_prompt: 'fake>',
             },
           },
@@ -295,7 +296,7 @@ describe('a PTY preset built from config (#149)', () => {
       if (!adapter) throw new Error('not built');
       const h = await adapter.start({ cwd: dir });
       const tap = new EventTap(adapter.events(h));
-      await adapter.send(h, { text: 'PRINT_SECRET' });
+      await adapter.send(h, { text: 'PRINT_VAR CLI_ENDPOINT' });
       await tap.waitFor((e) => e.t === 'message.delta', 30_000);
       await adapter.close(h);
       expect(tap.events).toContainEqual({ t: 'message.delta', text: 'value: [redacted]' });
