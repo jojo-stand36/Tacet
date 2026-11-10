@@ -254,6 +254,80 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(stub.calls[3]?.settingSources).toEqual(['project']);
   });
 
+  it('gives an unattended Worker only the file tools, no shell, and asks Tacet about reads (#206)', async () => {
+    const stub = stubQuery();
+    await make(stub).start({ cwd: root });
+    // Not set unless asked for: interactive sessions keep the SDK's defaults.
+    expect(stub.calls[0]?.tools).toBeUndefined();
+    expect(stub.calls[0]?.hooks).toBeUndefined();
+
+    const adapter = make(stub, { fileToolsOnly: true });
+    const h = await adapter.start({ cwd: root });
+    const opts = stub.calls[1] as Options;
+    expect(opts.tools).toEqual(['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep']);
+    expect(opts.disallowedTools).toEqual(['Bash', 'PowerShell', 'Monitor']);
+    expect(opts.allowedTools).toEqual([]);
+    expect(opts.permissionMode).toBe('default');
+    const matcher = opts.hooks?.PreToolUse?.[0];
+    expect(matcher).toMatchObject({ matcher: 'Read|Glob|Grep', onFailure: 'block' });
+    const hook = matcher?.hooks[0] as NonNullable<typeof matcher>['hooks'][number];
+
+    // The hook turns a read into an approval request; Tacet's answer becomes the hook's decision.
+    const tap = new EventTap(adapter.events(h));
+    const call = (tool_name: string, tool_input: unknown, id: string) =>
+      hook(
+        {
+          hook_event_name: 'PreToolUse',
+          tool_name,
+          tool_input,
+          tool_use_id: id,
+          session_id: 's',
+          transcript_path: '',
+          cwd: root,
+        } as never,
+        id,
+        { signal: new AbortController().signal },
+      );
+    const allowed = call('Glob', { pattern: '**/*.ts' }, 'toolu_a');
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+    if (req.event.t !== 'approval.request') throw new Error('no request');
+    expect(req.event).toMatchObject({
+      toolName: 'Glob',
+      requestedGrant: { input: { pattern: '**/*.ts' } },
+    });
+    await adapter.respond(h, req.event.id, { kind: 'allow_once', persist: false });
+    await expect(allowed).resolves.toMatchObject({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+    });
+    const refused = call('Read', { file_path: '/etc/passwd' }, 'toolu_b');
+    const req2 = await tap.waitFor((e) => e.t === 'approval.request', 5000, req.index + 1);
+    if (req2.event.t !== 'approval.request') throw new Error('no request');
+    await adapter.respond(h, req2.event.id, { kind: 'reject', persist: false, message: 'outside' });
+    await expect(refused).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'outside' },
+    });
+    expect(await refused).not.toHaveProperty('continue');
+    // A rewritten input is what runs; a cancel stops the turn.
+    const rewritten = call('Read', { file_path: 'a' }, 'toolu_c');
+    const req3 = await tap.waitFor((e) => e.t === 'approval.request', 5000, req2.index + 1);
+    await adapter.respond(h, (req3.event as { id: string }).id, {
+      kind: 'allow_once',
+      persist: false,
+      updatedInput: { file_path: 'b' },
+    });
+    await expect(rewritten).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'allow', updatedInput: { file_path: 'b' } },
+    });
+    const cancelled = call('Read', { file_path: 'a' }, 'toolu_d');
+    const req4 = await tap.waitFor((e) => e.t === 'approval.request', 5000, req3.index + 1);
+    await adapter.respond(h, (req4.event as { id: string }).id, { kind: 'cancel', persist: false });
+    await expect(cancelled).resolves.toMatchObject({
+      continue: false,
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
+    await adapter.close(h);
+  });
+
   it('maps resume and fork to the SDK options', async () => {
     const stub = stubQuery();
     const adapter = make(stub);
