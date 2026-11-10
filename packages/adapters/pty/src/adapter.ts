@@ -8,6 +8,7 @@ import {
   type AdapterCapabilities,
   type AgentAdapter,
   type AgentEvent,
+  type AgentTerminal,
   type ApprovalDecision,
   AsyncQueue,
   type InterruptResult,
@@ -42,6 +43,7 @@ import {
 } from './claude.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
+import { TerminalBuffer } from './terminal.js';
 
 /**
  * What interactive Claude Code in a PTY honestly supports (#15), verified on 2.1.319:
@@ -145,6 +147,8 @@ interface Session {
   cancelledAt: number;
   /** When the terminal last showed output. */
   lastOutputAt: number;
+  /** What `terminal()` shows. */
+  screen: TerminalBuffer;
   ready: () => void;
   exited: Promise<void>;
   exit?: { exitCode: number; signal?: number };
@@ -329,6 +333,7 @@ export class PtyAdapter implements AgentAdapter {
         queue: [],
         cancelledAt: 0,
         lastOutputAt: 0,
+        screen: new TerminalBuffer(this.#opts.cols ?? 200, this.#opts.rows ?? 50),
         ready,
         exited,
         closing: false,
@@ -346,6 +351,7 @@ export class PtyAdapter implements AgentAdapter {
       });
       pty.onData((d) => {
         session.lastOutputAt = Date.now();
+        session.screen.push(d);
         if (inputReady) return;
         const seen = tail + d;
         if (seen.includes(PASTE_MODE_ON)) {
@@ -465,6 +471,7 @@ export class PtyAdapter implements AgentAdapter {
     await this.#hooks.unregister(s.hookKey);
     this.#setState(s, 'done');
     s.events.end();
+    s.screen.end();
     this.#sessions.delete(h.id);
   }
 
@@ -476,6 +483,12 @@ export class PtyAdapter implements AgentAdapter {
 
   status(h: SessionHandle): SessionState {
     return this.#sessions.get(h.id)?.state ?? 'done';
+  }
+
+  terminal(h: SessionHandle): AgentTerminal {
+    const s = this.#sessions.get(h.id);
+    if (!s) throw new Error(`unknown session ${h.id}`);
+    return s.screen;
   }
 
   // ---- internals -------------------------------------------------------------------------
@@ -698,6 +711,7 @@ export class PtyAdapter implements AgentAdapter {
     s.approvals.clear();
     this.#setState(s, 'error', `claude exited (code ${s.exit?.exitCode ?? 'unknown'})`);
     s.events.end();
+    s.screen.end();
     for (const f of s.files) removeSessionFile(f);
     void this.#hooks.unregister(s.hookKey);
   }

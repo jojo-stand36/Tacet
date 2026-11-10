@@ -129,4 +129,20 @@ export interface AgentAdapter {
   status(h: SessionHandle): SessionState;
   /** Add context to the running session without starting a turn. */
   injectContext?(h: SessionHandle, text: string): Promise<void>;
+  /**
+   * The session's terminal, for adapters that run one (PTY, #15): what `tacet attach` shows.
+   * Read-only: typed keys would bypass `send` and `respond`, and so the event log. Its bytes
+   * travel on their own channel, never as events (ADR-003), and are never persisted.
+   */
+  terminal?(h: SessionHandle): AgentTerminal;
+}
+
+/** A read-only view of a session's terminal (`AgentAdapter.terminal`). */
+export interface AgentTerminal {
+  readonly cols: number;
+  readonly rows: number;
+  /** The most recent output (bounded), so a viewer can redraw the screen when it attaches. */
+  scrollback(): string;
+  /** Output from now on, until the session ends. Each call is its own stream. */
+  output(): AsyncIterable<string>;
 }
