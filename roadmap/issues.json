@@ -628,6 +628,17 @@
       "body": "Found in #181 (verified live on Gemini CLI 0.67.0 over ACP): a Gemini Worker's checkout is untrusted (Tacet never passes `GEMINI_CLI_TRUST_WORKSPACE`, folder trust is on), which keeps the checkout's `.gemini/settings.json`, `GEMINI.md`, skills, agents and `.gemini/.env` out. But in an untrusted folder Gemini also never contacts the MCP server Tacet passes in `session/new` (no request at all; one once trusted), so Gemini Workers cannot use `escalate`, `report_progress` or the other Mini-conductor tools. Trusting the checkout would load everything above; no flag trusts a folder for MCP only.\n\n### Tasks\n- [ ] Owner decision: Gemini Workers without Mini-conductor tools (escalation through ACP permission requests only), trust the checkout and accept what it loads, or find or ask upstream for an MCP-only trust.\n- [ ] Implement it, with a test against the real CLI, and update ARCHITECTURE §6 and the capability matrix.\n\n### Acceptance criteria\n- A Gemini Worker either reaches Tacet's MCP server with none of the checkout's project files loaded (real-CLI test with a hostile checkout), or its missing tools are declared and handled so a Gemini Worker never waits on a tool it cannot call.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (Gemini, #181)._"
     },
     {
+      "title": "Hold a task's pinned target commit with a ref so git gc cannot prune it",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #219 (PR #233). A task's `task.target` pins the commit its sub-tasks start from, but no ref holds that commit. Live checkouts keep it alive. But if the user resets or rewrites the branch during a long task and `git gc` prunes the commit, a later fresh checkout for the task (a retry, a new sub-task) fails to start (\"base commit does not name a commit\").\n\n### Tasks\n- [ ] When the Mini-conductor pins a target, also point `refs/tacet/<task>/target` at the commit. The repo's git side is behind a port (for example `Workspaces.pin?(taskId, commit)`), so the daemon stays git-free. The task id must be made ref-safe, as `taskBranch` does.\n- [ ] Delete the ref where the task's other Tacet refs are cleaned up. Today nothing deletes them: `tacet/*` branches are kept on purpose. At minimum, `tacet uninstall --purge --apply` removes every `refs/tacet/*` ref, which is internal and never a user branch, and its preview lists them.\n- [ ] Docs: ARCHITECTURE §2.4 and §3 (the `task.target` paragraph says no ref holds the commit today).\n\n### Acceptance criteria\n- After the pinned branch is reset and `git gc --prune=now` runs, a new checkout for the task still starts at the pinned commit (test).\n- `tacet uninstall --purge --apply` leaves no `refs/tacet/*` ref (test).\n\n_See #219, PR #233, packages/mini/src/daemon/daemon.ts (`#pinTarget`) and packages/cli/src/commands/purge-state.ts._"
+    },
+    {
       "title": "Integrate unattended Codex Worker commits from the Mini-conductor",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [

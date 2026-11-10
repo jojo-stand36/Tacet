@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:task-target:v1",
+  "title": "Tacet task.target payload",
+  "type": "object",
+  "properties": {
+    "branch": {
+      "description": "The local branch checked out when the task started",
+      "type": "string",
+      "minLength": 1
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+      "description": "Its commit then: where sub-tasks without dependencies start"
+    }
+  },
+  "required": [
+    "commit"
+  ]
+}
