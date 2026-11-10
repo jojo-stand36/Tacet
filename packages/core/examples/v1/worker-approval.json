@@ -1,0 +1,7 @@
+{
+  "sessionId": "sess-7",
+  "requestId": "approval-2f1c9a",
+  "toolName": "Edit",
+  "decision": "allowed",
+  "reason": "Edit inside the worktree (src/limiter.ts)"
+}

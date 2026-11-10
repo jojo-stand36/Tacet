@@ -82,6 +82,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
 - [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
 - [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
+- [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:worker-approval:v1",
+  "title": "Tacet worker.approval payload",
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The adapter's approval request id"
+    },
+    "toolName": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "enum": [
+        "allowed",
+        "refused"
+      ],
+      "x-tacet-fallback": "refused",
+      "type": "string"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "sessionId",
+    "requestId",
+    "decision",
+    "reason"
+  ]
+}

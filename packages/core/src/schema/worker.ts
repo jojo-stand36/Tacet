@@ -181,3 +181,17 @@ export const WorkerThrottled = z.object({
   windowMs: z.number().int().positive(),
 });
 export type WorkerThrottled = z.infer<typeof WorkerThrottled>;
+
+/**
+ * Payload of `worker.approval`: how the Mini-conductor answered an unattended Worker's approval
+ * request (#200; the interim policy until #25). `reason` never holds a path outside the Worker's
+ * checkout; the request itself, with the tool's input, is the transcript event before it.
+ */
+export const WorkerApproval = z.object({
+  sessionId: Id,
+  requestId: z.string().min(1).describe("The adapter's approval request id"),
+  toolName: z.string().min(1).optional(),
+  decision: openEnum(['allowed', 'refused'], 'refused'),
+  reason: z.string().min(1),
+});
+export type WorkerApproval = z.infer<typeof WorkerApproval>;

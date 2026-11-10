@@ -961,6 +961,58 @@ describe('MiniConductor', () => {
     expect(fake.approvalsAnswered.map((x) => x.kind)).toEqual(['reject']);
   });
 
+  it('allows a Claude Worker file tools inside its own checkout only, and records each answer (#200)', async () => {
+    let wtPath = '';
+    const claude = new ScriptedAdapter('claude-sdk', (input, s) => {
+      wtPath = s.opts.cwd;
+      const m = /\[tool (\w+) (\S+)\]/.exec(input);
+      if (!m) return { do: 'reply', text: 'done' };
+      const step: Script = { do: 'approval', grant: { input: { file_path: m[2] } } };
+      if (m[1]) step.toolName = m[1];
+      return step;
+    });
+    const d = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'claude-sdk', model: 'cheap' } } },
+      adapters: { 'claude-sdk': { adapter: claude, authRoute: 'api_key' } },
+      planner: new FixedPlanner(
+        [
+          'Edit src/a.ts',
+          'Write ../escape.txt',
+          'Write .git/config',
+          'Bash ls',
+          'Read /etc/passwd',
+        ].map((call, i) => ({
+          key: `k${i}`,
+          goal: `do [tool ${call}]`,
+          acceptanceCriteria: ['ok'],
+          dependsOn: i > 0 ? [`k${i - 1}`] : [],
+        })),
+      ),
+    });
+    await d.start();
+    d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(wtPath).not.toBe('');
+    expect(claude.approvalsAnswered.map((x) => x.kind)).toEqual([
+      'allow_once',
+      'reject',
+      'reject',
+      'reject',
+      'reject',
+    ]);
+    expect(claude.approvalsAnswered[1]?.message).toMatch(/leaves the worktree.*escalate/);
+    const recorded = ofType('worker.approval').map((e) => e.data as Record<string, unknown>);
+    expect(recorded.map((x) => [x.toolName, x.decision])).toEqual([
+      ['Edit', 'allowed'],
+      ['Write', 'refused'],
+      ['Write', 'refused'],
+      ['Bash', 'refused'],
+      ['Read', 'refused'],
+    ]);
+    // No path outside the checkout in the summary-grade record.
+    expect(JSON.stringify(recorded)).not.toContain('/etc/passwd');
+  });
+
   it('allows only the exact names of its own MCP tools', async () => {
     const d = make({
       planner: new FixedPlanner(
