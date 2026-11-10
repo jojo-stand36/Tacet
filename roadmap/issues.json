@@ -1531,6 +1531,17 @@
         "agent:claude"
       ],
       "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "Worktree gc by activity, and cleanup of planner checkouts a crash left behind",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p3",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #126. Moving the worktree registry into the event log dropped `touch()` and `lastActivityAt`. They had no production caller, and logging every touch would be write volume with no consumer. So `WorktreeManager.gc()` now judges staleness by creation time. It also has no caller yet.\n\n### Tasks\n- [ ] Derive a worktree's last activity from the `worker.*` events the Mini-conductor already keeps (the newest `worker.started`/`worker.ended`/`worker.progress` of the sessions with that `workspaceId`), and have the caller of `gc` pass it in. Don't record new events for this.\n- [ ] Decide when gc runs, for example with the landed sweep (#210), and which worktrees count as active (in `#runs`, or closing).\n- [ ] Planner checkouts (`CheckoutPlanner`) are force-removed after planning, but a crash mid-plan leaves one registered as live. Remove those at start: they hold nothing of value.\n\n### Acceptance criteria\n- A worktree whose sessions have all been idle longer than the threshold, and that holds no unintegrated work, is removed by gc. One with recent session activity is kept, even if it is old (test).\n- After a crash mid-plan, the next start removes the orphaned planner checkout (test).\n\n_See #126, packages/mini/src/worktree.ts (`gc`), packages/mini/src/standalone.ts (`CheckoutPlanner`) and docs/ARCHITECTURE.md §2.4._"
     }
   ]
 }
