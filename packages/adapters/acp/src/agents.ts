@@ -50,6 +50,14 @@ export interface AcpAgentSpec {
    * written there before every session. Used to give the agent settings without the user's.
    */
   home?: { env: string; files: Readonly<Record<string, string>> };
+  /**
+   * Where in `home` the agent keeps a session's own files (#232): paths relative to it, `/`
+   * separated, where `{id}` is the session id and `*` any run of characters within one segment.
+   * The first pattern names the session's transcript. `discard()` removes them all once the
+   * session will never be resumed, and sessions untouched for `retentionDays` are swept. Without
+   * it the agent's sessions are kept.
+   */
+  sessionFiles?: readonly string[];
   /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
   envDeny?: readonly string[];
   /**
@@ -170,6 +178,12 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   },
   verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
   home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
+  // A session's own files in its config dir (#232), read from the Agent SDK 0.3.318 binary that
+  // claude-agent-acp 0.101.0 pins: the transcript `projects/<encoded cwd>/<id>.jsonl` (seen live),
+  // its subagent and tool-result directory `projects/<encoded cwd>/<id>/`, and the per-session
+  // `file-history/<id>/` and `debug/<id>.txt`. The project directory is matched, not computed:
+  // its encoding of the cwd is Claude Code's own.
+  sessionFiles: ['projects/*/{id}.jsonl', 'projects/*/{id}', 'file-history/{id}', 'debug/{id}.txt'],
   // Never a subscription or gateway token, whatever the user passes through (#145).
   envDeny: ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
   // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`

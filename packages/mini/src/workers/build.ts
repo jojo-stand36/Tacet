@@ -162,7 +162,10 @@ export function buildWorkerAdapters(
     const slug = ACP_ID.exec(id)?.[1];
     if (slug !== undefined) {
       const { agent, secrets } = acpAgent(slug, where);
+      // Its sessions' files are kept as long as the event log keeps transcripts (#232).
+      const days = config.events?.retention?.transcript_days;
       return new AcpAdapter({
+        ...(days !== undefined ? { retentionDays: days } : {}),
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.acp,
         ...common,
