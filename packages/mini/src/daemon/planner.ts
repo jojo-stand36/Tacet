@@ -1,6 +1,12 @@
 import { assertSafePrompt, planIssues, type SessionHandle, type Task } from '@tacet/core';
 import { z } from 'zod';
-import type { Planner, PlanResult, ProposedSubtask, WorkerAdapter } from './ports.js';
+import {
+  type Planner,
+  type PlanResult,
+  type ProposedSubtask,
+  type WorkerAdapter,
+  workerRefusal,
+} from './ports.js';
 import { PLANNER_SYSTEM_PROMPT, plannerPrompt } from './prompts.js';
 
 const Proposal = z.object({
@@ -13,6 +19,7 @@ const Proposal = z.object({
         acceptanceCriteria: z.array(z.string().min(1)).min(1),
         kind: z.enum(['implement', 'review', 'explore']).optional(),
         dependsOn: z.array(z.string()).optional(),
+        indivisible: z.boolean().optional(),
       }),
     )
     .min(1)
@@ -50,6 +57,7 @@ export function parseProposal(text: string): {
       acceptanceCriteria: s.acceptanceCriteria,
       ...(s.kind ? { kind: s.kind } : {}),
       ...(s.dependsOn ? { dependsOn: s.dependsOn } : {}),
+      ...(s.indivisible ? { indivisible: true } : {}),
     })),
     ...(rationale !== undefined ? { rationale } : {}),
   };
@@ -79,6 +87,8 @@ export class AdapterPlanner implements Planner {
     if (opts.worker.authRoute !== 'api_key') {
       throw new Error('the planner runs unattended and must use the api_key route (#65)');
     }
+    const refused = workerRefusal(opts.worker);
+    if (refused) throw new Error(`adapter ${opts.adapterId}: refused for the planner: ${refused}`);
     this.#o = opts;
   }
 

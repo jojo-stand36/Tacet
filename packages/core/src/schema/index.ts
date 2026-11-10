@@ -13,6 +13,7 @@ import {
   WorkerEnded,
   WorkerIntegrated,
   WorkerNudged,
+  WorkerProfile,
   WorkerStarted,
   WorkerThrottled,
   WorkerVendorSession,
@@ -68,6 +69,7 @@ export const jsonSchemas = {
   },
   'worker-ended': { schema: WorkerEnded, title: 'Tacet worker.ended payload' },
   'worker-nudged': { schema: WorkerNudged, title: 'Tacet worker.nudged payload' },
+  'worker-profile': { schema: WorkerProfile, title: 'Tacet worker.profile payload' },
   'worker-integrated': { schema: WorkerIntegrated, title: 'Tacet worker.integrated payload' },
   'worker-throttled': { schema: WorkerThrottled, title: 'Tacet worker.throttled payload' },
   'worker-verification': {

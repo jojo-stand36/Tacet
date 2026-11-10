@@ -99,6 +99,8 @@ export interface ProposedSubtask {
   acceptanceCriteria: string[];
   kind?: 'implement' | 'review' | 'explore';
   dependsOn?: string[];
+  /** Cannot be handed off cleanly part-way, so it may get a larger context window (#110). */
+  indivisible?: boolean;
 }
 
 export interface PlanResult {
@@ -127,4 +129,13 @@ export interface WorkerAdapter {
 /** Mints per-Worker MCP configs (the Mini-conductor MCP server, #18). */
 export interface WorkerMcp {
   workerConfig(binding: WorkerBinding): { config: McpServerConfig; revoke: () => void };
+}
+
+/**
+ * Why an adapter may not run unattended sessions (an ACP agent's `workerRefused`, e.g. codex-acp
+ * until #183 is decided), or `undefined`. Read by duck typing, so any adapter can declare it.
+ */
+export function workerRefusal(w: WorkerAdapter): string | undefined {
+  const r = (w.adapter as { workerRefused?: unknown }).workerRefused;
+  return typeof r === 'string' && r.length > 0 ? r : undefined;
 }

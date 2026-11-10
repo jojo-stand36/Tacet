@@ -1246,6 +1246,17 @@
         "agent:claude"
       ],
       "body": "Follow-up from #168. On Linux, interactive codex-cli 0.167.0 starts a managed daemon (`codex app-server --listen unix:// --analytics-default-enabled --managed-daemon`, plus `codex app-server daemon pid-update-loop`; feature `daemon_auto_start`, stable and on by default) that outlives the PTY session: after `PtyCliAdapter.close` it keeps running, re-parented to PID 1. That breaks the adapters rule \"never leave orphaned PTYs/processes\". `-c features.daemon_auto_start=false` prevents it for Codex (verified live, `docs/adapters/spikes/168-resume-scope/`), but any CLI run as a `pty:<slug>` preset could detach a helper the same way.\n\n### Tasks\n- [ ] Recommend `-c features.daemon_auto_start=false` in Codex preset examples, and say why\n- [ ] Decide how the adapter limits detached processes: its own process group or session for the CLI and signalling the group on close (a `setsid` child escapes that), a cgroup or `prctl(PR_SET_CHILD_SUBREAPER)`-style subreaper, or documenting it per preset; verify what node-pty already does (the PTY child is a session leader)\n- [ ] Check whether the Codex daemon sends telemetry during a run (`--analytics-default-enabled`)\n\n### Acceptance criteria\n- A test or recorded live run shows no process a preset's CLI started is left running after `close()`, or the docs state the limit per platform\n\n_See packages/adapters/pty/src/cli-adapter.ts, .github/instructions/adapters.instructions.md and docs/adapters/capability-matrix.md (\"Generic PTY presets: resume\")._"
+    },
+    {
+      "title": "Codex fork keeps the source thread's model",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Found in #110 slice 2 (spike `docs/adapters/spikes/110-codex-effort/`, Codex 0.167.0, mock Responses API): `thread/fork` sent without a `model` came back on the catalog's default model (`gpt-6.1-sol`) with `reasoningEffort: null`, not on the source thread's model. The Codex adapter adopts the reported model, so its own state is consistent, but a forked Worker silently changes model and loses its effort unless the adapter sends them.\n\n### Tasks\n- [ ] Verify on the pinned Codex whether `thread/fork` honours `model` (and the thread config's `model_reasoning_effort`) in its params (`verify-vendor-facts`).\n- [ ] When forking without `SessionOptions.model`, send the source thread's model (and its effort, checked against `model/list`) so the fork continues on what the source ran.\n- [ ] Record the behaviour in the capability matrix Codex Resume/fork row.\n\n### Acceptance criteria\n- Against the mock Responses API, a fork of a thread that ran on `gpt-5.5` at `low`, started without a model or effort, sends its first request with model `gpt-5.5` and effort `low`.\n- A fork with an explicit `model` or `effort` still uses those, and an effort the model does not list is refused (`ProfileRefusedError`).\n\n_See docs/adapters/capability-matrix.md (Codex) and #110._"
     }
   ]
 }
