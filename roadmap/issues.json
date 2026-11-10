@@ -1509,6 +1509,28 @@
         "agent:claude"
       ],
       "body": "#146 lets a built-in ACP spec declare `fork: 'native'` (with `resume`), and the adapter forks by the unstable `session/fork` only when the session's `initialize` advertises it. No built-in agent declares either yet. Gemini 0.67.0 does not advertise fork, and `claude-acp` / `codex-acp` declare no `resume` through this adapter. Both vendor adapters advertise `sessionCapabilities.resume` and `fork` (spike #62; `claude-agent-acp` 0.101.0 `unstable_forkSession` copies the transcript under a new id and passes `_meta` to the new session).\n\nDeclaring them needs a live check: the source suggests the following, but does not prove it.\n\n### Tasks\n- [ ] Live, against the mock Messages API (claude-agent-acp) and the mock Responses API (codex-acp), check that a resumed and a forked Worker session keep the Worker options:\n  - claude-acp: `settingSources: []`, `strictMcpConfig`, and the file-tools-only set (#181, #206);\n  - codex-acp: its isolated `CODEX_HOME` and the never-authenticate setup.\n- [ ] Check that Tacet re-pins `sessionMode` after a resume or fork (a fork starts with the permission mode it records), and that the source session is left untouched.\n- [ ] Check that sessions resume across processes: `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are kept per repo.\n- [ ] Declare `resume: true` and `fork: 'native'` on the specs that pass, with tests, and record it in the capability matrix (`verify-vendor-facts`).\n\n### Acceptance criteria\n- A resumed and a forked `acp:claude-acp` Worker run with the same restrictions as a new one, shown live against the mock API.\n- The capability matrix records the versions checked and the date.\n\n_See #146, #181, #206, docs/adapters/spikes/62-acp-adapters and docs/adapters/capability-matrix.md §4._"
+    },
+    {
+      "title": "pty:claude Workers: an @path in a prompt may read files unasked",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Over the Claude Agent SDK and claude-agent-acp, an `@path` mention in a prompt is read into the prompt with no permission request, outside the checkout too. #214 closes that with `verbatimPrompts`, verified live. A Worker's next prompt can carry text the Worker wrote, such as a `verify` command's output or review findings.\n\n`pty:claude` (interactive Claude Code in a PTY) gets the same text. Its `promptText` (`packages/adapters/pty/src/adapter.ts`) refuses only a leading `/` or `!`. Interactive Claude Code probably expands `@path` too, and its `PreToolUse` hook does not see attachments. This is not verified: `node-pty` cannot build in the sessions that found it.\n\n### Tasks\n- [ ] Verify live, with the PTY conformance setup and the mock Messages API: does an `@<outside path>` pasted in a prompt reach the model? Check inside a ``` fence too.\n- [ ] If it does, refuse or neutralise `@` followed by a path character in Worker prompts. Alternatively, use an interactive-mode equivalent of verbatim prompts, if Claude Code has one: check the CLI reference (`verify-vendor-facts`).\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- A `pty:claude` Worker's prompt containing `@<path outside the checkout>` reads nothing into the prompt, shown live.\n\n_See #214, #200, #206 and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
     }
   ]
 }
