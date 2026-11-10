@@ -257,6 +257,7 @@ Accepted residual risks (owner decision, 2026-11-09):
 
 Other:
 
+- **Platforms** ([ADR-002](adr/002-language-runtime.md), 2026-11-10 addendum): macOS and Linux (Ubuntu), and Windows via WSL2, where Tacet runs inside the WSL2 Linux distro as on Linux, with its repos in the distro's own filesystem (#193). Native Windows awaits an ADR (#194).
 - Worktree isolation by default; optional OS sandbox later.
 - **`acp:codex-acp` is refused for unattended sessions** (interim default until the owner decides #183): it marks every session directory trusted itself, after any config Tacet can pass, so a checkout's `.codex/config.toml` (an MCP server command) and `AGENTS.md` would apply, whoever wrote them (observed live in #181). `AcpAgentSpec.workerRefused` says why; `buildWorkerAdapters` rejects a Worker tier or `workers.per_adapter` cap that names it, or a custom `agents.<slug>` whose command runs it (by name, path or npm package), and the Mini-conductor and the planner refuse an adapter built on the built-in codex-acp spec however they get it. Direct interactive use of the adapter is unchanged. A wrapper script that hides the command is not caught. Use `codex-app-server` instead, whose unattended Workers are kept untrusted (#181, below).
 - **Codex Worker isolation** (owner decision, 2026-11-09; #116):
