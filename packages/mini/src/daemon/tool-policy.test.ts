@@ -350,6 +350,26 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Write', { file_path: 'cfg/settings.json', content: '' }).allow).toBe(false);
   });
 
+  it("refuses writes to Tacet's own config, .tacet/, at any depth (#227)", () => {
+    for (const p of [
+      '.tacet/tacet.yaml',
+      '.tacet/local.yaml',
+      '.tacet',
+      'pkg/.tacet/x.yaml',
+      '.TACET/tacet.yaml',
+    ]) {
+      const r = ask('Write', { file_path: p, content: '' });
+      expect({ p, allow: r.allow }).toEqual({ p, allow: false });
+      expect(r.reason).toMatch(/escalate/);
+    }
+    expect(
+      ask('Edit', { file_path: '.tacet/tacet.yaml', old_string: 'a', new_string: 'b' }).allow,
+    ).toBe(false);
+    // Reading it is fine, and similar names are not it.
+    expect(ask('Read', { file_path: '.tacet/tacet.yaml' }).allow).toBe(true);
+    expect(ask('Write', { file_path: 'docs/tacet.md', content: '' }).allow).toBe(true);
+  });
+
   it('protects every lefthook config name (lefthook docs, checked 2026-11-10)', () => {
     for (const p of [
       'lefthook.yaml',

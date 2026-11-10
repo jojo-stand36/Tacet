@@ -104,6 +104,8 @@ const PROTECTED_DIRS: readonly string[][] = [
   ['.codex'],
   ['.husky'],
   ['.github', 'workflows'],
+  // Tacet's own config: `verify` commands, agent commands and tiers apply once merged (#227).
+  ['.tacet'],
 ];
 const PROTECTED_FILES: readonly string[] = [
   '.mcp.json',
