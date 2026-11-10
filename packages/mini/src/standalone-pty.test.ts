@@ -40,7 +40,9 @@ process.stdin.on('data', () => {
 /**
  * A generic CLI in a real PTY. A `pty:<slug>` preset cannot take the Mini-conductor's MCP server
  * (only `pty:claude` can, and that needs Claude Code), so this one is started without it; the
- * process, its terminal and the environment the Mini-conductor gives it are the real ones.
+ * process, its terminal and the environment the Mini-conductor gives it are the real ones. What a
+ * Worker's MCP config carries is checked where the session options are (the control-port tests in
+ * the CLI's standalone suite).
  */
 class NoMcpPty extends PtyCliAdapter {
   override start(opts: SessionOptions) {
@@ -150,7 +152,7 @@ describe.skipIf(!gate.ok)(
       }
       expect(seen).toContain('dump>');
       expect(seen).toMatch(/working \d+[\s\S]*working \d+/);
-      // Read only: a key typed at it ends the stream, and the Worker never gets it.
+      // The viewer leaves (read only is the port's own test: a frame from it closes it 1003).
       pty.close();
       await pty.closed;
 

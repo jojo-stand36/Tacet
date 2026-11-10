@@ -21,6 +21,13 @@ import {
   subtasksOf,
 } from '../state.js';
 
+/**
+ * Undo what a Worker's terminal may have left on (#201): attributes, a hidden cursor, the
+ * alternate screen, bracketed paste and mouse reporting.
+ */
+const RESTORE_TERMINAL =
+  '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+
 export interface Where {
   repo?: string;
   'user-dir'?: string;
@@ -192,17 +199,21 @@ export async function attach(
       if (pty) {
         const stop = () => pty.close();
         io.signal?.addEventListener('abort', stop, { once: true });
+        if (io.signal?.aborted) stop();
+        let code = 1000;
         try {
-          const { code } = await pty.closed;
-          if (!io.signal?.aborted) {
-            io.err(
-              code === 1000
-                ? '\r\n[the Worker session ended]'
-                : `\r\n[the terminal stream closed (${code})]`,
-            );
-          }
+          code = (await pty.closed).code;
         } finally {
           io.signal?.removeEventListener('abort', stop);
+          // Whatever the Worker's bytes left switched on, the user's own terminal gets back.
+          raw(new TextEncoder().encode(RESTORE_TERMINAL));
+        }
+        if (io.signal?.aborted) return 0;
+        if (code === 1000) io.err('\r\n[the Worker session ended]');
+        else if (code === 1001) io.err('\r\n[the run ended]');
+        else {
+          io.err(`\r\n[the terminal stream failed (${code})]`);
+          return 1;
         }
         return 0;
       }

@@ -75,7 +75,9 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
     // The CLI only: a Mini-conductor dials the Conductor, never another Mini-conductor.
     roles: ['cli'],
     // A PTY Worker's terminal, live, for `tacet attach` (ADR-003 §5).
-    ...(o.mini.terminalStream ? { pty: (id: string) => o.mini.terminalStream?.(id) } : {}),
+    ...(o.mini.terminalStream
+      ? { pty: (id: string, left: AbortSignal) => o.mini.terminalStream?.(id, left) }
+      : {}),
     serverInfo: o.serverInfo ?? { name: 'tacet-mini', version: '0.0.0' },
     ...(o.onError ? { onError: o.onError } : {}),
     handlers: {

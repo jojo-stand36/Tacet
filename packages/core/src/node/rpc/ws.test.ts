@@ -336,8 +336,11 @@ describe('Tacet RPC server and client', () => {
 });
 
 describe('/pty/<session> (#201, ADR-003 §5)', () => {
-  /** A stream of `chunks`, recording how many were pulled and whether it was let go. */
-  function source(chunks: Uint8Array[], hold = false) {
+  /**
+   * A stream of `chunks`, recording how many were pulled and whether it was let go. With `left`,
+   * it then waits, printing nothing, until the viewer leaves: as an idle Worker's terminal does.
+   */
+  function source(chunks: Uint8Array[], left?: AbortSignal) {
     const seen = { pulled: 0, released: false };
     async function* gen() {
       try {
@@ -345,10 +348,8 @@ describe('/pty/<session> (#201, ADR-003 §5)', () => {
           seen.pulled++;
           yield c;
         }
-        // A live terminal: more output now and then, never an end.
-        while (hold) {
-          await new Promise((r) => setTimeout(r, 20));
-          yield new Uint8Array([46]);
+        if (left && !left.aborted) {
+          await new Promise((r) => left.addEventListener('abort', r, { once: true }));
         }
       } finally {
         seen.released = true;
@@ -401,8 +402,8 @@ describe('/pty/<session> (#201, ADR-003 §5)', () => {
     const made: ReturnType<typeof source>[] = [];
     const { server, token } = await serve(randomToken(), {
       maxPtySockets: 1,
-      pty: () => {
-        const s = source([bytes('x')], true);
+      pty: (_id, left) => {
+        const s = source([bytes('x')], left);
         made.push(s);
         return s.stream;
       },
@@ -425,6 +426,24 @@ describe('/pty/<session> (#201, ADR-003 §5)', () => {
       expect(
         await upgrade(server.port, { host, authorization: `Bearer ${token.reveal()}` }, '/pty/s3'),
       ).toBe(101),
+    );
+  });
+
+  it('frees the slot of an upgrade that never completes', async () => {
+    const { server, token } = await serve(randomToken(), {
+      maxPtySockets: 2,
+      pty: () => source([bytes('x')]).stream,
+    });
+    const host = `127.0.0.1:${server.port}`;
+    const authorization = `Bearer ${token.reveal()}`;
+    // Past every check but malformed: ws refuses it (400) without making a socket.
+    for (let i = 0; i < 4; i++) {
+      expect(
+        await upgrade(server.port, { host, authorization, 'sec-websocket-key': 'short' }, '/pty/s'),
+      ).toBe(400);
+    }
+    await vi.waitFor(async () =>
+      expect(await upgrade(server.port, { host, authorization }, '/pty/s')).toBe(101),
     );
   });
 

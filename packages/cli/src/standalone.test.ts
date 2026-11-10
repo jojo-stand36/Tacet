@@ -16,6 +16,7 @@ import { newUlid } from '@tacet/core';
 import {
   miniRuntimePath,
   openEventStore,
+  readRuntimeFile,
   repoStatePaths,
   workerGitEnv,
   workerWorktree,
@@ -674,13 +675,53 @@ describe('tacet standalone (#21)', () => {
     // The terminal's own bytes, escape sequences and all.
     await vi.waitFor(() => expect(text()).toBe('$ make test\r\n\x1b[32mok\x1b[0m 12 tests'));
 
-    // The session ends: so does attach.
+    const secret = readRuntimeFile(runtimeFile).token.reveal();
+
+    // The session ends: so does attach, handing the user's terminal back as it was.
     expect((await tacet(['cancel', ...user(), id])).code).toBe(0);
     const a = await attaching;
     expect(a.code).toBe(0);
     expect(a.err).toContain('the Worker session ended');
     expect(a.out).toBe('');
+    expect(text().startsWith('$ make test\r\n\x1b[32mok\x1b[0m 12 tests')).toBe(true);
+    expect(
+      text().endsWith(
+        '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l',
+      ),
+    ).toBe(true);
+    // The port's token is in none of it.
+    expect([a.out, a.err, text()].some((x) => x.includes(secret))).toBe(false);
     expect((await running).code).toBe(1);
+  });
+
+  it('attach follows a Worker without a terminal through the log, with no note, while a run is live (#201)', async () => {
+    script = () => ({ do: 'hold' });
+    const running = tacet(['run', ...user(), 'no terminal here']);
+    const runtimeFile = miniRuntimePath(repo, join(root, 'home', '.tacet', 'run'));
+    await vi.waitFor(
+      () => {
+        if (!made.at(-1)?.sessions[0] || !existsSync(runtimeFile)) throw new Error('not yet');
+      },
+      { timeout: 10_000 },
+    );
+    const id = (
+      JSON.parse((await tacet(['status', ...user(), '--json'])).out) as { tasks: { id: string }[] }
+    ).tasks[0]?.id as string;
+    const got: Uint8Array[] = [];
+    const stop = new AbortController();
+    const attaching = tacet(['attach', ...user(), `${id}/1`], {
+      raw: (b) => got.push(b),
+      signal: stop.signal,
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    stop.abort();
+    const a = await attaching;
+    expect(a.code).toBe(0);
+    expect(a.out).toMatch(/worker \S+ started/);
+    expect(a.err).not.toContain('note:');
+    expect(got).toEqual([]);
+    expect((await tacet(['cancel', ...user(), id])).code).toBe(0);
+    await running;
   });
 });
 

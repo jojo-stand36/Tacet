@@ -2180,8 +2180,10 @@ describe('terminalStream (#201)', () => {
     expect(d.terminalStream('no-such-session')).toBeUndefined();
   });
 
-  it('draws the screen, follows the output, redraws a viewer that fell behind, and ends with the session', async () => {
+  /** A running session on a terminal adapter, and its terminal. */
+  async function running(endOnClose = true) {
     const term = new ScriptedTerminalAdapter('fake', () => ({ do: 'hold' }));
+    term.endOnClose = endOnClose;
     fake = term;
     const d = make();
     await d.start();
@@ -2189,23 +2191,67 @@ describe('terminalStream (#201)', () => {
     await expect.poll(() => ofType('worker.vendor_session', `${id}/1`).length).toBe(1);
     const handle = fake.sessions[0]?.handle;
     if (!handle) throw new Error('no session');
-    const t = term.terminal(handle);
-    t.push('$ before\r\n');
-    const stream = d.terminalStream(minted[0] ?? '');
+    return { d, id, t: term.terminal(handle), session: minted[0] ?? '' };
+  }
+  const open = (d: MiniConductor, session: string, signal?: AbortSignal) => {
+    const stream = d.terminalStream(session, signal);
     if (!stream) throw new Error('no terminal stream');
-    const it = stream[Symbol.asyncIterator]();
+    return stream[Symbol.asyncIterator]();
+  };
+
+  it('draws the screen, follows the output, and redraws a viewer that fell behind', async () => {
+    const { d, t, session } = await running();
+    t.push('$ before\r\n');
+    const it = open(d, session);
     expect(text((await it.next()).value)).toBe('$ before\r\n');
-    // Subscribed when the screen was taken: what comes next arrives once.
     t.push('live 1');
     expect(text((await it.next()).value)).toBe('live 1');
-    // Fell behind: a reset, then the whole screen again.
+    // Dropped for falling behind: a reset, then the whole screen again.
     t.lag();
     t.push('live 2');
     expect(text((await it.next()).value)).toBe('\x1bc$ before\r\nlive 1live 2');
-    // The session ends here: the stream ends, however the terminal behaves.
-    await d.cancel(id);
-    t.lag();
-    expect((await it.next()).done).toBe(true);
+    await it.return?.();
     expect(t.viewers).toBe(0);
+  });
+
+  it('does not take a viewer dropped before it read anything for the end of the session', async () => {
+    const { d, t, session } = await running();
+    t.push('screen');
+    const it = open(d, session);
+    expect(text((await it.next()).value)).toBe('screen');
+    // Dropped while its first frame was still being sent: its stream ends with nothing read.
+    t.lag();
+    t.push(' more');
+    const next = await it.next();
+    expect(next.done).toBe(false);
+    expect(text(next.value)).toBe('\x1bcscreen more');
+    await it.return?.();
+  });
+
+  it('lets the terminal go as soon as the viewer leaves, while the Worker prints nothing', async () => {
+    const { d, t, session } = await running();
+    const left = new AbortController();
+    const it = open(d, session, left.signal);
+    t.push('x');
+    expect(text((await it.next()).value)).toBe('x');
+    // Waiting for output that may not come for hours.
+    const pending = it.next();
+    await expect.poll(() => t.viewers).toBe(1);
+    left.abort();
+    expect((await pending).done).toBe(true);
+    expect(t.viewers).toBe(0);
+  });
+
+  it('ends when the session stops running here, even if its terminal does not end', async () => {
+    const { d, id, t, session } = await running(false);
+    const it = open(d, session);
+    t.push('x');
+    expect(text((await it.next()).value)).toBe('x');
+    const pending = it.next();
+    await d.cancel(id);
+    expect((await pending).done).toBe(true);
+    expect(t.viewers).toBe(0);
+    // A session that is no longer running has no terminal to open.
+    expect(d.terminalStream(session)).toBeUndefined();
   });
 });
