@@ -2,7 +2,6 @@ import {
   accessSync,
   constants,
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -97,19 +96,8 @@ describe('Claude Worker tool environment', () => {
     // If the command did not run, what the Bash tool reported says why.
     const reported = api.requests.flatMap((r) => (r.toolOutput ? [r.toolOutput] : []));
     expect(existsSync(file), `tool output: ${JSON.stringify(reported)}`).toBe(true);
-    // Nothing else in the checkout but, on Linux, the sandbox's empty placeholders for the files
-    // it write-protects (`package.json`, lockfiles, `.env*`, …; #150, owner decision 17): never a
-    // non-empty file. Cleaning them up is #263.
-    for (const name of readdirSync(cwd).filter((n) => n !== 'tool-env.txt')) {
-      expect(process.platform, name).toBe('linux');
-      const p = join(cwd, name);
-      const files = lstatSync(p).isDirectory()
-        ? readdirSync(p, { recursive: true, withFileTypes: true })
-            .filter((e) => !e.isDirectory())
-            .map((e) => join(e.parentPath, e.name))
-        : [p];
-      for (const f of files) expect(lstatSync(f).size, f).toBe(0);
-    }
+    // Nothing else in the checkout: the sandbox's placeholders are removed at close (#263).
+    expect(readdirSync(cwd)).toEqual(['tool-env.txt']);
     const out = readFileSync(file, 'utf8');
     expect(out).toContain('MYAPP_SETTING=kept');
     expect(out).not.toContain(KEY);
