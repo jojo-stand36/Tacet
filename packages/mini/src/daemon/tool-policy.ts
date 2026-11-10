@@ -111,12 +111,17 @@ const PROTECTED_FILES: readonly string[] = [
   '.npmrc',
   '.yarnrc',
   '.yarnrc.yml',
+  // Git hook managers: a linked worktree shares the repo's hooks.
+  '.pre-commit-config.yaml',
+  'lefthook.yml',
+  '.lefthook.yml',
 ];
 /** Editor files that can run commands: `.vscode/tasks.json` and its siblings. */
 const PROTECTED_IN: readonly [string, string][] = [
   ['.vscode', 'tasks.json'],
   ['.vscode', 'launch.json'],
   ['.vscode', 'settings.json'],
+  ['.vscode', 'mcp.json'],
 ];
 
 /** Whether writing `rel` (relative to the checkout, `/`-separated) would change protected config. */
@@ -158,6 +163,10 @@ export type ToolDecision = { allow: true; reason: string } | { allow: false; rea
  * the session: paths are resolved when the request is decided), and `.git` anywhere in the path.
  *
  * Reasons never contain a path outside the worktree: they are recorded in `worker.*` events.
+ *
+ * Checked when the request is decided, not when the tool runs: safe only while a Worker cannot
+ * create a symlink or hard link between the two (no Bash, no link-making tool; #206). Revisit
+ * before any such tool is allowed.
  */
 export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecision {
   const name = req.toolName ?? '';
@@ -188,6 +197,8 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     return refuse('the Worker checkout is gone');
   }
   const targets: string[] = [];
+  /** Where each path key landed: a glob is resolved from its tool's `path` (#213 review). */
+  const landed: Record<string, string> = {};
   for (const f of spec.paths) {
     const v = fields[f];
     if (v === undefined || v === null) continue;
@@ -200,13 +211,14 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
       );
     }
     targets.push(at);
+    landed[f] = at;
   }
   if (spec.needsPath && targets.length === 0) return refuse(`${name}: no path given`);
   for (const f of spec.globs) {
     const v = fields[f];
     if (v === undefined || v === null) continue;
     if (typeof v !== 'string' || v === '') return refuse(`${name}: ${f} is not a pattern`);
-    const why = badGlob(root, worktree, v);
+    const why = badGlob(root, worktree, v, landed.path ?? '');
     if (why) return refuse(`${name}: ${f} ${why}`);
   }
   const where = targets.length ? targets.map((t) => t || '.').join(', ') : 'the worktree';
@@ -219,13 +231,17 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
  * refused outright, as is a wildcard in a dot-segment (`.gi[t]`, `.g?t`) that could match `.git`.
  * The literal segments before the first wildcard must lead inside the checkout like a path.
  */
-function badGlob(root: string, given: string, v: string): string | undefined {
+function badGlob(root: string, given: string, v: string, base: string): string | undefined {
   if (v !== v.trim() || hasControl(v)) return 'has surrounding space or control characters';
   if (v.includes('\\')) return 'has a backslash';
   if (isAbsolute(v) || v.startsWith('~')) return 'names an absolute path';
   if (/[{}]/.test(v)) return 'uses brace expansion';
+  if (/^[$%]/.test(v)) return 'starts with $ or %';
   const segs = v.split('/');
   if (segs.includes('..')) return 'leaves the worktree';
+  if (segs.some((s) => s !== '' && s !== '.' && ntfsAlias(s))) {
+    return 'has a name another file system may read differently';
+  }
   // A wildcard segment that matches `.git` reaches it, except the bare `*` and `**` a search needs:
   // Glob only lists names, so those can show `.git` names, never contents (Read is refused there).
   if (segs.some((s) => isGitName(s) || (s !== '*' && s !== '**' && segmentMatches(s, '.git')))) {
@@ -237,7 +253,9 @@ function badGlob(root: string, given: string, v: string): string | undefined {
     literal.push(s);
   }
   if (literal.length > 0) {
-    const at = inside(root, given, literal.join('/'), false);
+    // From the tool's own `path` (already resolved inside the checkout), not the checkout root.
+    const from = base === '' ? [] : base.split(sep);
+    const at = inside(root, given, [...from, ...literal].join('/'), false);
     if (typeof at !== 'string') return at.why.replace(/^the path/, 'its directory');
   }
   return undefined;
@@ -267,13 +285,23 @@ function segmentMatches(rawSeg: string, name: string): boolean {
   }
 }
 
-/** Whether `s` has a C0 control character or DEL. */
+/** Whether `s` has a C0 or C1 control character (NEL included) or DEL. */
 function hasControl(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    if (c < 0x20 || c === 0x7f) return true;
+    if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return true;
   }
   return false;
+}
+
+/**
+ * A name NTFS (a WSL2 checkout under `/mnt/c`) or a URL-aware tool may read as another one, as
+ * git's protectNTFS refuses: a trailing dot or space (`.git.` is `.git`), a colon (alternate data
+ * streams, `.git::$INDEX_ALLOCATION`; also URL schemes such as `file:`), or an 8.3 short name
+ * (`GIT~1`, `CLAUDE~1`, `MCP~1.JSO`).
+ */
+function ntfsAlias(seg: string): boolean {
+  return /[. ]$/.test(seg) || seg.includes(':') || /~\d+(\.|$)/i.test(seg);
 }
 
 /** Whether `marker` appears in any string inside `v`. */
@@ -298,8 +326,13 @@ function inside(root: string, given: string, p: string, writes: boolean): string
   }
   // A backslash is an ordinary name character on POSIX: refused rather than guessed at.
   if (p.includes('\\')) return { why: 'the path has a backslash' };
+  // Expanded by nothing but a shell (Claude Code expands only `~`), refused all the same.
+  if (/^[$%]/.test(p)) return { why: 'the path starts with $ or %' };
   const segs = p.split('/').filter((s) => s !== '' && s !== '.');
   if (segs.includes('..')) return { why: 'the path leaves the worktree (..)' };
+  const odd = segs.find(ntfsAlias);
+  if (odd !== undefined)
+    return { why: 'the path has a name another file system may read differently' };
   let rel: string[];
   if (isAbsolute(p)) {
     const norm = segs.join(sep);
