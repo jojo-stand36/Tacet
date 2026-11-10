@@ -37,7 +37,10 @@ export interface BuildWorkerAdaptersOptions {
   claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr'>;
-  /** For the built-in `pty:claude` (Claude Code in a terminal). */
+  /**
+   * For the built-in `pty:claude` (Claude Code in a terminal). Pass `repoRoot` (and the resolved
+   * `events.state_dir`), so its sessions' state is kept per repo, not per checkout.
+   */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
   ptyCli?: Pick<PtyCliAdapterOptions, 'spawn' | 'quietMs' | 'startTimeoutMs' | 'killTimeoutMs'>;
@@ -115,7 +118,13 @@ export function buildWorkerAdapters(
     const ptySlug = PTY_ID.exec(id)?.[1];
     if (ptySlug === 'claude') {
       noShadow(ptySlug, true, 'pty', 'PTY preset');
-      return new PtyAdapter({ ...opts.claudePty, ...common });
+      // Its sessions' transcripts are kept as long as the event log keeps transcripts (#153).
+      const days = config.events?.retention?.transcript_days;
+      return new PtyAdapter({
+        ...(days !== undefined ? { retentionDays: days } : {}),
+        ...opts.claudePty,
+        ...common,
+      });
     }
     if (ptySlug !== undefined) {
       const preset = config.agents?.[ptySlug];
