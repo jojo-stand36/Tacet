@@ -37,6 +37,7 @@ export {
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
 export { type ReviewDiff, type ReviewDiffOptions, reviewDiff } from './git/diff.js';
+export { GitWorktrees, type GitWorktreesOptions } from './git/worktrees.js';
 export {
   GitIntegrator,
   type Integration,
