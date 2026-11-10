@@ -42,6 +42,7 @@ describe(`codex app-server schema (pinned ${CODEX_VERSION})`, () => {
         'thread/fork',
         'turn/start',
         'turn/interrupt',
+        'model/list',
       ]),
     );
   });
@@ -93,5 +94,25 @@ describe(`codex app-server schema (pinned ${CODEX_VERSION})`, () => {
       expect(usage).toContain(f);
     }
     expect(read('ServerNotification.json')).toContain('"interrupted"');
+  });
+
+  it('has the model/list fields and thread effort the effort check reads (#110)', () => {
+    const params = JSON.parse(read('v2/ModelListParams.json')).properties;
+    expect(params).toHaveProperty('includeHidden');
+    expect(params).toHaveProperty('cursor');
+    const list = JSON.parse(read('v2/ModelListResponse.json'));
+    expect(list.properties).toHaveProperty('data');
+    expect(list.properties).toHaveProperty('nextCursor');
+    const model = list.definitions.Model.properties;
+    for (const f of ['id', 'model', 'isDefault', 'supportedReasoningEfforts']) {
+      expect(model).toHaveProperty(f);
+    }
+    expect(list.definitions.ReasoningEffortOption.properties).toHaveProperty('reasoningEffort');
+    // A resumed thread reports the effort it keeps, so later model switches can be checked.
+    for (const f of ['ThreadStartResponse', 'ThreadResumeResponse', 'ThreadForkResponse']) {
+      const props = JSON.parse(read(`v2/${f}.json`)).properties;
+      expect(props, f).toHaveProperty('model');
+      expect(props, f).toHaveProperty('reasoningEffort');
+    }
   });
 });

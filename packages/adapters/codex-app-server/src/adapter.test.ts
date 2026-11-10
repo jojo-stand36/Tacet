@@ -219,6 +219,80 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
       .split('\n')
       .map((l) => JSON.parse(l));
 
+  const turnTexts = () =>
+    clientLog()
+      .filter((m) => m.method === 'turn/start')
+      .map((m) => m.params.input[0].text);
+
+  it('keeps send order when an earlier send waits on the effort check', async () => {
+    const adapter = make('models-slow');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    // Not awaited one by one: live input from a caller that fires and forgets.
+    const a = adapter.send(h, { text: 'A' }, { effort: 'low' });
+    const b = adapter.send(h, { text: 'B' });
+    await Promise.all([a, b]);
+    // Both turns run to the end.
+    const idle = (e: { t: string; state?: string }) => e.t === 'status' && e.state === 'idle';
+    const first = await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const end1 = await tap.waitFor(idle, 5000, first.index + 1);
+    await tap.waitFor(idle, 5000, end1.index + 1);
+    expect(turnTexts()).toEqual(['A', 'B']);
+    expect(clientLog().find((m) => m.method === 'turn/start')?.params.effort).toBe('low');
+    await adapter.close(h);
+  });
+
+  it('does not cache a failed model/list read, and refuses unlisted levels', async () => {
+    const adapter = make('models-fail-once');
+    const h = await adapter.start({ cwd: root });
+    await expect(adapter.send(h, { text: 'A' }, { effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    await expect(adapter.send(h, { text: 'B' }, { effort: 'xhigh' })).rejects.toMatchObject({
+      field: 'effort',
+      message: expect.stringMatching(/does not support/),
+    });
+    await adapter.send(h, { text: 'C' }, { effort: 'high' });
+    expect(clientLog().filter((m) => m.method === 'model/list')).toHaveLength(2);
+    await adapter.close(h);
+    expect(turnTexts()).toEqual(['C']);
+  });
+
+  it('refuses, without an unhandled rejection, when model/list fails at start', async () => {
+    // No model named: the catalog is read after thread/start, against the thread's model.
+    const adapter = make('models-fail-once');
+    await expect(adapter.start({ cwd: root, effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    // Named model: checked before thread/start, which then never runs.
+    rmSync(join(root, 'log.jsonl'), { force: true });
+    await expect(
+      make('models-fail-once').start({ cwd: root, model: 'fake-model', effort: 'low' }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError' });
+    expect(clientLog().some((m) => m.method === 'thread/start')).toBe(false);
+  });
+
+  it('lists a send still waiting on the effort check in the interrupt receipt', async () => {
+    const adapter = make('slow-both');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'A' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const b = adapter.send(h, { text: 'B' }, { effort: 'low' });
+    expect(await adapter.interrupt(h)).toEqual({ stillQueued: ['B'] });
+    await b;
+    await adapter.close(h);
+  });
+
+  it('stops paging model/list when the cursor repeats', async () => {
+    const adapter = make('models-loop');
+    const h = await adapter.start({ cwd: root, model: 'fake-model', effort: 'low' });
+    expect(clientLog().filter((m) => m.method === 'model/list')).toHaveLength(2);
+    await adapter.close(h);
+  });
+
   it('gives unattended Workers an allowlist of the environment, interactive ones all of it', async () => {
     const envLog = join(root, 'env.json');
     const user = {
