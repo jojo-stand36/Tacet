@@ -130,6 +130,14 @@ export interface AgentAdapter {
   /** Add context to the running session without starting a turn. */
   injectContext?(h: SessionHandle, text: string): Promise<void>;
   /**
+   * The closed session `vendorSessionId` will never be resumed (#153): delete what this adapter
+   * keeps to resume it, such as its own transcript copy. `cwd` is the session's working directory,
+   * used only to find where that state lives; it may no longer exist. Never touches the vendor's
+   * own stores (e.g. `~/.claude`), the worktree or the event log. Adapters that keep nothing leave
+   * it out.
+   */
+  discard?(vendorSessionId: string, cwd: string): Promise<void>;
+  /**
    * The session's terminal, for adapters that run one (PTY, #15): what `tacet attach` shows.
    * Read-only: typed keys would bypass `send` and `respond`, and so the event log. Its bytes
    * travel on their own channel, never as events (ADR-003), and are never persisted.

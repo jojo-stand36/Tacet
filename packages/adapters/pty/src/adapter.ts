@@ -42,6 +42,7 @@ import {
   prepareClaudeConfigDir,
   preToolUseDecision,
 } from './claude.js';
+import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
@@ -76,10 +77,19 @@ export interface PtyAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
-  /** The repo the Workers belong to; keys the state directory. Default: the session's cwd. */
+  /**
+   * The repo the Workers belong to; keys the state directory. Default: the repo of the session's
+   * cwd (the main checkout, for a git worktree), else the cwd itself.
+   */
   repoRoot?: string;
   /** Tacet's state directory. Default `~/.tacet/state`. */
   stateDir?: string;
+  /**
+   * Days after its last write that a session's Claude config directory (its transcript) is
+   * removed, if no Mini-conductor discarded it before (#153). Swept when the adapter starts its
+   * first session for a repo. Default 30, as `events.retention.transcript_days`.
+   */
+  retentionDays?: number;
   /** Directory for per-session secret files (hook settings, MCP config). Default core's. */
   sessionFileDir?: string;
   /** Milliseconds `start()` waits for the session to report it is ready. Default 30000. */
@@ -188,6 +198,8 @@ export class PtyAdapter implements AgentAdapter {
   readonly #sessions = new Map<string, Session>();
   readonly #hooks = new HookServer();
   #swept = false;
+  /** Claude config roots (`<repo state>/claude-pty`) already swept for old sessions. */
+  readonly #sweptRoots = new Set<string>();
 
   constructor(opts: PtyAdapterOptions = {}) {
     this.#opts = opts;
@@ -232,19 +244,40 @@ export class PtyAdapter implements AgentAdapter {
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
     const cwd = realpathSync(opts.cwd);
-    const home = env.HOME ?? homedir();
-    const configDir = join(
-      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
-      'claude-pty',
-      vendorSessionId,
-    );
+    // From the user's environment, not the Worker's: where state lives never depends on a session.
+    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
+    const root = this.#configRoot(cwd, home);
+    const configDir = join(root, vendorSessionId);
+    if (!this.#sweptRoots.has(root)) {
+      this.#sweptRoots.add(root);
+      try {
+        const live = new Set([...this.#sessions.values()].map((x) => x.handle.vendorSessionId));
+        live.add(vendorSessionId);
+        sweepClaudeConfigDirs(
+          root,
+          (this.#opts.retentionDays ?? 30) * 24 * 60 * 60 * 1000,
+          new Set([...live].filter((v): v is string => v !== undefined)),
+        );
+      } catch {
+        // Tried again by the next adapter that starts; the directories are only kept longer.
+      }
+    }
     if (opts.resume && !existsSync(configDir)) {
       throw new Error(`no PTY session ${vendorSessionId} to resume`);
     }
-    prepareClaudeConfigDir(configDir, {
-      cwd,
-      ...(env.ANTHROPIC_API_KEY ? { apiKey: env.ANTHROPIC_API_KEY } : {}),
-    });
+    // A new session that fails to start leaves no directory; a resumed one keeps its own.
+    const dropDir = () => {
+      if (!opts.resume) removeClaudeConfigDir(root, vendorSessionId);
+    };
+    try {
+      prepareClaudeConfigDir(configDir, {
+        cwd,
+        ...(env.ANTHROPIC_API_KEY ? { apiKey: env.ANTHROPIC_API_KEY } : {}),
+      });
+    } catch (err) {
+      dropDir();
+      throw err;
+    }
 
     const files: string[] = [];
     const fileOpts = {
@@ -257,13 +290,18 @@ export class PtyAdapter implements AgentAdapter {
       ready = r;
     });
     const early: HookBody[] = [];
-    const reg = await this.#hooks.register((body, reply, onAbort) => {
-      if (s) this.#onHook(s, body, reply, onAbort);
-      else {
-        early.push(body);
-        reply();
-      }
-    });
+    const reg = await this.#hooks
+      .register((body, reply, onAbort) => {
+        if (s) this.#onHook(s, body, reply, onAbort);
+        else {
+          early.push(body);
+          reply();
+        }
+      })
+      .catch((err: unknown) => {
+        dropDir();
+        throw err;
+      });
     const secrets = [reg.token.reveal(), ...mcpHeaderSecrets(opts.mcpServers)];
     try {
       const hookFile = writeSessionFile(
@@ -407,6 +445,7 @@ export class PtyAdapter implements AgentAdapter {
       if (s) await this.#terminate(s);
       for (const f of files) removeSessionFile(f);
       await this.#hooks.unregister(reg.key);
+      dropDir();
       throw err;
     }
     this.#sessions.set(handle.id, s);
@@ -486,6 +525,17 @@ export class PtyAdapter implements AgentAdapter {
     return this.#sessions.get(h.id)?.state ?? 'done';
   }
 
+  async discard(vendorSessionId: string, cwd: string): Promise<void> {
+    if (!UUID.test(vendorSessionId)) throw new Error('a PTY session is named by its UUID');
+    for (const s of this.#sessions.values()) {
+      if (s.handle.vendorSessionId === vendorSessionId) {
+        throw new Error(`PTY session ${vendorSessionId} is still open`);
+      }
+    }
+    const base = this.#opts.baseEnv ?? process.env;
+    removeClaudeConfigDir(this.#configRoot(cwd, base.HOME ?? homedir()), vendorSessionId);
+  }
+
   terminal(h: SessionHandle): AgentTerminal {
     const s = this.#sessions.get(h.id);
     if (!s) throw new Error(`unknown session ${h.id}`);
@@ -493,6 +543,17 @@ export class PtyAdapter implements AgentAdapter {
   }
 
   // ---- internals -------------------------------------------------------------------------
+
+  /** Where the sessions' Claude config directories live: `<repo state dir>/claude-pty`. */
+  #configRoot(cwd: string, home: string): string {
+    return join(
+      repoStateDir(
+        this.#opts.repoRoot ?? repoOf(cwd),
+        this.#opts.stateDir ?? defaultStateDir(home),
+      ),
+      'claude-pty',
+    );
+  }
 
   /**
    * Type a prompt as one bracketed paste and submit it. `UserPromptSubmit` acknowledges it; if it
