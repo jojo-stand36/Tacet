@@ -40,6 +40,7 @@ describe(`codex app-server schema (pinned ${CODEX_VERSION})`, () => {
         'thread/start',
         'thread/resume',
         'thread/fork',
+        'thread/read',
         'turn/start',
         'turn/interrupt',
         'model/list',
@@ -114,5 +115,13 @@ describe(`codex app-server schema (pinned ${CODEX_VERSION})`, () => {
       expect(props, f).toHaveProperty('model');
       expect(props, f).toHaveProperty('reasoningEffort');
     }
+  });
+
+  it('has the source-thread fields a fork reads and the fork params it sends (#175)', () => {
+    expect(JSON.parse(read('v2/ThreadReadParams.json')).properties).toHaveProperty('threadId');
+    const thread = JSON.parse(read('v2/ThreadReadResponse.json')).definitions.Thread.properties;
+    expect(thread).toHaveProperty('model');
+    expect(thread).toHaveProperty('reasoningEffort');
+    expect(JSON.parse(read('v2/ThreadForkParams.json')).properties).toHaveProperty('model');
   });
 });

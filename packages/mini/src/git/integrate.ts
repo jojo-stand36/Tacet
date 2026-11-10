@@ -15,6 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { inflateSync, constants as zlibConstants } from 'node:zlib';
 import {
   readWorkerFile,
   SAFE_GIT_ARGS,
@@ -265,12 +266,14 @@ function openIn(parent: OpenDir | undefined, name: string, flags: number): numbe
   return fd;
 }
 
-function openDir(parent: OpenDir | undefined, name: string): OpenDir | undefined {
+function openDir(parent: OpenDir | undefined, name: string, strict = false): OpenDir | undefined {
   let fd: number;
   try {
     fd = openIn(parent, name, constants.O_RDONLY | constants.O_DIRECTORY);
   } catch (err) {
     if ((err as Error).message.includes('changed while')) throw err;
+    // Strict callers vouch for what they did not see: only a missing directory is empty.
+    if (strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return undefined;
   }
   const st = fstatSync(fd);
@@ -338,6 +341,76 @@ async function snapshotLooseObjects(
     }
   } finally {
     closeSync(root.fd);
+  }
+}
+
+/**
+ * The commits among the Worker's loose objects (`<objects>/xx/yyyy…`), found the way
+ * `snapshotLooseObjects` walks the store: well-formed names only, regular files only, never
+ * through a symlink or a FIFO, at most 100,000 files, before `deadline`. Only each object's
+ * header is read and inflated; the store is never given to git. Throws when the store has packs
+ * (it cannot be checked without git) or cannot be read safely.
+ */
+export async function looseCommits(objectsDir: string, deadline: number): Promise<string[]> {
+  const root = openDir(undefined, objectsDir, true);
+  if (!root) return [];
+  const commits: string[] = [];
+  let files = 0;
+  try {
+    for (const d of listDir(root)) {
+      if (d === 'pack') {
+        const pack = openDir(root, d, true);
+        if (pack) {
+          try {
+            // Any entry: git also loads packs whose names start with a dot.
+            if (listDir(pack).length > 0) {
+              throw new Error("the Worker's object store has packs, which are not supported");
+            }
+          } finally {
+            closeSync(pack.fd);
+          }
+        }
+        continue;
+      }
+      if (!LOOSE_DIR.test(d)) continue;
+      const sub = openDir(root, d, true);
+      if (!sub) continue;
+      try {
+        for (const f of listDir(sub)) {
+          if (!LOOSE_FILE.test(f)) continue;
+          files += 1;
+          if (files > MAX_FILES) throw new Error("the Worker's object store has too many objects");
+          if (files % 500 === 0) {
+            if (Date.now() > deadline) throw new Error('reading the Worker objects timed out');
+            await new Promise((r) => setImmediate(r));
+          }
+          if (objectType(sub, f) === 'commit') commits.push(`${d}${f}`);
+        }
+      } finally {
+        closeSync(sub.fd);
+      }
+    }
+  } finally {
+    closeSync(root.fd);
+  }
+  return commits;
+}
+
+/** The type in a loose object's header (`<type> <size>\0`), from its first compressed bytes. */
+function objectType(dir: OpenDir, name: string): string {
+  const fd = openIn(dir, name, constants.O_RDONLY);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error('a Worker object is not a regular file');
+    const head = Buffer.alloc(64);
+    const n = readSync(fd, head, 0, head.length, 0);
+    const text = inflateSync(head.subarray(0, n), {
+      finishFlush: zlibConstants.Z_SYNC_FLUSH,
+    }).toString('latin1');
+    const type = /^(blob|tree|commit|tag) /.exec(text)?.[1];
+    if (!type) throw new Error('a Worker object has no valid header');
+    return type;
+  } finally {
+    closeSync(fd);
   }
 }
 

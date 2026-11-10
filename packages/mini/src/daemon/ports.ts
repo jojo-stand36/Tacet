@@ -8,9 +8,8 @@ import type {
 import type { WorkerBinding } from '@tacet/core/node';
 
 /**
- * The Worker's checkout, one per sub-task. Matches the worktree manager's `create`/`remove`
- * (#16, PR #103), plus the base commit of #134, which that manager's `create` needs to take. Paths stay inside the Mini-conductor: events
- * name a workspace by `id` only.
+ * The Worker's checkout, one per sub-task; `WorktreeManager` (#16) implements the port. Paths
+ * stay inside the Mini-conductor: events name a workspace by `id` only.
  */
 export interface Workspace {
   id: string;
@@ -25,7 +24,11 @@ export interface Workspaces {
   create(workerId: string, base?: string): Promise<Workspace>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
-  remove(id: string): Promise<void>;
+  /**
+   * Delete a checkout; a no-op for an id that is gone. Refuses (throws) rather than lose work
+   * nothing else has, such as local files or commits no other branch contains, unless `force`.
+   */
+  remove(id: string, options?: { force?: boolean }): Promise<void>;
 }
 
 /** The Worker's checkout failed its integrity checks: nothing was run in it. */
