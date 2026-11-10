@@ -363,8 +363,10 @@ export class MiniConductor {
   /**
    * Cancel a task (#202): it and its unfinished sub-tasks are recorded as `canceled`, their open
    * Worker sessions are ended (`worker.ended` with reason `canceled`, which is never resumed), its
-   * planner is stopped, and nothing more starts for it. Returns the ids canceled. Throws for an
-   * unknown task, a sub-task, or a task that has already ended.
+   * planner is stopped, and nothing more starts for it. Work already under way for it (a Worker
+   * starting, an integration, a roll-up) records nothing more once it returns. Returns the ids
+   * canceled. Throws for an unknown task, a sub-task, or a task that has already ended. A planner
+   * that ignores its abort signal keeps `settled()` waiting until it returns; its plan is dropped.
    */
   async cancel(taskId: string): Promise<string[]> {
     if (!this.#started) throw new Error('call start() first');
@@ -435,6 +437,19 @@ export class MiniConductor {
 
   #live(gen: number): boolean {
     return this.#started && gen === this.#gen;
+  }
+
+  /**
+   * Whether a sub-task, or the task it belongs to, has ended (canceled, say, #202): work still
+   * under way for it (a Worker starting, an integration, a roll-up) must not record anything more.
+   */
+  #ended(taskId: string): boolean {
+    const { tasks } = this.#state();
+    const root = taskId.split('/')[0] as string;
+    return [taskId, root].some((id) => {
+      const state = tasks[id]?.state;
+      return state !== undefined && TERMINAL.has(state);
+    });
   }
 
   #track<T>(p: Promise<T>): void {
@@ -548,6 +563,7 @@ export class MiniConductor {
       // One sub-task that cannot start must not hold up the others, nor be retried every tick.
       await this.#run(id, gen).catch((err: unknown) => {
         this.#errors.push(err);
+        if (this.#ended(id)) return;
         this.#o.store.append(
           this.#env(id, 'task.status', {
             state: 'failed',
@@ -742,6 +758,8 @@ export class MiniConductor {
       // The parent's branch gets the work of every sub-task (#134).
       const published = done ? await this.#publish(parent.task.id, results) : undefined;
       if (!this.#live(gen)) return;
+      // Canceled while its work was being published (#202): it keeps that state.
+      if (this.#ended(parent.task.id)) continue;
       const statuses = results.map((r) => r.verification?.status);
       const verification: VerificationStatus =
         !done || statuses.includes('failed')
@@ -1008,6 +1026,8 @@ export class MiniConductor {
       await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
       if (!this.#live(gen)) return;
     }
+    // Canceled while the checkout was being made: start nothing (#202).
+    if (this.#ended(subtaskId)) return;
     // Intent first: a crash after this leaves a record of the session and its checkout.
     this.#o.store.append([
       this.#env(
@@ -1091,7 +1111,8 @@ export class MiniConductor {
           if (this.#markers.delete(sessionId)) this.#saveMarkers();
         }),
       );
-      if (!this.#live(gen)) return;
+      // Canceled meanwhile: the cancellation already recorded this session's end (#202).
+      if (!this.#live(gen) || this.#ended(subtaskId)) return;
       this.#errors.push(err);
       this.#o.store.append(
         this.#env(
@@ -1117,8 +1138,9 @@ export class MiniConductor {
       this.#afterFailure(subtaskId);
       return;
     }
-    if (!this.#live(gen)) {
-      // Stopped while the session started: give it back without registering it.
+    if (!this.#live(gen) || this.#ended(subtaskId)) {
+      // Stopped or canceled while the session started: give it back without registering it.
+      // A cancellation already recorded its end.
       revoke();
       await worker.adapter.close(handle).catch(() => {});
       if (this.#markers.delete(sessionId)) this.#saveMarkers();
@@ -1290,6 +1312,7 @@ export class MiniConductor {
           ended = true;
           return;
         }
+        if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
         this.#o.store.append(this.#env(run.subtaskId, 'task.status', { state: 'input_required' }));
         return;
       }
@@ -1300,6 +1323,8 @@ export class MiniConductor {
         ended = true;
         return;
       }
+      // Ended meanwhile (canceled, say): nothing more is run in its checkout.
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
       // One round per check: the commands and the review of the same commit share it.
       const round = this.#verifyRounds(run);
       let verification: VerifyResult;
@@ -1393,6 +1418,8 @@ export class MiniConductor {
       return true;
     } catch (err) {
       this.#errors.push(err);
+      // Ended meanwhile (canceled, say): its end is recorded already.
+      if (this.#runs.get(run.subtaskId) !== run) return false;
       if (err instanceof WorktreeRefusedError) {
         await this.#refused(run);
         return false;
@@ -1417,6 +1444,8 @@ export class MiniConductor {
 
   /** The Worker's checkout failed its integrity checks: ask the user, end the run. */
   async #refused(run: Run): Promise<void> {
+    // Ended meanwhile (canceled, say): nothing to ask about a run that no longer exists.
+    if (this.#runs.get(run.subtaskId) !== run) return;
     // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
     this.#raise(
       run.subtaskId,
@@ -1678,6 +1707,7 @@ export class MiniConductor {
 
   /** After a failed run: retry (a restart does not count) or fail the sub-task for good. */
   #afterFailure(subtaskId: string): void {
+    if (this.#ended(subtaskId)) return;
     const failed = [...this.#state().sessions.values()].filter(
       (s) => s.taskId === subtaskId && s.ended !== undefined && COUNTED.has(s.ended),
     ).length;
@@ -1865,7 +1895,7 @@ const CANCELED_MESSAGE = 'canceled by the user';
 
 /** Why `taskId` cannot be canceled, or undefined when it can. */
 function cancelProblem(v: View, taskId: string): string | undefined {
-  const t = v.tasks[taskId];
+  const t = Object.hasOwn(v.tasks, taskId) ? v.tasks[taskId] : undefined;
   if (!t) return `unknown task ${taskId}`;
   if (t.task.parentId !== undefined || taskId.includes('/')) {
     return `${taskId} is a sub-task: cancel its task ${t.task.parentId ?? taskId.split('/')[0]}`;
@@ -1944,9 +1974,13 @@ export async function cancelStopped(
     if (problem) throw new Error(problem);
     const file = o.processFile ?? `${o.lockPath}.workers`;
     const errors = await endStaleWorkerProcesses(file);
+    // As `#saveMarkers` writes it: a crash mid-write never leaves a half-written file.
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(file, '[]\n', { mode: 0o600 });
+      writeFileSync(tmp, '[]\n', { flag: 'wx', mode: 0o600 });
+      renameSync(tmp, file);
     } catch (err) {
+      rmSync(tmp, { force: true });
       errors.push(err);
     }
     const env: MakeEnvelope = (t, type, data, sessionId) =>

@@ -57,7 +57,8 @@ export function readState(store: EventStore): TasksState {
 
 /**
  * Open escalations of a task and its sub-tasks: id, the task it is on, the question. Those of a
- * task that has ended (canceled, say) are left out: nobody waits on their answer.
+ * sub-task or task that has ended (canceled, failed, completed) are left out: an answer to them
+ * would never reach a Worker, so nobody waits on it (#202).
  */
 export function pendingEscalations(state: TasksState, root: string) {
   return Object.values(state.tasks)

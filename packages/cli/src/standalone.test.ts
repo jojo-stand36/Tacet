@@ -353,6 +353,27 @@ describe('tacet standalone (#21)', () => {
     expect((await tacet(['cancel', ...user()])).code).toBe(2);
   });
 
+  it('drops the open escalations of a canceled task from status (#202)', async () => {
+    const paths = repoStatePaths(repo, state);
+    script = () => {
+      raise(paths.events, 'Which database?');
+      return { do: 'reply', text: 'Escalated; waiting.' };
+    };
+    const r = await tacet(['run', ...user(), 'pick a database']);
+    expect(r.code).toBe(3);
+    const id = /task (\S+) submitted/.exec(r.err)?.[1] as string;
+    const escalations = async () =>
+      (
+        JSON.parse((await tacet(['status', ...user(), '--json'])).out) as {
+          tasks: { escalations: unknown[] }[];
+        }
+      ).tasks[0]?.escalations;
+    expect(await escalations()).toHaveLength(1);
+    expect((await tacet(['cancel', ...user(), id])).code).toBe(0);
+    // Nobody waits on that answer now: the question is no longer listed.
+    expect(await escalations()).toEqual([]);
+  });
+
   it('says so when the repo has no Tacet state, and refuses usage errors', async () => {
     expect((await tacet(['status', ...user()])).out).toContain('no Tacet state');
     expect((await tacet(['logs', ...user(), 'x'])).code).toBe(1);

@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,7 +10,13 @@ import {
   type TacetConfig,
   tasksProjection,
 } from '@tacet/core';
-import { type EventStore, openEventStore } from '@tacet/core/node';
+import {
+  type EventStore,
+  markedProcesses,
+  newWorkerMarker,
+  openEventStore,
+  WORKER_MARKER_VAR,
+} from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
@@ -1074,6 +1081,102 @@ describe('MiniConductor', () => {
       ]);
     });
 
+    it('starts nothing for a Worker whose start was under way when it was canceled', async () => {
+      fake.startDelayMs = 300;
+      const d = make({
+        planner: new FixedPlanner([{ key: 'a', goal: 'a [hold]', acceptanceCriteria: ['ok'] }]),
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      // Recorded and launching, not yet registered.
+      await expect
+        .poll(() => ofType('worker.started', `${id}/1`).length, { timeout: 5000 })
+        .toBe(1);
+      expect(fake.open).toBe(0);
+      await d.cancel(id);
+      await expect.poll(() => fake.sessions.length, { timeout: 5000 }).toBe(1);
+      await d.settled();
+      expect(fake.open).toBe(0);
+      expect(fake.sessions[0]?.inputs).toEqual([]);
+      expect(endReasons(id)).toEqual(['canceled']);
+      for (const t of [id, `${id}/1`]) expect(tasks()[t]?.state).toBe('canceled');
+      // Nothing about it is recorded after the cancellation.
+      const statuses = ofType('task.status', `${id}/1`).map(
+        (e) => (e.data as { state: string }).state,
+      );
+      expect(statuses.at(-1)).toBe('canceled');
+      expect(statuses.filter((x) => x === 'canceled')).toHaveLength(1);
+    });
+
+    it('records nothing more for a run whose integration was under way when it was canceled', async () => {
+      let release = () => {};
+      let integrating = false;
+      const verified: string[] = [];
+      const integrator: Integrator = {
+        integrate: async (subtaskId) => {
+          integrating = true;
+          await new Promise<void>((r) => {
+            release = r;
+          });
+          return { commit: 'c'.repeat(40), ref: `refs/heads/tacet/${subtaskId}` };
+        },
+        combine: async () => undefined,
+        publish: async (taskId) => `refs/heads/tacet/result/${taskId}`,
+      };
+      const verifier: Verifier = {
+        verify: async (task) => {
+          verified.push(task.id);
+          return { status: 'passed', commands: [] };
+        },
+      };
+      const d = make({
+        planner: new FixedPlanner([{ key: 'a', goal: 'a', acceptanceCriteria: ['ok'] }]),
+        integrator,
+        verifier,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => integrating, { timeout: 5000 }).toBe(true);
+      await d.cancel(id);
+      release();
+      await d.settled();
+      expect(verified).toEqual([]);
+      expect(types(`${id}/1`)).not.toContain('worker.integrated');
+      expect(types(`${id}/1`)).not.toContain('task.result');
+      for (const t of [id, `${id}/1`]) expect(tasks()[t]?.state).toBe('canceled');
+      expect(endReasons(id)).toEqual(['canceled']);
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'ends the Worker processes a crashed run left behind before recording the cancel',
+      async () => {
+        const d1 = make({
+          planner: new FixedPlanner([{ key: 'a', goal: 'a [hold]', acceptanceCriteria: ['ok'] }]),
+        });
+        await d1.start();
+        const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+        await expect.poll(() => fake.open, { timeout: 5000 }).toBe(1);
+        d1.crashForTest();
+        // What the crashed run's Worker left: a process carrying its marker, listed in the file.
+        const marker = newWorkerMarker();
+        const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+          env: { PATH: process.env.PATH ?? '/usr/bin:/bin', [WORKER_MARKER_VAR]: marker },
+          stdio: 'ignore',
+        });
+        try {
+          await expect.poll(() => markedProcesses([marker]).size, { timeout: 5000 }).toBe(1);
+          writeFileSync(join(dir, 'mini.lock.workers'), `${JSON.stringify([marker])}\n`);
+          const r = await cancelStopped(id, { store, lockPath: join(dir, 'mini.lock') });
+          expect(r.errors).toEqual([]);
+          expect(markedProcesses([marker]).size).toBe(0);
+          expect(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')).toBe('[]\n');
+          expect(tasks()[id]?.state).toBe('canceled');
+        } finally {
+          child.kill('SIGKILL');
+        }
+      },
+    );
+
     it('refuses an unknown task, a sub-task and a task that has ended', async () => {
       const d = make();
       await d.start();
@@ -1104,6 +1207,14 @@ describe('MiniConductor', () => {
       await expect(cancelStopped(id, { store, lockPath: join(dir, 'mini.lock') })).rejects.toThrow(
         'has already ended (canceled)',
       );
+
+      // Refused, it leaves the marker file and the lock as they were.
+      writeFileSync(join(dir, 'mini.lock.workers'), '["keep"]\n');
+      await expect(
+        cancelStopped('nope', { store, lockPath: join(dir, 'mini.lock') }),
+      ).rejects.toThrow('unknown task nope');
+      expect(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')).toBe('["keep"]\n');
+      expect(miniLockHolder(join(dir, 'mini.lock'))).toBeUndefined();
 
       // The next start records no restart for those sessions and runs nothing of the task.
       const before = fake.sessions.length;
