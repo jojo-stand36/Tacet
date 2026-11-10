@@ -885,7 +885,7 @@ export class MiniConductor {
       this.#combineFailures.delete(subtaskId);
       return { ...(commit !== undefined ? { commit } : {}), notes: [] };
     } catch (err) {
-      if (!this.#live(gen)) return undefined;
+      if (!this.#live(gen) || this.#ended(subtaskId)) return undefined;
       this.#errors.push(err);
       if (!(err instanceof MergeConflictError)) {
         // A git error (a timeout, say) may pass: try again on later ticks, a few times.
@@ -953,7 +953,8 @@ export class MiniConductor {
   // ---- Workers ---------------------------------------------------------------------------
 
   async #run(subtaskId: string, gen: number): Promise<void> {
-    if (this.#runs.has(subtaskId) || !this.#live(gen)) return;
+    // A tick's ready list can outlive a cancellation made while an earlier run of it started.
+    if (this.#runs.has(subtaskId) || !this.#live(gen) || this.#ended(subtaskId)) return;
     const v = this.#state();
     const view = v.tasks[subtaskId];
     if (!view) return;
@@ -1141,9 +1142,14 @@ export class MiniConductor {
     if (!this.#live(gen) || this.#ended(subtaskId)) {
       // Stopped or canceled while the session started: give it back without registering it.
       // A cancellation already recorded its end.
+      const canceled = this.#live(gen);
       revoke();
       await worker.adapter.close(handle).catch(() => {});
       if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      // A canceled session is never resumed: its vendor state can go (#153).
+      if (canceled && handle.vendorSessionId) {
+        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
+      }
       return;
     }
     const run: Run = {

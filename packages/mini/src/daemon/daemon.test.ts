@@ -1082,7 +1082,10 @@ describe('MiniConductor', () => {
     });
 
     it('starts nothing for a Worker whose start was under way when it was canceled', async () => {
-      fake.startDelayMs = 300;
+      let open = () => {};
+      fake.startGate = new Promise<void>((r) => {
+        open = r;
+      });
       const d = make({
         planner: new FixedPlanner([{ key: 'a', goal: 'a [hold]', acceptanceCriteria: ['ok'] }]),
       });
@@ -1094,8 +1097,13 @@ describe('MiniConductor', () => {
         .toBe(1);
       expect(fake.open).toBe(0);
       await d.cancel(id);
+      open();
       await expect.poll(() => fake.sessions.length, { timeout: 5000 }).toBe(1);
       await d.settled();
+      // Its vendor state goes too: a canceled session is never resumed.
+      await expect
+        .poll(() => fake.discarded.map((x) => x.vendorSessionId), { timeout: 5000 })
+        .toEqual([fake.sessions[0]?.handle.vendorSessionId]);
       expect(fake.open).toBe(0);
       expect(fake.sessions[0]?.inputs).toEqual([]);
       expect(endReasons(id)).toEqual(['canceled']);
