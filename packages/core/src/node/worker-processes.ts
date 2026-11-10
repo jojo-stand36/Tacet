@@ -77,6 +77,45 @@ export function markedProcesses(markers: readonly string[]): Map<string, number[
   return found;
 }
 
+interface ProcessIdentity {
+  /** When it started: tells it apart from a later process with the same pid. */
+  start: string;
+  zombie: boolean;
+}
+
+/**
+ * A process's start time and whether it is a zombie, or undefined when there is no such process.
+ * Linux: `/proc/<pid>/stat` (state, and start time in clock ticks since boot). macOS: `ps -o
+ * stat=,lstart=` in a fixed locale and time zone.
+ */
+function identity(pid: number): ProcessIdentity | undefined {
+  if (!Number.isInteger(pid) || pid <= 1) return undefined;
+  try {
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      const start = fields[19];
+      return start ? { start, zombie: fields[0] === 'Z' } : undefined;
+    }
+    const out = execFileSync('/bin/ps', ['-o', 'stat=,lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', TZ: 'UTC0' },
+    }).trim();
+    const m = out.match(/^(\S+)\s+(.+)$/);
+    return m ? { start: m[2] ?? '', zombie: (m[1] ?? '').startsWith('Z') } : undefined;
+  } catch {
+    // No such process (ps exits 1), or gone between the lookup and the read.
+    return undefined;
+  }
+}
+
+/** Whether `pid` is running: it exists and is not a zombie waiting to be reaped. */
+export function isProcessRunning(pid: number): boolean {
+  const id = identity(pid);
+  return id !== undefined && !id.zombie;
+}
+
 function signal(pid: number, sig: NodeJS.Signals): void {
   try {
     process.kill(pid, sig);
@@ -87,30 +126,57 @@ function signal(pid: number, sig: NodeJS.Signals): void {
 
 /**
  * End every process carrying one of `markers`: SIGTERM (Claude Code ends its own tools on
- * SIGTERM), then SIGKILL for whatever is still there after `graceMs`. Each round looks the
- * processes up again, so only processes that carry a marker at that moment are signalled.
- * Returns the pids found, and those still there after SIGKILL (normally none).
+ * SIGTERM), then SIGKILL for whatever is still running after `graceMs`.
+ *
+ * A process found by its marker is then followed by pid until it is gone, not looked up by its
+ * marker again, so it is never taken for gone only because its environment can no longer be read
+ * (macOS reads it from the process's memory). Its start time is
+ * checked before every signal, so a pid reused meanwhile is never signalled. Each round also
+ * looks for marked processes forked meanwhile. Returns the pids found, and those still running
+ * after SIGKILL (normally none).
  */
 export async function endMarkedProcesses(
   markers: readonly string[],
   opts: { graceMs?: number } = {},
 ): Promise<{ found: number[]; left: number[] }> {
-  const pids = () => [...markedProcesses(markers).values()].flat();
-  const first = pids();
-  if (first.length === 0) return { found: [], left: [] };
-  for (const pid of first) signal(pid, 'SIGTERM');
+  const tracked = new Map<number, string>();
+  const found: number[] = [];
+  /** Newly marked processes, which are now tracked. */
+  const scan = (): number[] => {
+    const fresh: number[] = [];
+    for (const pid of [...markedProcesses(markers).values()].flat()) {
+      if (tracked.has(pid)) continue;
+      const id = identity(pid);
+      if (!id || id.zombie) continue;
+      tracked.set(pid, id.start);
+      found.push(pid);
+      fresh.push(pid);
+    }
+    return fresh;
+  };
+  /** Tracked processes still running as the same process; the others stop being tracked. */
+  const running = (): number[] =>
+    [...tracked].flatMap(([pid, start]) => {
+      const id = identity(pid);
+      if (id && !id.zombie && id.start === start) return [pid];
+      tracked.delete(pid);
+      return [];
+    });
+  scan();
+  if (tracked.size === 0) return { found: [], left: [] };
+  for (const pid of running()) signal(pid, 'SIGTERM');
   const deadline = Date.now() + (opts.graceMs ?? 5000);
-  let left = pids();
-  while (left.length > 0 && Date.now() < deadline) {
+  while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
-    left = pids();
+    for (const pid of scan()) signal(pid, 'SIGTERM');
+    if (running().length === 0) return { found, left: [] };
   }
-  // Each round signals what is there now, so a process forked meanwhile is not missed.
   const killDeadline = Date.now() + 2000;
-  while (left.length > 0 && Date.now() < killDeadline) {
+  for (;;) {
+    scan();
+    const left = running();
+    if (left.length === 0 || Date.now() >= killDeadline) return { found, left };
     for (const pid of left) signal(pid, 'SIGKILL');
     await new Promise((r) => setTimeout(r, 100));
-    left = pids();
   }
-  return { found: first, left };
 }

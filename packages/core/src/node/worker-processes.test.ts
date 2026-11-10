@@ -1,29 +1,15 @@
 import { type ChildProcess, spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   endMarkedProcesses,
+  isProcessRunning,
   isWorkerMarker,
   markedProcesses,
   newWorkerMarker,
   WORKER_MARKER_VAR,
 } from './worker-processes.js';
 
-/** Running, not a zombie (in a container, PID 1 may never reap an orphan). */
-const alive = (pid: number) => {
-  try {
-    process.kill(pid, 0);
-  } catch {
-    return false;
-  }
-  if (process.platform !== 'linux') return true;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) !== 'Z';
-  } catch {
-    return false;
-  }
-};
+const alive = isProcessRunning;
 
 const started: ChildProcess[] = [];
 
@@ -74,6 +60,21 @@ describe.skipIf(process.platform === 'win32')('Worker processes by marker (#127)
     for (const bad of ['', 'PATH=/usr/bin', '*', `${m}\n`, `${m} x`, 42]) {
       expect(isWorkerMarker(bad)).toBe(false);
     }
+  });
+
+  it('counts a zombie as not running, though kill(pid, 0) still reaches it', async () => {
+    // `sleep 0` exits at once; the shell then becomes `sleep 5`, which never reaps it.
+    const parent = spawn('sh', ['-c', 'sleep 0 & echo $!; exec sleep 5'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    started.push(parent);
+    const zombie = await new Promise<number>((resolve) =>
+      parent.stdout?.once('data', (b: Buffer) => resolve(Number.parseInt(b.toString(), 10))),
+    );
+    await expect.poll(() => isProcessRunning(zombie)).toBe(false);
+    expect(() => process.kill(zombie, 0)).not.toThrow();
+    expect(isProcessRunning(parent.pid as number)).toBe(true);
+    expect(isProcessRunning(2 ** 22 + 12345)).toBe(false);
   });
 
   it('finds the processes that carry a marker, and no others', async () => {
