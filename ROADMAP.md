@@ -76,6 +76,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
 - [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
+- [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 
@@ -141,3 +142,5 @@ Plugins, A2A/ACP exposure, sandboxing, evals, docs, release.
 - [ ] **Docs site + quickstart + vendor auth/billing guide** — `docs` `P1` `either + human`
 - [ ] **v0.1 release: packaging (npm, Homebrew), installers, changelog** — `chore` `P1` `copilot`
 - [ ] **Re-check Bun when oven-sh/bun#25822 closes** — `spike` `P2` `claude`
+- [ ] **ADR: native Windows support** — `adr` `P2` `claude + human`
+- [ ] **Native Windows support (after the ADR)** — `epic` `P2` `claude + human`

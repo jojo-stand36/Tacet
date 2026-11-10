@@ -1295,6 +1295,41 @@
         "needs-human"
       ],
       "body": "Found in #181 (verified live on Gemini CLI 0.67.0 over ACP): a Gemini Worker's checkout is untrusted (Tacet never passes `GEMINI_CLI_TRUST_WORKSPACE`, folder trust is on), which keeps the checkout's `.gemini/settings.json`, `GEMINI.md`, skills, agents and `.gemini/.env` out. But in an untrusted folder Gemini also never contacts the MCP server Tacet passes in `session/new` (no request at all; one once trusted), so Gemini Workers cannot use `escalate`, `report_progress` or the other Mini-conductor tools. Trusting the checkout would load everything above; no flag trusts a folder for MCP only.\n\n### Tasks\n- [ ] Owner decision: Gemini Workers without Mini-conductor tools (escalation through ACP permission requests only), trust the checkout and accept what it loads, or find or ask upstream for an MCP-only trust.\n- [ ] Implement it, with a test against the real CLI, and update ARCHITECTURE §6 and the capability matrix.\n\n### Acceptance criteria\n- A Gemini Worker either reaches Tacet's MCP server with none of the checkout's project files loaded (real-CLI test with a hostile checkout), or its missing tools are declared and handled so a Gemini Worker never waits on a tool it cannot call.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (Gemini, #181)._"
+    },
+    {
+      "title": "Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Owner decision (2026-11-10, relayed by the coordinator): Tacet supports Windows, WSL2 first. Tacet runs inside a WSL2 Linux distro (Ubuntu) as on Linux: Node, git, the vendor CLIs and the repos all live in the distro. Native Windows comes later, through an ADR (#194, then #195).\n\n### Tasks\n- [ ] Docs: install steps inside WSL2 (distro, Node 24+, pnpm, git, the vendor CLIs), and the caveats:\n  - repos on `/mnt/c` and other Windows drives (9p/drvfs: slow, different permission and symlink semantics, case-insensitivity),\n  - Windows-side git, editors and indexers touching the same checkout as Tacet's Workers,\n  - sandboxing inside WSL2 (bubblewrap, socat) for the vendor CLIs that use them.\n  Verify each WSL fact from Microsoft's or the tool's own docs (`verify-vendor-facts`) and cite it.\n- [ ] A startup check that warns, with the reason and the fix, when the repo or the state dir is on a Windows drive (`/mnt/<letter>/...` or another drvfs/9p mount) inside WSL.\n- [ ] CI: find out from primary sources whether GitHub-hosted Windows runners can run the test suite inside WSL2 (not WSL1), and how (e.g. a setup action, nested virtualisation). Record the method and its limits. Add the job if it is feasible, or record why not and what would make it so.\n- [ ] ARCHITECTURE and AGENTS.md state WSL2 as supported once this lands.\n\n### Acceptance criteria\n- The docs describe a working WSL2 setup, with every WSL-specific claim sourced.\n- Starting Tacet on a repo under `/mnt/*` inside WSL prints the warning; a repo in the distro's own filesystem does not. A test covers both, using a fake mount table.\n- Either a CI job runs the suite inside WSL2 on a Windows runner, or the issue records, with sources, why that is not possible on GitHub-hosted runners and what the alternative is.\n\n_See docs/adr/002-language-runtime.md (platforms, with the 2026-11-10 addendum), docs/ARCHITECTURE.md and docs/RESEARCH.md._"
+    },
+    {
+      "title": "ADR: native Windows support",
+      "milestone": "M6 · Ecosystem & hardening",
+      "labels": [
+        "type:adr",
+        "area:core",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Owner decision (2026-11-10): Windows is supported through WSL2 first; native Windows comes later, through this ADR. The ADR lays out options with evidence for the owner to decide; it does not decide. It updates the platform statement of ADR-002 when accepted.\n\nEvery vendor and Windows fact below must be checked against primary sources before the ADR relies on it (`verify-vendor-facts`).\n\n### Questions and the options to lay out\n- **Ending a session's processes.** Tacet ends a Worker's whole process group (`detached` spawns, `kill(-pgid)`, #185, #191) and finds crashed Workers by an environment marker (#127). Windows has no process groups or `/proc`. Options: Job Objects (kill-on-close), a process-tree walk, or a helper process; how Node exposes each.\n- **Sandbox story.** On macOS and Linux the vendor CLIs bring their own sandboxes (Seatbelt, bubblewrap/Landlock) and Tacet plans its own (#53). What each vendor offers on Windows, if anything, and what Tacet could use (AppContainer, restricted tokens, Windows Sandbox): options and what each would cost.\n- **PTY.** The PTY adapter uses node-pty; on Windows that is ConPTY. What changes in the adapter and in the vendor CLIs' terminal behaviour.\n- **Paths, symlinks and junctions** in the safe-git code (`workerWorktree`, `trustedGitEnv`, the integration of Worker commits, #116, #119) and the worktree code: drive letters, case-insensitive paths, junctions and symlinks that need a privilege, and what the integrity checks must refuse.\n- **Vendor CLIs on Windows.** For each adapter (Claude Code / Agent SDK, Codex app-server, Gemini CLI, OpenCode, the ACP agents): whether it runs natively on Windows, with which sandbox, auth and config locations. Checked per vendor, with sources and dates.\n- **Local servers, files and secrets.** Loopback binding, the 0600 runtime and session files (ACLs instead of modes), and the keychain (Windows Credential Manager).\n- **CI and support cost** of a native Windows target.\n\n### Tasks\n- [ ] Draft `docs/adr/NNN-native-windows.md` from the template, Status: proposed, with the options above and their evidence.\n- [ ] Owner decides; update ADR-002's platforms and ARCHITECTURE accordingly.\n\n### Acceptance criteria\n- A proposed ADR covers each question above with options, sources and trade-offs, and leaves the decision to the owner.\n\nImplementation follows in #195. _See docs/adr/002-language-runtime.md, docs/ARCHITECTURE.md §6 and #193 (WSL2)._"
+    },
+    {
+      "title": "Native Windows support (after the ADR)",
+      "milestone": "M6 · Ecosystem & hardening",
+      "labels": [
+        "type:epic",
+        "area:core",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Placeholder for a later milestone: implementing native Windows support as the native-Windows ADR decides. Blocked on that ADR (#194) being accepted; its tasks are written from the decision.\n\n### Tasks\n- [ ] Split into issues once the ADR is accepted.\n\n### Acceptance criteria\n- Defined by the accepted ADR.\n\n_See #194, #193 (WSL2) and docs/adr/002-language-runtime.md._"
     }
   ]
 }
