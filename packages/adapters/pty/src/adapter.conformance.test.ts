@@ -38,36 +38,10 @@ function claudeBinary(): string {
  * API (#15): no credentials, no network. State comes from Claude Code's hooks.
  */
 /**
- * On Linux, interactive Claude Workers refuse to start until #164: Claude Code's sandbox (needed so
- * the commands they run never see the API key, #150) blocks the hooks that report back to Tacet.
- * There the refusal is what is tested; the real sessions run on macOS.
+ * The scrub (#150) is on: on Linux the real sessions run under Claude Code's sandbox, so
+ * bubblewrap and socat must be installed (as on CI); its hooks relay through command hooks (#164).
  */
-const linux = process.platform === 'linux';
-
-describe.runIf(linux && gate.ok)('PtyAdapter on Linux (#164)', () => {
-  it('refuses to start an interactive Claude Worker, saying why', async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-linux-')));
-    try {
-      const adapter = new PtyAdapter({
-        command: [claudeBinary()],
-        stateDir: join(root, 'state'),
-        sessionFileDir: join(root, 'run'),
-        baseEnv: {
-          PATH: process.env.PATH,
-          HOME: root,
-          ANTHROPIC_API_KEY: 'sk-ant-placeholder-not-a-real-key-0123456789',
-        },
-      });
-      await expect(adapter.start({ cwd: root })).rejects.toThrow(
-        /can't run on Linux yet.*#164.*claude-sdk/,
-      );
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  });
-});
-
-describe.skipIf(!gate.ok || linux)(
+describe.skipIf(!gate.ok)(
   gatedTitle('PtyAdapter conformance (interactive Claude Code in a PTY, mock Messages API)', gate),
   () => {
     let api: MockMessagesApi;
@@ -323,11 +297,16 @@ describe.skipIf(!gate.ok || linux)(
           .sort(),
       ).toEqual([`${h.id}.hook.json`, `${h.id}.json`, `${h.id}.settings.json`].sort());
       for (const f of mine()) expect(statSync(join(f.parentPath, f.name)).mode & 0o777).toBe(0o600);
-      const settings = mine().find((f) => f.name.endsWith('.settings.json'));
+      const hookFile = mine().find((f) => f.name.endsWith('.hook.json'));
       const hookToken = String(
-        JSON.parse(readFileSync(join(settings?.parentPath ?? '', settings?.name ?? ''), 'utf8'))
-          .hooks.Stop[0].hooks[0].headers.Authorization,
-      ).replace('Bearer ', '');
+        JSON.parse(readFileSync(join(hookFile?.parentPath ?? '', hookFile?.name ?? ''), 'utf8'))
+          .token,
+      );
+      // The settings name only the relay and that file: no token (#164).
+      const settings = mine().find((f) => f.name.endsWith('.settings.json'));
+      expect(
+        readFileSync(join(settings?.parentPath ?? '', settings?.name ?? ''), 'utf8'),
+      ).not.toContain(hookToken);
       expect(hookToken.length).toBeGreaterThan(20);
       const tap = new EventTap(adapter.events(h));
       await turn(h, tap, 'SAY files');
