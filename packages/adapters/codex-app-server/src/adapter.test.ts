@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   mkdirSync,
   mkdtempSync,
@@ -628,24 +629,48 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
             await new Promise((r) => setTimeout(r, 25));
           }
         }
-        const running = (() => {
-          try {
-            const stat = readFileSync(`/proc/${childPid}/stat`, 'utf8');
-            return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
-          } catch {
-            try {
-              process.kill(childPid as number, 0);
-              return process.platform !== 'linux';
-            } catch {
-              return false;
-            }
-          }
-        })();
-        expect(running).toBe(false);
+        expect(running(childPid)).toBe(false);
       } finally {
         // Never leave the SIGTERM-ignoring child running on the test machine.
         try {
-          if (childPid) process.kill(childPid, 'SIGKILL');
+          if (childPid && running(childPid)) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'reports a self-exit only once the whole process group is gone (#198)',
+    async () => {
+      const adapter = make('child-term-crash', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        const tap = new EventTap(adapter.events(h));
+        await adapter.send(h, { text: 'go' });
+        // Checked the moment the error is seen: a caller cleaning up on it races nothing.
+        let alive: boolean | undefined;
+        const seen = tap.waitFor((e) => {
+          if (e.t === 'status' && e.state === 'error') {
+            alive = running(childPid as number);
+            return true;
+          }
+          return false;
+        }, 10_000);
+        const { event } = await seen;
+        expect(event).toMatchObject({ message: expect.stringContaining('exited unexpectedly') });
+        expect(alive).toBe(false);
+        // Ended at once, though: nothing more can be sent to it while its group is reaped.
+        await expect(adapter.send(h, { text: 'again' })).rejects.toThrow('has ended');
+        // close() after it waits on that one reap: the group, seen empty, is never polled again.
+        const before = Date.now();
+        await adapter.close(h);
+        expect(Date.now() - before).toBeLessThan(250);
+      } finally {
+        try {
+          if (childPid && running(childPid)) process.kill(childPid, 'SIGKILL');
         } catch {}
       }
     },
@@ -766,3 +791,30 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     await adapter.close(h);
   });
 });
+
+/**
+ * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
+ * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
+ * where `kill(pid, 0)` also finds a zombie.
+ */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+  } catch {
+    if (process.platform === 'linux') return false;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    return state.trim() !== '' && !state.trim().startsWith('Z');
+  } catch (err) {
+    // `ps` exits 1 once the pid is gone; anything else is a broken check, not an answer.
+    if ((err as { status?: number }).status === 1) return false;
+    throw err;
+  }
+}

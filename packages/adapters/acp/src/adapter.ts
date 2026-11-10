@@ -143,6 +143,12 @@ interface Session {
   /** How often the agent left the pinned mode. */
   drifts: number;
   exited: Promise<void>;
+  /**
+   * Resolves once the agent has exited and the exit handler's reap of its process group has
+   * finished: the one reap of the group (#218). Closing waits on it rather than polling the group
+   * again, since an id seen empty may belong to another group by then.
+   */
+  gone: Promise<void>;
   exit?: { code: number | null; signal: NodeJS.Signals | null };
   stderrTail: string;
   closing: boolean;
@@ -220,6 +226,8 @@ export class AcpAdapter implements AgentAdapter {
     const handle: SessionHandle = { id: randomUUID() };
     let s: Session | undefined;
     const exitInfo: { value?: Session['exit']; reaped?: boolean } = {};
+    // Resolves only after an `exit`: wait on it only once the process has exited.
+    const { promise: gone, resolve: markGone } = Promise.withResolvers<void>();
     const exited = new Promise<void>((resolve) => {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
@@ -232,6 +240,7 @@ export class AcpAdapter implements AgentAdapter {
         void drained(proc)
           .then(() => this.#reapGroup(proc))
           .then(() => {
+            markGone();
             exitInfo.reaped = true;
             flushStderr();
             if (s) this.#onExit(s);
@@ -311,6 +320,7 @@ export class AcpAdapter implements AgentAdapter {
         turning: false,
         loading: false,
         exited,
+        gone,
         ...(exitInfo.value ? { exit: exitInfo.value } : {}),
         stderrTail,
         closing: false,
@@ -331,7 +341,7 @@ export class AcpAdapter implements AgentAdapter {
       s = undefined;
       conn.close();
       proc.stdin?.end();
-      await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      await this.#terminate(proc, exited, () => exitInfo.value !== undefined, gone);
       flushStderr();
       if (err instanceof ProfileRefusedError || err instanceof AuthRoutingError) throw err;
       if (err instanceof RequestError && err.code === AUTH_REQUIRED) {
@@ -416,7 +426,7 @@ export class AcpAdapter implements AgentAdapter {
     }
     s.conn.close();
     s.proc.stdin?.end();
-    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined);
+    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined, s.gone);
     if (error !== undefined) this.#setState(s, 'error', error);
     this.#setState(s, 'done');
     s.events.end();
@@ -776,7 +786,12 @@ export class AcpAdapter implements AgentAdapter {
     return scrubLiterals(redactSecrets(text), secrets);
   }
 
-  async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
+  async #terminate(
+    proc: ChildProcess,
+    exited: Promise<void>,
+    hasExited: () => boolean,
+    gone: Promise<void>,
+  ) {
     const within = (ms: number) =>
       Promise.race([
         exited.then(() => true),
@@ -792,14 +807,17 @@ export class AcpAdapter implements AgentAdapter {
     }
     // The agent's own children (claude-agent-acp's Claude Code, its MCP servers) got SIGTERM
     // when it exited, but may still be shutting down and writing: wait for the whole group, so
-    // nothing of a closed session is left running (#181 CI).
-    await this.#reapGroup(proc);
+    // nothing of a closed session is left running (#181 CI). The exit handler reaps the group,
+    // once (#218). A process that never exited (it failed to spawn) has no group to wait for; an
+    // `error` after a spawn without an `exit` cannot happen here (signals go through process.kill).
+    await (hasExited() ? gone : this.#reapGroup(proc));
   }
 
   /**
    * Once the leader has exited (and the group had SIGTERM), wait for the rest of its group, then
    * SIGKILL what is left. SIGKILL only right after seeing a running member: a pid is not reused
-   * while it is the id of a group with members, so this cannot reach a reused group id.
+   * while it is the id of a group with members, so this cannot reach a reused group id. Called
+   * once per process: never again once its group has been seen empty.
    */
   async #reapGroup(proc: ChildProcess): Promise<void> {
     const timeout = this.#opts.killTimeoutMs ?? 5000;

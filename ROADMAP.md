@@ -89,6 +89,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
+- [ ] **ACP adapter: close() after a self-exit must not poll the reaped process group again** — `chore` `P2` `claude`
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
 
