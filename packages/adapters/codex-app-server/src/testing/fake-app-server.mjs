@@ -23,7 +23,7 @@ if (mode === 'child') {
   const child = spawn('sleep', ['60'], { stdio: 'ignore' });
   log({ childPid: child.pid });
 }
-if (mode === 'child-term') {
+if (mode === 'child-term' || mode === 'child-term-crash') {
   // A child that ignores SIGTERM, like a tool or MCP server still shutting down (#191).
   const child = spawn('sh', ['-c', 'trap "" TERM; while :; do sleep 0.1; done'], {
     stdio: 'ignore',
@@ -109,7 +109,8 @@ rl.on('line', async (line) => {
     if (mode === 'slow-start') await sleep(300);
     send({ id: m.id, result: { turn: { id: turnId, status: 'inProgress' } } });
     send({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: turnId } } });
-    if (mode === 'crash') process.exit(3);
+    // child-term-crash: exits by itself while its SIGTERM-ignoring child still runs (#198).
+    if (mode === 'crash' || mode === 'child-term-crash') process.exit(3);
     if (mode === 'drop-stdout') {
       process.stdout.end();
       setTimeout(() => process.exit(4), 100);

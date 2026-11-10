@@ -10,3 +10,4 @@ export * from './process-group.js';
 export * from './session-files.js';
 export * from './state-dir.js';
 export * from './worker-processes.js';
+export * from './wsl.js';
