@@ -9,8 +9,9 @@ import type { Io } from './io.js';
 export type { Io };
 
 const USAGE = `usage:
-  tacet init [--worker ADAPTER] [--model MODEL] [--json]
-                                 set up .tacet/ in this repo (never overwrites a file)
+  tacet init [--worker ADAPTER] [--model MODEL] [--keep-merged-worktrees] [--json]
+                                 set up .tacet/ in this repo (never overwrites a file); Worker
+                                 checkouts are removed once their work is merged, unless kept
   tacet uninstall [--apply] [--purge] [--json]
                                  preview, then remove what init wrote (--purge: all of .tacet/,
                                  after a backup to ~/.tacet/backups)
@@ -35,7 +36,12 @@ const COMMON = {
 } as const;
 
 const OPTIONS = {
-  init: { ...COMMON, worker: { type: 'string' }, model: { type: 'string' } },
+  init: {
+    ...COMMON,
+    worker: { type: 'string' },
+    model: { type: 'string' },
+    'keep-merged-worktrees': { type: 'boolean' },
+  },
   uninstall: { ...COMMON, apply: { type: 'boolean' }, purge: { type: 'boolean' } },
   run: {
     ...COMMON,
