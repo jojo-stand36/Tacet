@@ -55,11 +55,7 @@ export const UPWARD_EVENT_TYPES = ['agent.usage'] as const;
 export function isForwardable(type: string): boolean {
   if (!EventType.safeParse(type).success) return false;
   if ((UPWARD_EVENT_TYPES as readonly string[]).includes(type)) return true;
-  const ns = type.split('.', 1)[0] ?? '';
-  return (
-    (UPWARD_EVENT_NAMESPACES as readonly string[]).includes(ns) &&
-    !(LOCAL_EVENT_NAMESPACES as readonly string[]).includes(ns)
-  );
+  return (UPWARD_EVENT_NAMESPACES as readonly string[]).includes(type.split('.', 1)[0] ?? '');
 }
 
 /** True if `type` belongs to a namespace this version of Tacet knows. */

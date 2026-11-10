@@ -17,11 +17,14 @@ import {
   isKnownEventNamespace,
   type JsonSchemaName,
   jsonSchemas,
+  LOCAL_EVENT_NAMESPACES,
   parseAgentEvent,
   Task,
   TaskExt,
   toJsonSchema,
   Ulid,
+  UPWARD_EVENT_NAMESPACES,
+  UPWARD_EVENT_TYPES,
 } from '../index.js';
 
 // ajv-formats ships CommonJS; depending on the loader the plugin is the module or its `.default`.
@@ -219,6 +222,21 @@ describe('JSON Schema export', () => {
 });
 
 describe('forwarding upward: the ADR-003 §4 allowlist (#256)', () => {
+  it('is exactly the §4 list, and shares nothing with the local namespaces', () => {
+    // Widening the upward stream is a protocol decision (ADR-003 §4), not a code change.
+    expect([...UPWARD_EVENT_NAMESPACES]).toEqual([
+      'task',
+      'escalation',
+      'decision',
+      'handoff',
+      'worker',
+    ]);
+    expect([...UPWARD_EVENT_TYPES]).toEqual(['agent.usage']);
+    for (const ns of LOCAL_EVENT_NAMESPACES) {
+      expect(UPWARD_EVENT_NAMESPACES as readonly string[]).not.toContain(ns);
+    }
+  });
+
   it('forwards each allowlisted type', () => {
     for (const type of [
       'task.created',
