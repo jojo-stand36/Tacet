@@ -1420,6 +1420,18 @@
         "agent:either"
       ],
       "body": "Standalone mode (#21) can run, resume and answer, but cannot cancel a task. The task state `canceled` exists in the projection, but nothing records it.\n\n### Tasks\n- [ ] `MiniConductor.cancel(taskId)`: end the task's open Worker sessions, record `task.status canceled` for the task and its sub-tasks, and start nothing more for it.\n- [ ] `tacet cancel <task>`: cancel in the running process (Ctrl-C, then `tacet cancel`, then `tacet run --resume` continues the rest), or through the control port once it exists.\n\n### Acceptance criteria\n- After `tacet cancel <task>`, `tacet status` shows the task and its sub-tasks as canceled, no Worker of it is running, and `tacet run --resume` does not pick it up.\n\n_See #21._"
+      },
+      {
+      "title": "ReDoS: quadratic fence-stripping regex on reviewer and planner replies",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "area:mini",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "CodeQL (polynomial-regex) flagged `packages/mini/src/review/adapter-reviewer.ts:45-48`, as reported in a Copilot comment on #103. It is real.\n\n`parseReview` strips a code fence from the reviewer's reply with `.replace(/^```(?:json)?\\s*/i, '')` and `.replace(/\\s*```$/, '')`. The second pattern is quadratic on a long run of whitespace that is not followed by a fence: the engine retries the `\\s*` run from every start position. Timed on Node 24 with `\"x\" + \" \".repeat(n) + \"y\"`:\n\n| n | time |\n|---|---|\n| 10,000 | 42 ms |\n| 20,000 | 196 ms |\n| 40,000 | 809 ms |\n| 400,000 | about 80 s (extrapolated) |\n\n**Reachable:** the input is the reviewer model's whole reply, and the reviewer reads a diff the Worker wrote (#19). A Worker that gets the reviewer to emit a long whitespace run, or a reviewer that misbehaves on its own, blocks the Mini-conductor's event loop and so stalls every Worker. The planner's `parseProposal` (`packages/mini/src/daemon/planner.ts:37-38`) uses the same two regexes on the planner's reply.\n\n### Tasks\n- [ ] One shared fence-stripping helper with linear time (string operations, no backtracking regex), used by `parseReview` and `parseProposal`.\n- [ ] Cap the reply length that is parsed at 256 KB. A longer reply is an invalid reply, as for invalid JSON.\n- [ ] Review `packages/mini/` for other regexes applied to model- or Worker-controlled text.\n\n### Acceptance criteria\n- A reply of 1 MB of whitespace, with or without a fence, is handled in well under a second, and the test fails on the old code.\n- The existing parse tests (with and without a fence) still pass.\n\n_See packages/mini/src/review/adapter-reviewer.ts, packages/mini/src/daemon/planner.ts and #19._"
     }
   ]
 }

@@ -34,6 +34,14 @@ const CHANGES = JSON.stringify({
 });
 
 describe('parseReview', () => {
+  it('refuses a hostile reply in linear time, and an over-long one at once (#203)', () => {
+    const t0 = performance.now();
+    expect(() => parseReview(`x${' '.repeat(200_000)}y`)).toThrow(/not JSON/);
+    expect(() => parseReview(`\`\`\`json\n${' '.repeat(200_000)}`)).toThrow(/not JSON/);
+    expect(() => parseReview(' '.repeat(300 * 1024))).toThrow(/longer than/);
+    expect(performance.now() - t0).toBeLessThan(5000);
+  });
+
   it('reads a verdict, with or without a code fence', () => {
     expect(parseReview(APPROVE)).toEqual({ verdict: 'approve', findings: [] });
     expect(parseReview(`\`\`\`json\n${CHANGES}\n\`\`\``).findings).toHaveLength(2);
@@ -203,6 +211,12 @@ describe('reviewDiff and AdapterReviewer', () => {
     expect(r.status).toBe('passed');
     expect(adapter.approvalsAnswered.map((d) => d.kind)).toEqual(['reject']);
     expect(adapter.sessions[0]?.inputs[1]).toMatch(/^That reply was invalid/);
+  });
+
+  it('stops collecting a reply past the parse cap and gives an error (#203)', async () => {
+    const huge = 'x'.repeat(300 * 1024);
+    const r = await reviewer(() => ({ do: 'reply', text: huge })).run();
+    expect(r).toMatchObject({ status: 'error', notes: 'the reviewer gave no valid verdict' });
   });
 
   it('gives an error, never a pass, when it gets no valid verdict or times out', async () => {

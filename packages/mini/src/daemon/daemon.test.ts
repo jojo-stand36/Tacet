@@ -1274,6 +1274,11 @@ describe('planning', () => {
       ).subtasks.map((s) => s.key),
     ).toEqual(['a', 'b']);
     expect(() => parseProposal('Here is my plan')).toThrow(/not JSON/);
+    // A hostile reply (a long whitespace run) is refused in linear time; an over-long one at once (#203).
+    const t0 = performance.now();
+    expect(() => parseProposal(`x${' '.repeat(200_000)}y`)).toThrow(/not JSON/);
+    expect(() => parseProposal(' '.repeat(300 * 1024))).toThrow(/longer than/);
+    expect(performance.now() - t0).toBeLessThan(5000);
     // `indivisible` is kept only when true (#110).
     expect(
       parseProposal(
