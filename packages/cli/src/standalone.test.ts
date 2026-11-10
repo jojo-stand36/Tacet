@@ -9,6 +9,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,12 +17,14 @@ import { newUlid } from '@tacet/core';
 import {
   miniRuntimePath,
   openEventStore,
+  readRuntimeFile,
   repoStatePaths,
   workerGitEnv,
   workerWorktree,
 } from '@tacet/core/node';
 import { type Script, ScriptedAdapter } from '@tacet/mini/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SpawnDetached } from './commands/detach.js';
 import type { Io } from './io.js';
 import { main } from './main.js';
 
@@ -642,6 +645,102 @@ describe('tacet standalone (#21)', () => {
     expect(bad.code).toBe(1);
     expect(bad.err).toContain('tiers.worker');
     expect(JSON.parse((await tacet(['status', ...user(), '--json'])).out).running).toBeNull();
+  });
+
+  describe('tacet run --detach (#201)', () => {
+    const runtimeFile = () => miniRuntimePath(repo, join(root, 'home', '.tacet', 'run'));
+    const logFile = () => runtimeFile().replace(/\.json$/, '.log');
+    /** The background run, in this process: what it was started with, and how it ended. */
+    const started: { argv: string[]; env: Record<string, string | undefined> }[] = [];
+    let child: Promise<number> | undefined;
+    const inProcess: SpawnDetached = (argv, childEnv) => {
+      started.push({ argv, env: childEnv });
+      child = main(argv, {
+        out: () => {},
+        err: () => {},
+        cwd: repo,
+        env: childEnv,
+        home: join(root, 'home'),
+        pollMs: 20,
+        standalone: { adapters: { 'claude-sdk': { adapter: fake(), authRoute: 'api_key' } } },
+      });
+      return { pid: process.pid, exited: child };
+    };
+    beforeEach(() => {
+      started.length = 0;
+      child = undefined;
+    });
+
+    it('runs in the background, waits for an answer instead of stopping, and passes no secret', async () => {
+      const paths = repoStatePaths(repo, state);
+      let escId = '';
+      script = (cwd, input) => {
+        if (input.includes('Answer to your escalation')) {
+          commit(cwd, `${input.split(': ').at(-1)}\n`);
+          return undefined;
+        }
+        escId = raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      const r = await tacet(['run', ...user(), '--detach', 'pick a database'], {
+        spawnDetached: inProcess,
+      });
+      expect(r.code, r.err).toBe(0);
+      const id = /task (\S+) running in the background \(pid (\d+)\)/.exec(r.err)?.[1] as string;
+      expect(id).toBeTruthy();
+      expect(r.err).toContain(logFile());
+      // The run as given, as the background run, with the user's environment as it is.
+      expect(started).toHaveLength(1);
+      expect(started[0]?.argv).toEqual(['run', ...user(), 'pick a database', '--detached-child']);
+      expect(started[0]?.env).toBe(env);
+      expect(statSync(logFile()).mode & 0o777).toBe(0o600);
+
+      // It waits for the answer: no terminal, and it does not stop.
+      await vi.waitFor(() => expect(escId).not.toBe(''), { timeout: 10_000 });
+      let ended = false;
+      void child?.then(() => {
+        ended = true;
+      });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(ended).toBe(false);
+      const secret = readRuntimeFile(runtimeFile()).token.reveal();
+      // A second background run beside it is refused.
+      const again = await tacet(['run', ...user(), '--detach', 'another'], {
+        spawnDetached: inProcess,
+      });
+      expect(again.code).toBe(1);
+      expect(again.err).toContain('already live');
+      expect(started).toHaveLength(1);
+
+      const a = await tacet(['answer', ...user(), escId, 'Postgres']);
+      expect(a.code, a.err).toBe(0);
+      expect(await child).toBe(0);
+      const branch = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/tacet/'])
+        .split('\n')
+        .find((b) => b.includes(id)) as string;
+      expect(git(repo, ['show', `${branch}:work.txt`])).toBe('Postgres');
+      expect(existsSync(runtimeFile())).toBe(false);
+      // The port's token, made by the background run itself, was never given to it or shown.
+      const holds = (v: unknown) => String(v).includes(secret);
+      expect(started[0]?.argv.some(holds)).toBe(false);
+      expect(Object.entries(started[0]?.env ?? {}).some(([k, v]) => holds(k) || holds(v))).toBe(
+        false,
+      );
+      expect([r.out, r.err, again.err, a.out, a.err].some(holds)).toBe(false);
+    });
+
+    it('says why when the background run ends at once', async () => {
+      const r = await tacet(['run', ...user(), '--detach', 'x'], {
+        spawnDetached: (_argv, _env, fd) => {
+          writeSync(fd, 'config has no tiers.worker\n');
+          return { pid: 2 ** 22 + 1, exited: Promise.resolve(1) };
+        },
+      });
+      expect(r.code).toBe(1);
+      expect(r.err).toContain('ended at once (exit 1)');
+      expect(r.err).toContain('config has no tiers.worker');
+      expect((await tacet(['run', ...user(), '--detach'])).code).toBe(2);
+    });
   });
 });
 

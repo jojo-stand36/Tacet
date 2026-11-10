@@ -3,6 +3,7 @@ import { formatExplain } from '@tacet/core';
 import { ConfigError, loadConfig, StateDirError } from '@tacet/core/node';
 import { answer } from './commands/answer.js';
 import { cancel } from './commands/cancel.js';
+import { detach } from './commands/detach.js';
 import { init, uninstall } from './commands/init.js';
 import { attach, logs, status } from './commands/read.js';
 import { run } from './commands/run.js';
@@ -23,6 +24,9 @@ const USAGE = `usage:
                                  run a task in this repo until it is done (standalone)
   tacet run --resume [--answer ID=TEXT]...
                                  carry on with unfinished tasks, answering escalations
+  tacet run --detach [...]       the same in the background, until its tasks are done; it waits
+                                 for answers (tacet answer) instead of stopping, and logs to
+                                 ~/.tacet/run/minis/<repo>.log
   tacet cancel <task> [--json]   cancel a task and its sub-tasks (in the live run, if any)
   tacet answer <escalation> <text> [--json]
                                  answer an open escalation in the live run
@@ -61,6 +65,9 @@ const OPTIONS = {
     single: { type: 'boolean' },
     resume: { type: 'boolean' },
     answer: { type: 'string', multiple: true },
+    detach: { type: 'boolean' },
+    // Internal: the background run `--detach` starts (#201). Not in the usage text.
+    'detached-child': { type: 'boolean' },
   },
   cancel: COMMON,
   answer: COMMON,
@@ -109,6 +116,17 @@ export async function main(argv: string[], io: Io): Promise<number> {
         if (positionals.length > 0 && values.resume) {
           io.err('give a task or --resume, not both');
           return 2;
+        }
+        if (values.detach) {
+          if (positionals.length === 0 && !values.resume) {
+            io.err('tacet run needs a task, or --resume');
+            return 2;
+          }
+          return await detach(
+            io,
+            rest.filter((a) => a !== '--detach'),
+            v,
+          );
         }
         return await run(io, positionals.length > 0 ? positionals.join(' ') : undefined, v);
       case 'cancel':
