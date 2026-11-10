@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
   type Decision,
@@ -23,9 +23,10 @@ import {
 } from '@tacet/core';
 import {
   type EventStore,
-  endProcessGroup,
-  type ProcessGroupRecord,
-  processStartTime,
+  endMarkedProcesses,
+  isWorkerMarker,
+  newWorkerMarker,
+  WORKER_MARKER_VAR,
 } from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
 import {
@@ -58,7 +59,7 @@ export interface MiniConductorOptions {
   /** Single-instance lock, e.g. `<repoStateDir>/mini.lock`. */
   lockPath: string;
   /**
-   * Where the process groups of running Worker sessions are kept (0600), so a restarted
+   * Where the process markers of running Worker sessions are kept (0600), so a restarted
    * Mini-conductor can end what a crashed one left running (#127). Default `<lockPath>.workers`.
    */
   processFile?: string;
@@ -156,8 +157,8 @@ export class MiniConductor {
   readonly #planning = new Set<string>();
   /** Background work (plans, Worker event loops) that `stop()` waits for. */
   readonly #inflight = new Set<Promise<unknown>>();
-  /** Process groups of running Worker sessions, by session (#127). */
-  readonly #groups = new Map<string, ProcessGroupRecord>();
+  /** Process markers of Worker sessions that may be running, by session (#127). */
+  readonly #markers = new Map<string, string>();
   /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
@@ -200,7 +201,7 @@ export class MiniConductor {
     this.#lock();
     try {
       // Before anything resumes: a Worker a crashed predecessor left running would race it.
-      await this.#endStaleGroups();
+      await this.#endStaleWorkers();
     } catch (err) {
       this.#unlock();
       throw err;
@@ -869,6 +870,11 @@ export class MiniConductor {
     let revoke = () => {};
     let mcpServerName = '';
     let handle: SessionHandle;
+    // Recorded before the vendor process exists, so a crash at any point after this leaves it
+    // findable (#127).
+    const marker = newWorkerMarker();
+    this.#markers.set(sessionId, marker);
+    this.#saveMarkers();
     try {
       const minted = this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId });
       revoke = minted.revoke;
@@ -880,6 +886,7 @@ export class MiniConductor {
         ...(tier.model !== undefined ? { model: tier.model } : {}),
         ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
         ...(resume ? { resume } : {}),
+        env: { [WORKER_MARKER_VAR]: marker },
       });
     } catch (err) {
       revoke();
@@ -900,6 +907,7 @@ export class MiniConductor {
       // Stopped while the session started: give it back without registering it.
       revoke();
       await worker.adapter.close(handle).catch(() => {});
+      if (this.#markers.delete(sessionId)) this.#saveMarkers();
       return;
     }
     const run: Run = {
@@ -919,7 +927,6 @@ export class MiniConductor {
       openTools: new Map(),
     };
     this.#runs.set(subtaskId, run);
-    this.#noteProcess(run);
     this.#noteVendorSession(run);
     this.#track(this.#consume(run, worker, gen));
     // Answers that came while no session was open go into the first message.
@@ -964,7 +971,6 @@ export class MiniConductor {
       for await (const e of worker.adapter.events(run.handle)) {
         if (this.#runs.get(run.subtaskId) !== run || !this.#live(gen)) return;
         this.#record(run, e);
-        this.#noteProcess(run);
         run.lastActivity = this.#now().getTime();
         run.nudgedAt = undefined;
         if (e.t === 'tool.call') run.openTools.set(e.id, run.lastActivity);
@@ -1232,7 +1238,7 @@ export class MiniConductor {
       .close(run.handle)
       .catch((err: unknown) => this.#errors.push(err));
     // Closed by its adapter: nothing of it is left to end after a crash.
-    if (this.#groups.delete(run.sessionId)) this.#saveGroups();
+    if (this.#markers.delete(run.sessionId)) this.#saveMarkers();
   }
 
   // ---- Worker processes (#127) -----------------------------------------------------------
@@ -1241,21 +1247,11 @@ export class MiniConductor {
     return this.#o.processFile ?? `${this.#o.lockPath}.workers`;
   }
 
-  /** Record the vendor process group of a running session once its adapter reports it. */
-  #noteProcess(run: Run): void {
-    const pgid = run.handle.processGroup;
-    if (pgid === undefined || this.#groups.has(run.sessionId)) return;
-    if (this.#runs.get(run.subtaskId) !== run) return;
-    const startTime = processStartTime(pgid);
-    this.#groups.set(run.sessionId, { pgid, ...(startTime !== undefined ? { startTime } : {}) });
-    this.#saveGroups();
-  }
-
-  #saveGroups(): void {
+  #saveMarkers(): void {
     const file = this.#processFile;
     const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(tmp, `${JSON.stringify([...this.#groups.values()])}\n`, {
+      writeFileSync(tmp, `${JSON.stringify([...this.#markers.values()])}\n`, {
         flag: 'wx',
         mode: 0o600,
       });
@@ -1266,34 +1262,33 @@ export class MiniConductor {
     }
   }
 
-  /** End the Worker process groups a predecessor recorded and never closed. */
-  async #endStaleGroups(): Promise<void> {
-    let text: string;
+  /**
+   * End the processes of Worker sessions a predecessor recorded and never closed: every process
+   * whose environment carries one of their markers, the vendor's tools included.
+   */
+  async #endStaleWorkers(): Promise<void> {
+    const file = this.#processFile;
+    // Temp files of a write a crash interrupted.
     try {
-      text = readFileSync(this.#processFile, 'utf8');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
-      throw err;
-    }
-    let records: unknown;
-    try {
-      records = JSON.parse(text);
+      const dir = dirname(file);
+      const prefix = `${basename(file)}.`;
+      for (const name of readdirSync(dir)) {
+        if (name.startsWith(prefix) && name.endsWith('.tmp'))
+          rmSync(join(dir, name), { force: true });
+      }
     } catch {
-      records = [];
+      // No directory yet.
     }
-    await Promise.all(
-      (Array.isArray(records) ? records : [])
-        .map((r) => r as Partial<ProcessGroupRecord>)
-        .filter((r) => typeof r.pgid === 'number')
-        .map((r) =>
-          endProcessGroup({
-            pgid: r.pgid as number,
-            ...(typeof r.startTime === 'string' ? { startTime: r.startTime } : {}),
-          }),
-        ),
-    );
-    this.#groups.clear();
-    this.#saveGroups();
+    let markers: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+      markers = (Array.isArray(parsed) ? parsed : []).filter(isWorkerMarker);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.#errors.push(err);
+    }
+    if (markers.length > 0) await endMarkedProcesses(markers);
+    this.#markers.clear();
+    this.#saveMarkers();
   }
 
   // ---- escalation answers ----------------------------------------------------------------

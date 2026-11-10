@@ -7,6 +7,9 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
+ *   its shell's pid to `background.pid` and then becomes `sleep 600`; with `ESCALATE` in the same first message,
+ *   it then escalates as below.
  * - `ESCALATE`: calls the Tacet MCP `escalate` tool with a fixed question: the offered tool whose
  *   name ends in `escalate`, else `mcp__tacet__escalate` (Claude Code defers MCP tools behind
  *   ToolSearch, so they are usually not offered by name).
@@ -60,9 +63,46 @@ function lastUser(body: Body): { text: string; toolResult: boolean } {
 
 let n = 0;
 
+function firstUserText(body: Body): string {
+  const m = (body.messages ?? []).find((x) => x.role === 'user');
+  if (!m) return '';
+  return typeof m.content === 'string'
+    ? m.content
+    : m.content.map((b) => (b.type === 'text' ? (b.text ?? '') : '')).join('\n');
+}
+
 function plan(body: Body): Block[] {
   const { text, toolResult } = lastUser(body);
+  const first = firstUserText(body);
+  if (toolResult && /BACKGROUND_TOOL/.test(first) && /ESCALATE/.test(first)) {
+    const done = JSON.stringify(body.messages ?? []).includes('Which queue should');
+    if (!done) {
+      const offered = (body.tools ?? []).map((t) => t.name ?? '');
+      return [
+        {
+          type: 'tool_use',
+          id: `toolu_mock_${++n}`,
+          name: offered.find((t) => /tacet.*escalate$/.test(t)) ?? 'mcp__tacet__escalate',
+          input: { question: 'Which queue should the jobs use?', urgency: 'normal' },
+        },
+      ];
+    }
+  }
   if (toolResult) return [{ type: 'text', text: 'Tool finished.' }];
+  if (/BACKGROUND_TOOL/.test(text)) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Bash',
+        input: {
+          command: 'echo $$ > background.pid; exec sleep 600',
+          description: 'start a background job',
+          run_in_background: true,
+        },
+      },
+    ];
+  }
   if (/RUN_TOOL/.test(text)) {
     return [
       {

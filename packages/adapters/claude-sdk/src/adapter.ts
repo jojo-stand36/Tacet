@@ -1,4 +1,3 @@
-import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   type CanUseTool,
@@ -10,8 +9,6 @@ import {
   type Query,
   type SDKMessage,
   type SDKUserMessage,
-  type SpawnedProcess,
-  type SpawnOptions,
   query as sdkQuery,
 } from '@anthropic-ai/claude-agent-sdk';
 import {
@@ -235,10 +232,6 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           // A file, not the `mcpServers` option: the SDK passes `mcpServers` as JSON on the
           // command line, where any local user can read the Worker token in the process list.
           ...(mcpConfigPath ? { extraArgs: { 'mcp-config': mcpConfigPath } } : {}),
-          // Its own process group (#127).
-          ...(process.platform !== 'win32'
-            ? { spawnClaudeCodeProcess: (o: SpawnOptions) => spawnGroupLeader(o, handle) }
-            : {}),
         },
       });
     } catch (err) {
@@ -653,35 +646,4 @@ export function toPermissionResult(
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/**
- * Start Claude Code as the leader of its own process group, as the SDK would otherwise start it
- * (`SpawnOptions`: command, args, cwd, env, signal; SDK 0.3.319), and report the group on the
- * handle (#127). The group is signalled when the SDK aborts the process, and when the leader
- * exits, so the tools it started (a long `Bash` command, say) do not outlive it. The adapter
- * sets no `stderr` option, so stderr is not read.
- */
-function spawnGroupLeader(o: SpawnOptions, handle: SessionHandle): SpawnedProcess {
-  const child = spawn(o.command, o.args, {
-    cwd: o.cwd,
-    env: o.env,
-    stdio: ['pipe', 'pipe', 'ignore'],
-    detached: true,
-  });
-  if (child.pid !== undefined) handle.processGroup = child.pid;
-  // The SDK aborts only after its own graceful close; then nothing in the group may stay.
-  o.signal?.addEventListener('abort', () => signalGroup(child, 'SIGKILL'), { once: true });
-  // On exit, synchronously: its children keep the group id taken, so this cannot reach a
-  // reused group.
-  child.once('exit', () => signalGroup(child, 'SIGTERM'));
-  return child;
-}
-
-function signalGroup(child: ChildProcess, signal: NodeJS.Signals): void {
-  try {
-    if (child.pid !== undefined) process.kill(-child.pid, signal);
-  } catch {
-    // ESRCH: nothing left.
-  }
 }

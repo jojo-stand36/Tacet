@@ -83,12 +83,6 @@ export interface SessionHandle {
   readonly id: string;
   /** The vendor's session or thread id, for resume. Known once the vendor reports it. */
   vendorSessionId?: string;
-  /**
-   * The POSIX process group the vendor process leads (its pid), once it has started, so a
-   * Mini-conductor can end what a crashed predecessor left running (#127). Local only: never
-   * part of an event.
-   */
-  processGroup?: number;
 }
 
 export interface UserInput {
