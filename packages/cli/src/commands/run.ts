@@ -190,6 +190,8 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
         if (answered > 0) continue;
         const left = readState(sa.store);
         const still = open.flatMap((r) => pendingEscalations(left, r));
+        // Answered meanwhile, over the run's control port (`tacet answer`, #201): carry on.
+        if (still.length === 0) continue;
         if (o.json) {
           const tasks = open.map((r) => ({ id: r, state: left.tasks[r]?.state }));
           io.out(safeJson({ tasks, escalations: still }));
