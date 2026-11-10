@@ -8,6 +8,7 @@ import {
   workerRefusal,
 } from './ports.js';
 import { PLANNER_SYSTEM_PROMPT, plannerPrompt } from './prompts.js';
+import { unfence } from './reply.js';
 import { sessionTurns } from './turns.js';
 
 const Proposal = z.object({
@@ -32,10 +33,8 @@ export function parseProposal(text: string): {
   subtasks: ProposedSubtask[];
   rationale?: string;
 } {
-  const body = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/, '');
+  // An over-long reply is an invalid reply too, with its own reason (#203).
+  const body = unfence(text);
   let json: unknown;
   try {
     json = JSON.parse(body);
