@@ -165,28 +165,42 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     );
     writeFileSync(join(userClaude, 'projects', '-users-own', 'own.jsonl'), "the user's own\n");
     writeFileSync(join(home, '.claude.json'), '{"hasCompletedOnboarding":true}');
+    // The user's global settings, with a hook, and their CLAUDE.md: a Worker loads neither.
+    const hookRan = join(root, 'user-hook-ran-237');
+    const hook = [{ hooks: [{ type: 'command', command: `touch '${hookRan}'` }] }];
+    writeFileSync(
+      join(userClaude, 'settings.json'),
+      JSON.stringify({ hooks: { SessionStart: hook, UserPromptSubmit: hook } }),
+    );
+    writeFileSync(join(userClaude, 'CLAUDE.md'), 'Always mention USER-CLAUDEMD-237.\n');
+    const key = 'sk-ant-api03-tacet-237-keep-me-out-0123456789abcdef';
     const listAll = (dir: string): string[] =>
       readdirSync(dir, { recursive: true, withFileTypes: true })
         .filter((e) => e.isFile())
         .map((e) => join(e.parentPath, e.name));
     const userBefore = Object.fromEntries(listAll(home).map((p) => [p, readFileSync(p, 'utf8')]));
     const state = join(root, 'state-237');
-    const worker = new ClaudeSdkAdapter({
-      authRoute: 'api_key',
-      repoRoot: join(root, 'repo-237'),
-      stateDir: state,
-      baseEnv: {
-        PATH: process.env.PATH,
-        HOME: home,
-        // Even a config dir the user set is not the Worker's (#237).
-        CLAUDE_CONFIG_DIR: userClaude,
-        ANTHROPIC_BASE_URL: api.url,
-        ANTHROPIC_API_KEY: 'placeholder-not-a-real-key',
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-        DISABLE_AUTOUPDATER: '1',
-      },
-      mcpConfigDir: join(root, 'run', 'mcp'),
-    });
+    const make237 = (extra: Partial<ConstructorParameters<typeof ClaudeSdkAdapter>[0]> = {}) =>
+      new ClaudeSdkAdapter({
+        authRoute: 'api_key',
+        repoRoot: join(root, 'repo-237'),
+        stateDir: state,
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: home,
+          // Even a config dir the user set is not the Worker's (#237).
+          CLAUDE_CONFIG_DIR: userClaude,
+          ANTHROPIC_BASE_URL: api.url,
+          ANTHROPIC_API_KEY: key,
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+          DISABLE_AUTOUPDATER: '1',
+        },
+        mcpConfigDir: join(root, 'run', 'mcp'),
+        // The production Worker (#206).
+        fileToolsOnly: true,
+        ...extra,
+      });
+    let worker = make237();
     const say = async (resume: string | undefined, word: string) => {
       const h = await worker.start({
         cwd: worktree,
@@ -203,6 +217,15 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
       listAll(state).filter((p) => p.includes(id) || readFileSync(p, 'utf8').includes(word));
 
     const done = await say(undefined, 'done237');
+    // The Worker's turn (not the title request, which offers no tools): the file tools only.
+    const doneTurn = api.requests.findLast(
+      (r) => r.tools.length > 0 && r.text.includes('SAY done237'),
+    );
+    expect(
+      (doneTurn?.tools ?? [])
+        .filter((n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder')
+        .sort(),
+    ).toEqual([...FILE_TOOLS].sort());
     expect(traces(done, 'done237').some((p) => p.endsWith(`${done}.jsonl`))).toBe(true);
     await worker.discard(done, worktree);
     expect(traces(done, 'done237')).toEqual([]);
@@ -218,6 +241,23 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     expect(again?.raw).toContain('SAY kept237');
     await worker.discard(kept, worktree);
     expect(traces(kept, 'kept237')).toEqual([]);
+
+    // Even a caller that opts into user settings gets the session's own, empty dir, never the
+    // user's: their hook does not run and their CLAUDE.md is not sent.
+    worker = make237({ sdkOptions: { settingSources: ['user'] } });
+    const optedIn = await say(undefined, 'user237');
+    expect(existsSync(hookRan)).toBe(false);
+    expect(api.requests.some((r) => r.raw.includes('USER-CLAUDEMD-237'))).toBe(false);
+
+    // The API key is in no file of the state dir, whole or as the suffix Claude Code records
+    // approved keys by.
+    expect(
+      listAll(state).filter((p) => {
+        const text = readFileSync(p, 'utf8');
+        return text.includes(key) || text.includes(key.slice(-20));
+      }),
+    ).toEqual([]);
+    await worker.discard(optedIn, worktree);
 
     // The user's home is byte for byte as it was, and their login was never copied.
     expect(Object.fromEntries(listAll(home).map((p) => [p, readFileSync(p, 'utf8')]))).toEqual(
