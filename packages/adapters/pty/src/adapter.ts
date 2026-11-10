@@ -706,6 +706,8 @@ export class PtyAdapter implements AgentAdapter {
       s.promptId = promptId;
       s.join = undefined;
       clearTimeout(s.ackTimer);
+      // Reported as not taken while it waited: it was, after all.
+      if (s.state === 'waiting_input' && s.approvals.size === 0) this.#setState(s, 'running');
     }
     // A turn-scoped hook from another turn than the one in progress (e.g. an interrupted one
     // whose events arrive late) changes nothing. A hook with an id while no turn of Tacet's owns
@@ -724,6 +726,14 @@ export class PtyAdapter implements AgentAdapter {
         (ev.hook_event_name === 'Stop' || ev.hook_event_name === 'StopFailure')
       ) {
         s.join.stage = 'armed';
+        // If the prompt's own turn never shows, it waits in the terminal.
+        clearTimeout(s.ackTimer);
+        s.ackTimer = setTimeout(() => {
+          if (s.join && s.state === 'running' && !s.ended && !s.closing) {
+            this.#setState(s, 'waiting_input', 'the prompt was not taken; check the terminal');
+          }
+        }, this.#opts.ackTimeoutMs ?? 15_000);
+        s.ackTimer.unref();
       } else if (promptId !== s.join?.id) {
         this.#stale(s, promptId);
       }
@@ -754,13 +764,9 @@ export class PtyAdapter implements AgentAdapter {
             // under a new prompt_id that no UserPromptSubmit announces.
             s.promptId = undefined;
             s.join = { id: promptId, stage: 'awaitStop' };
-            // If the prompt's own turn never shows, it waits in the terminal.
-            s.ackTimer = setTimeout(() => {
-              if (s.join && s.state === 'running' && !s.ended && !s.closing) {
-                this.#setState(s, 'waiting_input', 'the prompt was not taken; check the terminal');
-              }
-            }, this.#opts.ackTimeoutMs ?? 15_000);
-            s.ackTimer.unref();
+            // The joined turn may run for long; the wait for the prompt's own turn starts when
+            // that turn has ended.
+            clearTimeout(s.ackTimer);
           } else {
             s.promptId = promptId;
             s.join = undefined;

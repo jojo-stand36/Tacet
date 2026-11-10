@@ -526,6 +526,32 @@ describe('PtyAdapter (fake claude)', () => {
     await adapter.close(h);
   });
 
+  it('does not report a joined prompt as not taken while the turn it joined still runs (#190)', async () => {
+    const adapter = make({ FAKE_MODE: 'NO_ACK' }, { ackTimeoutMs: 200 });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    const [p1, p2] = [randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => f.writes.length).toBeGreaterThan(0);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+    await adapter.interrupt(h);
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'SAY after' });
+    await expect.poll(() => f.writes.some((w) => w.includes('SAY after'))).toBe(true);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SAY after' });
+    // The joined turn runs longer than the ack timeout before it ends.
+    await new Promise((r) => setTimeout(r, 600));
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'You said after.' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(tap.events.slice(from).flatMap((e) => (e.t === 'status' ? [e.state] : []))).toEqual([
+      'running',
+      'idle',
+    ]);
+    await adapter.close(h);
+  });
+
   it("types a cancelled prompt's text again only after its late submit, and credits the new turn (#190)", async () => {
     const { adapter, h, tap, f, typedCount, deltas } = await scripted();
     const [p1, p2] = [randomUUID(), randomUUID()];
