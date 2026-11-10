@@ -30,6 +30,12 @@ class FakeClaude implements Pty {
   typed = '';
   writes: string[] = [];
   promptId: string | undefined;
+  /**
+   * The prompt whose `UserPromptSubmit` the adapter has answered. Claude Code waits for that hook
+   * before the turn does anything else, so tests wait on this, not on `promptId`, before sending
+   * the turn's next hooks: otherwise a late `UserPromptSubmit` can overtake them.
+   */
+  submitted: string | undefined;
   ctrlD = 0;
   readonly url: string;
   readonly token: string;
@@ -97,8 +103,10 @@ class FakeClaude implements Pty {
     this.typed = '';
     if (this.opts.env.FAKE_MODE === 'NO_ACK') return;
     void (async () => {
-      this.promptId = randomUUID();
+      const id = randomUUID();
+      this.promptId = id;
       await this.hook('UserPromptSubmit', { prompt: text });
+      this.submitted = id;
       if (text === 'CRASH') return this.exit(3);
       if (text === 'HANG') return;
       await this.hook('Stop', { last_assistant_message: `reply: ${text}` });
@@ -278,7 +286,7 @@ describe('PtyAdapter (fake claude)', () => {
     const f = fake();
     // Ends with the start of the hook token: a streaming scrubber would hold that back and split.
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
+    await expect.poll(() => f.submitted).toBeDefined();
     await f.hook('Stop', {
       last_assistant_message: `token ${f.token} then ${f.token.slice(0, 5)}`,
     });
@@ -293,8 +301,8 @@ describe('PtyAdapter (fake claude)', () => {
     const tap = new EventTap(adapter.events(h));
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
-    const hung = f.promptId;
+    await expect.poll(() => f.submitted).toBeDefined();
+    const hung = f.submitted;
     await adapter.interrupt(h);
     expect(f.writes.at(-1)).toBe('\x1b');
     expect(adapter.status(h)).toBe('cancelled');
@@ -324,8 +332,8 @@ describe('PtyAdapter (fake claude)', () => {
     const tap = new EventTap(adapter.events(h));
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
-    const hung = f.promptId;
+    await expect.poll(() => f.submitted).toBeDefined();
+    const hung = f.submitted;
     // A tool of the cancelled turn is still open when Esc is sent.
     const ls = { tool_name: 'Bash', tool_input: { command: 'ls' } };
     await f.hook('PreToolUse', { ...ls, tool_use_id: 'old' });
@@ -337,7 +345,7 @@ describe('PtyAdapter (fake claude)', () => {
     const late = await f.json('PermissionRequest', { ...ls, prompt_id: hung });
     expect(late).toMatchObject({ hookSpecificOutput: { decision: { interrupt: true } } });
     await next;
-    await expect.poll(() => f.promptId).not.toBe(hung);
+    await expect.poll(() => f.submitted).not.toBe(hung);
     expect(texts(tap)).toEqual([]);
     // One prompt typed after the Esc; the queued one waits for that turn to end.
     const afterEsc = f.writes.slice(f.writes.indexOf('\x1b') + 1);
@@ -361,7 +369,7 @@ describe('PtyAdapter (fake claude)', () => {
     const h = await adapter.start({ cwd: join(root, 'wt') });
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
+    await expect.poll(() => f.submitted).toBeDefined();
     await adapter.interrupt(h);
     // Typed only after the wait that follows an Esc: interrupted within it.
     const typing = adapter.send(h, { text: 'never' });
@@ -379,7 +387,7 @@ describe('PtyAdapter (fake claude)', () => {
     const tap = new EventTap(adapter.events(h));
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
+    await expect.poll(() => f.submitted).toBeDefined();
     const p1 = f.json('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'a' } });
     const p2 = f.json('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'b' } });
     await expect.poll(() => tap.events.filter((e) => e.t === 'approval.request').length).toBe(2);
@@ -408,7 +416,7 @@ describe('PtyAdapter (fake claude)', () => {
     const tap = new EventTap(adapter.events(h));
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
+    await expect.poll(() => f.submitted).toBeDefined();
     const a = { tool_name: 'Bash', tool_input: { command: 'ls' } };
     const b = { tool_name: 'Bash', tool_input: { command: 'rm x', description: 'remove' } };
     expect(await f.json('PreToolUse', { ...a, tool_use_id: 'tu-a' })).toMatchObject({
@@ -445,7 +453,7 @@ describe('PtyAdapter (fake claude)', () => {
     const tap = new EventTap(adapter.events(h));
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
+    await expect.poll(() => f.submitted).toBeDefined();
     const perm = f.json('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'x' } });
     const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
     if (req.event.t !== 'approval.request') throw new Error('no request');
@@ -458,9 +466,9 @@ describe('PtyAdapter (fake claude)', () => {
     expect(f.writes).not.toContain('\x1b');
 
     // A permission whose hook Claude Code stops waiting for: its own dialog is up.
-    const before = f.promptId;
+    const before = f.submitted;
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).not.toBe(before);
+    await expect.poll(() => f.submitted).not.toBe(before);
     const abort = new AbortController();
     const held = f
       .hook('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'y' } }, abort.signal)
@@ -483,13 +491,13 @@ describe('PtyAdapter (fake claude)', () => {
     const tap = new EventTap(adapter.events(h));
     const f = fake();
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).toBeDefined();
+    await expect.poll(() => f.submitted).toBeDefined();
     await f.hook('StopFailure');
     const end = await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
     expect(end.event).toMatchObject({ message: 'the turn failed' });
-    const before = f.promptId;
+    const before = f.submitted;
     await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.promptId).not.toBe(before);
+    await expect.poll(() => f.submitted).not.toBe(before);
     const perm = f.json('PermissionRequest', { tool_name: 'Bash', tool_input: {} });
     await tap.waitFor((e) => e.t === 'approval.request', 5000);
     await adapter.close(h);
