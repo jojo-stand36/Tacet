@@ -175,15 +175,16 @@ export class AcpAdapter implements AgentAdapter {
       detached: process.platform !== 'win32',
     });
     // Longest first, so a secret that starts another does not leave that one's end showing.
+    // MCP header values are always scrubbed; the others from four characters up.
     const secrets = [
       ...new Set([
         ...mcpHeaderSecrets(opts.mcpServers),
-        ...(this.#opts.secrets ?? []),
-        ...spec.apiKeyEnv.flatMap((name) => env[name] ?? []),
+        ...[
+          ...(this.#opts.secrets ?? []),
+          ...spec.apiKeyEnv.flatMap((name) => env[name] ?? []),
+        ].filter((v) => v.length >= 4),
       ]),
-    ]
-      .filter((v) => v.length >= 4)
-      .sort((a, b) => b.length - a.length);
+    ].sort((a, b) => b.length - a.length);
     const handle: SessionHandle = { id: randomUUID() };
     let s: Session | undefined;
     const exitInfo: { value?: Session['exit'] } = {};

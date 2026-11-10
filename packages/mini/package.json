@@ -32,6 +32,7 @@
     "@tacet/adapter-acp": "workspace:*",
     "@tacet/adapter-claude-sdk": "workspace:*",
     "@tacet/adapter-codex-app-server": "workspace:*",
+    "@tacet/adapter-pty": "workspace:*",
     "@tacet/core": "workspace:*",
     "zod": "catalog:"
   },

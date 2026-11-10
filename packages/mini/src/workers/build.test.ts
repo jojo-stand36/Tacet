@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { TacetConfig } from '@tacet/core';
 import { type EventStore, loadConfig, openEventStore } from '@tacet/core/node';
+import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
@@ -16,6 +17,8 @@ const FAKE_AGENT = join(
   '../../../adapters/acp/src/testing/fake-acp-agent.mjs',
 );
 const SECRET = 'agent-secret-value-1234';
+/** The PTY adapter's fake line-based CLI: `PRINT_SECRET` prints the value of FAKE_SECRET. */
+const FAKE_CLI = join(import.meta.dirname, '../../../adapters/pty/src/testing/fake-cli.mjs');
 
 const mcp: WorkerMcp = {
   workerConfig: () => ({
@@ -49,11 +52,24 @@ describe('buildWorkerAdapters', () => {
       baseEnv: {},
     });
     expect(acp['acp:gemini']?.adapter.id).toBe('gemini');
+    const pty = buildWorkerAdapters(
+      config({
+        tiers: { worker: { adapter: 'pty:claude', model: 'm' }, review: { adapter: 'pty:aider' } },
+        agents: { aider: { kind: 'pty', command: ['aider'], ready_prompt: '> ' } },
+      }),
+      { baseEnv: {} },
+    );
+    expect(pty['pty:claude']?.adapter.id).toBe('pty:claude');
+    expect(pty['pty:aider']?.adapter.id).toBe('pty:aider');
   });
 
   it('names the tier or config path for everything it cannot build', () => {
     const cases: [Partial<TacetConfig>, RegExp][] = [
       [{ tiers: {} }, /no tiers\.worker/],
+      [
+        { tiers: { worker: { adapter: 'codex-app-server' } } },
+        /tiers\.worker\.model: codex-app-server needs a model/,
+      ],
       [
         { tiers: { worker: { adapter: 'opencode' } } },
         /tiers\.worker\.adapter: no Worker adapter "opencode" yet/,
@@ -97,6 +113,35 @@ describe('buildWorkerAdapters', () => {
           agents: { goose: { kind: 'acp', command: ['goose'], env: { K: { keychain: 'a/b' } } } },
         },
         /agents\.goose\.env\.K: keychain references are not supported yet/,
+      ],
+      [
+        { tiers: { worker: { adapter: 'pty:nope' } } },
+        /tiers\.worker\.adapter: no PTY preset "nope"/,
+      ],
+      [
+        {
+          tiers: { worker: { adapter: 'pty:goose' } },
+          agents: { goose: { kind: 'acp', command: ['goose'] } },
+        },
+        /agents\.goose is of kind acp; use acp:goose/,
+      ],
+      [
+        {
+          tiers: { worker: { adapter: 'pty:claude' } },
+          agents: { claude: { kind: 'pty', command: ['my-claude'] } },
+        },
+        /agents\.claude: "claude" is a built-in PTY preset/,
+      ],
+      [
+        {
+          tiers: { worker: { adapter: 'pty:aider', model: 'gpt' } },
+          agents: { aider: { kind: 'pty', command: ['aider'] } },
+        },
+        /tiers\.worker\.model: pty:aider cannot choose a model/,
+      ],
+      [
+        { workers: { per_adapter: { 'pty:typo': 1 } } },
+        /workers\.per_adapter\.pty:typo: no PTY preset "typo"/,
       ],
       [
         { workers: { per_adapter: { 'acp:typo': 1 } } },
@@ -211,6 +256,8 @@ describe('a Mini-conductor started from a config file (#149)', () => {
       'acp:fake',
       expect.arrayContaining(['MY_AGENT_TOKEN', 'OPENAI_API_KEY', 'UNRELATED']),
     ]);
+    // Only the Worker's own events: the task's goal (in task.* events) holds the value on purpose,
+    // so the fake agent, which replies with its prompt, has the secret to print.
     const agentEvents = store
       .query({})
       .map((e) => e.envelope)
@@ -218,5 +265,43 @@ describe('a Mini-conductor started from a config file (#149)', () => {
     expect(agentEvents.length).toBeGreaterThan(0);
     expect(JSON.stringify(agentEvents)).not.toContain(SECRET);
     expect(JSON.stringify(agentEvents)).toContain('[redacted]');
+  });
+});
+
+describe('a PTY preset built from config (#149)', () => {
+  it('passes its resolved secret to the CLI and never into events', {
+    timeout: 60_000,
+  }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tacet-mini-pty-'));
+    try {
+      const adapters = buildWorkerAdapters(
+        {
+          tiers: { worker: { adapter: 'pty:fake' } },
+          agents: {
+            fake: {
+              kind: 'pty',
+              command: [process.execPath, FAKE_CLI],
+              env: { FAKE_SECRET: { env: 'MY_CLI_SECRET' } },
+              ready_prompt: 'fake>',
+            },
+          },
+        },
+        {
+          baseEnv: { PATH: process.env.PATH, HOME: dir, MY_CLI_SECRET: SECRET },
+          ptyCli: { quietMs: 300, killTimeoutMs: 1000 },
+        },
+      );
+      const adapter = adapters['pty:fake']?.adapter;
+      if (!adapter) throw new Error('not built');
+      const h = await adapter.start({ cwd: dir });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'PRINT_SECRET' });
+      await tap.waitFor((e) => e.t === 'message.delta', 30_000);
+      await adapter.close(h);
+      expect(tap.events).toContainEqual({ t: 'message.delta', text: 'value: [redacted]' });
+      expect(JSON.stringify(tap.events)).not.toContain(SECRET);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

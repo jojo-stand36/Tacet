@@ -293,6 +293,9 @@ importers:
       '@tacet/adapter-codex-app-server':
         specifier: workspace:*
         version: link:../adapters/codex-app-server
+      '@tacet/adapter-pty':
+        specifier: workspace:*
+        version: link:../adapters/pty
       '@tacet/core':
         specifier: workspace:*
         version: link:../core

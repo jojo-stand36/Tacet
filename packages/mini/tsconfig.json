@@ -18,6 +18,9 @@
     },
     {
       "path": "../adapters/acp"
+    },
+    {
+      "path": "../adapters/pty"
     }
   ]
 }
