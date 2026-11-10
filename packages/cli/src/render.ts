@@ -84,6 +84,9 @@ export function formatEvent(e: EventEnvelope): string {
     case 'agent.status':
       what = `status ${str(d, 'state') ?? '?'}${str(d, 'message') ? `: ${oneLine(str(d, 'message') ?? '')}` : ''}`;
       break;
+    case 'maintenance.problem':
+      what = `problem (${[str(d, 'op') ?? '?', str(d, 'workspaceId')].filter(Boolean).join(' ')}): ${oneLine(str(d, 'message') ?? '', 300)}`;
+      break;
     case 'agent.usage':
       what = `usage in ${d.inputTokens ?? 0} out ${d.outputTokens ?? 0}${typeof d.costUsd === 'number' ? ` $${d.costUsd.toFixed(4)}` : ''}`;
       break;

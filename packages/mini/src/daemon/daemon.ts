@@ -14,6 +14,8 @@ import {
   type Decision,
   Escalation,
   type EventEnvelope,
+  type MaintenanceOp,
+  type MaintenanceProblem,
   newUlid,
   type Priority,
   type ProfileField,
@@ -90,6 +92,11 @@ export interface MiniConductorOptions {
   /** Repo id stamped on events. */
   repo?: string;
   miniId?: string;
+  /**
+   * Directories replaced in the text of `maintenance.problem` events (#254), most specific first:
+   * e.g. the worktree root by `<worktrees>`, the repo by `<repo>`, the home directory by `~`.
+   */
+  redactPaths?: ReadonlyArray<readonly [string, string]>;
   now?: () => Date;
   /** How often to look for answered escalations, in ms. Default 1000. */
   pollMs?: number;
@@ -257,9 +264,10 @@ export class MiniConductor {
   /** The generation whose landed sweep is in flight, so a slow one is never started twice. */
   #sweepingGen: number | undefined;
   /** Landed-sweep problems already reported, so a slow timer does not grow `errors` forever. */
-  readonly #sweepErrors = new Set<string>();
   /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
   readonly #closing = new Set<string>();
+  /** Maintenance problems recorded by this process (#254), by op, task, workspace and text. */
+  readonly #problems = new Set<string>();
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -312,7 +320,7 @@ export class MiniConductor {
       throw err;
     }
     // Under the lock, before a checkout is looked up: the registry catches up with the disk.
-    await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#errors.push(err));
+    await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#problem('reconcile', err));
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -965,11 +973,7 @@ export class MiniConductor {
         try {
           landed = await integrator.landed(published.commit, target);
         } catch (err) {
-          const key = `${root.task.id} ${(err as Error).message}`;
-          if (!this.#sweepErrors.has(key)) {
-            this.#sweepErrors.add(key);
-            this.#errors.push(err);
-          }
+          this.#problem('landed', err, { taskId: root.task.id });
           continue;
         }
         if (!landed || !this.#live(gen)) continue;
@@ -990,7 +994,12 @@ export class MiniConductor {
         // Kept (local files, or work none of these contain) until the user forces it.
         await this.#o.workspaces
           .remove(id, { landed: [published.commit, ...superseded] })
-          .catch(() => {});
+          .catch((err: unknown) => {
+            // Kept for its work is the rule working; anything else is a problem (#254).
+            if ((err as Error)?.name !== 'WorktreeKeptError') {
+              this.#problem('landed', err, { taskId: root.task.id, workspaceId: id });
+            }
+          });
       }
     }
   }
@@ -1022,17 +1031,20 @@ export class MiniConductor {
       if (s.activeAt === undefined) continue;
       lastActivity.set(s.workspaceId, Math.max(lastActivity.get(s.workspaceId) ?? 0, s.activeAt));
     }
-    await gc({
-      olderThanMs: days * 86_400_000,
-      activeWorktreeIds: [...active],
-      lastActivity,
-    }).catch((err: unknown) => {
-      const key = `gc ${(err as Error).message}`;
-      if (!this.#sweepErrors.has(key)) {
-        this.#sweepErrors.add(key);
-        this.#errors.push(err);
-      }
-    });
+    let result: Awaited<ReturnType<typeof gc>>;
+    try {
+      result = await gc({
+        olderThanMs: days * 86_400_000,
+        activeWorktreeIds: [...active],
+        lastActivity,
+      });
+    } catch (err) {
+      this.#problem('gc', err);
+      return;
+    }
+    for (const f of result.failed ?? []) {
+      this.#problem('gc', new Error(f.message), { workspaceId: f.id });
+    }
   }
 
   /**
@@ -2163,6 +2175,46 @@ export class MiniConductor {
   #state(): View {
     this.#view = readView(this.#o.store, this.#view);
     return this.#view;
+  }
+
+  /**
+   * A failure of the Mini-conductor's own upkeep (#254): recorded as `maintenance.problem` once
+   * per distinct problem in this process (so a sweep does not repeat it every 10 minutes), with
+   * directories replaced and secrets redacted, and kept in `errors`.
+   */
+  #problem(
+    op: MaintenanceOp,
+    err: unknown,
+    about: { taskId?: string; workspaceId?: string } = {},
+  ): void {
+    let message = err instanceof Error ? err.message : String(err);
+    for (const [dir, label] of this.#o.redactPaths ?? []) {
+      if (dir) message = message.split(dir).join(label);
+    }
+    message = redactSecrets(message).trim().slice(0, 2000) || 'unknown error';
+    const key = JSON.stringify([op, about.taskId, about.workspaceId, message]);
+    if (this.#problems.has(key)) return;
+    this.#problems.add(key);
+    this.#errors.push(err);
+    const now = this.#now();
+    try {
+      this.#o.store.append({
+        v: 1,
+        id: newUlid(now.getTime()),
+        ts: now.toISOString(),
+        source: { kind: 'mini', id: this.#o.miniId ?? 'mini' },
+        ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+        ...(about.taskId !== undefined ? { taskId: about.taskId } : {}),
+        type: 'maintenance.problem',
+        data: {
+          op,
+          message,
+          ...(about.workspaceId !== undefined ? { workspaceId: about.workspaceId } : {}),
+        } satisfies MaintenanceProblem,
+      } as EventEnvelope);
+    } catch {
+      // The log itself failing is in `errors` already.
+    }
   }
 
   #env(taskId: string, type: string, data: unknown, sessionId?: string): EventEnvelope {

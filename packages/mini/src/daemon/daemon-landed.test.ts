@@ -711,6 +711,62 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(await manager.get(old.id)).toBeDefined();
     });
 
+    it('records maintenance failures once, without paths or secrets (#254)', async () => {
+      const where = join(root, 'worktrees', 'w-1');
+      let gcs = 0;
+      const failing: Workspaces = {
+        create: (workerId, base, o) => manager.create(workerId, base, o),
+        get: (id) => manager.get(id),
+        remove: (id, o) => manager.remove(id, o),
+        head: () => manager.head(),
+        reconcile: () => Promise.reject(new Error(`cannot remove ${where}: busy`)),
+        gc: async () => {
+          gcs += 1;
+          return {
+            removed: [],
+            failed: [{ id: 'w-1', message: `rm ${where}: token sk-ant-api03-${'a'.repeat(40)}` }],
+          };
+        },
+      };
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: failing,
+        planner: new SingleStepPlanner(),
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        landedSweepMs: 20,
+        redactPaths: [[join(root, 'worktrees'), '<worktrees>']],
+      });
+      await daemon.start();
+      await vi.waitFor(() => expect(gcs).toBeGreaterThan(2), { timeout: 3_000 });
+      const problems = store
+        .query({ typePrefix: 'maintenance' })
+        .map((e) => ({ ...(e.envelope.data as object), taskId: e.envelope.taskId }));
+      expect(problems).toHaveLength(2);
+      expect(problems[0]).toEqual({
+        op: 'reconcile',
+        message: 'cannot remove <worktrees>/w-1: busy',
+        taskId: undefined,
+      });
+      expect(problems[1]).toMatchObject({ op: 'gc', workspaceId: 'w-1' });
+      const text = JSON.stringify(problems);
+      expect(text).not.toContain(root);
+      expect(text).not.toContain('sk-ant-api03');
+      expect(daemon.errors).toHaveLength(2);
+    });
+
     it('runs no gc with idle_days 0', async () => {
       const calls: GcOptions[] = [];
       await runTask(commitWork, { remove_merged: false, idle_days: 0 }, undefined, {

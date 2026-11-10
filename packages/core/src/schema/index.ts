@@ -5,6 +5,7 @@ import { EventEnvelope } from './envelope.js';
 import { Escalation, EscalationExt } from './escalation.js';
 import { HandoffPacket } from './handoff.js';
 import { HelloParams, HelloResult } from './hello.js';
+import { MaintenanceProblem } from './maintenance.js';
 import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
 import { SummaryPacket } from './summary.js';
@@ -30,6 +31,7 @@ export * from './envelope.js';
 export * from './escalation.js';
 export * from './handoff.js';
 export * from './hello.js';
+export * from './maintenance.js';
 export * from './plan.js';
 export * from './profile.js';
 export * from './summary.js';
@@ -86,6 +88,10 @@ export const jsonSchemas = {
   'worker-review': { schema: WorkerReview, title: 'Tacet worker.review payload' },
   'workspace-created': { schema: WorkspaceCreated, title: 'Tacet workspace.created payload' },
   'workspace-removed': { schema: WorkspaceRemoved, title: 'Tacet workspace.removed payload' },
+  'maintenance-problem': {
+    schema: MaintenanceProblem,
+    title: 'Tacet maintenance.problem payload',
+  },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;

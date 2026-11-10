@@ -14,8 +14,10 @@ export const EVENT_NAMESPACES = [
   'handoff',
   'worker',
   'budget',
-  // Local to the Mini-conductor (#126): its worktree registry, never forwarded upward.
+  // Local to the Mini-conductor, never forwarded upward: its worktree registry (#126) and the
+  // failures of its own upkeep (#254).
   'workspace',
+  'maintenance',
 ] as const;
 
 /**
@@ -27,7 +29,7 @@ export const EventType = z
   .regex(/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/, 'expected a dotted lowercase event type');
 
 /** Namespaces that stay with the Mini-conductor and are never forwarded upward (ADR-003 §3). */
-export const LOCAL_EVENT_NAMESPACES = ['workspace'] as const;
+export const LOCAL_EVENT_NAMESPACES = ['workspace', 'maintenance'] as const;
 
 /** False for an event type a forwarder must keep local, such as the worktree registry (#126). */
 export function isForwardable(type: string): boolean {

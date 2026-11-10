@@ -208,6 +208,10 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 
 `workspace.*` (`workspace.created`, `workspace.removed`) joins the event namespaces of §1: the Mini-conductor's worktree registry, moved from per-worktree state files into the log (#126). It is local to the Mini-conductor: not in the upward stream of §3, never forwarded to the Conductor, and its payloads carry ids, never paths. Additive under §2.
 
+### Addendum (2026-11-10, proposed, pending owner approval): `maintenance.*` namespace (§1)
+
+`maintenance.*` (`maintenance.problem`: `op`, an open enum of `reconcile`, `landed`, `gc`, `unpin` with fallback `other`; `message`; optional `workspaceId`; the envelope's `taskId` when the problem is about one task) joins the event namespaces of §1: failures of the Mini-conductor's unattended upkeep (the start-time worktree reconcile, the landed sweep, idle gc, deleting finished tasks' pin refs), recorded so the user sees them (#254). Like `workspace.*`, it is local to the Mini-conductor: not in the §4 upward stream, never forwarded (`LOCAL_EVENT_NAMESPACES`). It has no path fields; in `message`, the repo, state, worktree and home directories are replaced, secrets are redacted, and the length is bounded. Additive under §2. Also proposed: a namespace listed in `LOCAL_EVENT_NAMESPACES` is additive and needs only an ARCHITECTURE §3 line, not another addendum.
+
 ## Consequences
 
 - `docs/ARCHITECTURE.md` needs, in the PR that accepts this ADR:
