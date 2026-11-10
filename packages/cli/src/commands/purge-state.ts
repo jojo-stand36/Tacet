@@ -205,7 +205,7 @@ export async function applyState(
     }
     throw err;
   }
-  result.warnings = locked.errors.map((e) => (e instanceof Error ? e.message : String(e)));
+  result.warnings.push(...locked.errors.map((e) => (e instanceof Error ? e.message : String(e))));
   if (result.dirRemoved) {
     try {
       // A run that started since the lock was released keeps its dir: nothing of it is touched.
@@ -218,10 +218,6 @@ export async function applyState(
   return result;
 }
 
-/**
- * Every `refs/heads/tacet/*` branch and its tip. The purge keeps them all, so (owner decision on
- * #211) work they hold counts as kept: a checkout whose commits are on one need no `--force`.
- */
 /** `refs/tacet/*` and their tips (#236): never branches, only Tacet's own bookkeeping. */
 function internalRefs(io: Io, root: string): Map<string, string> {
   const refs = new Map<string, string>();
@@ -251,6 +247,10 @@ function internalRefs(io: Io, root: string): Map<string, string> {
   return refs;
 }
 
+/**
+ * Every `refs/heads/tacet/*` branch and its tip. The purge keeps them all, so (owner decision on
+ * #211) work they hold counts as kept: a checkout whose commits are on one need no `--force`.
+ */
 function tacetTips(io: Io, root: string): Map<string, string> {
   const tips = new Map<string, string>();
   let out = '';

@@ -460,6 +460,25 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       });
     });
 
+    it('fails planning, with no target recorded, when it cannot hold the pinned commit (#236)', async () => {
+      const failing: Workspaces = {
+        ...withoutHead(),
+        head: manager.head.bind(manager),
+        pin: () => Promise.reject(new Error('ref locked')),
+      };
+      await expect(
+        runTask(commitWork, undefined, undefined, { workspaces: failing }),
+      ).rejects.toThrow('the task published no result');
+      expect(store.query({ typePrefix: 'task.target' })).toEqual([]);
+      const status = store
+        .query({ typePrefix: 'task.status' })
+        .map((e) => e.envelope.data as { state: string; message?: string });
+      expect(status.at(-1)).toMatchObject({
+        state: 'failed',
+        message: expect.stringContaining("cannot hold the task's target commit: ref locked"),
+      });
+    });
+
     it('keeps a target pinned before a crash, and plans there', async () => {
       const pinned = git(repo, ['rev-parse', 'HEAD']);
       writeFileSync(join(repo, 'later.txt'), 'later\n');

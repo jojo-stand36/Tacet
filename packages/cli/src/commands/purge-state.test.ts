@@ -156,6 +156,20 @@ describe('tacet uninstall --purge: run state (#211)', () => {
     );
   });
 
+  it('warns when it cannot delete an internal ref (#236)', async () => {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['update-ref', 'refs/tacet/task-1/target', head]);
+    // A held ref lock makes the delete fail.
+    const lock = join(
+      git(repo, ['rev-parse', '--absolute-git-dir']),
+      'refs/tacet/task-1/target.lock',
+    );
+    writeFileSync(lock, '');
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.err).toContain('could not delete refs/tacet/task-1/target');
+    expect(git(repo, ['rev-parse', 'refs/tacet/task-1/target'])).toBe(head);
+  });
+
   it('removes the run state when nothing holds unintegrated work, without --force', async () => {
     await manager().create('clean');
     expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(0);
