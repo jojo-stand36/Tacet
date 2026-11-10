@@ -100,6 +100,28 @@ export interface Integrator {
     workspace: Workspace,
     commit?: string,
   ): Promise<{ path: string; untracked: boolean }[] | undefined>;
+  /**
+   * Commit the checkout's uncommitted changes for a Worker that cannot run git (#260), onto
+   * `parent` (or its HEAD) by Tacet's own Worker identity, and point the sub-task's branch at it.
+   * `refused` when a change is protected config or too big; undefined when there is nothing.
+   */
+  commitFor?(
+    subtaskId: string,
+    workspace: Workspace,
+    o: {
+      parent?: string;
+      message: string;
+      skip?: (c: { path: string; untracked: boolean }) => boolean;
+    },
+  ): Promise<
+    | { commit: string; ref: string; paths: string[] }
+    | {
+        refused:
+          | { why: 'protected'; paths: string[] }
+          | { why: 'too-big'; bytes: number; files: number };
+      }
+    | undefined
+  >;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
   /**

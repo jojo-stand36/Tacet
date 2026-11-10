@@ -129,8 +129,11 @@ const PROTECTED_IN: readonly [string, string][] = [
   ['.vscode', 'mcp.json'],
 ];
 
-/** Whether writing `rel` (relative to the checkout, `/`-separated) would change protected config. */
-function protectedConfig(rel: string): boolean {
+/**
+ * Whether writing `rel` (relative to the checkout, `/`-separated) would change protected config.
+ * Also what Tacet refuses to commit for a Worker (#260).
+ */
+export function protectedConfig(rel: string): boolean {
   const segs = rel.split(sep).map(fold);
   const name = segs.at(-1) ?? '';
   if (PROTECTED_FILES.includes(name)) return true;

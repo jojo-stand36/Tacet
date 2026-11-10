@@ -25,6 +25,7 @@ import {
   workerWorktree,
 } from '@tacet/core/node';
 import { type Integrator, type Workspace, WorktreeRefusedError } from '../daemon/ports.js';
+import { protectedConfig } from '../daemon/tool-policy.js';
 import { amendedInReflog, branchTip, detectLanded, isReplacement, type Landed } from './landed.js';
 import { combineCommits, setTaskBranch } from './merge.js';
 
@@ -523,6 +524,124 @@ export async function uncommittedChanges(opts: {
   }
 }
 
+/** The author and committer of the commits Tacet makes for Workers (#260): never the user's. */
+export const TACET_WORKER_IDENTITY = { name: 'Tacet Worker', email: 'worker@tacet.invalid' };
+
+/** Why Tacet did not commit a Worker's changes (#260). */
+export type CommitRefusal =
+  | { why: 'protected'; paths: string[] }
+  | { why: 'too-big'; bytes: number; files: number };
+
+export interface CommitWorktreeOptions {
+  cwd: string;
+  repoRoot: string;
+  /** The task branch to point at the commit (under `refs/heads/tacet/`). */
+  ref: string;
+  /** The parent: the run's last commit; without one, the Worker's HEAD (read as data). */
+  parent?: string | undefined;
+  message: string;
+  /** Paths that are not committed, as if absent (the sandbox's empty placeholders, #263). */
+  skip?: (change: UncommittedChange) => boolean;
+  /** Paths whose change Tacet refuses to commit: agent, hook and tool config (#200, #227). */
+  protectedPath: (path: string) => boolean;
+  /** Most bytes (sum of the changed files' sizes) and files in one commit. */
+  maxBytes?: number;
+  maxFiles?: number;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+}
+
+/**
+ * Commit a Worker's uncommitted changes for it (#260), for Workers that cannot run git
+ * (claude-sdk and the other Claude and Gemini routes, which have no shell). From the main repo,
+ * as `uncommittedChanges` reads them: a throwaway index of the parent in a directory Tacet owns,
+ * `git add` of exactly the changed paths (their contents read as data; a symlink is stored as a
+ * link, never followed), `write-tree`, and `commit-tree` with the parent, unsigned, by
+ * `TACET_WORKER_IDENTITY`; the objects go to the shared store and the Worker's own store is never
+ * read. Then `ref` points at the commit. Refuses, committing nothing, when a changed path is
+ * protected config or the change is too big. Undefined when there is nothing to commit or no
+ * parent the repo has.
+ */
+export async function commitWorktree(
+  opts: CommitWorktreeOptions,
+): Promise<
+  { commit: string; ref: string; paths: string[] } | { refused: CommitRefusal } | undefined
+> {
+  if (!opts.ref.startsWith(TASK_REF_PREFIX)) {
+    throw new Error(`integration only writes branches under ${TASK_REF_PREFIX}`);
+  }
+  const changes = await uncommittedChanges({
+    cwd: opts.cwd,
+    repoRoot: opts.repoRoot,
+    commit: opts.parent,
+    ...(opts.env ? { env: opts.env } : {}),
+    maxPaths: (opts.maxFiles ?? 5000) + 1,
+  });
+  const wt = workerWorktree(opts.cwd, opts.repoRoot);
+  if (!changes || !wt) return undefined;
+  const paths = changes.filter((c) => !opts.skip?.(c)).map((c) => c.path);
+  if (paths.length === 0) return undefined;
+  const blocked = paths.filter((p) => opts.protectedPath(p));
+  if (blocked.length > 0) return { refused: { why: 'protected', paths: blocked } };
+  let bytes = 0;
+  for (const p of paths) {
+    try {
+      const st = lstatSync(join(opts.cwd, p));
+      bytes += st.isFile() ? st.size : 0;
+    } catch {
+      // Deleted: no bytes.
+    }
+  }
+  if (paths.length > (opts.maxFiles ?? 5000) || bytes > (opts.maxBytes ?? 50 * 1024 * 1024)) {
+    return { refused: { why: 'too-big', bytes, files: paths.length } };
+  }
+  const env = opts.env ?? process.env;
+  const tmp = mkdtempSync(join(tmpdir(), 'tacet-commit-'));
+  try {
+    const gitEnv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.commonDir,
+      GIT_INDEX_FILE: join(tmp, 'index'),
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
+      GIT_AUTHOR_NAME: TACET_WORKER_IDENTITY.name,
+      GIT_AUTHOR_EMAIL: TACET_WORKER_IDENTITY.email,
+      GIT_COMMITTER_NAME: TACET_WORKER_IDENTITY.name,
+      GIT_COMMITTER_EMAIL: TACET_WORKER_IDENTITY.email,
+    };
+    const git = (args: string[], input?: string) =>
+      run(['git', ...SAFE_GIT_ARGS, '-c', 'core.symlinks=true', ...args], {
+        cwd: opts.repoRoot,
+        env: gitEnv,
+        timeoutMs: opts.timeoutMs ?? 120_000,
+        input,
+      });
+    const parent =
+      opts.parent ?? (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    if (parent === undefined || !COMMIT_ID.test(parent)) return undefined;
+    await git(['read-tree', parent]);
+    await git(
+      ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul', '--literal-pathspecs'],
+      paths.join('\0'),
+    );
+    const tree = await git(['write-tree']);
+    const commit = await git([
+      'commit-tree',
+      '--no-gpg-sign',
+      tree,
+      '-p',
+      parent,
+      '-m',
+      opts.message,
+    ]);
+    if (!COMMIT_ID.test(commit)) throw new Error('commit-tree gave no commit id');
+    await setTaskBranch(opts.ref, commit, { repoRoot: opts.repoRoot, env });
+    return { commit, ref: opts.ref, paths };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 interface RunOptions {
   cwd: string;
   env: Record<string, string>;
@@ -690,6 +809,23 @@ export class GitIntegrator implements Integrator {
       return false;
     }
     return wt ? amendedInReflog(join(wt.gitDir, 'logs', 'HEAD'), later) : false;
+  }
+
+  commitFor(
+    subtaskId: string,
+    workspace: Workspace,
+    o: { parent?: string; message: string; skip?: (c: UncommittedChange) => boolean },
+  ): ReturnType<typeof commitWorktree> {
+    return commitWorktree({
+      cwd: workspace.path,
+      repoRoot: this.#repoRoot,
+      ref: taskBranch(subtaskId),
+      parent: o.parent,
+      message: o.message,
+      ...(o.skip ? { skip: o.skip } : {}),
+      protectedPath: protectedConfig,
+      env: this.#env,
+    });
   }
 
   uncommitted(workspace: Workspace, commit?: string): Promise<UncommittedChange[] | undefined> {
