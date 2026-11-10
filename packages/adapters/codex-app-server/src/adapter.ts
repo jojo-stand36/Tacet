@@ -35,7 +35,13 @@ import {
   workerGitEnv,
   workerWorktree,
 } from '@tacet/core/node';
-import { AuthRoutingError, CODEX_ENV_ALLOW, type CodexAuthRoute, codexLaunch } from './auth.js';
+import {
+  AuthRoutingError,
+  CODEX_ENV_ALLOW,
+  type CodexAuthRoute,
+  codexLaunch,
+  KEY_VARS,
+} from './auth.js';
 import { JsonRpcPeer, METHOD_NOT_FOUND, RpcError } from './jsonrpc.js';
 
 /** The Codex CLI version this adapter is pinned to and conformance-tested against. */
@@ -323,6 +329,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
           // writable, and nothing else of the repo's .git (#116). Thread config keys are dotted
           // override paths, so this sets only `writable_roots` and keeps the rest of the table.
           ...(gitDir !== undefined ? { 'sandbox_workspace_write.writable_roots': [gitDir] } : {}),
+          // The commands a Worker runs get its environment (already an allowlist, #147) without
+          // the API key Codex itself uses (#150): Codex's default passes everything, key included.
+          ...(unattended ? { 'shell_environment_policy.exclude': [...KEY_VARS] } : {}),
         },
       };
       const result = await rpc.request<Obj>(
