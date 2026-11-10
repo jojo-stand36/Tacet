@@ -16,10 +16,16 @@ git(['init', '-q', '-b', 'main'], main); writeFileSync(join(main, 'R'), 'x');
 git(['add', '.'], main); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'r'], main);
 const wts = ['wt1', 'wt2', 'wt3'].map((n) => { const p = join(root, n); git(['worktree', 'add', '-q', '-b', n, p], main); return p; });
 // Trust each checkout, so no trust prompt blocks the TUI.
-writeFileSync(join(home, 'config.toml'), codexAcpConfig(`${api.url}/v1`) + wts.map((w) => `\n[projects."${w}"]\ntrust_level = "trusted"\n`).join(''));
+// DAEMON=off adds `[features] daemon_auto_start = false` to config.toml (codex 0.167 `features list`: stable, on by default).
+const daemonOff = process.env.DAEMON === 'off' ? 'daemon_auto_start = false\n' : '';
+writeFileSync(join(home, 'config.toml'), codexAcpConfig(`${api.url}/v1`).replace('[features]\n', `[features]\n${daemonOff}`) + wts.map((w) => `\n[projects."${w}"]\ntrust_level = "trusted"\n`).join(''));
 const adapter = new PtyCliAdapter({
   slug: 'codex',
-  preset: { command: [codex], resumeArgs: ['resume', '--last'] },
+  // DAEMON=flag passes the same setting on the command line instead, as a preset would.
+  preset: {
+    command: process.env.DAEMON === 'flag' ? [codex, '-c', 'features.daemon_auto_start=false'] : [codex],
+    resumeArgs: ['resume', '--last'],
+  },
   baseEnv: { PATH: process.env.PATH, HOME: root, CODEX_HOME: home, OPENAI_API_KEY: 'sk-test-0000000000000000' },
   envPolicy: { pass: ['CODEX_HOME', 'OPENAI_API_KEY'] },
   quietMs: 2500, startTimeoutMs: 30000, killTimeoutMs: 3000,
@@ -50,5 +56,8 @@ await turn(wts[1], 'SAY beta', false);
 await turn(wts[0], 'SAY gamma', true);
 await turn(wts[2], 'SAY delta', true);
 await api.close();
+const daemons = execFileSync("ps", ["-eo", "pid=,args="]).toString().split("\n").filter((l) => l.includes(home) && l.includes("app-server"));
+console.log(`codex app-server daemons left running: ${daemons.length}`);
+for (const l of daemons) process.kill(Number(l.trim().split(" ")[0]));
 rmSync(root, { recursive: true, force: true });
 process.exit(0);

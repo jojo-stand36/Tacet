@@ -15,7 +15,6 @@ const main = join(root, 'repo'); mkdirSync(main);
 const git = (args, cwd) => execFileSync('git', args, { cwd, stdio: 'pipe' }).toString().trim();
 git(['init', '-q', '-b', 'main'], main);
 writeFileSync(join(main, 'README'), 'x\n');
-git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qam', 'init', '--allow-empty'], main);
 git(['add', '.'], main); git(['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'r'], main);
 const wt1 = join(root, 'wt1'), wt2 = join(root, 'wt2');
 git(['worktree', 'add', '-q', '-b', 'w1', wt1], main);

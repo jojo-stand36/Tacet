@@ -26,7 +26,8 @@ const files = () => { const o = {}; const walk = (d) => { for (const f of readdi
 const step = async (cwd, args) => {
   const before = files();
   const res = await run(cwd, args);
-  const changed = Object.keys(files()).filter((p) => files()[p] !== before[p] && /chats|session/i.test(p)).map((p) => p.slice(ghome.length));
+  const after = files();
+  const changed = Object.keys(after).filter((p) => after[p] !== before[p] && /chats|session/i.test(p)).map((p) => p.slice(ghome.length));
   console.log(`${cwd.split('/').at(-1)} ${args.join(' ')}: ${res}\n   chat files changed: ${changed.join(', ') || 'none'}`);
 };
 await step(wts[0], ['-p', 'SAY alpha']);
