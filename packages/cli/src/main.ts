@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 import { formatExplain } from '@tacet/core';
 import { ConfigError, loadConfig, StateDirError } from '@tacet/core/node';
+import { cancel } from './commands/cancel.js';
 import { init, uninstall } from './commands/init.js';
 import { attach, logs, status } from './commands/read.js';
 import { run } from './commands/run.js';
@@ -19,6 +20,7 @@ const USAGE = `usage:
                                  run a task in this repo until it is done (standalone)
   tacet run --resume [--answer ID=TEXT]...
                                  carry on with unfinished tasks, answering escalations
+  tacet cancel <task> [--json]   cancel a task and its sub-tasks (interrupt a live run first)
   tacet status [--json]          tasks, sub-tasks, open escalations; whether a run is live
   tacet logs <task> [--transcript] [--json] [--follow]
                                  a task's events (--transcript adds the Workers' own)
@@ -50,6 +52,7 @@ const OPTIONS = {
     resume: { type: 'boolean' },
     answer: { type: 'string', multiple: true },
   },
+  cancel: COMMON,
   status: COMMON,
   logs: { ...COMMON, transcript: { type: 'boolean' }, follow: { type: 'boolean', short: 'f' } },
   attach: COMMON,
@@ -97,6 +100,9 @@ export async function main(argv: string[], io: Io): Promise<number> {
           return 2;
         }
         return await run(io, positionals.length > 0 ? positionals.join(' ') : undefined, v);
+      case 'cancel':
+        if (positionals.length !== 1) return usage(io);
+        return await cancel(io, positionals[0] as string, v);
       case 'status':
         if (positionals.length > 0) return usage(io);
         return await status(io, v);

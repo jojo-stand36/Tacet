@@ -233,6 +233,8 @@ export class MiniConductor {
   readonly #o: MiniConductorOptions;
   readonly #runs = new Map<string, Run>();
   readonly #planning = new Set<string>();
+  /** Aborts the planner of a task, for `cancel()`. */
+  readonly #planAborts = new Map<string, AbortController>();
   /** Background work (plans, Worker event loops) that `stop()` waits for. */
   readonly #inflight = new Set<Promise<unknown>>();
   /** Process markers of Worker sessions that may be running, by session (#127). */
@@ -378,6 +380,33 @@ export class MiniConductor {
   }
 
   /**
+   * Cancel a task (#202): it and its unfinished sub-tasks are recorded as `canceled`, their open
+   * Worker sessions are ended (`worker.ended` with reason `canceled`, which is never resumed), its
+   * planner is stopped, and nothing more starts for it. Work already under way for it (a Worker
+   * starting, an integration, a roll-up) records nothing more once it returns. Returns the ids
+   * canceled. Throws for an unknown task, a sub-task, or a task that has already ended. A planner
+   * that ignores its abort signal keeps `settled()` waiting until it returns; its plan is dropped.
+   */
+  async cancel(taskId: string): Promise<string[]> {
+    if (!this.#started) throw new Error('call start() first');
+    const v = this.#state();
+    const problem = cancelProblem(v, taskId);
+    if (problem) throw new Error(problem);
+    this.#planAborts.get(taskId)?.abort();
+    const runs = [...this.#runs.values()].filter(
+      (r) => r.subtaskId === taskId || r.subtaskId.startsWith(`${taskId}/`),
+    );
+    // Recorded first, so the scheduler starts nothing more for it while the sessions close.
+    const { events, canceled } = cancelEvents(v, taskId, (...a) => this.#env(...a), {
+      open: new Set(runs.map((r) => r.sessionId)),
+    });
+    this.#o.store.append(events);
+    await Promise.all(runs.map((r) => this.#end(r, 'canceled', CANCELED_MESSAGE)));
+    this.#kick();
+    return canceled;
+  }
+
+  /**
    * Wait until there is nothing left to do now: nothing planning or running, nothing ready to
    * start, no answer waiting to be delivered and no result waiting to be rolled up.
    */
@@ -431,6 +460,19 @@ export class MiniConductor {
     return this.#started && gen === this.#gen;
   }
 
+  /**
+   * Whether a sub-task, or the task it belongs to, has ended (canceled, say, #202): work still
+   * under way for it (a Worker starting, an integration, a roll-up) must not record anything more.
+   */
+  #ended(taskId: string): boolean {
+    const { tasks } = this.#state();
+    const root = taskId.split('/')[0] as string;
+    return [taskId, root].some((id) => {
+      const state = tasks[id]?.state;
+      return state !== undefined && TERMINAL.has(state);
+    });
+  }
+
   #track<T>(p: Promise<T>): void {
     const tracked = p
       .catch((err: unknown) => this.#errors.push(err))
@@ -446,11 +488,20 @@ export class MiniConductor {
     if (this.#planning.has(task.id)) return;
     this.#planning.add(task.id);
     const gen = this.#gen;
+    const abort = new AbortController();
+    this.#planAborts.set(task.id, abort);
+    // A task canceled while it was being planned keeps its state: the plan is dropped.
+    const dropped = () => {
+      const state = this.#state().tasks[task.id]?.state;
+      return !this.#live(gen) || (state !== undefined && TERMINAL.has(state));
+    };
     this.#track(
       (async () => {
         try {
-          const proposal = await this.#o.planner.plan(task, { signal: this.#abort.signal });
-          if (!this.#live(gen)) return;
+          const proposal = await this.#o.planner.plan(task, {
+            signal: AbortSignal.any([this.#abort.signal, abort.signal]),
+          });
+          if (dropped()) return;
           const idOf = new Map(proposal.subtasks.map((s, i) => [s.key, `${task.id}/${i + 1}`]));
           const plan = TaskPlan.parse({
             subtasks: proposal.subtasks.map((s) => ({
@@ -491,7 +542,7 @@ export class MiniConductor {
             this.#env(task.id, 'task.status', { state: 'working' }),
           ]);
         } catch (err) {
-          if (!this.#live(gen)) return;
+          if (dropped()) return;
           this.#errors.push(err);
           this.#o.store.append(
             this.#env(task.id, 'task.status', {
@@ -501,6 +552,7 @@ export class MiniConductor {
           );
         } finally {
           this.#planning.delete(task.id);
+          if (this.#planAborts.get(task.id) === abort) this.#planAborts.delete(task.id);
           this.#kick();
         }
       })(),
@@ -532,6 +584,7 @@ export class MiniConductor {
       // One sub-task that cannot start must not hold up the others, nor be retried every tick.
       await this.#run(id, gen).catch((err: unknown) => {
         this.#errors.push(err);
+        if (this.#ended(id)) return;
         this.#o.store.append(
           this.#env(id, 'task.status', {
             state: 'failed',
@@ -726,6 +779,8 @@ export class MiniConductor {
       // The parent's branch gets the work of every sub-task (#134).
       const published = done ? await this.#publish(parent.task.id, results) : undefined;
       if (!this.#live(gen)) return;
+      // Canceled while its work was being published (#202): it keeps that state.
+      if (this.#ended(parent.task.id)) continue;
       const statuses = results.map((r) => r.verification?.status);
       const verification: VerificationStatus =
         !done || statuses.includes('failed')
@@ -977,7 +1032,7 @@ export class MiniConductor {
       this.#combineFailures.delete(subtaskId);
       return { ...(commit !== undefined ? { commit } : {}), notes: [] };
     } catch (err) {
-      if (!this.#live(gen)) return undefined;
+      if (!this.#live(gen) || this.#ended(subtaskId)) return undefined;
       this.#errors.push(err);
       if (!(err instanceof MergeConflictError)) {
         // A git error (a timeout, say) may pass: try again on later ticks, a few times.
@@ -1045,7 +1100,8 @@ export class MiniConductor {
   // ---- Workers ---------------------------------------------------------------------------
 
   async #run(subtaskId: string, gen: number): Promise<void> {
-    if (this.#runs.has(subtaskId) || !this.#live(gen)) return;
+    // A tick's ready list can outlive a cancellation made while an earlier run of it started.
+    if (this.#runs.has(subtaskId) || !this.#live(gen) || this.#ended(subtaskId)) return;
     const v = this.#state();
     const view = v.tasks[subtaskId];
     if (!view) return;
@@ -1118,6 +1174,8 @@ export class MiniConductor {
       await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
       if (!this.#live(gen)) return;
     }
+    // Canceled while the checkout was being made: start nothing (#202).
+    if (this.#ended(subtaskId)) return;
     // Intent first: a crash after this leaves a record of the session and its checkout.
     this.#o.store.append([
       this.#env(
@@ -1202,7 +1260,8 @@ export class MiniConductor {
           if (this.#markers.delete(sessionId)) this.#saveMarkers();
         }),
       );
-      if (!this.#live(gen)) return;
+      // Canceled meanwhile: the cancellation already recorded this session's end (#202).
+      if (!this.#live(gen) || this.#ended(subtaskId)) return;
       this.#errors.push(err);
       this.#o.store.append(
         this.#env(
@@ -1228,11 +1287,17 @@ export class MiniConductor {
       this.#afterFailure(subtaskId);
       return;
     }
-    if (!this.#live(gen)) {
-      // Stopped while the session started: give it back without registering it.
+    if (!this.#live(gen) || this.#ended(subtaskId)) {
+      // Stopped or canceled while the session started: give it back without registering it.
+      // A cancellation already recorded its end.
+      const canceled = this.#live(gen);
       revoke();
       await worker.adapter.close(handle).catch(() => {});
       if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      // A canceled session is never resumed: its vendor state can go (#153).
+      if (canceled && handle.vendorSessionId) {
+        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
+      }
       return;
     }
     const run: Run = {
@@ -1430,6 +1495,7 @@ export class MiniConductor {
           ended = true;
           return;
         }
+        if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
         this.#o.store.append(this.#env(run.subtaskId, 'task.status', { state: 'input_required' }));
         return;
       }
@@ -1440,6 +1506,8 @@ export class MiniConductor {
         ended = true;
         return;
       }
+      // Ended meanwhile (canceled, say): nothing more is run in its checkout.
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
       // One round per check: the commands and the review of the same commit share it.
       const round = this.#verifyRounds(run);
       let verification: VerifyResult;
@@ -1533,6 +1601,8 @@ export class MiniConductor {
       return true;
     } catch (err) {
       this.#errors.push(err);
+      // Ended meanwhile (canceled, say): its end is recorded already.
+      if (this.#runs.get(run.subtaskId) !== run) return false;
       if (err instanceof WorktreeRefusedError) {
         await this.#refused(run);
         return false;
@@ -1557,6 +1627,8 @@ export class MiniConductor {
 
   /** The Worker's checkout failed its integrity checks: ask the user, end the run. */
   async #refused(run: Run): Promise<void> {
+    // Ended meanwhile (canceled, say): nothing to ask about a run that no longer exists.
+    if (this.#runs.get(run.subtaskId) !== run) return;
     // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
     this.#raise(
       run.subtaskId,
@@ -1818,6 +1890,7 @@ export class MiniConductor {
 
   /** After a failed run: retry (a restart does not count) or fail the sub-task for good. */
   #afterFailure(subtaskId: string): void {
+    if (this.#ended(subtaskId)) return;
     const failed = [...this.#state().sessions.values()].filter(
       (s) => s.taskId === subtaskId && s.ended !== undefined && COUNTED.has(s.ended),
     ).length;
@@ -1913,33 +1986,7 @@ export class MiniConductor {
    * whose environment carries one of their markers, the vendor's tools included.
    */
   async #endStaleWorkers(): Promise<void> {
-    const file = this.#processFile;
-    // Temp files of a write a crash interrupted.
-    try {
-      const dir = dirname(file);
-      const prefix = `${basename(file)}.`;
-      for (const name of readdirSync(dir)) {
-        if (name.startsWith(prefix) && name.endsWith('.tmp'))
-          rmSync(join(dir, name), { force: true });
-      }
-    } catch {
-      // No directory yet.
-    }
-    let markers: string[] = [];
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-      markers = (Array.isArray(parsed) ? parsed : []).filter(isWorkerMarker);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.#errors.push(err);
-    }
-    if (markers.length > 0) {
-      const { left } = await endMarkedProcesses(markers);
-      if (left.length > 0) {
-        this.#errors.push(
-          new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`),
-        );
-      }
-    }
+    this.#errors.push(...(await endStaleWorkerProcesses(this.#processFile)));
     this.#markers.clear();
     this.#saveMarkers();
   }
@@ -1997,125 +2044,12 @@ export class MiniConductor {
 
   /** The current reading of the log, rebuilt only when it has grown. */
   #state(): View {
-    const count = this.#o.store.count();
-    if (this.#view && this.#view.count === count) return this.#view;
-    const tasks = this.#o.store.replay(tasksProjection).tasks;
-    const sessions = new Map<string, SessionRecord>();
-    const kinds = new Map<string, string>();
-    const indivisible = new Set<string>();
-    const escalations = new Map<string, EscalationRecord>();
-    const decisions = new Map<string, string>();
-    const progress = new Map<string, string>();
-    const progressAt = new Map<string, number>();
-    for (const { envelope: e } of this.#o.store.query({})) {
-      const d = (e.data ?? {}) as Record<string, unknown>;
-      const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
-      if (e.type === 'worker.progress') {
-        // Written by the MCP backend: the session is on the envelope, the report is the data.
-        const summary = str('summary');
-        if (summary && e.taskId) progress.set(e.taskId, summary);
-        if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
-      } else if (e.type.startsWith('worker.')) {
-        const id = str('sessionId');
-        if (!id || !e.taskId) continue;
-        if (e.type === 'worker.started') {
-          const adapter = str('adapter');
-          const workspaceId = str('workspaceId');
-          const baseCommit = str('baseCommit');
-          const baseBranch = str('baseBranch');
-          sessions.set(id, {
-            sessionId: id,
-            taskId: e.taskId,
-            ...(adapter ? { adapter } : {}),
-            ...(workspaceId ? { workspaceId } : {}),
-            ...(baseCommit ? { baseCommit } : {}),
-            ...(baseBranch ? { baseBranch } : {}),
-          });
-        } else {
-          const s = sessions.get(id);
-          if (!s) continue;
-          const vendor = str('vendorSessionId');
-          if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
-          else if (e.type === 'worker.ended') {
-            s.ended = str('reason') ?? 'failed';
-            if (d.workspaceRefused === true) s.refused = true;
-          }
-        }
-      } else if (e.type === 'task.planned') {
-        const plan = TaskPlan.safeParse(e.data);
-        if (plan.success) {
-          for (const s of plan.data.subtasks) {
-            kinds.set(s.id, s.kind);
-            // Each plan is the full current one, so a replan can also clear the mark.
-            if (s.indivisible) indivisible.add(s.id);
-            else indivisible.delete(s.id);
-          }
-        }
-      } else if (e.type === 'escalation.raised') {
-        const id = str('id');
-        if (id && e.taskId) {
-          escalations.set(id, {
-            id,
-            taskId: e.taskId,
-            ...(e.sessionId ? { sessionId: e.sessionId } : {}),
-            ...(str('contextRef') ? { contextRef: str('contextRef') } : {}),
-            resolved: false,
-            delivered: false,
-          });
-        }
-      } else if (e.type === 'escalation.resolved') {
-        const x = escalations.get(str('escalationId') ?? '');
-        if (x) {
-          x.resolved = true;
-          const answer = str('answer');
-          const decisionId = str('decisionId');
-          if (answer !== undefined) x.answer = answer;
-          if (decisionId !== undefined) x.decisionId = decisionId;
-        }
-      } else if (e.type === 'escalation.delivered') {
-        const x = escalations.get(str('escalationId') ?? '');
-        if (x) x.delivered = true;
-      } else if (e.type === 'decision.recorded') {
-        const dec = d as Partial<Decision>;
-        if (typeof dec.id === 'string' && typeof dec.decision === 'string') {
-          decisions.set(dec.id, dec.decision);
-        }
-      }
-    }
-    // An answer given as a recorded decision (ADR-003 §4 DecisionExt) carries its text there.
-    for (const x of escalations.values()) {
-      if (x.answer === undefined && x.decisionId) {
-        const text = decisions.get(x.decisionId);
-        if (text !== undefined) x.answer = text;
-      }
-    }
-    this.#view = {
-      count,
-      tasks,
-      sessions,
-      kinds,
-      indivisible,
-      escalations,
-      decisions,
-      progress,
-      progressAt,
-    };
+    this.#view = readView(this.#o.store, this.#view);
     return this.#view;
   }
 
   #env(taskId: string, type: string, data: unknown, sessionId?: string): EventEnvelope {
-    const now = this.#now();
-    return {
-      v: 1,
-      id: newUlid(now.getTime()),
-      ts: now.toISOString(),
-      source: { kind: 'mini', id: this.#o.miniId ?? 'mini' },
-      ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
-      taskId,
-      ...(sessionId !== undefined ? { sessionId } : {}),
-      type,
-      data,
-    } as EventEnvelope;
+    return envelope(this.#o, this.#now(), taskId, type, data, sessionId);
   }
 
   #now(): Date {
@@ -2125,46 +2059,319 @@ export class MiniConductor {
   // ---- single instance -------------------------------------------------------------------
 
   #lock(): void {
-    const path = this.#o.lockPath;
-    if (HELD_LOCKS.has(path)) {
-      throw new Error('a Mini-conductor in this process is already running for this repo');
-    }
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-        HELD_LOCKS.add(path);
-        return;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      }
-      // Take a stale lock over by renaming it away first: of two processes doing this at once,
-      // only one rename succeeds, and the loser retries against the winner's new lock.
-      const aside = `${path}.${process.pid}.${randomUUID()}.stale`;
-      try {
-        renameSync(path, aside);
-      } catch {
-        continue;
-      }
-      const pid = Number.parseInt(readFileSync(aside, 'utf8'), 10);
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
-        // Not stale after all: put it back and refuse.
-        try {
-          renameSync(aside, path);
-        } catch {
-          rmSync(aside, { force: true });
-        }
-        throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
-      }
-      rmSync(aside, { force: true });
-    }
-    throw new Error('could not take the Mini-conductor lock');
+    takeMiniLock(this.#o.lockPath);
   }
 
   #unlock(): void {
-    if (!HELD_LOCKS.delete(this.#o.lockPath)) return;
-    rmSync(this.#o.lockPath, { force: true });
+    releaseMiniLock(this.#o.lockPath);
   }
+}
+
+/** An event of this Mini-conductor. */
+function envelope(
+  o: { miniId?: string; repo?: string },
+  now: Date,
+  taskId: string,
+  type: string,
+  data: unknown,
+  sessionId?: string,
+): EventEnvelope {
+  return {
+    v: 1,
+    id: newUlid(now.getTime()),
+    ts: now.toISOString(),
+    source: { kind: 'mini', id: o.miniId ?? 'mini' },
+    ...(o.repo !== undefined ? { repo: o.repo } : {}),
+    taskId,
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    type,
+    data,
+  } as EventEnvelope;
+}
+
+const CANCELED_MESSAGE = 'canceled by the user';
+
+/** Why `taskId` cannot be canceled, or undefined when it can. */
+function cancelProblem(v: View, taskId: string): string | undefined {
+  const t = Object.hasOwn(v.tasks, taskId) ? v.tasks[taskId] : undefined;
+  if (!t) return `unknown task ${taskId}`;
+  if (t.task.parentId !== undefined || taskId.includes('/')) {
+    return `${taskId} is a sub-task: cancel its task ${t.task.parentId ?? taskId.split('/')[0]}`;
+  }
+  if (TERMINAL.has(t.state)) return `task ${taskId} has already ended (${t.state})`;
+  return undefined;
+}
+
+type MakeEnvelope = (
+  taskId: string,
+  type: string,
+  data: unknown,
+  sessionId?: string,
+) => EventEnvelope;
+
+/**
+ * The events that cancel `taskId`: `worker.ended` (`canceled`) for each of its sessions with no
+ * end recorded, except `open` ones the caller ends itself, then `task.status canceled` for each
+ * unfinished sub-task and the task last.
+ */
+function cancelEvents(
+  v: View,
+  taskId: string,
+  env: MakeEnvelope,
+  opts: { open?: ReadonlySet<string> } = {},
+): { events: EventEnvelope[]; canceled: string[] } {
+  const ours = (id: string) => id === taskId || id.startsWith(`${taskId}/`);
+  const events: EventEnvelope[] = [];
+  for (const s of v.sessions.values()) {
+    if (s.ended === undefined && ours(s.taskId) && !opts.open?.has(s.sessionId)) {
+      events.push(
+        env(
+          s.taskId,
+          'worker.ended',
+          { sessionId: s.sessionId, reason: 'canceled', message: CANCELED_MESSAGE },
+          s.sessionId,
+        ),
+      );
+    }
+  }
+  const subs = Object.values(v.tasks)
+    .filter((t) => t.task.id !== taskId && ours(t.task.id) && !TERMINAL.has(t.state))
+    .map((t) => t.task.id)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const canceled = [...subs, taskId];
+  for (const id of canceled) {
+    events.push(env(id, 'task.status', { state: 'canceled', message: CANCELED_MESSAGE }));
+  }
+  return { events, canceled };
+}
+
+export interface CancelStoppedOptions {
+  store: EventStore;
+  /** The repo's Mini-conductor lock: taken for the change, so no Mini-conductor runs meanwhile. */
+  lockPath: string;
+  /** Default `<lockPath>.workers`, as for `MiniConductor`. */
+  processFile?: string;
+  repo?: string;
+  miniId?: string;
+  now?: () => Date;
+}
+
+/**
+ * Cancel a task while no Mini-conductor runs for the repo (`tacet cancel`, #202): takes the
+ * repo's lock (throws if a live Mini-conductor holds it), ends Worker processes a crashed one
+ * left running, records the cancellation as `MiniConductor.cancel` does, and releases the lock.
+ * Returns the ids canceled and any problems met ending stale processes.
+ */
+export async function cancelStopped(
+  taskId: string,
+  o: CancelStoppedOptions,
+): Promise<{ canceled: string[]; errors: unknown[] }> {
+  takeMiniLock(o.lockPath);
+  try {
+    const problem = cancelProblem(readView(o.store), taskId);
+    if (problem) throw new Error(problem);
+    const file = o.processFile ?? `${o.lockPath}.workers`;
+    const errors = await endStaleWorkerProcesses(file);
+    // As `#saveMarkers` writes it: a crash mid-write never leaves a half-written file.
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, '[]\n', { flag: 'wx', mode: 0o600 });
+      renameSync(tmp, file);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      errors.push(err);
+    }
+    const env: MakeEnvelope = (t, type, data, sessionId) =>
+      envelope(o, o.now?.() ?? new Date(), t, type, data, sessionId);
+    const { events, canceled } = cancelEvents(readView(o.store), taskId, env);
+    o.store.append(events);
+    return { canceled, errors };
+  } finally {
+    releaseMiniLock(o.lockPath);
+  }
+}
+
+/** One reading of the log, rebuilt only when it has grown since `prev`. */
+function readView(store: EventStore, prev?: View): View {
+  const count = store.count();
+  if (prev && prev.count === count) return prev;
+  const tasks = store.replay(tasksProjection).tasks;
+  const sessions = new Map<string, SessionRecord>();
+  const kinds = new Map<string, string>();
+  const indivisible = new Set<string>();
+  const escalations = new Map<string, EscalationRecord>();
+  const decisions = new Map<string, string>();
+  const progress = new Map<string, string>();
+  const progressAt = new Map<string, number>();
+  for (const { envelope: e } of store.query({})) {
+    const d = (e.data ?? {}) as Record<string, unknown>;
+    const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
+    if (e.type === 'worker.progress') {
+      // Written by the MCP backend: the session is on the envelope, the report is the data.
+      const summary = str('summary');
+      if (summary && e.taskId) progress.set(e.taskId, summary);
+      if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
+    } else if (e.type.startsWith('worker.')) {
+      const id = str('sessionId');
+      if (!id || !e.taskId) continue;
+      if (e.type === 'worker.started') {
+        const adapter = str('adapter');
+        const workspaceId = str('workspaceId');
+        const baseCommit = str('baseCommit');
+        const baseBranch = str('baseBranch');
+        sessions.set(id, {
+          sessionId: id,
+          taskId: e.taskId,
+          ...(adapter ? { adapter } : {}),
+          ...(workspaceId ? { workspaceId } : {}),
+          ...(baseCommit ? { baseCommit } : {}),
+          ...(baseBranch ? { baseBranch } : {}),
+        });
+      } else {
+        const s = sessions.get(id);
+        if (!s) continue;
+        const vendor = str('vendorSessionId');
+        if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
+        else if (e.type === 'worker.ended') {
+          s.ended = str('reason') ?? 'failed';
+          if (d.workspaceRefused === true) s.refused = true;
+        }
+      }
+    } else if (e.type === 'task.planned') {
+      const plan = TaskPlan.safeParse(e.data);
+      if (plan.success) {
+        for (const s of plan.data.subtasks) {
+          kinds.set(s.id, s.kind);
+          // Each plan is the full current one, so a replan can also clear the mark.
+          if (s.indivisible) indivisible.add(s.id);
+          else indivisible.delete(s.id);
+        }
+      }
+    } else if (e.type === 'escalation.raised') {
+      const id = str('id');
+      if (id && e.taskId) {
+        escalations.set(id, {
+          id,
+          taskId: e.taskId,
+          ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+          ...(str('contextRef') ? { contextRef: str('contextRef') } : {}),
+          resolved: false,
+          delivered: false,
+        });
+      }
+    } else if (e.type === 'escalation.resolved') {
+      const x = escalations.get(str('escalationId') ?? '');
+      if (x) {
+        x.resolved = true;
+        const answer = str('answer');
+        const decisionId = str('decisionId');
+        if (answer !== undefined) x.answer = answer;
+        if (decisionId !== undefined) x.decisionId = decisionId;
+      }
+    } else if (e.type === 'escalation.delivered') {
+      const x = escalations.get(str('escalationId') ?? '');
+      if (x) x.delivered = true;
+    } else if (e.type === 'decision.recorded') {
+      const dec = d as Partial<Decision>;
+      if (typeof dec.id === 'string' && typeof dec.decision === 'string') {
+        decisions.set(dec.id, dec.decision);
+      }
+    }
+  }
+  // An answer given as a recorded decision (ADR-003 §4 DecisionExt) carries its text there.
+  for (const x of escalations.values()) {
+    if (x.answer === undefined && x.decisionId) {
+      const text = decisions.get(x.decisionId);
+      if (text !== undefined) x.answer = text;
+    }
+  }
+  return {
+    count,
+    tasks,
+    sessions,
+    kinds,
+    indivisible,
+    escalations,
+    decisions,
+    progress,
+    progressAt,
+  };
+}
+
+/** Take the repo's single-instance Mini-conductor lock, or throw when a live one holds it. */
+function takeMiniLock(path: string): void {
+  if (HELD_LOCKS.has(path)) {
+    throw new Error('a Mini-conductor in this process is already running for this repo');
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+      HELD_LOCKS.add(path);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    // Take a stale lock over by renaming it away first: of two processes doing this at once,
+    // only one rename succeeds, and the loser retries against the winner's new lock.
+    const aside = `${path}.${process.pid}.${randomUUID()}.stale`;
+    try {
+      renameSync(path, aside);
+    } catch {
+      continue;
+    }
+    const pid = Number.parseInt(readFileSync(aside, 'utf8'), 10);
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
+      // Not stale after all: put it back and refuse.
+      try {
+        renameSync(aside, path);
+      } catch {
+        rmSync(aside, { force: true });
+      }
+      throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
+    }
+    rmSync(aside, { force: true });
+  }
+  throw new Error('could not take the Mini-conductor lock');
+}
+
+/** Release a lock this process took with `takeMiniLock`. */
+function releaseMiniLock(path: string): void {
+  if (!HELD_LOCKS.delete(path)) return;
+  rmSync(path, { force: true });
+}
+
+/**
+ * End every process whose environment carries a marker in `file` (#127). The caller then records
+ * that none is left. Returns the problems met, for the caller to report.
+ */
+async function endStaleWorkerProcesses(file: string): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  // Temp files of a write a crash interrupted.
+  try {
+    const dir = dirname(file);
+    const prefix = `${basename(file)}.`;
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith(prefix) && name.endsWith('.tmp'))
+        rmSync(join(dir, name), { force: true });
+    }
+  } catch {
+    // No directory yet.
+  }
+  let markers: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    markers = (Array.isArray(parsed) ? parsed : []).filter(isWorkerMarker);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') errors.push(err);
+  }
+  if (markers.length > 0) {
+    const { left } = await endMarkedProcesses(markers);
+    if (left.length > 0) {
+      errors.push(new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`));
+    }
+  }
+  return errors;
 }
 
 /** The part an adapter's `ProfileRefusedError` names; matched by name, as across package copies. */
