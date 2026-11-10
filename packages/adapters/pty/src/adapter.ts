@@ -6,9 +6,10 @@ import { fileURLToPath } from 'node:url';
 import {
   authEnv,
   claudeEnvAllow,
+  placeholderSnapshot,
   removeClaudeConfigDir,
+  removeSandboxPlaceholders,
   repoOf,
-  SubprocessScrubError,
   sweepClaudeConfigDirs,
   withSubprocessScrub,
   writeMcpConfig,
@@ -152,6 +153,8 @@ interface Session {
   events: AsyncQueue<AgentEvent>;
   state: SessionState;
   secrets: string[];
+  /** Under the scrub: the checkout and which sandbox placeholder paths it had before (#263). */
+  placeholders: { cwd: string; before: Set<string> } | undefined;
   hookKey: string;
   files: string[];
   approvals: Map<string, PendingApproval>;
@@ -281,18 +284,13 @@ export class PtyAdapter implements AgentAdapter {
     const keyed = authEnv('api_key', { ...filtered.env, ...opts.env });
     // The commands the Worker runs never see its key (#150).
     const scrub = !(this.#opts.subprocessScrub === false && this.#opts.spawn);
-    if (scrub && process.platform === 'linux') {
-      // Seen on Ubuntu CI: under the sandbox the scrub needs, the `Stop` hook gets an HTTP 500 that
-      // Tacet never sent, so no turn ever ends for it. Fail closed until #164 (coordinator, #150).
-      throw new SubprocessScrubError(
-        "interactive Claude Workers (pty:claude) can't run on Linux yet: Claude Code's sandbox, which keeps the API key from the commands they run, blocks the hooks that report back to Tacet (#164); use the claude-sdk adapter",
-      );
-    }
     const env = scrub ? withSubprocessScrub(keyed) : keyed;
 
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
     const cwd = realpathSync(opts.cwd);
+    // The sandbox the scrub turns on leaves empty placeholders in the checkout; removed at close.
+    const placeholders = scrub ? { cwd, before: placeholderSnapshot(cwd) } : undefined;
     // From the user's environment, not the Worker's: where state lives never depends on a session.
     const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
     const root = this.#configRoot(cwd, home);
@@ -355,14 +353,14 @@ export class PtyAdapter implements AgentAdapter {
     try {
       const hookFile = writeSessionFile(
         `${handle.id}.hook.json`,
-        JSON.stringify({ url: `${reg.url}/SessionStart`, token: reg.token.reveal() }),
+        JSON.stringify({ url: reg.url, token: reg.token.reveal() }),
         fileOpts,
       );
       files.push(hookFile);
       const forward = `${shellQuote(process.execPath)} ${shellQuote(forwardScript())} ${shellQuote(hookFile)}`;
       const settingsPath = writeSessionFile(
         `${handle.id}.settings.json`,
-        JSON.stringify(claudeHookSettings({ url: reg.url, token: reg.token.reveal(), forward })),
+        JSON.stringify(claudeHookSettings({ forward })),
         fileOpts,
       );
       files.push(settingsPath);
@@ -415,6 +413,7 @@ export class PtyAdapter implements AgentAdapter {
         events: new AsyncQueue(),
         state: 'idle',
         secrets,
+        placeholders,
         hookKey: reg.key,
         files,
         approvals: new Map(),
@@ -569,6 +568,7 @@ export class PtyAdapter implements AgentAdapter {
     this.#releaseApprovals(s);
     await this.#terminate(s, true);
     for (const f of s.files) removeSessionFile(f);
+    if (s.placeholders) removeSandboxPlaceholders(s.placeholders.cwd, s.placeholders.before);
     await this.#hooks.unregister(s.hookKey);
     this.#setState(s, 'done');
     s.events.end();
