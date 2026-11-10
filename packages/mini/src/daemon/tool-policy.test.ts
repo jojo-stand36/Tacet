@@ -100,6 +100,20 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
       expect(ask('Write', { file_path: p, content: '' }).allow).toBe(false);
     }
     expect(ask('Read', { file_path: 'sub/.git/config' }).allow).toBe(false);
+    // HFS+ ignores zero-width code points; NTFS resolves the short name GIT~1.
+    for (const p of [
+      '.g\u200cit',
+      '.git\u200c/config',
+      '.\ufeffgit/config',
+      'GIT~1/config',
+      'git~2',
+    ]) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
+    expect(ask('Glob', { pattern: '.g\u200cit/*' }).allow).toBe(false);
     expect(ask('Grep', { pattern: 'x', path: '.git' }).allow).toBe(false);
     expect(ask('Glob', { pattern: '.git/**' }).allow).toBe(false);
     for (const pattern of [
@@ -243,6 +257,20 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Edit', { file_path: '.mcp.json', old_string: 'a', new_string: 'b' }).allow).toBe(
       false,
     );
+    // Names a case-insensitive file system folds to one of them (#200 third review).
+    for (const p of [
+      '.github/workflow\u017f/ci.yml',
+      '.mcp.j\u017fon',
+      '.hu\u017fky/pre-commit',
+      '.hus\u212ay/pre-commit',
+      '.clau\u200dde/settings.json',
+      '.\ufeffenvrc',
+    ]) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
     // Through a symlink that resolves to one.
     mkdirSync(join(wt, '.husky'));
     symlinkSync(join(wt, '.husky'), join(wt, 'hooks'));

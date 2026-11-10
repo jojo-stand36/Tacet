@@ -121,7 +121,7 @@ const PROTECTED_IN: readonly [string, string][] = [
 
 /** Whether writing `rel` (relative to the checkout, `/`-separated) would change protected config. */
 function protectedConfig(rel: string): boolean {
-  const segs = rel.split(sep).map((s) => s.toLowerCase());
+  const segs = rel.split(sep).map(fold);
   const name = segs.at(-1) ?? '';
   if (PROTECTED_FILES.includes(name)) return true;
   for (let i = 0; i < segs.length; i++) {
@@ -244,7 +244,8 @@ function badGlob(root: string, given: string, v: string): string | undefined {
 }
 
 /** Whether the glob segment `seg` (`*`, `?`, `[...]`; braces are refused before) matches `name`, ignoring case. */
-function segmentMatches(seg: string, name: string): boolean {
+function segmentMatches(rawSeg: string, name: string): boolean {
+  const seg = fold(rawSeg);
   let re = '';
   for (let i = 0; i < seg.length; i++) {
     const c = seg[i] as string;
@@ -363,7 +364,22 @@ function inside(root: string, given: string, p: string, writes: boolean): string
 
 /** `.git`, in any letter case (case-insensitive file systems). */
 function isGitName(s: string): boolean {
-  return s.toLowerCase() === '.git';
+  const f = fold(s);
+  // `git~1` and the like: the NTFS short name a `.git` can be reached by (git's protectNTFS).
+  return f === '.git' || /^git~\d+$/.test(f);
+}
+
+/**
+ * A name as a case-insensitive file system may compare it: compatibility-normalised (NFKC maps
+ * `ſ` to `s`), with the code points HFS+ ignores removed (zero-width joiners, bidi marks, BOM;
+ * CVE-2014-9390), and case-folded by upper- then lower-casing (APFS and HFS+ fold case).
+ */
+export function fold(s: string): string {
+  return s
+    .normalize('NFKC')
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
+    .toUpperCase()
+    .toLowerCase();
 }
 
 function refuse(reason: string): ToolDecision {
