@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type EventEnvelope, newUlid, type TacetConfig, tasksProjection } from '@tacet/core';
-import { type EventStore, openEventStore } from '@tacet/core/node';
+import { type EventStore, isProcessRunning, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import { MiniConductor, type MiniConductorOptions } from './daemon.js';
@@ -108,6 +109,36 @@ afterEach(async () => {
 });
 
 describe('MiniConductor', () => {
+  it('ends what a closed Worker session left running, such as a detached daemon (#171)', async () => {
+    // Like interactive Codex's managed app-server: detached from the session, it outlives the
+    // vendor process, and carries the session's marker in its environment.
+    const children: number[] = [];
+    const start = fake.start.bind(fake);
+    fake.start = async (opts) => {
+      const h = await start(opts);
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env, ...opts.env },
+      });
+      child.unref();
+      if (child.pid !== undefined) children.push(child.pid);
+      return h;
+    };
+    const d = make();
+    await d.start();
+    const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['done'], priority: 'p1' });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(children.length).toBeGreaterThan(0);
+    // Closing and sweeping follow the session's end, which `settled()` does not wait for.
+    for (const pid of children)
+      await expect.poll(() => isProcessRunning(pid), { message: `pid ${pid}` }).toBe(false);
+    // Nothing left to end after a crash either: the marker file is empty.
+    const markers = () => JSON.parse(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8'));
+    await expect.poll(markers).toEqual([]);
+  });
+
   it('plans, runs sub-tasks in dependency order, and rolls the result up', async () => {
     const d = make({
       planner: new FixedPlanner([

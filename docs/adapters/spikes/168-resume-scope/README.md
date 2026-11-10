@@ -41,8 +41,8 @@ Notes:
 - **Interactive Codex starts a managed daemon that outlives the PTY session.** Each interactive run left `codex app-server --listen unix:// --analytics-default-enabled --managed-daemon` and its `daemon pid-update-loop` running, re-parented to PID 1, after `PtyCliAdapter.close`. They are started by the feature `daemon_auto_start` (`codex features list`: stable, on by default).
   - `-c features.daemon_auto_start=false`, or `[features] daemon_auto_start = false` in `config.toml`, stops it. Run that way, no daemon was left and resume behaved the same (`DAEMON=flag` and `DAEMON=off` in `codex-tui.mjs`).
   - `codex exec` started no daemon.
-  - Whether the daemon sends telemetry during a mock run (`--analytics-default-enabled`) was not checked.
-  - The adapter's own handling of a CLI's detached processes is #171.
+  - Telemetry: `codex app-server --help` (0.167.0) says analytics are off by default for the app-server, and `--analytics-default-enabled`, which the managed daemon runs with, turns them on by default; `[analytics] enabled = false` in `config.toml` (or `-c analytics.enabled=false`) opts out. Whether it actually sent anything during the mock runs was not observed.
+  - #171: the daemon keeps the session's environment, including the Mini-conductor's `TACET_WORKER_MARKER`, so the Mini-conductor now ends it after the session closes, as it ends anything else the session left (verified live: both daemon processes carried the marker, and the sweep ended both).
 - The interactive Codex UI sent one title-generation request to the model per session started or resumed. Each run here had one turn, so whether it repeats per turn was not checked. Either way it is extra cost.
 - An interactive Gemini preset must get past the API-key dialog. This is a preset setup question, not a resume one.
 

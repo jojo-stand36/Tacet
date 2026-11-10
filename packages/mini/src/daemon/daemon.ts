@@ -923,7 +923,7 @@ export class MiniConductor {
       // Stopped while the session started: give it back without registering it.
       revoke();
       await worker.adapter.close(handle).catch(() => {});
-      if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      await this.#sweep(sessionId);
       return;
     }
     const run: Run = {
@@ -1254,8 +1254,7 @@ export class MiniConductor {
     await this.#o.adapters[run.adapterId]?.adapter
       .close(run.handle)
       .catch((err: unknown) => this.#errors.push(err));
-    // Closed by its adapter: nothing of it is left to end after a crash.
-    if (this.#markers.delete(run.sessionId)) this.#saveMarkers();
+    await this.#sweep(run.sessionId);
     // Only a session stopped for a restart is ever resumed (#153).
     const vendor =
       run.handle.vendorSessionId ?? this.#state().sessions.get(run.sessionId)?.vendorSessionId;
@@ -1265,6 +1264,32 @@ export class MiniConductor {
   }
 
   /** Let the adapter drop what it keeps to resume a session that never will be. Best effort. */
+  /**
+   * After its adapter closed a session, end whatever the session started and left running (#171):
+   * a closed vendor process does not end what it detached, such as the managed `codex app-server`
+   * daemon interactive Codex starts, which keeps the session's marker. Its marker is then
+   * forgotten, unless something survived even SIGKILL: it stays for the next start to retry.
+   */
+  async #sweep(sessionId: string): Promise<void> {
+    const marker = this.#markers.get(sessionId);
+    if (marker === undefined) return;
+    let left: number[];
+    try {
+      ({ left } = await endMarkedProcesses([marker]));
+    } catch (err) {
+      // Kept: the next start tries again.
+      this.#errors.push(err);
+      return;
+    }
+    if (left.length > 0) {
+      this.#errors.push(
+        new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`),
+      );
+      return;
+    }
+    if (this.#markers.delete(sessionId)) this.#saveMarkers();
+  }
+
   async #discard(adapterId: string, vendorSessionId: string, cwd: string): Promise<void> {
     const adapter = this.#o.adapters[adapterId]?.adapter;
     if (!adapter?.discard) return;
