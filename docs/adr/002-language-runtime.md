@@ -120,9 +120,9 @@ Rejected without a deep evaluation. Schema duplication across languages works ag
 
 ## Addendum (2026-11-10): Windows via WSL2 (owner decision)
 
-The owner decided on 2026-11-10 (relayed by the coordinator) that Tacet supports Windows, **WSL2 first**:
+Owner decision, 2026-11-10: Tacet targets Windows, **WSL2 first**:
 
-- **Supported:** Windows through WSL2. Tacet, Node, git, the vendor CLIs and the repos all live inside a WSL2 Linux distro (Ubuntu), so it is the Linux target, with WSL-specific caveats and checks. Implementation: #193 (docs, a warning for repos on Windows drives under `/mnt/*`, and CI inside WSL2 if GitHub-hosted runners allow it).
+- **Target:** Windows through WSL2. Tacet, Node, git, the vendor CLIs and the repos all live inside a WSL2 Linux distro (Ubuntu), so it is the Linux target, with WSL-specific caveats and checks. Implementation: #193 (docs, a warning for repos on Windows drives under `/mnt/*`, and CI inside WSL2 if GitHub-hosted runners allow it).
 - **Not yet a target:** native Windows. It comes later through its own ADR (#194), which lays out the options (process groups and Job Objects, sandboxing, ConPTY, paths and junctions, vendor CLI support) for the owner to decide, then implementation (#195).
 
-This amends "Windows is not a target" in Context, decision 2 and Consequences above: read them as "native Windows is not a target". The rest of this ADR is unchanged.
+This amends the Windows exclusions in Context, decision 2 and Consequences above: read them as excluding native Windows only. The rest of this ADR is unchanged.
