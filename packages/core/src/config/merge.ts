@@ -116,6 +116,22 @@ export function mergeConfig(
         `verify: the task layer (${layer.origin}) may not change the verify commands`,
       );
     }
+    if (layer.name === 'task') {
+      // Nor weaken it: choose the reviewer, waive cross-vendor review, or claim a vendor (#19).
+      const tiers = layer.data.tiers ?? {};
+      if (tiers.review !== undefined) {
+        layerErrors.push(
+          `tiers.review: the task layer (${layer.origin}) may not change the reviewer`,
+        );
+      }
+      for (const [name, tier] of Object.entries(tiers)) {
+        if (tier?.vendor !== undefined) {
+          layerErrors.push(
+            `tiers.${name}.vendor: the task layer (${layer.origin}) may not declare a vendor`,
+          );
+        }
+      }
+    }
     if (layer.name === 'task' && layer.data.review?.enabled === false) {
       // A task may ask for review, never skip one the repo or the user asked for (#19).
       layerErrors.push(`review.enabled: the task layer (${layer.origin}) may not turn review off`);

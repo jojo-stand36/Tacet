@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -117,6 +117,26 @@ describe('reviewDiff and AdapterReviewer', () => {
     expect(cut.truncated).toBe(true);
     expect(cut.patch.length).toBeLessThanOrEqual(40);
     await expect(reviewDiff('HEAD', base, { repoRoot: repo })).rejects.toThrow(/full commit ids/);
+    // HEAD already holds the commit: no telling what changed, never an empty change.
+    git('merge', '-q', '--ff-only', 'work');
+    await expect(reviewDiff(commit, undefined, { repoRoot: repo })).rejects.toThrow(
+      /already in HEAD/,
+    );
+  });
+
+  it('redacts before it cuts, so a key at the cut is not half sent', async () => {
+    const full = await reviewDiff(commit, base, { repoRoot: repo });
+    const at = full.patch.indexOf('sk-ant-');
+    // Cut in the middle of the key.
+    const d = await reviewDiff(commit, base, {
+      repoRoot: repo,
+      maxBytes: at + 5,
+      redact: redactSecrets,
+    });
+    expect(d.truncated).toBe(true);
+    expect(d.patch).not.toContain('sk-an');
+    expect(d.patch.endsWith('[reda')).toBe(true);
+    expect(Buffer.byteLength(d.patch)).toBeLessThanOrEqual(at + 5);
   });
 
   it('never runs an external diff driver or textconv the repo config names', async () => {
@@ -137,7 +157,7 @@ describe('reviewDiff and AdapterReviewer', () => {
       diff: { repoRoot: repo },
       ...over,
     });
-    const ctx = { commit, base, cwd: repo, signal: new AbortController().signal, marker: 'mk-1' };
+    const ctx = { commit, base, signal: new AbortController().signal, marker: 'mk-1' };
     return { adapter, run: () => r.review(TASK, ctx) };
   }
 
@@ -148,7 +168,11 @@ describe('reviewDiff and AdapterReviewer', () => {
     expect(r.usage).toBeDefined();
     const s = adapter.sessions[0];
     expect(s?.opts.mcpServers).toBeUndefined();
-    expect(s?.opts.cwd).toBe(repo);
+    // An empty directory of its own, gone afterwards: never a checkout of the Worker's commit,
+    // whose project settings, hooks and instructions a vendor CLI would load (review blocker).
+    expect(s?.opts.cwd).not.toBe(repo);
+    expect(s?.opts.cwd).toMatch(/tacet-review-/);
+    expect(existsSync(s?.opts.cwd ?? repo)).toBe(false);
     expect(s?.opts.env?.[WORKER_MARKER_VAR]).toBe('mk-1');
     const prompt = s?.inputs[0] ?? '';
     expect(prompt).toContain('greet() returns hello');
@@ -202,7 +226,6 @@ describe('reviewDiff and AdapterReviewer', () => {
     const out = await r.review(TASK, {
       commit: base,
       base,
-      cwd: repo,
       signal: new AbortController().signal,
       marker: 'mk',
     });

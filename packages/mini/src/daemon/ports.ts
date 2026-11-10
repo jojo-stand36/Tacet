@@ -98,8 +98,6 @@ export interface ReviewContext {
   commit: string;
   /** The commit the Worker's checkout started at (#134); undefined: the main branch. */
   base?: string;
-  /** A throwaway checkout of `commit` for the reviewer to work in; never the Worker's. */
-  cwd: string;
   /** Aborts when the author's session ends or the Mini-conductor stops. */
   signal: AbortSignal;
   /** Process marker for the reviewer's session (#127). */

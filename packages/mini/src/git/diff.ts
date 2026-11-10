@@ -11,6 +11,8 @@ export interface ReviewDiffOptions {
   env?: Record<string, string | undefined>;
   /** Most bytes of patch kept. Default 64 KiB. */
   maxBytes?: number;
+  /** Applied to the stat and the patch before the patch is cut to `maxBytes`. */
+  redact?: (text: string) => string;
   timeoutMs?: number;
 }
 
@@ -39,6 +41,8 @@ function git(
         env: {
           ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
           ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+          // The repo's own `.git` directory, as for integration (#119): a main checkout, not a
+          // linked worktree or submodule whose `.git` is a file.
           GIT_DIR: join(o.repoRoot, '.git'),
         },
         timeout: o.timeoutMs ?? 60_000,
@@ -81,14 +85,25 @@ export async function reviewDiff(
   }
   const from = base ?? (await git(o, ['merge-base', 'HEAD', commit], 4096)).stdout.trim();
   if (!COMMIT_ID.test(from)) throw new Error('no merge base to diff from');
-  const flags = ['--no-ext-diff', '--no-textconv', '--no-color', '-M'];
-  const stat = await git(o, ['diff', ...flags, '--stat=200', from, commit], 1024 * 1024);
+  // The main checkout's HEAD already holds the commit (its branch is checked out or merged):
+  // there is no telling what the Worker changed, which must not read as an empty change.
+  if (base === undefined && from === commit) throw new Error('the commit is already in HEAD');
+  // No external diff driver or textconv; no user-wide attributes (which could hide paths as
+  // binary); binary content shown as text, within the cut.
+  const flags = ['--no-ext-diff', '--no-textconv', '--no-color', '--text', '-M'];
+  const cfg = ['-c', 'core.attributesFile=/dev/null'];
+  const redact = o.redact ?? ((t: string) => t);
+  const stat = await git(o, [...cfg, 'diff', ...flags, '--stat=200', from, commit], 1024 * 1024);
   const maxBytes = o.maxBytes ?? 64 * 1024;
-  const patch = await git(o, ['diff', ...flags, from, commit], maxBytes);
+  // Read twice what is kept, redact, then cut: a secret at the cut is redacted whole first.
+  const raw = await git(o, [...cfg, 'diff', ...flags, from, commit], 2 * maxBytes);
+  let patch = Buffer.from(redact(raw.stdout), 'utf8');
+  const cut = patch.length > maxBytes;
+  if (cut) patch = patch.subarray(0, maxBytes);
   return {
     base: from,
-    stat: stat.stdout.trimEnd(),
-    patch: patch.stdout,
-    truncated: patch.truncated || stat.truncated,
+    stat: redact(stat.stdout.trimEnd()),
+    patch: patch.toString('utf8'),
+    truncated: cut || raw.truncated || stat.truncated,
   };
 }

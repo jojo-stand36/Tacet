@@ -166,8 +166,9 @@ const CHECKOUT_CHECK = '(verification failed before any command)';
 
 /**
  * A check's result with the reviewer's verdict folded in (#19). Blocking findings fail it, with
- * the findings as the Worker's feedback; a reviewer that gave no verdict leaves it `partial`
- * (owner decision pending: block instead), as do commands that did not run.
+ * the findings as the Worker's feedback. A reviewer that gave no verdict turns `passed` into
+ * `partial` (owner decision pending: block instead) and leaves `not_run` or `partial` as they
+ * are; an approval turns commands `not_run` into `partial`.
  */
 function withReview(v: VerifyResult, r: ReviewResult): VerifyResult {
   const blocking = r.findings.filter((f) => f.severity !== 'minor').length;
@@ -1384,17 +1385,16 @@ export class MiniConductor {
   }
 
   /**
-   * Review a finished turn's integrated change (#19), when review is on: a throwaway checkout of
-   * the commit for the reviewer, its process marker recorded first, aborted if the session ends.
-   * Undefined when there is nothing to review: review off, no commit, or a review or explore
-   * sub-task. The verdict becomes a `worker.review` event (counts only) and its usage is charged
-   * to the sub-task.
+   * Review a finished turn's integrated change (#19), when review is on: the reviewer's process
+   * marker recorded first, aborted if the session ends. Undefined when there is nothing to
+   * review: review off or no commit integrated (whatever the sub-task's kind: a commit is
+   * reviewed). The verdict becomes a `worker.review` event (counts only) and its usage is
+   * charged to the sub-task; a review that was stopped records only its usage, so it uses no
+   * fix round.
    */
   async #review(run: Run, task: Task, round: number): Promise<ReviewResult | undefined> {
     const reviewer = this.#o.reviewer;
     if (!this.#o.config.review?.enabled || !reviewer || run.commit === undefined) return undefined;
-    const kind = this.#state().kinds.get(run.subtaskId);
-    if (kind === 'review' || kind === 'explore') return undefined;
     const tier = this.#o.config.tiers?.review;
     const commit = run.commit;
     const abort = new AbortController();
@@ -1404,15 +1404,13 @@ export class MiniConductor {
     this.#markers.set(key, marker);
     this.#saveMarkers();
     const started = this.#now().getTime();
-    let checkout: Workspace | undefined;
+    const signal = AbortSignal.any([abort.signal, this.#abort.signal]);
     let result: ReviewResult;
     try {
-      checkout = await this.#o.workspaces.create(`review-${randomUUID()}`, commit);
       result = await reviewer.review(task, {
         commit,
         ...(run.baseCommit !== undefined ? { base: run.baseCommit } : {}),
-        cwd: checkout.path,
-        signal: AbortSignal.any([abort.signal, this.#abort.signal]),
+        signal,
         marker,
       });
     } catch (err) {
@@ -1425,13 +1423,26 @@ export class MiniConductor {
       };
     } finally {
       if (run.verifyAbort === abort) run.verifyAbort = undefined;
-      if (checkout) await this.#o.workspaces.remove(checkout.id).catch((e) => this.#errors.push(e));
       // Whatever the reviewer's session left running goes with it.
       await endMarkedProcesses([marker]).catch(() => undefined);
       if (this.#markers.get(key) === marker) {
         this.#markers.delete(key);
         this.#saveMarkers();
       }
+    }
+    const usage = result.usage
+      ? [
+          this.#env(run.subtaskId, 'agent.usage', {
+            t: 'usage',
+            source: 'reported',
+            ...result.usage,
+          }),
+        ]
+      : [];
+    if (signal.aborted) {
+      // Stopped, not judged: the session ended or the Mini-conductor stopped. No round is used.
+      if (usage.length > 0) this.#o.store.append(usage);
+      return undefined;
     }
     const count = (sev: string) => result.findings.filter((f) => f.severity === sev).length;
     this.#o.store.append([
@@ -1453,15 +1464,7 @@ export class MiniConductor {
         },
         run.sessionId,
       ),
-      ...(result.usage
-        ? [
-            this.#env(run.subtaskId, 'agent.usage', {
-              t: 'usage',
-              source: 'reported',
-              ...result.usage,
-            }),
-          ]
-        : []),
+      ...usage,
     ]);
     return result;
   }

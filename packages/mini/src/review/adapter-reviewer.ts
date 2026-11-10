@@ -1,4 +1,7 @@
 import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { redactSecrets, type Task } from '@tacet/core';
 import { WORKER_MARKER_VAR } from '@tacet/core/node';
 import { z } from 'zod';
@@ -138,12 +141,14 @@ export interface AdapterReviewerOptions {
   diff: ReviewDiffOptions;
   /** Milliseconds to wait for one reply. Default 10 minutes. */
   timeoutMs?: number;
+  /** Where the reviewer's empty working directory is made. Default `os.tmpdir()`. */
+  tmpDir?: string;
 }
 
 /**
  * Reviews with one session on the `review` tier (#19), as `AdapterPlanner` plans: no Tacet MCP
  * server (no token, no Worker tools), every approval refused, and the change given in the
- * prompt, so it needs no tool. It works in a throwaway checkout, never the Worker's. The verdict
+ * prompt, so it needs no tool. It works in an empty directory of its own, never a checkout. The verdict
  * is read only from its own reply: nothing in the Worker's checkout can approve. An invalid reply
  * is retried once; any failure is an `error` result, never a pass.
  */
@@ -174,19 +179,39 @@ export class AdapterReviewer implements Reviewer {
     });
     let diff: Awaited<ReturnType<typeof reviewDiff>>;
     try {
-      diff = await reviewDiff(ctx.commit, ctx.base, this.#o.diff);
+      // Redacted before it is cut: a key at the cut is not half sent to another vendor.
+      diff = await reviewDiff(ctx.commit, ctx.base, { ...this.#o.diff, redact: redactSecrets });
     } catch {
       return error('the change could not be read for review');
     }
     if (diff.patch.trim() === '') {
       return { status: 'passed', ...base, findings: [], notes: 'no change to review' };
     }
-    ctx.signal.throwIfAborted();
+    if (ctx.signal.aborted) return error('the review was stopped');
+    // An empty directory of its own as cwd, never a checkout: a vendor CLI loads project
+    // settings, hooks and instructions from its cwd (the Claude Agent SDK loads every settings
+    // source by default), and a checkout of the Worker's commit would hand it the Worker's.
+    const cwd = await mkdtemp(join(this.#o.tmpDir ?? tmpdir(), 'tacet-review-'));
+    try {
+      return await this.#session(task, ctx, diff, cwd, base, error);
+    } finally {
+      await rm(cwd, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  async #session(
+    task: Task,
+    ctx: ReviewContext,
+    diff: { stat: string; patch: string; truncated: boolean },
+    cwd: string,
+    base: { adapter: string; model?: string },
+    error: (notes: string, extra?: Partial<ReviewResult>) => ReviewResult,
+  ): Promise<ReviewResult> {
     const { adapter } = this.#o.worker;
     let h: Awaited<ReturnType<typeof adapter.start>>;
     try {
       h = await adapter.start({
-        cwd: ctx.cwd,
+        cwd,
         systemPrompt: REVIEWER_SYSTEM_PROMPT,
         ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
         ...(this.#o.effort !== undefined ? { effort: this.#o.effort } : {}),
@@ -210,7 +235,7 @@ export class AdapterReviewer implements Reviewer {
         refusal: 'The reviewer is read-only: the change is in the message.',
         timeoutMs: this.#o.timeoutMs ?? 600_000,
       });
-      let reply = await turns(reviewerPrompt(task, redactDiff(diff)));
+      let reply = await turns(reviewerPrompt(task, diff));
       for (let attempt = 0; ; attempt++) {
         try {
           const { verdict, findings } = parseReview(reply);
@@ -246,9 +271,4 @@ export class AdapterReviewer implements Reviewer {
       await adapter.close(h).catch(() => {});
     }
   }
-}
-
-/** Secrets a Worker committed are not sent to another vendor. */
-function redactDiff<T extends { stat: string; patch: string }>(d: T): T {
-  return { ...d, stat: redactSecrets(d.stat), patch: redactSecrets(d.patch) };
 }

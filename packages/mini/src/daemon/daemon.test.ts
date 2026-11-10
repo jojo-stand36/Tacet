@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type EventEnvelope, newUlid, type TacetConfig, tasksProjection } from '@tacet/core';
@@ -138,11 +138,9 @@ describe('MiniConductor', () => {
     /** A reviewer that answers from `results`, in turn, recording what it was given. */
     function scriptedReviewer(results: ReviewResult['status'][]) {
       const calls: ReviewContext[] = [];
-      const cwdExisted: boolean[] = [];
       const reviewer: Reviewer = {
         async review(_task, ctx) {
           calls.push(ctx);
-          cwdExisted.push(existsSync(ctx.cwd));
           const status = results[Math.min(calls.length - 1, results.length - 1)] ?? 'passed';
           return {
             status,
@@ -158,7 +156,7 @@ describe('MiniConductor', () => {
           };
         },
       };
-      return { reviewer, calls, cwdExisted };
+      return { reviewer, calls };
     }
     const reviews = () =>
       ofType('worker.review').map(
@@ -178,7 +176,7 @@ describe('MiniConductor', () => {
       );
 
     it("completes approved work, recording the verdict and the reviewer's usage", async () => {
-      const { reviewer, calls, cwdExisted } = scriptedReviewer(['passed']);
+      const { reviewer, calls } = scriptedReviewer(['passed']);
       const d = make({ config: REVIEW, reviewer, integrator });
       await d.start();
       const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
@@ -186,10 +184,9 @@ describe('MiniConductor', () => {
       expect(tasks()[id]?.state).toBe('completed');
       expect(calls).toHaveLength(1);
       expect(calls[0]?.commit).toBe(COMMIT);
-      // A throwaway checkout of its own, gone afterwards, with a marker of its own.
-      expect(cwdExisted).toEqual([true]);
-      expect(existsSync(calls[0]?.cwd ?? '')).toBe(false);
-      expect(calls[0]?.cwd).not.toBe(fake.sessions[0]?.opts.cwd);
+      // No checkout is made for it (it gets the change in its prompt), and it has a marker of its
+      // own.
+      expect(ws.created).toHaveLength(1);
       expect(calls[0]?.marker).toMatch(/\S/);
       expect(reviews()).toEqual([
         expect.objectContaining({ round: 0, status: 'passed', blockers: 0, minors: 1 }),
@@ -317,8 +314,8 @@ describe('MiniConductor', () => {
       });
     });
 
-    it('skips review and explore sub-tasks', async () => {
-      const { reviewer, calls } = scriptedReviewer(['failed']);
+    it('reviews a commit whatever the sub-task kind (review, explore)', async () => {
+      const { reviewer, calls } = scriptedReviewer(['passed']);
       const d = make({
         config: REVIEW,
         reviewer,
@@ -332,7 +329,8 @@ describe('MiniConductor', () => {
       const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
       await d.settled();
       expect(tasks()[id]?.state).toBe('completed');
-      expect(calls).toHaveLength(0);
+      // The planner chooses the kind: a code-writing "explore" sub-task gets no pass on it.
+      expect(calls).toHaveLength(2);
     });
 
     it('has nothing to review when no commit was integrated', async () => {
@@ -348,9 +346,11 @@ describe('MiniConductor', () => {
     it('aborts a review in progress when the Mini-conductor stops, its marker recorded meanwhile', async () => {
       let fileHadIt = false;
       let aborted = false;
+      let marker = '';
       const reviewer: Reviewer = {
         review: (_t, ctx) =>
           new Promise((resolve) => {
+            marker = ctx.marker;
             fileHadIt = readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8').includes(
               ctx.marker,
             );
@@ -371,7 +371,9 @@ describe('MiniConductor', () => {
       await expect.poll(() => fileHadIt).toBe(true);
       await d.stop();
       expect(aborted).toBe(true);
-      expect(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8')).not.toMatch(/review:/);
+      expect(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8')).not.toContain(marker);
+      // A stopped review judged nothing: no verdict recorded, so the restart keeps its fix round.
+      expect(reviews()).toEqual([]);
     });
 
     it('refuses to start with review on and no reviewer, or a reviewer of the same vendor', () => {
