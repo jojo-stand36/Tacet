@@ -15,6 +15,7 @@ import {
   findSecrets,
   type InterruptResult,
   mcpHeaderSecrets,
+  ProfileRefusedError,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
@@ -62,7 +63,12 @@ export const CODEX_CAPABILITIES: AdapterCapabilities = {
   usage: { live: true, context: true, cost: 'none' },
   modelSwitch: 'per-turn',
   injectContext: false,
+  // `turn/start.effort` applies to that turn and later ones (verified on 0.167.0, #110). Codex
+  // lowers a level the model lacks to its highest one and passes unlisted names through, so the
+  // adapter checks each level against `model/list` first.
   effortSwitch: 'per-turn',
+  // No window can be chosen: `model_context_window` only shrinks the model's window (#110).
+  contextSizes: [],
 };
 
 export interface CodexAdapterOptions {
@@ -118,6 +124,14 @@ export interface CodexAdapterOptions {
 
 type Queued = { text: string; model?: string; effort?: string };
 
+/** The part of a `model/list` entry the effort check reads (fields checked by schema.test.ts). */
+interface CodexModel {
+  id: string;
+  model: string;
+  isDefault: boolean;
+  supportedReasoningEfforts: { reasoningEffort: string }[];
+}
+
 interface PendingApproval {
   kind: 'command' | 'fileChange' | 'permissions' | 'elicitation';
   params: Record<string, unknown>;
@@ -139,6 +153,12 @@ interface Session {
   closing: boolean;
   ended: boolean;
   model: string | undefined;
+  /** Model and effort the queued turns leave in force, for checking the next `send()`. */
+  planned: { model: string | undefined; effort: string | undefined };
+  /** The `model/list` catalog, fetched once when an effort first needs checking. */
+  models: Promise<CodexModel[]> | undefined;
+  /** Sends still waiting on an effort check; later sends queue behind them, in order. */
+  sending: Promise<void> | undefined;
   secrets: string[];
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
@@ -159,6 +179,82 @@ const TOOL_ITEMS = new Set([
   'imageGeneration',
 ]);
 const ALL_OPTIONS: ApprovalOption[] = ['allow_once', 'allow_always', 'reject', 'cancel'];
+
+/** The effort in force after a send with `opts`. */
+const effortOf = (s: Session, opts?: SendOptions): string | undefined =>
+  opts?.effort ?? s.planned.effort;
+
+/** Effort stays in force across turns, so a model switch must keep it valid too. */
+function needsEffortCheck(s: Session, opts?: SendOptions): boolean {
+  const model = opts?.model ?? s.planned.model;
+  return (
+    effortOf(s, opts) !== undefined && (opts?.effort !== undefined || model !== s.planned.model)
+  );
+}
+
+/** At most this many `model/list` pages, so a server that repeats its cursor cannot loop. */
+const MODEL_LIST_MAX_PAGES = 50;
+
+/** The whole `model/list` catalog, hidden models included; malformed entries are skipped. */
+async function listModels(rpc: JsonRpcPeer): Promise<CodexModel[]> {
+  const out: CodexModel[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MODEL_LIST_MAX_PAGES; page++) {
+    const res = await rpc.request<Obj>('model/list', {
+      includeHidden: true,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const m of Array.isArray(res.data) ? res.data : []) {
+      if (
+        isObj(m) &&
+        typeof m.id === 'string' &&
+        typeof m.model === 'string' &&
+        Array.isArray(m.supportedReasoningEfforts)
+      ) {
+        out.push({
+          id: m.id,
+          model: m.model,
+          isDefault: m.isDefault === true,
+          supportedReasoningEfforts: m.supportedReasoningEfforts.filter(
+            (e): e is { reasoningEffort: string } =>
+              isObj(e) && typeof e.reasoningEffort === 'string',
+          ),
+        });
+      }
+    }
+    cursor = str(res.nextCursor);
+    if (!cursor || seen.has(cursor)) break;
+    seen.add(cursor);
+  }
+  return out;
+}
+
+/** The catalog, or a refusal the policy can fall back from when it cannot be read. */
+async function catalog(models: Promise<CodexModel[]>): Promise<CodexModel[]> {
+  try {
+    return await models;
+  } catch (err) {
+    throw new ProfileRefusedError('effort', `cannot read model/list: ${errorMessage(err)}`);
+  }
+}
+
+/**
+ * Refuse an effort the model does not list. Codex lowers an unsupported level such as `ultra`
+ * to the model's highest one and passes unknown names through (#110), so neither is left to it.
+ * A model the catalog does not cover is refused too: its levels cannot be confirmed.
+ */
+function checkEffort(models: CodexModel[], model: string | undefined, effort: string): void {
+  const m =
+    model === undefined
+      ? models.find((x) => x.isDefault)
+      : models.find((x) => x.id === model || x.model === model);
+  const name = model ?? 'the default model';
+  if (!m) throw new ProfileRefusedError('effort', `cannot confirm effort support for ${name}`);
+  if (!m.supportedReasoningEfforts.some((e) => e.reasoningEffort === effort)) {
+    throw new ProfileRefusedError('effort', `${name} does not support effort ${effort}`);
+  }
+}
 
 function defaultCodexPath(): string {
   const require = createRequire(import.meta.url);
@@ -188,6 +284,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
+    if (opts.contextWindow !== undefined) {
+      throw new ProfileRefusedError(
+        'contextWindow',
+        `Codex has no context-window choice; ${opts.contextWindow} cannot be honoured`,
+      );
+    }
     const route = this.#opts.authRoute ?? 'api_key';
     const unattended = (this.#opts.mode ?? 'unattended') === 'unattended';
     if (unattended && route !== 'api_key') {
@@ -302,9 +404,18 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // EPIPE when Codex closed its input: fail the peer instead of crashing the host process.
     proc.stdin?.on('error', (err) => rpc.fail(err));
 
+    let models: Promise<CodexModel[]> | undefined;
     try {
       await rpc.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null });
       rpc.notify('initialized');
+      // Checked before the thread starts, since `thread/start` takes any level without a word.
+      // Without a model named, the thread's model (config may choose it) is checked below.
+      // The read is awaited where it starts: one left pending across `thread/start` would be an
+      // unhandled rejection if it failed meanwhile, and that ends the host process.
+      if (opts.effort !== undefined && opts.model !== undefined) {
+        models = listModels(rpc);
+        checkEffort(await catalog(models), opts.model, opts.effort);
+      }
       const threadParams = {
         cwd: opts.cwd,
         approvalPolicy: this.#opts.approvalPolicy ?? 'on-request',
@@ -341,6 +452,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
       const thread = isObj(result.thread) ? result.thread : {};
       const threadId = str(thread.id);
       if (!threadId) throw new Error('app-server returned no thread id');
+      const threadModel = str(result.model) ?? opts.model;
+      if (opts.effort !== undefined && opts.model === undefined) {
+        // No model call has been made yet, so refusing here is still before launch.
+        models = listModels(rpc);
+        checkEffort(await catalog(models), threadModel, opts.effort);
+      }
       handle.vendorSessionId = threadId;
       s = {
         handle,
@@ -356,6 +473,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
         closing: false,
         ended: false,
         model: str(result.model) ?? opts.model,
+        // A resumed thread keeps the effort an earlier turn set (`reasoningEffort`, observed on
+        // 0.167.0, #110), so a later model switch is checked against it too.
+        planned: { model: threadModel, effort: opts.effort ?? str(result.reasoningEffort) },
+        models,
+        sending: undefined,
         secrets,
         exited,
         get exit() {
@@ -366,6 +488,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
         `codex app-server failed to start the session: ${scrubLiterals(redactSecrets(errorMessage(err)), secrets)}`,
@@ -390,6 +513,38 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async send(h: SessionHandle, input: UserInput, opts?: SendOptions): Promise<void> {
     const s = this.#live(h);
+    // Without a pending check, input is queued at once, as before.
+    if (!s.sending && !needsEffortCheck(s, opts)) return this.#enqueue(s, input, opts);
+    // Otherwise behind earlier sends, so turns keep the order they were sent in.
+    const run = (s.sending ?? Promise.resolve()).then(async () => {
+      this.#live(h);
+      const effort = effortOf(s, opts);
+      if (effort !== undefined && needsEffortCheck(s, opts)) {
+        s.models ??= listModels(s.rpc);
+        const p = s.models;
+        // A failed read is not cached: the next send tries again.
+        const models = await catalog(p).catch((err: unknown) => {
+          if (s.models === p) s.models = undefined;
+          throw err;
+        });
+        checkEffort(models, opts?.model ?? s.planned.model, effort);
+      }
+      this.#enqueue(s, input, opts);
+    });
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    s.sending = tail;
+    void tail.then(() => {
+      if (s.sending === tail) s.sending = undefined;
+    });
+    return run;
+  }
+
+  /** Queue a turn and record the model and effort it leaves in force. */
+  #enqueue(s: Session, input: UserInput, opts?: SendOptions): void {
+    s.planned = { model: opts?.model ?? s.planned.model, effort: effortOf(s, opts) };
     s.queue.push({
       text: input.text,
       ...(opts?.model !== undefined ? { model: opts.model } : {}),
@@ -400,6 +555,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
     const s = this.#live(h);
+    // Sends still waiting on an effort check are queued first, so the receipt lists them too.
+    if (s.sending) await s.sending;
     const stillQueued = s.queue.map((q) => q.text);
     const turn = s.turn;
     if (!turn) return { stillQueued };
