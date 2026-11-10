@@ -123,7 +123,8 @@ describe('buildWorkerAdapters', () => {
     }) as never;
     const built = buildWorkerAdapters(config({}), {
       baseEnv: { ANTHROPIC_API_KEY: 'placeholder-not-a-key' },
-      claude: { query },
+      // A stub replaces the binary: no sandbox to need (#150).
+      claude: { query, subprocessScrub: false },
     });
     const dir = mkdtempSync(join(tmpdir(), 'tacet-build-206-'));
     try {

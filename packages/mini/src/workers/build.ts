@@ -45,7 +45,7 @@ export interface BuildWorkerAdaptersOptions {
   /** Passed through to the adapters as they are built; for tests and the entry point. */
   claude?: Pick<
     ClaudeSdkAdapterOptions,
-    'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions' | 'stateDir'
+    'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions' | 'stateDir' | 'subprocessScrub'
   >;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs' | 'stateDir'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
