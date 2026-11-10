@@ -1,0 +1,10 @@
+{
+  "sessionId": "sess-2",
+  "model": "claude-sonnet-4-6",
+  "effort": "high",
+  "reasons": {
+    "model": "tiers.worker.model",
+    "effort": "raised from medium after 1 failed attempt(s) (tiers.worker.max_effort high)",
+    "contextWindow": "default; hand off at the threshold"
+  }
+}

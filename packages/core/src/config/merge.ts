@@ -108,7 +108,9 @@ export function mergeConfig(
   };
   const layerErrors: string[] = [];
   for (const layer of all) {
-    if (layer.name === 'task') layerErrors.push(...taskRaisesWorkers(merged, layer));
+    if (layer.name === 'task') {
+      layerErrors.push(...taskRaisesWorkers(merged, layer), ...taskSetsTierBounds(layer));
+    }
     layerErrors.push(...workerEnvErrors(layer));
     apply(merged, layer.data as Plain, layer, '', []);
   }
@@ -138,6 +140,19 @@ export function mergeConfig(
     explain,
     errors: [...layerErrors, ...shapeErrors, ...validateEffective(config)],
   };
+}
+
+/** Tier bounds (#110) are the user's and the repo's to set: a task may not set them, to widen or to narrow. */
+function taskSetsTierBounds(layer: ConfigLayer): string[] {
+  const errors: string[] = [];
+  for (const [role, t] of Object.entries(layer.data.tiers ?? {})) {
+    for (const key of ['models', 'max_effort', 'max_context_window'] as const) {
+      if (t[key] !== undefined) {
+        errors.push(`tiers.${role}.${key}: the task layer (${layer.origin}) may not set it`);
+      }
+    }
+  }
+  return errors;
 }
 
 /**

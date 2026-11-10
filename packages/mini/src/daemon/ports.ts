@@ -72,6 +72,8 @@ export interface ProposedSubtask {
   acceptanceCriteria: string[];
   kind?: 'implement' | 'review' | 'explore';
   dependsOn?: string[];
+  /** Cannot be handed off cleanly part-way, so it may get a larger context window (#110). */
+  indivisible?: boolean;
 }
 
 export interface PlanResult {

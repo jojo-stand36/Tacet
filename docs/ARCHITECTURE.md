@@ -110,7 +110,7 @@ All events go to an append-only **event log** (SQLite) → UI timelines, replay,
 
 The log is `openEventStore()` in `@tacet/core/node` (#6). It stores each envelope verbatim, is idempotent on the envelope id, and blocks `UPDATE`/`DELETE` with triggers. State is rebuilt with pure projections (`tasksProjection` in `@tacet/core`). Retention deletes old transcript-grade events (`agent.message`, `agent.tool`, `agent.approval`, `agent.status`, `agent.escalation`) and keeps every summary-grade event, so task state replays exactly after compaction. Driver: `better-sqlite3`, chosen under [ADR-002](adr/002-language-runtime.md) decision 5 because `node:sqlite` is still a release candidate (Stability 1.2) in Node 24 and 26 as of 2026-11-09; callers use the `EventStore` interface, so moving to `node:sqlite` once it is Stable touches one file.
 
-Every state change is wrapped in an **event envelope** before it is stored or forwarded: `{v, id (ULID), ts, source, repo?, taskId?, sessionId?, correlationId?, causationId?, type, data}`. `AgentEvent` above is the payload of the `agent.*` envelope types (for example `agent.message.delta` and `agent.usage`). The other namespaces are `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `worker.*` and `budget.*`. Worker lifecycle events are summary-grade and kept by retention: `worker.started` (`WorkerStarted`: adapter, model, `workspaceId`, `attempt`, `previousSessionId` for a replacement session, `baseCommit` when a new checkout starts from its dependencies' work, #134), `worker.vendor_session` (the vendor's session id, once known), `worker.nudged`, `worker.integrated` (the Worker's commit is in the repo under `refs/heads/tacet/<task>`, #119), `worker.throttled` (a Worker went over its limit on `escalate` or `record_decision`, by default 6 and 30 per 10 minutes; the calls over it get a tool error and create nothing, #121) and `worker.ended` (`reason`: `finished`, `failed`, `stuck`, `restart`, `canceled`, `handoff`; unknown reads as `failed`; `failed` and `stuck` count against `workers.max_attempts`, the others do not). A Mini-conductor writes `worker.started` before it starts the vendor session, so a crash in between still leaves a record, and rebuilds its Worker pool from these events on restart. They name workspaces by id, never by path, because they are forwarded to the Conductor. Receivers ignore unknown fields and unknown event types. The full envelope is in [ADR-003 §1](adr/003-wire-protocols.md#1-one-transport-envelope-and-one-event-envelope).
+Every state change is wrapped in an **event envelope** before it is stored or forwarded: `{v, id (ULID), ts, source, repo?, taskId?, sessionId?, correlationId?, causationId?, type, data}`. `AgentEvent` above is the payload of the `agent.*` envelope types (for example `agent.message.delta` and `agent.usage`). The other namespaces are `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `worker.*` and `budget.*`. Worker lifecycle events are summary-grade and kept by retention: `worker.started` (`WorkerStarted`: adapter, model, `workspaceId`, `attempt`, `previousSessionId` for a replacement session, `baseCommit` when a new checkout starts from its dependencies' work, #134), `worker.profile` (`WorkerProfile`: the model, effort and context window the policy chose, with `reasons` keyed by part, written in the same append as `worker.started`; written again with `refused` when the adapter refuses a part, then once more for the profile the session runs on, so the last one for a session is in force unless it is refused, when no session ran, #110), `worker.vendor_session` (the vendor's session id, once known), `worker.nudged`, `worker.integrated` (the Worker's commit is in the repo under `refs/heads/tacet/<task>`, #119), `worker.throttled` (a Worker went over its limit on `escalate` or `record_decision`, by default 6 and 30 per 10 minutes; the calls over it get a tool error and create nothing, #121) and `worker.ended` (`reason`: `finished`, `failed`, `stuck`, `restart`, `canceled`, `handoff`; unknown reads as `failed`; `failed` and `stuck` count against `workers.max_attempts`, the others do not). A Mini-conductor writes `worker.started` before it starts the vendor session, so a crash in between still leaves a record, and rebuilds its Worker pool from these events on restart. They name workspaces by id, never by path, because they are forwarded to the Conductor. Receivers ignore unknown fields and unknown event types. The full envelope is in [ADR-003 §1](adr/003-wire-protocols.md#1-one-transport-envelope-and-one-event-envelope).
 
 ## 4. Configuration layers
 
@@ -126,7 +126,14 @@ Example repo config:
 ```yaml
 tiers:
   mini:    { adapter: claude-sdk, model: sonnet, effort: medium }
-  worker:  { adapter: codex-app-server, model: gpt-codex-mini, effort: low }
+  worker:                   # bounds: what the session-profile policy may choose (#110)
+    adapter: codex-app-server
+    model: gpt-5.5            # the default; must be one of models
+    models: [gpt-5.5, gpt-6-luna]
+    effort: low
+    max_effort: high
+    # escalate_effort_on_retry: true   # off by default; the retry policy is #34
+    # max_context_window: 1000000      # absent: never a larger window; hand off instead
   review:  { adapter: claude-sdk, model: opus, cross_vendor: true }
 escalation:
   autonomy: medium
@@ -166,11 +173,26 @@ events:
 **Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
 
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
+- The task layer may not set the tier bounds (`tiers.*.models`, `max_effort`, `max_context_window`), and the merged `model` and `effort` must lie within them (#110).
 - The task layer may only **lower** `workers.*`, never raise it, because the Worker pool is repo-wide (owner decision, 2026-11-09): a raise is a config error. It may not set `workers.env` at all, and the committed repo layer may not name a secret-looking variable in `workers.env.pass` (#147, §6).
 - Exception: `policies`, `escalation.always_ask` and `workers.env.pass` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule or a toolchain variable set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
 - Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A keychain reference is read at startup from the OS keychain (#160): `security find-generic-password` on macOS, or `secret-tool lookup` (a Secret Service keyring such as gnome-keyring) on Linux. It is never unlocked by Tacet; the value must be printable ASCII (one trailing newline is dropped); and a missing, locked or unreadable item is a startup error naming its config path, never a value (details: [spike #160](adapters/spikes/160-keychain/README.md)). A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
 - `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
+
+**Session profile** (#110). Each Worker session runs on a profile, `SessionProfile { model, effort?, contextWindow? }` in `@tacet/core`. The Mini-conductor chooses it with `chooseProfile` (`packages/mini/src/daemon/profile.ts`) from the tier and its bounds, the sub-task and its failed attempts:
+
+- **Model:** the tier's `model`, else the first of `models`.
+- **Effort:** the tier's `effort`. With `escalate_effort_on_retry` it rises one level per failed attempt, up to `max_effort`. Levels are ordered `none` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max` < `ultra` (`EFFORT_LEVELS`).
+- **Context window:** a cost lever, off by default. Tacet hands off at the `handoff` threshold (§2.3, #31). It opts into a larger window only for a sub-task the planner marked `indivisible`, when `max_context_window` allows it and the adapter lists such a size (`contextSizes`).
+
+Every choice is written as a `worker.profile` event with a reason for each part, next to `worker.started`. A profile outside the bounds fails the sub-task before any session starts.
+
+Adapters declare what they can honour: `effortSwitch` (`per-turn` or `per-session`) and `contextSizes`. Anything they cannot honour they refuse with `ProfileRefusedError` instead of ignoring it (capability matrix §7):
+- Claude refuses levels the model lacks, and the 1M window outside Sonnet 4/4.5.
+- Codex checks every level against `model/list` and refuses every window.
+
+When an adapter refuses a part, the Mini-conductor logs it and starts the session again without counting a failed attempt. A refused effort steps down one level, but never below the tier's `effort`; below that, the model's default effort is used, which is the vendor's choice and is not checked against `max_effort`. A refused context window falls back to the default. A refused model has no fallback, so the sub-task fails at once. The `mini` tier (the planner) does not go through the policy and takes no bounds. Budget headroom is not an input yet: the cost ledger is #35. Task-type rules and per-task overrides are #33.
 
 ## 5. Packages (monorepo)
 

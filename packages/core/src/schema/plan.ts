@@ -26,6 +26,12 @@ export const PlannedSubtask = z.object({
     .default([])
     .describe('Ids of sub-tasks in the same plan that must complete first')
     .meta({ uniqueItems: true }),
+  indivisible: z
+    .boolean()
+    .optional()
+    .describe(
+      'The work cannot be handed off cleanly part-way (e.g. one long read), so a larger context window may be used where config allows it (#110)',
+    ),
 });
 export type PlannedSubtask = z.infer<typeof PlannedSubtask>;
 

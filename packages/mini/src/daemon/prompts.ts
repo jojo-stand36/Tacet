@@ -17,10 +17,13 @@ Rules:
 - Prefer few, meaningful sub-tasks over many tiny ones. A small task can be a single sub-task.
 - Use kind "review" for a final review of the combined change when the task is risky; reviews are
   run by a different vendor than the implementers. Use kind "explore" for read-only investigation.
+- Set "indivisible": true only on a sub-task that cannot be split or handed over part-way, such as
+  one long read of a large file. It may then get a larger context window, which costs more.
 
-Reply with JSON only, no prose and no code fences, in exactly this shape:
+Reply with JSON only, no prose and no code fences, in exactly this shape ("kind", "dependsOn" and
+"indivisible" are optional):
 {"rationale": "...", "subtasks": [{"key": "short-id", "goal": "...", "acceptanceCriteria": ["..."],
-"kind": "implement", "dependsOn": ["other-key"]}]}`;
+"kind": "implement", "dependsOn": ["other-key"], "indivisible": false}]}`;
 
 export function plannerPrompt(task: Task): string {
   return safePrompt([
