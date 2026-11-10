@@ -204,6 +204,11 @@ export function buildWorkerAdapters(
     const preset = config.agents?.[slug];
     const builtin = BUILTIN_ACP_AGENTS[slug];
     noShadow(slug, builtin !== undefined, 'acp', 'ACP agent');
+    if (builtin?.workerRefused) {
+      throw new WorkerConfigError(
+        `${where}: acp:${slug} is refused for Workers: ${builtin.workerRefused}`,
+      );
+    }
     if (builtin) return { agent: builtin, secrets: [] };
     if (!preset) {
       throw new WorkerConfigError(
