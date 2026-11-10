@@ -9,7 +9,15 @@ import { GitIntegrator, resultBranch, taskBranch } from '../git/integrate.js';
 import { CommandVerifier } from '../verify/command-verifier.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
-import type { Planner, ProposedSubtask, Workspace, Workspaces } from './ports.js';
+import {
+  type Integrator,
+  type Planner,
+  type ProposedSubtask,
+  type Verifier,
+  type Workspace,
+  type Workspaces,
+  WorktreeRefusedError,
+} from './ports.js';
 import { type Script, ScriptedAdapter } from './testing.js';
 
 /**
@@ -80,18 +88,25 @@ describe('MiniConductor with git worktrees', () => {
     script: (cwd: string, input: string) => unknown,
     planner: Planner = new SingleStepPlanner(),
     verify?: string[],
-    opts: { workspaces?: Workspaces } = {},
+    opts: {
+      adapterId?: string;
+      integrator?: Integrator;
+      verifier?: Verifier;
+      workspaces?: Workspaces;
+    } = {},
   ) {
-    const fake = new ScriptedAdapter('fake', (input, s) => {
+    const adapterId = opts.adapterId ?? 'fake';
+    const fake = new ScriptedAdapter(adapterId, (input, s) => {
       return (script(s.opts.cwd, input) as Script | undefined) ?? { do: 'reply', text: 'done' };
     });
     daemon = new MiniConductor({
       store,
       config: {
-        tiers: { worker: { adapter: 'fake', model: 'cheap' } },
+        tiers: { worker: { adapter: adapterId, model: 'cheap' } },
         ...(verify ? { verify, workers: { verify_fix_attempts: 2 } } : {}),
       },
-      ...(verify
+      ...(opts.verifier ? { verifier: opts.verifier } : {}),
+      ...(verify && !opts.verifier
         ? {
             verifier: new CommandVerifier({
               repoRoot: repo,
@@ -101,9 +116,9 @@ describe('MiniConductor with git worktrees', () => {
             }),
           }
         : {}),
-      adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+      adapters: { [adapterId]: { adapter: fake, authRoute: 'api_key' } },
       workspaces: opts.workspaces ?? new GitWorkspaces(),
-      integrator: new GitIntegrator(repo, env),
+      integrator: opts.integrator ?? new GitIntegrator(repo, env),
       planner,
       mcp: {
         workerConfig: () => ({
@@ -388,6 +403,172 @@ describe('MiniConductor with git worktrees', () => {
     const parent = data<{ openQuestions: string[] }>(id, 'task.result').at(-1);
     expect(parent?.openQuestions.join('\n')).toMatch(/conflicts \(x\.txt\)/);
     expect(() => git(repo, ['rev-parse', '--verify', '-q', resultBranch(id)])).toThrow();
+  });
+
+  it('fails, without retrying, a sub-task whose changes were never committed (#261)', async () => {
+    const d = start(
+      (cwd) => {
+        writeFileSync(join(cwd, 'work.txt'), 'work\n');
+        // An empty placeholder of Claude's Linux sandbox (#263) is not a change.
+        writeFileSync(join(cwd, 'package.json'), '');
+      },
+      undefined,
+      undefined,
+      { adapterId: 'claude-sdk' },
+    );
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const sub = `${id}/1`;
+    expect(tasks()[sub]?.state).toBe('failed');
+    const message = data<{ message?: string }>(sub, 'task.status').at(-1)?.message ?? '';
+    expect(message).toMatch(/^nothing was integrated: the Worker changed 1 file \("work\.txt"\)/);
+    expect(message).toContain('claude-sdk Workers cannot commit yet, #260');
+    expect(message).not.toContain('package.json');
+    expect(data<{ outcome: string }>(sub, 'task.result').at(-1)?.outcome).toBe('failed');
+    // One attempt: retrying a Worker that cannot commit would only fail again.
+    expect(data(sub, 'worker.started')).toHaveLength(1);
+    expect(tasks()[id]?.state).toBe('failed');
+  });
+
+  /** The real integrator, but with `uncommitted` replaced. */
+  const integratorWith = (uncommitted: () => Promise<undefined>) =>
+    new (class extends GitIntegrator {
+      override uncommitted = uncommitted;
+    })(repo, env);
+
+  it('quotes, redacts and shortens the paths it names, and counts placeholders outside the sandbox (#261)', async () => {
+    const token = `sk-ant-api03-${'a'.repeat(40)}`;
+    const d = start((cwd) => {
+      writeFileSync(join(cwd, 'line\nbreak.txt'), 'x\n');
+      writeFileSync(join(cwd, `${token}.txt`), 'x\n');
+      writeFileSync(join(cwd, `${'l'.repeat(200)}.txt`), 'x\n');
+      // Not a Claude sandbox: an empty package.json is the Worker's own.
+      writeFileSync(join(cwd, 'package.json'), '');
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const message = data<{ message?: string }>(`${id}/1`, 'task.status').at(-1)?.message ?? '';
+    expect(message).toMatch(/^nothing was integrated: the Worker changed 4 files/);
+    expect(message).toContain('"line\\nbreak.txt"');
+    expect(message).not.toContain('\n');
+    expect(message).not.toContain(token);
+    expect(message).not.toContain('l'.repeat(130));
+    expect(message).toContain('package.json');
+    expect(message).toContain('(the Worker must commit its work)');
+  });
+
+  it('does not claim no change when the checkout could not be checked (#261)', async () => {
+    const failing = integratorWith(async () => {
+      throw new Error('git is too old');
+    });
+    const d = start(() => undefined, undefined, undefined, { integrator: failing });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+    const message = data<{ message?: string }>(`${id}/1`, 'task.status').at(-1)?.message ?? '';
+    expect(message).toBe(
+      'the Worker made no commit, and its checkout could not be checked (git is too old)',
+    );
+    // Nothing to compare with is said the same way, never as "no change".
+    const unknown = integratorWith(async () => undefined);
+    await d.stop();
+    const e = start(() => undefined, undefined, undefined, { integrator: unknown });
+    await e.start();
+    const id2 = e.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await e.settled();
+    expect(data<{ message?: string }>(`${id2}/1`, 'task.status').at(-1)?.message).toMatch(
+      /could not be checked \(no commit to compare with, or not a worktree of the repo\)$/,
+    );
+  });
+
+  it('asks the user, as integration does, when the checkout fails the integrity checks during the check (#261)', async () => {
+    const forged = integratorWith(async () => {
+      throw new WorktreeRefusedError('the worktree was forged');
+    });
+    const d = start(() => undefined, undefined, undefined, { integrator: forged });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[`${id}/1`]?.state).not.toBe('completed');
+    expect(
+      data<{ workspaceRefused?: boolean }>(`${id}/1`, 'worker.ended').at(-1)?.workspaceRefused,
+    ).toBe(true);
+  });
+
+  it('says, for the sub-task and in the parent summary, when work was checked only in part or not at all (#261)', async () => {
+    const statuses = ['partial', 'not_run', 'passed'] as const;
+    let call = 0;
+    const verifier: Verifier = {
+      verify: async () => {
+        const status = statuses[call++] ?? 'passed';
+        return {
+          status,
+          commands: ['pnpm test'],
+          ...(status === 'partial' ? { notes: 'review did not finish' } : {}),
+        };
+      },
+    };
+    const d = start(
+      (cwd, input) => {
+        if (input.includes('[a]')) commitFiles(cwd, { 'a.txt': 'a\n' });
+        if (input.includes('[c]')) commitFiles(cwd, { 'c.txt': 'c\n' });
+      },
+      chain,
+      undefined,
+      { verifier },
+    );
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const note = (sub: string) => data<{ message?: string }>(sub, 'task.status').at(-1)?.message;
+    expect(note(`${id}/1`)).toBe('verification ran only in part (review did not finish)');
+    expect(note(`${id}/2`)).toBe('verification did not run; no change: the Worker made no commit');
+    expect(note(`${id}/3`)).toBeUndefined();
+    const summary = data<{ summary: string }>(id, 'task.result').at(-1)?.summary ?? '';
+    expect(summary).toContain(`${id}/1: verification ran only in part (review did not finish)`);
+    expect(summary).toContain(`${id}/2: verification did not run`);
+    expect(summary).not.toContain(`${id}/3: verification`);
+  });
+
+  it('counts no change for a checkout moved to a commit the repo already has (#261)', async () => {
+    // The same work done before: a commit already in the repo, with a file the base lacks.
+    git(repo, ['checkout', '-q', '-b', 'earlier']);
+    writeFileSync(join(repo, 'done.txt'), 'done\n');
+    git(repo, ['add', 'done.txt']);
+    git(repo, ['commit', '-qm', 'earlier work']);
+    const earlier = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['checkout', '-q', 'main']);
+    const d = start((cwd) => {
+      const wt = workerWorktree(cwd, repo);
+      if (!wt) throw new Error('not a worktree');
+      git(cwd, ['checkout', '-q', '--detach', earlier], workerGitEnv(wt));
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    // Compared with its own HEAD, not its base: done.txt is committed, not left over.
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+  });
+
+  it('says so when a completed sub-task changed nothing or left changes out (#261)', async () => {
+    const d = start((cwd, input) => {
+      if (input.includes('[a]')) {
+        commitFiles(cwd, { 'a.txt': 'a\n' });
+        writeFileSync(join(cwd, 'stray.txt'), 'left\n');
+      }
+    }, chain);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const note = (sub: string) => data<{ message?: string }>(sub, 'task.status').at(-1)?.message;
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+    expect(note(`${id}/1`)).toBe('1 file ("stray.txt") left uncommitted, not in the result');
+    // A sub-task that only reviews is fine, and says it changed nothing.
+    expect(tasks()[`${id}/2`]?.state).toBe('completed');
+    expect(note(`${id}/2`)).toBe('no change: the Worker made no commit');
   });
 
   it('removes the sandbox placeholders a crashed Claude session left, never a tracked one (#263)', async () => {

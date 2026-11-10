@@ -10,10 +10,12 @@ import {
   openSync,
   readdirSync,
   readSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inflateSync, constants as zlibConstants } from 'node:zlib';
 import {
@@ -434,11 +436,145 @@ function readRegular(dir: OpenDir, name: string, budget: number): Buffer {
   }
 }
 
+/** A path in a Worker's checkout that differs from the commit it was compared with (#261). */
+export interface UncommittedChange {
+  path: string;
+  /** New and not ignored, rather than changed or deleted. */
+  untracked: boolean;
+}
+
+/** Git 2.41 added `--attr-source`, which the comparison needs (#261). */
+const ATTR_SOURCE_GIT = '2.41';
+
+/**
+ * What the Worker's checkout has that `commit` does not (#261): files changed, deleted or added
+ * (untracked and not ignored), compared without the Worker's own index, config, HEAD or objects.
+ * `commit` must be one the repo already has: the integrated one, else the Worker's HEAD (read as
+ * data). A throwaway index of it is built in a directory Tacet owns and refreshed against the
+ * checkout, from the main repo (`GIT_DIR` = its common dir, `SAFE_GIT_ARGS`, only PATH and HOME).
+ * Attributes come from `commit`, never the checkout (`--attr-source`, git 2.41), so a Worker's
+ * `.gitattributes` cannot make git run a filter. Those `commit`'s attributes name still run, and
+ * `commit` may be the Worker's integrated one, so its attributes may be the Worker's: only filter
+ * drivers the user configured can be named, which a checkout of the work would run anyway. Ignore rules are the checkout's, so any `.gitignore` the Worker added, changed or
+ * hid is itself reported. Submodules are not looked into.
+ *
+ * Throws `WorktreeRefusedError` for a forged worktree, and an error when git fails (older than
+ * 2.41, say) or times out. Undefined when it cannot tell: `cwd` is not a worktree of the repo, or
+ * there is no commit to compare with. Stops at `maxPaths` paths (then there may be more).
+ */
+export async function uncommittedChanges(opts: {
+  cwd: string;
+  repoRoot: string;
+  /** Without one, the Worker's HEAD (read as data), when the repo has that commit. */
+  commit?: string | undefined;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+  maxPaths?: number;
+}): Promise<UncommittedChange[] | undefined> {
+  if (opts.commit !== undefined && !COMMIT_ID.test(opts.commit)) throw new Error('bad commit');
+  let wt: WorkerWorktree | undefined;
+  try {
+    wt = workerWorktree(opts.cwd, opts.repoRoot);
+  } catch (err) {
+    throw new WorktreeRefusedError((err as Error).message);
+  }
+  if (!wt) return undefined;
+  const env = opts.env ?? process.env;
+  const maxPaths = opts.maxPaths ?? 1000;
+  const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+  const tmp = mkdtempSync(join(tmpdir(), 'tacet-status-'));
+  try {
+    const gitEnv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.commonDir,
+      GIT_INDEX_FILE: join(tmp, 'index'),
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
+      GIT_ATTR_NOSYSTEM: '1',
+    };
+    let attrs: string[] = [];
+    const git = (args: string[], o: { maxNul?: number } = {}) => {
+      const left = deadline - Date.now();
+      if (left <= 0) return Promise.reject(new Error('checking the checkout timed out'));
+      return run(
+        ['git', ...attrs, ...SAFE_GIT_ARGS, '-c', 'core.attributesFile=/dev/null', ...args],
+        {
+          cwd: opts.repoRoot,
+          env: gitEnv,
+          timeoutMs: left,
+          raw: true,
+          ...(o.maxNul !== undefined ? { maxNul: o.maxNul } : {}),
+        },
+      );
+    };
+    const commit =
+      opts.commit ?? (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    if (commit === undefined) return undefined;
+    // Only a commit the repo already has: a Worker's own commit is never read from its store.
+    if (
+      !(await git(['cat-file', '-e', `${commit}^{commit}`]).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      return undefined;
+    }
+    attrs = [`--attr-source=${commit}`];
+    await git(['read-tree', commit]).catch((err: Error) => {
+      throw /attr-source/.test(err.message)
+        ? new Error(`checking for uncommitted changes needs git ${ATTR_SOURCE_GIT} or later`)
+        : err;
+    });
+    // Hashes every tracked file once (the index has no stat data yet); `-q` goes on past changes.
+    await git(['update-index', '-q', '--refresh', '--ignore-submodules']);
+    const changes: UncommittedChange[] = [];
+    const seen = new Set<string>();
+    const add = (path: string, untracked: boolean) => {
+      if (changes.length >= maxPaths || path === '' || seen.has(path)) return;
+      seen.add(path);
+      changes.push({ path, untracked });
+    };
+    // `M\0path\0` or `D\0path\0`, …: the checkout against the index, which holds exactly `commit`.
+    const diff = (
+      await git(['diff-files', '-z', '--name-status', '--no-renames', '--ignore-submodules=all'], {
+        maxNul: 2 * maxPaths,
+      })
+    ).split('\0');
+    for (let i = 0; i + 1 < diff.length; i += 2) add(diff[i + 1] as string, false);
+    for (const p of (
+      await git(['ls-files', '-z', '-o', '--exclude-standard'], { maxNul: maxPaths })
+    ).split('\0')) {
+      add(p, true);
+    }
+    // A new `.gitignore` can ignore itself and everything else: an ignored one is a change too.
+    for (const p of (
+      await git(
+        ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--', ':(glob)**/.gitignore'],
+        {
+          maxNul: maxPaths,
+        },
+      )
+    ).split('\0')) {
+      add(p, true);
+    }
+    return changes;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 interface RunOptions {
   cwd: string;
   env: Record<string, string>;
   timeoutMs: number;
   input?: string | undefined;
+  /** Stdout as is, not trimmed (porcelain output starts with significant spaces). */
+  raw?: boolean;
+  /**
+   * Stop reading after this many NUL-terminated entries (or about 4 KiB an entry), kill the command and
+   * resolve with the entries read so far.
+   */
+  maxNul?: number;
 }
 
 /**
@@ -492,7 +628,30 @@ function run(argv: string[], o: RunOptions): Promise<string> {
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let errBytes = 0;
-    child.stdout.on('data', (c: Buffer) => out.push(c));
+    let outBytes = 0;
+    let nuls = 0;
+    let capped = false;
+    child.stdout.on('data', (c: Buffer) => {
+      if (capped) return;
+      if (o.maxNul === undefined) {
+        out.push(c);
+        return;
+      }
+      // Keep whole entries only, up to the cap.
+      let end = c.length;
+      for (let i = c.indexOf(0); i !== -1; i = c.indexOf(0, i + 1)) {
+        nuls += 1;
+        if (nuls >= o.maxNul) {
+          end = i + 1;
+          capped = true;
+          break;
+        }
+      }
+      outBytes += end;
+      if (!capped && outBytes > o.maxNul * 4200) capped = true;
+      out.push(c.subarray(0, end));
+      if (capped) child.kill('SIGKILL');
+    });
     child.stderr.on('data', (c: Buffer) => {
       if (errBytes < 4096) err.push(c);
       errBytes += c.length;
@@ -504,8 +663,12 @@ function run(argv: string[], o: RunOptions): Promise<string> {
     });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      if (code === 0) resolve(Buffer.concat(out).toString('utf8').trim());
-      else {
+      if (code === 0 || capped) {
+        let text = Buffer.concat(out).toString('utf8');
+        // A capped read ends at the last whole entry.
+        if (capped) text = text.slice(0, text.lastIndexOf('\0') + 1);
+        resolve(o.raw ? text : text.trim());
+      } else {
         const why = signal === 'SIGKILL' ? 'timed out' : Buffer.concat(err).toString('utf8').trim();
         reject(new Error(`${argv.slice(0, 5).join(' ')}: ${why.slice(0, 500)}`));
       }
@@ -671,6 +834,15 @@ export class GitIntegrator implements Integrator {
       return false;
     }
     return wt ? amendedInReflog(join(wt.gitDir, 'logs', 'HEAD'), later) : false;
+  }
+
+  uncommitted(workspace: Workspace, commit?: string): Promise<UncommittedChange[] | undefined> {
+    return uncommittedChanges({
+      cwd: workspace.path,
+      repoRoot: this.#repoRoot,
+      commit,
+      env: this.#env,
+    });
   }
 
   async publish(taskId: string, commit: string): Promise<string> {

@@ -46,6 +46,14 @@ export type SpawnDetached = (
 /** The internal flag the background run gets: it waits for answers instead of exiting. */
 export const DETACHED_CHILD = '--detached-child';
 
+/**
+ * Whether `argv` (the command line after the script) is the background run `--detach` started:
+ * exactly as `childArgs` makes it, the flag right after `run`, never a task or answer text.
+ */
+export function isDetachedChild(argv: readonly string[]): boolean {
+  return argv[0] === 'run' && argv[1] === DETACHED_CHILD;
+}
+
 /** How long a background run may take to open its control port before the start fails. */
 export const START_TIMEOUT_MS = 60_000;
 
@@ -131,10 +139,11 @@ export async function detach(io: Io, goal: string | undefined, o: RunOptions): P
   const runtimeFile = runtimeFileFor(io, repoRoot);
   const log = detachedLogFor(io, repoRoot);
   mkdirSync(dirname(log), { recursive: true, mode: 0o700 });
-  // Appending: should two starts race past the lock check, neither writes over the other.
+  // Appending: should two starts race past the lock check, neither writes over the other. Readable
+  // too: the background run keeps its log's newest lines under a cap (#273).
   const fd = openSync(
     log,
-    constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND,
+    constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND,
     0o600,
   );
   let child: DetachedChild;
