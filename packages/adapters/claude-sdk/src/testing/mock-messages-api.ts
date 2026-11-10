@@ -9,6 +9,9 @@ import type { AddressInfo } from 'node:net';
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
  * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
  *   without asking for a file in its working directory.
+ * - `GLOB_TOOL <path> <pattern>`: asks for `Glob` with that `path` and `pattern`.
+ * - `GREP_TOOL <path> <pattern>`: asks for `Grep` (`files_with_matches`) with that `path` and
+ *   regex.
  * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
  *   its shell's pid to `background.pid` and then becomes `sleep 600`; with `ESCALATE` in the same first message,
  *   it then escalates as below.
@@ -136,6 +139,32 @@ function plan(body: Body): Block[] {
         id: `toolu_mock_${++n}`,
         name: 'Bash',
         input: { command: 'touch tool-ran.txt', description: 'create a file' },
+      },
+    ];
+  }
+  const glob = /GLOB_TOOL (\S+) (\S+)/.exec(text);
+  if (glob) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Glob',
+        input: { path: glob[1] as string, pattern: glob[2] as string },
+      },
+    ];
+  }
+  const grep = /GREP_TOOL (\S+) (\S+)/.exec(text);
+  if (grep) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Grep',
+        input: {
+          path: grep[1] as string,
+          pattern: grep[2] as string,
+          output_mode: 'files_with_matches',
+        },
       },
     ];
   }

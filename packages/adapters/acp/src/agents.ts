@@ -174,6 +174,36 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   sessionMeta: { claudeCode: { options: { settingSources: [], strictMcpConfig: true } } },
 };
 
+/**
+ * claude-agent-acp session options for an unattended Worker (#206), merged into
+ * `_meta.claudeCode.options` (passed to the SDK's `query()`, 0.101.0 `acp-agent.js`): the file
+ * tools only and no shell. Not `Glob` or `Grep`: the SDK runs them without asking, and over ACP
+ * there is no hook to ask with. Verified against the mock API by the vendor conformance test.
+ */
+export const CLAUDE_ACP_WORKER_OPTIONS = {
+  tools: ['Read', 'Write', 'Edit', 'NotebookEdit'],
+  disallowedTools: ['Bash', 'PowerShell', 'Monitor'],
+} as const;
+
+/** `spec` with `CLAUDE_ACP_WORKER_OPTIONS` merged into its `_meta.claudeCode.options`. */
+export function claudeAcpWorkerSpec(spec: AcpAgentSpec): AcpAgentSpec {
+  const meta = (spec.sessionMeta ?? {}) as { claudeCode?: { options?: Record<string, unknown> } };
+  return {
+    ...spec,
+    sessionMeta: {
+      ...meta,
+      claudeCode: {
+        ...meta.claudeCode,
+        options: {
+          ...meta.claudeCode?.options,
+          tools: [...CLAUDE_ACP_WORKER_OPTIONS.tools],
+          disallowedTools: [...CLAUDE_ACP_WORKER_OPTIONS.disallowedTools],
+        },
+      },
+    },
+  };
+}
+
 /** The model provider codex-acp's Codex uses for Workers: the key comes from the environment. */
 export const CODEX_ACP_PROVIDER = 'tacet-openai-api-key';
 
