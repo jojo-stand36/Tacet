@@ -68,7 +68,9 @@ export interface PtyPreset {
    * picks the latest session of a wider scope could continue another Worker's session. Checked
    * per worktree on Linux (#168): `['resume', '--last']` for codex-cli 0.167.0 (live, in a PTY),
    * `['--resume', 'latest']` for Gemini CLI 0.67.0 (live with `-p`, and from the bundle's code for
-   * interactive use); with nothing saved there, both start a fresh session. Tacet resumes a
+   * interactive use); with nothing saved there, both start a fresh session. A Codex preset's
+   * command also passes `-c features.daemon_auto_start=false`: interactive Codex otherwise starts
+   * a managed daemon, shared per `CODEX_HOME`, that outlives the session (#171). Tacet resumes a
    * Worker only in the checkout it ran in, so "the last session here" is that checkout's, which
    * can be an earlier attempt's. A generic CLI has no session id Tacet can read, so
    * `vendorSessionId` is a marker, set at start.

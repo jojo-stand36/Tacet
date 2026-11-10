@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:worker-profile:v1",
+  "title": "Tacet worker.profile payload",
+  "type": "object",
+  "properties": {
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effort": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "contextWindow": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "reasons": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "effort": {
+          "type": "string",
+          "minLength": 1
+        },
+        "contextWindow": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "model",
+        "effort",
+        "contextWindow"
+      ]
+    },
+    "refused": {
+      "description": "The adapter refused this profile (ProfileRefusedError)",
+      "type": "object",
+      "properties": {
+        "field": {
+          "enum": [
+            "model",
+            "effort",
+            "contextWindow"
+          ],
+          "x-tacet-fallback": "model",
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "message"
+      ]
+    }
+  },
+  "required": [
+    "sessionId",
+    "reasons"
+  ]
+}
