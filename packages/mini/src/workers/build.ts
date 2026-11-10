@@ -43,12 +43,18 @@ export interface BuildWorkerAdaptersOptions {
   keychain?: KeychainOptions;
   /** Passed through to the adapters as they are built; for tests and the entry point. */
   claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
-  codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs'>;
+  codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs' | 'stateDir'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
   /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
   ptyCli?: Pick<PtyCliAdapterOptions, 'spawn' | 'quietMs' | 'startTimeoutMs' | 'killTimeoutMs'>;
+  /**
+   * Also build the planner's adapter (`tiers.mini`, #21), with the same checks, when that tier is
+   * set. It is keyed by its id like the others; the standalone entry point hands it to the
+   * `AdapterPlanner`.
+   */
+  withPlanner?: boolean;
 }
 
 /** PTY presets built in, by slug; `agents.<slug>` may not reuse these names. */
@@ -84,7 +90,7 @@ export function buildWorkerAdapters(
   const baseEnv = opts.baseEnv ?? process.env;
   const envPolicy = workerEnvPolicy(config);
   const out: Record<string, WorkerAdapter> = {};
-  for (const name of WORKER_TIERS) {
+  for (const name of opts.withPlanner ? [...WORKER_TIERS, 'mini' as const] : WORKER_TIERS) {
     const tier = tiers[name];
     if (!tier) continue;
     const id = tier.adapter;

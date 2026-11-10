@@ -283,9 +283,24 @@ export async function startMockMessagesApi(
     url: `http://127.0.0.1:${port}`,
     requests,
     close: () =>
-      new Promise<void>((r) => {
+      new Promise<void>((resolve, reject) => {
         server.closeAllConnections();
-        server.close(() => r());
+        // Not expected to wait; if it ever does (#189), say what is still open rather than
+        // leaving a test hook to time out without a reason.
+        const stuck = setTimeout(() => {
+          server.getConnections((_err, open) =>
+            reject(
+              new Error(
+                `mock Messages API did not close within 5 s: ${open} connection(s) open, listening=${server.listening}`,
+              ),
+            ),
+          );
+        }, 5000);
+        stuck.unref();
+        server.close(() => {
+          clearTimeout(stuck);
+          resolve();
+        });
       }),
   };
 }

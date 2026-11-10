@@ -262,6 +262,9 @@ importers:
       '@tacet/core':
         specifier: workspace:*
         version: link:../core
+      '@tacet/mini':
+        specifier: workspace:*
+        version: link:../mini
 
   packages/conductor:
     dependencies:

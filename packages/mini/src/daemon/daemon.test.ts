@@ -12,7 +12,12 @@ import {
 import { type EventStore, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
-import { MiniConductor, type MiniConductorOptions, VERIFY_CODEX_WORKERS } from './daemon.js';
+import {
+  MiniConductor,
+  type MiniConductorOptions,
+  miniLockHolder,
+  VERIFY_CODEX_WORKERS,
+} from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
 import type {
   Integrator,
@@ -947,6 +952,74 @@ describe('MiniConductor', () => {
     expect(tasks()[sub]?.state).toBe('completed');
     expect(fake.sessions[0]?.inputs.at(-1)).toBe(`Answer to your escalation ${escId}: Postgres`);
     expect(ofType('escalation.delivered', sub)).toHaveLength(1);
+  });
+
+  it("answer() records the user's answer and delivers it (#21)", async () => {
+    const escId = newUlid();
+    fake = new ScriptedAdapter('fake', (input, s) => {
+      if (input.includes('[ask]') && !s.inputs.some((x) => x.startsWith('Answer'))) {
+        // What the MCP escalate tool would write for this Worker.
+        const sessionId = store
+          .query({ typePrefix: 'worker.started' })
+          .map((e) => e.envelope)
+          .at(-1)?.data as { sessionId: string };
+        store.append({
+          v: 1,
+          id: newUlid(),
+          ts: new Date().toISOString(),
+          source: { kind: 'worker', id: sessionId.sessionId },
+          taskId: store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope.taskId,
+          sessionId: sessionId.sessionId,
+          type: 'escalation.raised',
+          data: {
+            id: escId,
+            taskId: store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope.taskId,
+            question: 'Which database?',
+            urgency: 'normal',
+            createdAt: new Date().toISOString(),
+            status: 'pending',
+          },
+        });
+        return { do: 'reply', text: 'Escalated; waiting.' };
+      }
+      return script(input);
+    });
+    const d = make({
+      planner: new FixedPlanner([
+        { key: 'q', goal: 'needs a decision [ask]', acceptanceCriteria: ['ok'] },
+      ]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+    // Waiting on a person is not completion, and the session stays open for the answer.
+    expect(ofType('task.result', sub)).toHaveLength(0);
+    expect(fake.open).toBe(1);
+    expect(() => d.answer(newUlid(), 'x')).toThrow(/unknown escalation/);
+    expect(() => d.answer(escId, '  ')).toThrow(/empty/);
+    d.answer(escId, 'Postgres');
+    expect(() => d.answer(escId, 'MySQL')).toThrow(/already resolved/);
+    expect(ofType('escalation.resolved', sub).map((e) => e.data)).toEqual([
+      { escalationId: escId, answer: 'Postgres', source: 'user' },
+    ]);
+    await d.settled();
+    expect(tasks()[sub]?.state).toBe('completed');
+    expect(fake.sessions[0]?.inputs.at(-1)).toBe(`Answer to your escalation ${escId}: Postgres`);
+    expect(ofType('escalation.delivered', sub)).toHaveLength(1);
+  });
+
+  it('miniLockHolder names the running holder only (#21)', async () => {
+    const lock = join(dir, 'mini.lock');
+    expect(miniLockHolder(lock)).toBeUndefined();
+    const d = make();
+    await d.start();
+    expect(miniLockHolder(lock)).toBe(process.pid);
+    await d.stop();
+    expect(miniLockHolder(lock)).toBeUndefined();
+    // A stale lock from a process that is gone.
+    writeFileSync(lock, '2147483646\n');
+    expect(miniLockHolder(lock)).toBeUndefined();
   });
 
   it('refuses every approval an unattended Worker asks for', async () => {
