@@ -28,6 +28,8 @@ export interface MockResponsesApi {
     toolOutput?: string;
     authorized: boolean;
     tools: string[];
+    /** Number of input items: the conversation so far, so a resumed thread shows its history. */
+    inputs: number;
   }[];
   close(): Promise<void>;
 }
@@ -93,6 +95,7 @@ async function handle(
         ? (t.tools ?? []).map((x) => `${t.name}/${x.name ?? ''}`)
         : [t.name ?? t.type ?? ''],
     ),
+    inputs: body.input?.length ?? 0,
   });
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
   const sse = (event: Record<string, unknown> & { type: string }) =>
