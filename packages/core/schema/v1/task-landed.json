@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:task-landed:v1",
+  "title": "Tacet task.landed payload",
+  "type": "object",
+  "properties": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+      "description": "The published result commit (SummaryPacket.published.commit)"
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^refs\\/heads\\/\\S+$"
+    },
+    "how": {
+      "enum": [
+        "merge",
+        "squash"
+      ],
+      "x-tacet-fallback": "merge",
+      "type": "string"
+    },
+    "landedAs": {
+      "description": "The target commit that makes the same change, for a squash merge",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    }
+  },
+  "required": [
+    "commit",
+    "target",
+    "how"
+  ]
+}

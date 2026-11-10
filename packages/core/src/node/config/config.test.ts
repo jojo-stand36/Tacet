@@ -229,6 +229,19 @@ describe('loadConfig', () => {
     ).toThrow(/task layer .* may not change a Worker's environment/);
   });
 
+  it('turns merged-worktree cleanup on by default, lets the repo or local layer set it, never a task (#210)', () => {
+    expect(loadConfig({ userDir, repoRoot }).config.worktrees).toEqual({ remove_merged: true });
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'worktrees: { remove_merged: false }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.worktrees?.remove_merged).toBe(false);
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'worktrees: { remove_merged: true }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.worktrees?.remove_merged).toBe(true);
+    expect(() =>
+      loadConfig({ userDir, repoRoot, task: { worktrees: { remove_merged: false } } }),
+    ).toThrow(/worktrees: the task layer .* may not change worktree cleanup/);
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'worktrees: { remove_merged: "yes" }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/remove_merged/);
+  });
+
   it('never lets a task change the verify commands, and lets it only lower their limits (#19)', () => {
     for (const verify of [[], ['true']]) {
       expect(() => loadConfig({ userDir, repoRoot, task: { verify } })).toThrow(
