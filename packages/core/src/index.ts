@@ -4,6 +4,7 @@
  */
 export const packageName = '@tacet/core' as const;
 
+export * from './adapter/env.js';
 export * from './adapter/errors.js';
 export * from './adapter/redact.js';
 export type * from './adapter/types.js';

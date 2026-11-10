@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ENV_PASS_PATTERN } from '../adapter/env.js';
 
 /**
  * Tacet configuration (ARCHITECTURE.md §4). Config is written by people, so enums here are
@@ -133,6 +134,22 @@ export const TacetConfig = z.strictObject({
       stuck_after_s: z.number().int().positive(),
       nudge_grace_s: z.number().int().positive(),
       max_attempts: z.number().int().positive(),
+      /**
+       * Worker environment (#147). A Worker starts with an allowlist of the user's environment;
+       * `pass` adds names, or prefixes ending in `*`. A prefix never passes a secret-looking
+       * name (`*_TOKEN`, `*_KEY`, `AWS_*`, ...): name such a variable exactly, in the user or
+       * local layer. Unioned across layers; the task layer may not set it.
+       */
+      env: z.strictObject({
+        pass: z.array(
+          z
+            .string()
+            .regex(
+              ENV_PASS_PATTERN,
+              'expected an environment variable name, or a prefix ending in * (e.g. MYAPP_*)',
+            ),
+        ),
+      }),
     })
     .partial()
     .optional(),

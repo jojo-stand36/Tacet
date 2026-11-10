@@ -153,6 +153,7 @@ workers:                    # Worker pool (#17); defaults shown
   stuck_after_s: 300        # silent this long: nudge
   nudge_grace_s: 900        # still silent this much later: replace the session
   max_attempts: 3           # failed or stuck runs (or an unknown end reason) before a sub-task fails; restarts, handoffs and cancels do not count (owner decision)
+  # env: { pass: [MYAPP_*, NPM_TOKEN] }   # more of your environment for Workers (#147); see §6
 events:
   # state_dir: ~/.tacet/state   # DB at <state_dir>/<repo-hash>/events.db, outside the repo
   retention:
@@ -162,8 +163,8 @@ events:
 **Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
 
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
-- The task layer may only **lower** `workers.*`, never raise it, because the Worker pool is repo-wide (owner decision, 2026-11-09): a raise is a config error.
-- Exception: `policies` and `escalation.always_ask` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
+- The task layer may only **lower** `workers.*`, never raise it, because the Worker pool is repo-wide (owner decision, 2026-11-09): a raise is a config error. It may not set `workers.env` at all, and the committed repo layer may not name a secret-looking variable in `workers.env.pass` (#147, §6).
+- Exception: `policies`, `escalation.always_ask` and `workers.env.pass` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule or a toolchain variable set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
 - Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
 - `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
@@ -223,4 +224,6 @@ Other:
     - The object-dir variables apply to every repo the Worker touches, so a submodule, a `git clone` or a nested repo inside the worktree does not work for unattended Codex Workers yet.
   - Unattended Codex Workers get their own `CODEX_HOME` at `~/.tacet/state/<repo>/codex`; interactive sessions keep the user's `~/.codex`. The user's `config.toml` customisations (including their MCP servers) therefore do not apply to unattended Workers.
   - Codex `features.plugins` is off for unattended Workers, so a Worker start never syncs plugins from GitHub.
+- **Worker environment** (#147): a Worker starts with an allowlist of the user's environment, not all of it (`workerEnv` in `@tacet/core`): a base set (PATH, HOME, user, locale, terminal, temp dirs, proxies, CA bundles), toolchain locations (`JAVA_HOME`, `GOPATH`, `CARGO_HOME`, `NVM_DIR`, `VIRTUAL_ENV`, ...), the adapter's own vendor variables, and `workers.env.pass` (names, or prefixes ending in `*`). A prefix never passes a secret-looking name (`*_TOKEN`, `*_KEY`, `*_SECRET`, `AWS_*`, ...); such a variable passes only by its exact name, from the user or local layer, never the committed repo layer, and never from a task. Tacet's own per-session variables (`TACET_WORKER_MARKER`, the session's MCP settings) are added after filtering. Adapters report the names (never values) of dropped variables through a callback, not in events. Interactive sessions inherit the user's whole environment, by an explicit option. `SSH_AUTH_SOCK` and GPG agent variables are not in the base set, so unattended Workers do not sign commits or push over SSH with the user's agent unless the user passes them. The three defaults in this bullet (interactive exempt, repo layer may not pass secrets, no SSH or GPG agent) await the owner's confirmation.
+  - **Accepted residual risk:** the allowlist limits accidental exposure (environment dumps in transcripts and test logs, third-party `acp:` agents). It is not a boundary against a hostile Worker: Workers run as the user with `HOME` set and can read `~/.aws/credentials`, `~/.npmrc` or shell profiles until the sandbox (#53), and a Worker hands its own vendor key to the tools it runs.
 - All approvals and decisions are logged and attributable.
