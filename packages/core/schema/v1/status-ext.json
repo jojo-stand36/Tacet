@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:status-ext:v1",
+  "title": "Tacet A2A status extension (urn:tacet:a2a-ext:status:v1)",
+  "type": "object",
+  "properties": {
+    "goal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "enum": [
+        "submitted",
+        "working",
+        "input_required",
+        "auth_required",
+        "completed",
+        "failed",
+        "canceled",
+        "rejected"
+      ],
+      "x-tacet-fallback": "working",
+      "type": "string"
+    },
+    "outcome": {
+      "enum": [
+        "completed",
+        "failed",
+        "partial",
+        "blocked"
+      ],
+      "x-tacet-fallback": "failed",
+      "type": "string"
+    },
+    "target": {
+      "type": "object",
+      "properties": {
+        "branch": {
+          "description": "The local branch checked out when the task started",
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+          "description": "Its commit then: where sub-tasks without dependencies start"
+        }
+      },
+      "required": [
+        "commit"
+      ]
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "inputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outputTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "costUsd": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens",
+        "costUsd"
+      ],
+      "description": "Spent on the task itself: the planner"
+    },
+    "subtasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "goal": {
+            "type": "string",
+            "minLength": 1
+          },
+          "state": {
+            "enum": [
+              "submitted",
+              "working",
+              "input_required",
+              "auth_required",
+              "completed",
+              "failed",
+              "canceled",
+              "rejected"
+            ],
+            "x-tacet-fallback": "working",
+            "type": "string"
+          },
+          "activeWorkers": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "description": "Worker session ids running now"
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "inputTokens": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "outputTokens": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "costUsd": {
+                "type": "number",
+                "minimum": 0
+              }
+            },
+            "required": [
+              "inputTokens",
+              "outputTokens",
+              "costUsd"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "goal",
+          "state",
+          "activeWorkers",
+          "usage"
+        ]
+      }
+    },
+    "escalations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "taskId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "question": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "taskId",
+          "question"
+        ]
+      },
+      "description": "Open escalations of the task and its unfinished sub-tasks"
+    }
+  },
+  "required": [
+    "goal",
+    "state",
+    "usage",
+    "subtasks",
+    "escalations"
+  ]
+}

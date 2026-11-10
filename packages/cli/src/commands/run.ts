@@ -185,6 +185,9 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
         let answered = 0;
         if (io.prompt) io.err('answer each question, or press Enter to leave it for later');
         for (const x of io.prompt ? pending : []) {
+          // Answered meanwhile over the run's control port (`tacet answer`, #201): not asked again.
+          const now = readState(sa.store);
+          if (!open.flatMap((r) => pendingEscalations(now, r)).some((y) => y.id === x.id)) continue;
           const answer = await io.prompt?.(terminalSafe(`${x.taskId} asks: ${x.question}\n> `));
           // End of input: nobody is there to ask.
           if (answer === undefined || io.signal?.aborted) break;
@@ -200,6 +203,8 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
         if (answered > 0) continue;
         const left = readState(sa.store);
         const still = open.flatMap((r) => pendingEscalations(left, r));
+        // Answered meanwhile, over the run's control port (`tacet answer`, #201): carry on.
+        if (still.length === 0) continue;
         if (o.json) {
           const tasks = open.map((r) => ({ id: r, state: left.tasks[r]?.state }));
           io.out(safeJson({ tasks, escalations: still }));

@@ -1,12 +1,18 @@
-import { TaskTarget } from '@tacet/core';
+import { statusEntries, type TaskStatusEntry, TaskTarget } from '@tacet/core';
 import type { EventStore, StoredEvent } from '@tacet/core/node';
+import { liveControl, liveStatus } from '../control.js';
 import type { Io } from '../io.js';
-import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
+import {
+  formatEvent,
+  formatStatusEntry,
+  isSummaryEvent,
+  safeJson,
+  terminalSafe,
+} from '../render.js';
 import {
   DONE_STATES,
   isSubtaskOf,
   openLog,
-  pendingEscalations,
   readState,
   repoRootFrom,
   rootTasks,
@@ -46,62 +52,68 @@ function targetOf(store: EventStore, taskId: string): TaskTarget | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
-/** `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live. */
+/**
+ * `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live.
+ * A live run answers over its control port (#201); otherwise the log is read, read-only.
+ */
 export async function status(io: Io, o: Where & { json?: boolean }): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
   const paths = statePaths(repoRoot, o['user-dir'], io.home);
   const { miniLockHolder } = await import('@tacet/mini');
   const pid = miniLockHolder(paths.lock);
-  const store = openLog(paths);
-  if (!store) {
-    if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [], problems: [] }));
-    else io.out(`no Tacet state for ${repoRoot}`);
-    return 0;
+  let tasks: TaskStatusEntry[] | undefined;
+  let source: 'run' | 'log' = 'log';
+  const client = pid !== undefined ? await liveControl(io, repoRoot, paths) : undefined;
+  if (client) {
+    try {
+      tasks = await liveStatus(client);
+      source = 'run';
+    } catch (err) {
+      const why = terminalSafe((err as Error).message);
+      io.err(`note: the live run did not answer (${why}); reading the log instead`);
+    } finally {
+      await client.close();
+    }
   }
-  try {
-    const state = readState(store);
-    const roots = rootTasks(state);
-    if (o.json) {
-      const tasks = roots.map((t) => {
-        const target = targetOf(store, t.task.id);
-        return {
-          id: t.task.id,
-          goal: t.task.goal,
-          state: t.state,
-          ...(t.result ? { outcome: t.result.outcome } : {}),
-          ...(target ? { target } : {}),
-          usage: t.usage,
-          subtasks: subtasksOf(state, t.task.id).map((s) => ({
-            id: s.task.id,
-            goal: s.task.goal,
-            state: s.state,
-            activeWorkers: s.activeWorkers,
-            usage: s.usage,
-          })),
-          escalations: pendingEscalations(state, t.task.id),
-        };
-      });
-      io.out(
-        safeJson({ running: pid ?? null, tasks, problems: recentProblems(store).map(problemJson) }),
-      );
+  if (!tasks) {
+    const store = openLog(paths);
+    if (!store) {
+      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [], problems: [] }));
+      else io.out(`no Tacet state for ${repoRoot}`);
       return 0;
     }
-    io.out(pid ? `Mini-conductor running (pid ${pid})` : 'Mini-conductor not running');
-    if (roots.length === 0) io.out('no tasks');
-    for (const t of roots) {
-      io.out(formatTask(t, subtasksOf(state, t.task.id)));
-      const target = targetOf(store, t.task.id);
-      if (target) {
-        const where = target.branch ? terminalSafe(target.branch) : 'a detached HEAD';
-        io.out(`  targets ${where} (started at ${target.commit.slice(0, 12)})`);
-      }
+    try {
+      tasks = statusEntries(readState(store), (id) => targetOf(store, id));
+    } finally {
+      store.close();
     }
-    const problems = recentProblems(store);
-    if (problems.length > 0) {
-      io.out('maintenance problems (latest first):');
-      for (const p of problems) io.out(`  ${formatEvent(p.envelope)}`);
-    }
+  }
+  // Kept in the log only, whoever answered for the tasks (#254).
+  const problems = readProblems(paths);
+  if (o.json) {
+    io.out(safeJson({ running: pid ?? null, source, tasks, problems: problems.map(problemJson) }));
     return 0;
+  }
+  io.out(
+    pid
+      ? `Mini-conductor running (pid ${pid})${source === 'run' ? '' : '; read from the log'}`
+      : 'Mini-conductor not running',
+  );
+  if (tasks.length === 0) io.out('no tasks');
+  for (const t of tasks) io.out(formatStatusEntry(t));
+  if (problems.length > 0) {
+    io.out('maintenance problems (latest first):');
+    for (const p of problems) io.out(`  ${formatEvent(p.envelope)}`);
+  }
+  return 0;
+}
+
+/** The recent maintenance problems in the repo's log (#254); none without a log. */
+function readProblems(paths: Parameters<typeof openLog>[0]): StoredEvent[] {
+  const store = openLog(paths);
+  if (!store) return [];
+  try {
+    return recentProblems(store);
   } finally {
     store.close();
   }

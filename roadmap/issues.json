@@ -454,7 +454,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n- [ ] Borrow (ADR-001): Run native PTY wrappers inside an OS sandbox (`bwrap` on Linux, `seatbelt` on macOS), as Omnigent does (`omnigent/sandbox/`); coordinate with #53\n- [ ] Borrow (ADR-001): Use Gas Town's agent preset schema (launch command, ready prompt, resume flag, process name) for per-CLI PTY config (`docs/agent-provider-integration.md` §Tier 1)\n- [ ] Borrow (ADR-001): Context-pressure injection through a `UserPromptSubmit` hook with a model id → window table, after Gas City (`cmd/gc/context_inject.go`); re-derive the table from vendor docs\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [x] node-pty session manager with scrollback\n- [x] Local HTTP endpoint receiving hook events\n- [x] Installer that writes hook config into the worktree's settings (non-destructively): per-session `--settings` files outside the worktree instead\n- [x] Borrow (ADR-001): Run native PTY wrappers inside an OS sandbox (`bwrap` on Linux, `seatbelt` on macOS), as Omnigent does (`omnigent/sandbox/`): moved to #53, which has the same item\n- [x] Borrow (ADR-001): Use Gas Town's agent preset schema (launch command, ready prompt, resume flag, process name) for per-CLI PTY config (`docs/agent-provider-integration.md` §Tier 1): `agents.<slug>` with `kind: pty` (#157); no process name, since Worker processes are tracked by pid (#127)\n- [x] Borrow (ADR-001): Context-pressure injection through a `UserPromptSubmit` hook with a model id → window table, after Gas City (`cmd/gc/context_inject.go`); re-derive the table from vendor docs: moved to #255 (M3)\n- [x] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: generic ACP client",
@@ -613,6 +613,17 @@
         "agent:claude"
       ],
       "body": "Found in #110 slice 2 (spike `docs/adapters/spikes/110-codex-effort/`, Codex 0.167.0, mock Responses API): `thread/fork` sent without a `model` came back on the catalog's default model (`gpt-6.1-sol`) with `reasoningEffort: null`, not on the source thread's model. The Codex adapter adopts the reported model, so its own state is consistent, but a forked Worker silently changes model and loses its effort unless the adapter sends them.\n\n### Tasks\n- [ ] Verify on the pinned Codex whether `thread/fork` honours `model` (and the thread config's `model_reasoning_effort`) in its params (`verify-vendor-facts`).\n- [ ] When forking without `SessionOptions.model`, send the source thread's model (and its effort, checked against `model/list`) so the fork continues on what the source ran.\n- [ ] Record the behaviour in the capability matrix Codex Resume/fork row.\n\n### Acceptance criteria\n- Against the mock Responses API, a fork of a thread that ran on `gpt-5.5` at `low`, started without a model or effort, sends its first request with model `gpt-5.5` and effort `low`.\n- A fork with an explicit `model` or `effort` still uses those, and an effort the model does not list is refused (`ProfileRefusedError`).\n\n_See docs/adapters/capability-matrix.md (Codex) and #110._"
+    },
+    {
+      "title": "Codex in a PTY: a prompt ending in @token is not submitted; check pasted image paths",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Found while working on #245. In live tests against the local mock Responses API, interactive Codex 0.167.0 in a PTY does not read an `@path` into a prompt. But when a Worker prompt ends in an `@token` (`… see @note.txt`), Codex opens its \"Mentions\" popup, and the Enter that Tacet types then inserts the selected completion instead of submitting. The prompt text changes (`@note.txt` became `note.txt`), and the turn is not submitted until Esc and then Enter. The `PtyCliAdapter` turn stalls, and the next prompt Tacet types lands in that composer. An `@` that is not the last word submits normally.\n\nSeparately, Codex source (`codex-rs/tui/src/bottom_pane/chat_composer.rs`, main) attaches a pasted path as an image when it names an image file (`handle_paste_image_path`). That would send an image from outside the checkout to the model. When this triggers, for example whether a prompt with surrounding text counts, is unverified.\n\n### Tasks\n- [ ] Reproduce the trailing-`@` popup with the PTY live setup, and decide how to fix it: close the popup before submitting, end the prompt with a character that doesn't complete, or disable `mentions_v2`. Verify any switch first (`verify-vendor-facts`).\n- [ ] Probe live whether a Worker prompt holding an image path attaches the image, both inside and outside the checkout.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- A Codex `pty:<slug>` Worker prompt that ends in `@<path>` is submitted with its text unchanged, shown live.\n- A prompt holding an image path outside the checkout attaches nothing, shown live or documented with a source.\n\n_See #245, #244 and docs/adapters/capability-matrix.md (\"Generic PTY presets\")._"
     },
     {
       "title": "Core: modelSwitch 'none' for adapters that cannot choose a model",
@@ -817,6 +828,18 @@
         "agent:either"
       ],
       "body": "Follow-up from #18. The Mini-conductor MCP backend keeps per-Worker state (latest progress, the one-handoff-per-session flag) in memory keyed by Worker session. Nothing removes it when the Worker ends and its token is revoked, so a long-running Mini-conductor grows without bound.\n\n### Tasks\n- [ ] Drop a Worker's in-memory state when its token is revoked or its session ends\n- [ ] Keep anything needed later in the event log, not in memory\n\n### Acceptance criteria\n- After a Worker's token is revoked, the backend holds no state for that Worker (test)\n- A new Worker with a new session id starts with clean state (test)\n\n_See docs/ARCHITECTURE.md and ADR-003 §6 for context._"
+    },
+    {
+      "title": "PtyCliAdapter: @path expansion in Gemini, Codex and claude presets",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "`PtyCliAdapter` (`packages/adapters/pty/src/cli-adapter.ts`) types Worker prompts through the same `promptText` as `pty:claude`, and has no mitigation for file mentions. The Gemini CLI docs say `@<path>` will \"Inject the content of the specified file … into your current prompt\" through `read_many_files` (github.com/google-gemini/gemini-cli `docs/reference/commands.md`, \"At commands\"). They don't say whether that is limited to the workspace. Codex's interactive `@` behaviour is unverified. A preset whose command is `claude` itself would not get the `CLAUDE_CODE_DISABLE_FILE_MENTIONS` that #226 sets for `pty:claude`. A Worker's next prompt can carry text a Worker wrote.\n\n### Tasks\n- [ ] Verify each CLI preset's interactive `@` behaviour from primary docs, and live where possible (`verify-vendor-facts`).\n- [ ] Per CLI: set its documented switch if one exists; otherwise neutralise or refuse mentions in Worker prompts. For a `claude` preset, refuse it or set the same variable.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- For each `PtyCliAdapter` preset, a Worker prompt containing `@<path outside the checkout>` reads nothing in, shown live or documented with a source.\n\n_See #226 and docs/ARCHITECTURE.md §2._"
     },
     {
       "title": "Rate-limit escalate and record_decision in the Mini-conductor MCP server",
@@ -1107,6 +1130,18 @@
       "body": "Over the Claude Agent SDK and claude-agent-acp, an `@path` mention in a prompt is read into the prompt with no permission request, outside the checkout too. #214 closes that with `verbatimPrompts`, verified live. A Worker's next prompt can carry text the Worker wrote, such as a `verify` command's output or review findings.\n\n`pty:claude` (interactive Claude Code in a PTY) gets the same text. Its `promptText` (`packages/adapters/pty/src/adapter.ts`) refuses only a leading `/` or `!`. Interactive Claude Code probably expands `@path` too, and its `PreToolUse` hook does not see attachments. This is not verified: `node-pty` cannot build in the sessions that found it.\n\n### Tasks\n- [ ] Verify live, with the PTY conformance setup and the mock Messages API: does an `@<outside path>` pasted in a prompt reach the model? Check inside a ``` fence too.\n- [ ] If it does, refuse or neutralise `@` followed by a path character in Worker prompts. Alternatively, use an interactive-mode equivalent of verbatim prompts, if Claude Code has one: check the CLI reference (`verify-vendor-facts`).\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- A `pty:claude` Worker's prompt containing `@<path outside the checkout>` reads nothing into the prompt, shown live.\n\n_See #214, #200, #206 and docs/ARCHITECTURE.md §2._"
     },
     {
+      "title": "pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "The #226 review found that a `pty:claude` Worker prompt containing an image path (`@<png>`, a quoted path, or `../x.png`) makes interactive Claude Code 2.1.319 show \"Pasting…\". The input box ends up holding only the path and the prompt is never submitted, even after another Enter. Tacet types every prompt as a bracketed paste, so a Worker's prompt is a paste. The turn wedges, with or without `CLAUDE_CODE_DISABLE_FILE_MENTIONS`. No image was attached in that probe. However, the docs list pasted images as their own attachment route (code.claude.com/docs/en/permissions, \"What Read and Edit rules cover\"), and `CLAUDE_CODE_DISABLE_FILE_MENTIONS` covers only `@` mentions.\n\n### Tasks\n- [ ] Probe live with the PTY conformance setup: a real-size PNG; absolute, relative and quoted paths; inside and outside the checkout. Does anything get attached? What do Tacet's submit acknowledgement and timeout do with the stuck turn?\n- [ ] Evaluate `permissions.blockReadsOutsideWorkingDirectories: true` in Tacet's `--settings` file. The docs say attachments from refused paths are left out (v2.1.257+). Also evaluate `CLAUDE_CODE_DISABLE_ATTACHMENTS=1`. Verify each live before relying on it.\n- [ ] Make a stuck paste fail the turn visibly instead of hanging. Refusing or neutralising image paths in prompts is also acceptable.\n\n### Acceptance criteria\n- A `pty:claude` Worker prompt containing an image path outside the checkout attaches nothing and does not hang the turn, shown live.\n\n_See #226, docs/adapters/capability-matrix.md (PTY rows) and docs/ARCHITECTURE.md §2._"
+    },
+    {
       "title": "tacet cancel <task> in standalone mode",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1329,6 +1364,17 @@
         "agent:either"
       ],
       "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security → frontier)\n- [ ] Borrow (ADR-001): Capacity governor: a per-repo cap on concurrent workers, after Gas Town's scheduler `max_polecats` (`docs/design/scheduler.md`); coordinate with #17\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "PTY Workers: context-pressure injection through a UserPromptSubmit hook",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Split from #15, whose remaining borrow item this is (ADR-001: borrow the idea, not the code).\n\nAn interactive `pty:claude` Worker reports no context usage through the SDK, so Tacet can't see when its context fills up. Gas City adds the session's context pressure to each prompt through a `UserPromptSubmit` hook, using a table from model id to context window (`cmd/gc/context_inject.go`). The same works for Tacet's PTY Workers. Tacet already gets `UserPromptSubmit` for every PTY turn (#15, #190).\n\n### Tasks\n- [ ] Re-derive the model id → context window table from vendor docs (`verify-vendor-facts`), not from Gas City's copy. Record it in the capability matrix with sources.\n- [ ] From the PTY hooks, work out context usage per turn (the transcript's usage, or what the hooks report). Report it as `agent.usage` with `context`, as the SDK adapters do.\n- [ ] Optionally answer `UserPromptSubmit` with `additionalContext` stating the remaining context, so the Worker can hand off early. Gate this behind a setting, off by default, until the automatic handoff thresholds (#31) use it.\n- [ ] Tests against the mock Messages API with a real PTY session: usage is reported, and the injection appears only when enabled.\n\n### Acceptance criteria\n- A `pty:claude` Worker's context usage shows up as `agent.usage` events, so automatic handoff (#31) can act on it.\n\n_See #15, #31, docs/ARCHITECTURE.md (PTY hook tokens, context handoff) and ADR-001._"
     },
     {
       "title": "Per-session model, effort and context-size selection",

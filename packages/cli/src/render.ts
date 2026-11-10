@@ -1,4 +1,4 @@
-import type { EventEnvelope, TaskView } from '@tacet/core';
+import type { EventEnvelope, TaskStatusEntry, TaskView } from '@tacet/core';
 
 /**
  * Text from the event log made safe to print on a terminal: Worker output is untrusted, so C0
@@ -96,7 +96,40 @@ export function formatEvent(e: EventEnvelope): string {
   return terminalSafe(`${time} ${where} ${what}`);
 }
 
-/** A task and its sub-tasks as `tacet status` shows them. */
+/**
+ * One task as `tacet status` prints it (#201): the same lines as `formatTask`, built from a status
+ * entry so a live run and the log print alike. Only escalations still open are listed.
+ */
+export function formatStatusEntry(e: TaskStatusEntry): string {
+  const lines = [`${e.id} ${e.state}: ${oneLine(e.goal)}`];
+  for (const s of e.subtasks) {
+    const workers = s.activeWorkers.length ? ` workers: ${s.activeWorkers.join(', ')}` : '';
+    lines.push(`  ${s.id} ${s.state}: ${oneLine(s.goal, 100)}${workers}`);
+  }
+  for (const x of e.escalations) {
+    lines.push(`  escalation ${x.id} (${x.taskId}): ${oneLine(x.question, 300)}`);
+  }
+  const total = [e, ...e.subtasks].reduce(
+    (a, t) => ({
+      inputTokens: a.inputTokens + t.usage.inputTokens,
+      outputTokens: a.outputTokens + t.usage.outputTokens,
+      costUsd: a.costUsd + t.usage.costUsd,
+    }),
+    { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+  );
+  if (total.inputTokens || total.outputTokens || total.costUsd) {
+    lines.push(
+      `  usage: in ${total.inputTokens} out ${total.outputTokens} $${total.costUsd.toFixed(4)}`,
+    );
+  }
+  if (e.target) {
+    const where = e.target.branch ?? 'a detached HEAD';
+    lines.push(`  targets ${where} (started at ${e.target.commit.slice(0, 12)})`);
+  }
+  return terminalSafe(lines.join('\n'));
+}
+
+/** A task and its sub-tasks as `tacet run` reports them. */
 export function formatTask(view: TaskView, subs: TaskView[]): string {
   const lines = [`${view.task.id} ${view.state}: ${oneLine(view.task.goal)}`];
   for (const s of subs) {

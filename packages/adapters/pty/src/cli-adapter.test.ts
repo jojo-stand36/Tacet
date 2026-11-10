@@ -1,7 +1,7 @@
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionHandle } from '@tacet/core';
+import { ForkRefusedError, type SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PTY_LAST_SESSION, PtyCliAdapter, stripEcho } from './cli-adapter.js';
@@ -167,7 +167,7 @@ describe.skipIf(!gate.ok)(
       );
       await expect(
         resumable.start({ cwd, resume: { vendorSessionId: PTY_LAST_SESSION, fork: true } }),
-      ).rejects.toThrow(/fork/);
+      ).rejects.toThrow(ForkRefusedError);
       await resumable.close(resumed);
 
       // Resumed with nothing saved (the marker is set before the CLI saves anything): this fake
@@ -180,6 +180,35 @@ describe.skipIf(!gate.ok)(
       const tap4 = new EventTap(resumable.events(none));
       expect(reply((await turn(resumable, none, tap4, 'RECALL')).events)).toContain('(nothing)');
       await resumable.close(none);
+    });
+
+    it('types every @ as \\@ for a preset that asks for it (#245)', {
+      timeout: 60_000,
+    }, async () => {
+      const escaping = make({
+        preset: { command: [process.execPath, FAKE], readyPrompt: 'fake>', escapeAt: true },
+      });
+      const h = await escaping.start({ cwd: root });
+      const tap = new EventTap(escaping.events(h));
+      const { events } = await turn(escaping, h, tap, 'see @/etc/hosts and a@b.c');
+      expect(reply(events)).toContain('echo: . see \\@/etc/hosts and a\\@b.c .');
+      // Text that already has backslashes before an `@` cannot undo the escape: every `@` typed
+      // still has a backslash right before it, which Gemini 0.67.0 reads as a literal at sign
+      // however many come before it (verified live with one, two and three).
+      const tricky = 'a \\@x b \\\\@y c \\ @z d @@w';
+      const typed = reply((await turn(escaping, h, tap, tricky)).events);
+      expect(typed).toContain(`echo: . ${tricky.replaceAll('@', '\\@')} .`);
+      // A prompt made only of paths starts and ends with a segment that is never a file.
+      expect(reply((await turn(escaping, h, tap, "'./a.txt")).events)).toContain(
+        "echo: . './a.txt .",
+      );
+      expect(/(^|[^\\])@/.test(typed)).toBe(false);
+      await escaping.close(h);
+      // Without it, the text is typed as given.
+      const h2 = await adapter.start({ cwd: root });
+      const tap2 = new EventTap(adapter.events(h2));
+      expect(reply((await turn(adapter, h2, tap2, 'see @x')).events)).toContain('echo: see @x');
+      await adapter.close(h2);
     });
 
     it('refuses what a generic CLI cannot do, and reports a crash once', {
