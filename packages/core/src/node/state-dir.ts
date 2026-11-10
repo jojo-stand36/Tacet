@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { tokenKey } from './auth/secret.js';
 
 /** `~/.tacet/state`, the default for config `events.state_dir`. Never inside a repo. */
@@ -8,10 +8,15 @@ export function defaultStateDir(home: string = homedir()): string {
   return join(home, '.tacet', 'state');
 }
 
+/** Config `events.state_dir` cannot be used; the message says why. */
+export class StateDirError extends Error {
+  override name = 'StateDirError';
+}
+
 /**
  * The state directory config `events.state_dir` names, or the default. `~` and `~/...` are
  * expanded; anything else must be absolute. Refused inside `repoRoot`, where it could be
- * committed or read by Workers. Throws `Error` with the reason.
+ * committed or read by Workers. Throws `StateDirError` with the reason.
  */
 export function resolveStateDir(
   configured: string | undefined,
@@ -23,13 +28,16 @@ export function resolveStateDir(
   if (dir === '~') dir = home;
   else if (dir.startsWith('~/')) dir = join(home, dir.slice(2));
   if (!isAbsolute(dir)) {
-    throw new Error(`events.state_dir must be absolute or start with ~/ (got ${configured})`);
+    throw new StateDirError(
+      `events.state_dir must be absolute or start with ~/ (got ${configured})`,
+    );
   }
   dir = resolve(dir);
   if (repoRoot !== undefined) {
     const rel = relative(canonical(resolve(repoRoot)), canonicalPrefix(dir));
-    if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
-      throw new Error(`events.state_dir ${configured} is inside the repo; put it outside`);
+    const outside = rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+    if (!outside) {
+      throw new StateDirError(`events.state_dir ${configured} is inside the repo; put it outside`);
     }
   }
   return dir;

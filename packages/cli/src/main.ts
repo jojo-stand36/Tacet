@@ -1,6 +1,6 @@
 import { parseArgs } from 'node:util';
 import { formatExplain } from '@tacet/core';
-import { ConfigError, loadConfig } from '@tacet/core/node';
+import { ConfigError, loadConfig, StateDirError } from '@tacet/core/node';
 import { attach, logs, status } from './commands/read.js';
 import { run } from './commands/run.js';
 import type { Io } from './io.js';
@@ -91,11 +91,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
         return explain(io, v);
     }
   } catch (err) {
-    if (err instanceof ConfigError) {
-      io.err(err.message);
-      return 1;
-    }
-    if (err instanceof Error && /^events\.state_dir /.test(err.message)) {
+    if (err instanceof ConfigError || err instanceof StateDirError) {
       io.err(err.message);
       return 1;
     }

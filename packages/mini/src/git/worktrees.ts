@@ -48,18 +48,27 @@ export class GitWorktrees implements Workspaces {
 
   async remove(id: string): Promise<void> {
     const path = this.#path(id);
-    if (path === undefined || !existsSync(path)) return;
-    const next = this.#queue.then(() => this.#git(['worktree', 'remove', '--force', path]));
+    if (path === undefined) return;
+    // A checkout deleted by hand is still registered: prune it instead.
+    const args = existsSync(path) ? ['worktree', 'remove', '--force', path] : ['worktree', 'prune'];
+    const next = this.#queue.then(() => this.#git(args));
     this.#queue = next.catch(() => {});
     await next;
   }
 
   async #create(workerId: string, base?: string): Promise<Workspace> {
     const id = `ws-${workerId.replace(/[^\w.-]/g, '_')}`;
-    const path = this.#path(id) as string;
+    const path = this.#path(id);
+    if (path === undefined) throw new Error(`cannot make a checkout for Worker id ${workerId}`);
     if (existsSync(path)) throw new Error(`checkout ${id} already exists`);
     mkdirSync(this.#root, { recursive: true, mode: 0o700 });
-    const at = base ?? (await this.#git(['rev-parse', '--verify', 'HEAD^{commit}']));
+    // A commit, never an option or a range: the port takes any string.
+    const at = await this.#git([
+      'rev-parse',
+      '--verify',
+      '--end-of-options',
+      `${base ?? 'HEAD'}^{commit}`,
+    ]);
     await this.#git(['worktree', 'add', '-q', '--detach', path, at]);
     const wt = workerWorktree(path, this.#o.repoRoot);
     if (!wt) throw new Error(`checkout ${id} is not a worktree of the repo`);

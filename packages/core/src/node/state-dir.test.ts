@@ -62,6 +62,8 @@ describe('resolveStateDir (#21)', () => {
     symlinkSync(repo, join(dir, 'link'));
     expect(() => resolveStateDir(join(repo, '.tacet-state'), repo)).toThrow(/inside the repo/);
     expect(() => resolveStateDir(repo, repo)).toThrow(/inside the repo/);
+    // A name that only starts with dots is still inside.
+    expect(() => resolveStateDir(join(repo, '..state'), repo)).toThrow(/inside the repo/);
     // Through a symlink, and for a directory not created yet.
     expect(() => resolveStateDir(join(dir, 'link', 'a', 'b'), repo)).toThrow(/inside the repo/);
     expect(resolveStateDir(join(dir, 'state'), repo)).toBe(join(dir, 'state'));

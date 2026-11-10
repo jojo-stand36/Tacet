@@ -10,6 +10,17 @@ export function terminalSafe(text: string): string {
   return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f‪-‮⁦-⁩]/g, '?');
 }
 
+/**
+ * Pretty JSON safe to print on a terminal: `JSON.stringify` escapes C0 controls itself; C1
+ * controls and bidi overrides are escaped here too (as `\\uXXXX`, so the data is unchanged).
+ */
+export function safeJson(value: unknown, indent = 2): string {
+  return JSON.stringify(value, null, indent).replace(
+    /[\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
 /** At most `n` characters, on one line. */
 export function oneLine(text: string, n = 160): string {
   const flat = text.replace(/\s+/g, ' ').trim();

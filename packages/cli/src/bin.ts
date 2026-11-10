@@ -6,7 +6,7 @@ const abort = new AbortController();
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => {
     // A second signal does not wait: the next start ends what was left running (#127).
-    if (abort.signal.aborted) process.exit(130);
+    if (abort.signal.aborted) process.exit(sig === 'SIGINT' ? 130 : 143);
     abort.abort();
   });
 }
@@ -15,6 +15,8 @@ const interactive = process.stdin.isTTY && process.stdout.isTTY;
 const prompt = interactive
   ? async (question: string): Promise<string | undefined> => {
       const rl = createInterface({ input: process.stdin, output: process.stdout });
+      // A terminal readline takes Ctrl-C itself instead of the process getting SIGINT.
+      rl.on('SIGINT', () => abort.abort());
       try {
         return await rl.question(question, { signal: abort.signal });
       } catch {

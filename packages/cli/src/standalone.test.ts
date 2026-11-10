@@ -143,7 +143,8 @@ describe('tacet standalone (#21)', () => {
         commit(cwd, `${input.split(': ').at(-1)}\n`);
         return undefined;
       }
-      escId = raise(paths.events, 'Which database?');
+      const id = raise(paths.events, 'Which database?');
+      escId ??= id;
       return { do: 'reply', text: 'Escalated; waiting.' };
     };
     const r = await tacet(['run', ...user(), 'pick a database']);
@@ -151,11 +152,47 @@ describe('tacet standalone (#21)', () => {
     expect(r.out).toContain(`escalation ${escId}`);
     expect(r.out).toContain('Which database?');
     expect((await tacet(['run', ...user(), '--resume', '--answer', 'bad'])).code).toBe(2);
+    const first = /task (\S+) submitted/.exec(r.err)?.[1] as string;
 
-    const again = await tacet(['run', ...user(), '--resume', '--answer', `${escId}=Postgres`]);
+    // Nothing is running now: following the stopped task or its session ends instead of waiting.
+    expect((await tacet(['logs', ...user(), '--follow', first])).code).toBe(0);
+    // The run recorded its session as ended (restart): attach shows it and returns.
+    const att = await tacet(['attach', ...user(), `${first}/1`]);
+    expect(att.code).toBe(0);
+    expect(att.out).toMatch(/ended: restart/);
+
+    // A new task does not leave the unfinished one running unseen: it is followed and asked too,
+    // and --json makes the wait machine-readable.
+    const second = await tacet(['run', ...user(), '--json', 'another task']);
+    expect(second.code).toBe(3);
+    expect(second.err).toContain(`also resuming ${first}`);
+    const waiting = JSON.parse(second.out) as {
+      tasks: { id: string; state: string }[];
+      escalations: { id: string; taskId: string; question: string }[];
+    };
+    expect(waiting.tasks.map((x) => x.id)).toContain(first);
+    expect(waiting.escalations).toContainEqual({
+      id: escId,
+      taskId: `${first}/1`,
+      question: 'Which database?',
+    });
+    const other = waiting.escalations.find((x) => x.id !== escId)?.id as string;
+    expect(other).toBeTruthy();
+
+    const again = await tacet([
+      'run',
+      ...user(),
+      '--resume',
+      '--answer',
+      `${escId}=Postgres`,
+      '--answer',
+      `${other}=SQLite`,
+    ]);
     expect(again.code).toBe(0);
-    const branch = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/tacet/']);
-    expect(git(repo, ['show', `${branch.split('\n')[0]}:work.txt`])).toBe('Postgres');
+    const branch = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/tacet/'])
+      .split('\n')
+      .find((b) => b.includes(first)) as string;
+    expect(git(repo, ['show', `${branch}:work.txt`])).toBe('Postgres');
     expect((await tacet(['run', ...user(), '--resume'])).err).toContain('nothing to resume');
   });
 
@@ -184,6 +221,33 @@ describe('tacet standalone (#21)', () => {
     // The Worker's question reaches the terminal without its escape sequence.
     expect(questions[0]).not.toContain('\x1b');
     expect(questions[0]).toContain('Which ?]52;c;cGF3bmVk?database?');
+  });
+
+  it('leaves a question for later on Enter, and stops with 130 on an interrupt at the prompt', async () => {
+    const paths = repoStatePaths(repo, state);
+    script = () => {
+      raise(paths.events, 'Which database?');
+      return { do: 'reply', text: 'waiting' };
+    };
+    const later = await tacet(['run', ...user(), 'pick a database'], { prompt: async () => '' });
+    expect(later.code).toBe(3);
+    const abort = new AbortController();
+    const r = await tacet(['run', ...user(), '--resume'], {
+      signal: abort.signal,
+      prompt: async () => {
+        abort.abort();
+        return undefined;
+      },
+    });
+    expect(r.code).toBe(130);
+  });
+
+  it('refuses a directory outside git before starting anything', async () => {
+    const plain = join(root, 'plain');
+    mkdirSync(plain);
+    const r = await tacet(['run', ...user(), 'x'], { cwd: plain });
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('not in a git repository');
   });
 
   it('refuses to run beside another live Mini-conductor for the repo', async () => {
@@ -260,6 +324,11 @@ function raise(eventsPath: string, question: string): string {
     const started = store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope;
     if (!started) throw new Error('no Worker started');
     const { sessionId } = started.data as { sessionId: string };
+    // Once per sub-task: a restarted session does not ask again.
+    const earlier = store
+      .query({ taskId: started.taskId as string, typePrefix: 'escalation.raised' })
+      .at(-1)?.envelope.data as { id: string } | undefined;
+    if (earlier) return earlier.id;
     const id = newUlid();
     store.append({
       v: 1,

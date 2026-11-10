@@ -1,7 +1,9 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { SummaryPacket } from '@tacet/core';
 import type { Standalone } from '@tacet/mini/standalone';
 import type { Io } from '../io.js';
-import { formatEvent, formatTask, isSummaryEvent, terminalSafe } from '../render.js';
+import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
 import {
   DONE_STATES,
   isSubtaskOf,
@@ -51,6 +53,10 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
   }
 
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
+  if (!existsSync(join(repoRoot, '.git'))) {
+    io.err(`${terminalSafe(repoRoot)} is not in a git repository: Tacet works on a git repo`);
+    return EXIT.failed;
+  }
   const { startStandalone } = await import('@tacet/mini/standalone');
   const dropped = new Set<string>();
   let sa: Standalone;
@@ -86,19 +92,22 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
         return EXIT.usage;
       }
     }
-    let roots: string[];
+    // The Mini-conductor resumes every unfinished task when it starts, so this run follows,
+    // asks for and waits on all of them, not only a new one.
+    const unfinished = rootTasks(readState(sa.store))
+      .filter((t) => !DONE_STATES.has(t.state))
+      .map((t) => t.task.id);
+    const roots: string[] = [];
     if (goal !== undefined) {
-      roots = [sa.mini.submit({ goal, acceptanceCriteria: o.accept ?? [] })];
+      roots.push(sa.mini.submit({ goal, acceptanceCriteria: o.accept ?? [] }));
       io.err(`task ${roots[0]} submitted`);
-    } else {
-      roots = rootTasks(readState(sa.store))
-        .filter((t) => !DONE_STATES.has(t.state))
-        .map((t) => t.task.id);
-      if (roots.length === 0) {
-        io.err('nothing to resume');
-        return EXIT.done;
-      }
-      io.err(`resuming ${roots.join(', ')}`);
+    } else if (unfinished.length === 0) {
+      io.err('nothing to resume');
+      return EXIT.done;
+    }
+    if (unfinished.length > 0) {
+      roots.push(...unfinished);
+      io.err(`${goal !== undefined ? 'also resuming' : 'resuming'} ${unfinished.join(', ')}`);
     }
 
     // Progress: what happens from now on, summary-grade, to stderr.
@@ -136,27 +145,34 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
 
       const pending = open.flatMap((r) => pendingEscalations(state, r));
       if (pending.length > 0) {
-        let asked = false;
+        let answered = 0;
+        if (io.prompt) io.err('answer each question, or press Enter to leave it for later');
         for (const x of io.prompt ? pending : []) {
           const answer = await io.prompt?.(terminalSafe(`${x.taskId} asks: ${x.question}\n> `));
           // End of input: nobody is there to ask.
           if (answer === undefined || io.signal?.aborted) break;
-          asked = true;
           if (answer.trim() === '') continue;
           try {
             sa.mini.answer(x.id, answer);
+            answered += 1;
           } catch (err) {
             io.err(terminalSafe((err as Error).message));
           }
         }
-        if (!asked) {
-          for (const x of pending) {
+        if (io.signal?.aborted) continue;
+        if (answered > 0) continue;
+        const left = readState(sa.store);
+        const still = open.flatMap((r) => pendingEscalations(left, r));
+        if (o.json) {
+          const tasks = open.map((r) => ({ id: r, state: left.tasks[r]?.state }));
+          io.out(safeJson({ tasks, escalations: still }));
+        } else {
+          for (const x of still) {
             io.out(terminalSafe(`escalation ${x.id} (${x.taskId}): ${x.question}`));
           }
-          io.err('waiting for answers: tacet run --resume --answer <escalation id>=<answer>');
-          return EXIT.waiting;
         }
-        continue;
+        io.err('waiting for answers: tacet run --resume --answer <escalation id>=<answer>');
+        return EXIT.waiting;
       }
       const stuck = open.flatMap((r) =>
         [state.tasks[r], ...subtasksOf(state, r)].filter((t) => t?.state === 'auth_required'),
@@ -189,7 +205,7 @@ function report(io: Io, sa: Standalone, roots: string[], json?: boolean): number
       .map((e) => e.envelope.data as SummaryPacket)
       .at(-1),
   }));
-  if (json) io.out(JSON.stringify(results.length === 1 ? results[0] : results, null, 2));
+  if (json) io.out(safeJson(results.length === 1 ? results[0] : results));
   else {
     for (const r of results) {
       const t = state.tasks[r.id];

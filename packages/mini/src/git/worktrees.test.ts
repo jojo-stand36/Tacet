@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { CheckoutPlanner } from '../standalone.js';
 import { GitWorktrees } from './worktrees.js';
 
 describe('GitWorktrees (#21)', () => {
@@ -67,6 +68,46 @@ describe('GitWorktrees (#21)', () => {
     await again.remove(a.id);
     expect(await again.get(a.id)).toBeUndefined();
     expect(git(repo, ['worktree', 'list'])).not.toContain('ws-s1');
+  });
+
+  it('refuses a base that is not a commit, and a Worker id it cannot name', async () => {
+    const w = make();
+    await expect(w.create('s1', '--upload-pack=touch /tmp/x')).rejects.toThrow(/rev-parse/);
+    await expect(w.create('s2', 'nope')).rejects.toThrow(/rev-parse/);
+    await expect(w.create('..')).rejects.toThrow(/cannot make a checkout/);
+  });
+
+  it('prunes a checkout deleted by hand', async () => {
+    const w = make();
+    const a = await w.create('s1');
+    rmSync(a.path, { recursive: true, force: true });
+    await w.remove(a.id);
+    expect(git(repo, ['worktree', 'list'])).not.toContain('ws-s1');
+  });
+
+  it('plans in a throwaway checkout, never in the repo (#21 review)', async () => {
+    let seen: string | undefined;
+    const planner = new CheckoutPlanner(make(), (cwd) => ({
+      plan: async () => {
+        seen = cwd;
+        // A planner whose adapter writes without asking (Codex's sandbox).
+        writeFileSync(join(cwd, 'README'), 'changed by the planner\n');
+        return { subtasks: [] };
+      },
+    }));
+    const task = {
+      id: 't1',
+      goal: 'g',
+      acceptanceCriteria: [],
+      priority: 'p2' as const,
+      createdAt: '',
+    };
+    await planner.plan(task);
+    expect(seen).toBeDefined();
+    expect(seen?.startsWith(join(root, 'state', 'worktrees'))).toBe(true);
+    expect(existsSync(seen as string)).toBe(false);
+    expect(git(repo, ['status', '--porcelain'])).toBe('');
+    expect(git(repo, ['worktree', 'list'])).not.toContain('plan-t1');
   });
 
   it('creates many at once without colliding on the repo lock', async () => {

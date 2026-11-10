@@ -1,4 +1,5 @@
-import type { TacetConfig } from '@tacet/core';
+import { randomUUID } from 'node:crypto';
+import type { TacetConfig, Task } from '@tacet/core';
 import {
   type EventStore,
   loadConfig,
@@ -10,7 +11,7 @@ import {
 } from '@tacet/core/node';
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
-import type { Planner, Reviewer, WorkerAdapter } from './daemon/ports.js';
+import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
 import { GitIntegrator } from './git/integrate.js';
 import { GitWorktrees } from './git/worktrees.js';
 import { EventLogBackend } from './mcp/backend.js';
@@ -80,17 +81,28 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       acp: { ...o.workers?.acp, stateDir },
     });
   const tiers = config.tiers ?? {};
+  const workspaces = new GitWorktrees({
+    repoRoot: o.repoRoot,
+    root: paths.worktrees,
+    env: baseEnv,
+  });
   let planner: Planner = new SingleStepPlanner();
-  if (!o.singleStep && tiers.mini) {
-    const worker = adapters[tiers.mini.adapter];
-    if (!worker) throw new Error(`tiers.mini.adapter ${tiers.mini.adapter} was not built`);
-    planner = new AdapterPlanner({
-      worker,
-      adapterId: tiers.mini.adapter,
-      ...(tiers.mini.model !== undefined ? { model: tiers.mini.model } : {}),
-      ...(tiers.mini.effort !== undefined ? { effort: tiers.mini.effort } : {}),
-      cwd: o.repoRoot,
-    });
+  const mini = tiers.mini;
+  if (!o.singleStep && mini) {
+    const worker = adapters[mini.adapter];
+    if (!worker) throw new Error(`tiers.mini.adapter ${mini.adapter} was not built`);
+    // Never in the user's checkout: some adapters write without asking (Codex's sandbox).
+    planner = new CheckoutPlanner(
+      workspaces,
+      (cwd) =>
+        new AdapterPlanner({
+          worker,
+          adapterId: mini.adapter,
+          ...(mini.model !== undefined ? { model: mini.model } : {}),
+          ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
+          cwd,
+        }),
+    );
   }
   let reviewer: Reviewer | undefined;
   if (config.review?.enabled && tiers.review) {
@@ -117,7 +129,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       store,
       config,
       adapters,
-      workspaces: new GitWorktrees({ repoRoot: o.repoRoot, root: paths.worktrees, env: baseEnv }),
+      workspaces,
       planner,
       verifier: commandVerifierFromConfig(config, { repoRoot: o.repoRoot, baseEnv }),
       ...(reviewer ? { reviewer } : {}),
@@ -151,5 +163,29 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
     await server?.close();
     store.close();
     throw err;
+  }
+}
+
+/**
+ * Plans each task in a throwaway detached checkout of the repo's HEAD, removed afterwards. The
+ * planner is read-only by instruction and its approval requests are refused, but an adapter may
+ * write without asking (Codex's `workspace-write` sandbox), and the user's own checkout must never
+ * be changed by Tacet.
+ */
+export class CheckoutPlanner implements Planner {
+  constructor(
+    private readonly workspaces: Workspaces,
+    private readonly make: (cwd: string) => Planner,
+  ) {}
+
+  async plan(task: Task, opts: { signal?: AbortSignal } = {}): Promise<PlanResult> {
+    const ws = await this.workspaces.create(
+      `plan-${task.id.replace(/\//g, '_')}-${randomUUID().slice(0, 8)}`,
+    );
+    try {
+      return await this.make(ws.path).plan(task, opts);
+    } finally {
+      await this.workspaces.remove(ws.id).catch(() => {});
+    }
   }
 }

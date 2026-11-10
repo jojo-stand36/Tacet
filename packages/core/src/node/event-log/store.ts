@@ -113,8 +113,9 @@ export function defaultEventDbPath(repoPath: string, stateDir = defaultStateDir(
 export interface OpenEventStoreOptions {
   /**
    * Open an existing log for reading only, from a process other than its writer (`tacet status`,
-   * `logs`, `attach`, #21): nothing is created or changed, and `append` and `compact` throw. Reads
-   * while the writer appends are safe (WAL). Throws when there is no log at `path`.
+   * `logs`, `attach`, #21): the log is never written, and `append` and `compact` throw. SQLite may
+   * create its `-wal` and `-shm` files beside the log, in the log's own 0700 directory. Reads
+   * while the writer appends are safe (WAL). Throws, creating nothing, when there is no log.
    */
   readonly?: boolean;
 }

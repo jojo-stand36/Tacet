@@ -1,6 +1,6 @@
 import type { EventStore, StoredEvent } from '@tacet/core/node';
 import type { Io } from '../io.js';
-import { formatEvent, formatTask, isSummaryEvent, terminalSafe } from '../render.js';
+import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
 import {
   DONE_STATES,
   isSubtaskOf,
@@ -19,13 +19,23 @@ export interface Where {
   'user-dir'?: string;
 }
 
-/** Open the repo's log read-only, or say there is none. Returns the store or an exit code. */
-function open(io: Io, where: Where): EventStore | number {
+/**
+ * Open the repo's log read-only, or say there is none. With it, `live()`: whether a Mini-conductor
+ * is running for the repo, so a follower stops once nothing more can be written.
+ */
+async function open(
+  io: Io,
+  where: Where,
+): Promise<{ store: EventStore; live: () => boolean } | undefined> {
   const repoRoot = repoRootFrom(where.repo ?? io.cwd);
-  const store = openLog(statePaths(repoRoot, where['user-dir'], io.home));
-  if (store) return store;
-  io.err(`no Tacet state for ${repoRoot}: run \`tacet run "<task>"\` first`);
-  return -1;
+  const paths = statePaths(repoRoot, where['user-dir'], io.home);
+  const store = openLog(paths);
+  if (!store) {
+    io.err(`no Tacet state for ${terminalSafe(repoRoot)}: run \`tacet run "<task>"\` first`);
+    return undefined;
+  }
+  const { miniLockHolder } = await import('@tacet/mini');
+  return { store, live: () => miniLockHolder(paths.lock) !== undefined };
 }
 
 /** `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live. */
@@ -36,7 +46,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   const pid = miniLockHolder(paths.lock);
   const store = openLog(paths);
   if (!store) {
-    if (o.json) io.out(JSON.stringify({ running: pid ?? null, tasks: [] }, null, 2));
+    if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [] }));
     else io.out(`no Tacet state for ${repoRoot}`);
     return 0;
   }
@@ -59,7 +69,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
         })),
         escalations: pendingEscalations(state, t.task.id),
       }));
-      io.out(JSON.stringify({ running: pid ?? null, tasks }, null, 2));
+      io.out(safeJson({ running: pid ?? null, tasks }));
       return 0;
     }
     io.out(pid ? `Mini-conductor running (pid ${pid})` : 'Mini-conductor not running');
@@ -81,14 +91,16 @@ export async function logs(
   task: string,
   o: Where & { transcript?: boolean; json?: boolean; follow?: boolean },
 ): Promise<number> {
-  const store = open(io, o);
-  if (typeof store === 'number') return 1;
+  const opened = await open(io, o);
+  if (!opened) return 1;
+  const { store, live } = opened;
   try {
     if (!readState(store).tasks[task]) {
       io.err(`unknown task ${terminalSafe(task)}`);
       return 1;
     }
     let after = 0;
+    let stopped = false;
     for (;;) {
       for (const e of store.query({ afterSeq: after })) {
         after = e.seq;
@@ -98,6 +110,9 @@ export async function logs(
       }
       if (!o.follow || io.signal?.aborted) return 0;
       if (DONE_STATES.has(readState(store).tasks[task]?.state ?? '')) return 0;
+      // Nothing is running, so nothing more will come; one more read catches a last write.
+      if (stopped) return 0;
+      stopped = !live();
       await sleep(io.pollMs ?? 250, io.signal);
     }
   } finally {
@@ -115,8 +130,10 @@ export async function attach(
   target: string,
   o: Where & { json?: boolean },
 ): Promise<number> {
-  const store = open(io, o);
-  if (typeof store === 'number') return 1;
+  if (target === '') return 2;
+  const opened = await open(io, o);
+  if (!opened) return 1;
+  const { store, live } = opened;
   try {
     const started = () =>
       store.query({ typePrefix: 'worker.started' }).map((e) => ({
@@ -147,6 +164,7 @@ export async function attach(
     const followed = new Set([session]);
     let after = 0;
     let ended = false;
+    let stopped = false;
     for (;;) {
       for (const e of store.query({ afterSeq: after })) {
         after = e.seq;
@@ -171,6 +189,13 @@ export async function attach(
         if (state !== 'working' && state !== 'submitted') return 0;
       }
       if (io.signal?.aborted) return 0;
+      if (stopped) {
+        io.err(
+          'no Mini-conductor is running for this repo; the session continues at the next tacet run',
+        );
+        return 0;
+      }
+      stopped = !live();
       await sleep(io.pollMs ?? 250, io.signal);
     }
   } finally {
@@ -185,5 +210,5 @@ function sessionOf(e: StoredEvent): string | undefined {
 }
 
 function print(io: Io, e: StoredEvent, json?: boolean) {
-  io.out(json ? JSON.stringify(e.raw) : formatEvent(e.envelope));
+  io.out(json ? safeJson(e.raw, 0) : formatEvent(e.envelope));
 }
