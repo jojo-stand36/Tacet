@@ -6,238 +6,250 @@ import { assertConformance, EventTap, formatResults, runConformance } from '@tac
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PTY_LAST_SESSION, PtyCliAdapter, stripEcho } from './cli-adapter.js';
 import { loadPty, type Pty, type PtySpawnOptions } from './pty.js';
+import { gatedTitle, ptyGate } from './testing/pty-gate.js';
+
+// node-pty must load in CI; locally a machine that could not build it skips these (#189).
+const gate = await ptyGate();
 
 const FAKE = join(import.meta.dirname, 'testing', 'fake-cli.mjs');
 
 /** A generic, line-based CLI in a real PTY (#15), configured like an `agents.<slug>` preset. */
-describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
-  let root: string;
-  let adapter: PtyCliAdapter;
-  const make = (extra: object = {}) =>
-    new PtyCliAdapter({
-      slug: 'fake',
-      preset: {
-        command: [process.execPath, FAKE],
-        env: { FAKE_SETTING: 'on' },
-        readyPrompt: 'fake>',
-      },
-      quietMs: 300,
-      killTimeoutMs: 1000,
-      baseEnv: {
-        PATH: process.env.PATH,
-        HOME: root,
-        OPENAI_API_KEY: 'sk-other-vendor',
-      },
-      ...extra,
+describe.skipIf(!gate.ok)(
+  gatedTitle('PtyCliAdapter (a line-based CLI in a real PTY)', gate),
+  () => {
+    let root: string;
+    let adapter: PtyCliAdapter;
+    const make = (extra: object = {}) =>
+      new PtyCliAdapter({
+        slug: 'fake',
+        preset: {
+          command: [process.execPath, FAKE],
+          env: { FAKE_SETTING: 'on' },
+          readyPrompt: 'fake>',
+        },
+        quietMs: 300,
+        killTimeoutMs: 1000,
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: root,
+          OPENAI_API_KEY: 'sk-other-vendor',
+        },
+        ...extra,
+      });
+    const withEnv = (env: Record<string, string>, secrets?: string[]) =>
+      make({
+        preset: {
+          command: [process.execPath, FAKE],
+          env,
+          readyPrompt: 'fake>',
+          ...(secrets ? { secrets } : {}),
+        },
+      });
+
+    beforeAll(async () => {
+      await loadPty();
+      root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-cli-')));
+      adapter = make();
     });
-  const withEnv = (env: Record<string, string>, secrets?: string[]) =>
-    make({
-      preset: {
-        command: [process.execPath, FAKE],
-        env,
-        readyPrompt: 'fake>',
-        ...(secrets ? { secrets } : {}),
-      },
+    afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+    const reply = (events: { t: string; text?: string }[]) =>
+      events.map((e) => (e.t === 'message.delta' ? e.text : '')).join('');
+
+    async function turn(a: PtyCliAdapter, h: SessionHandle, tap: EventTap, text: string) {
+      const from = tap.events.length;
+      await a.send(h, { text });
+      const end = await tap.waitFor(
+        (e) => e.t === 'status' && e.state !== 'running',
+        30_000,
+        from + 1,
+      );
+      return { end: end.event, events: tap.events.slice(from, end.index + 1) };
+    }
+
+    it('passes the P0 probes', { timeout: 120_000 }, async () => {
+      const results = await runConformance(adapter, {
+        session: { cwd: root },
+        replyPrompt: 'hello',
+        approvalPrompt: 'unused: approvals=none',
+        slowPrompt: 'SLOW',
+        timeoutMs: 30_000,
+      });
+      console.log(formatResults(results));
+      assertConformance(results);
     });
 
-  beforeAll(async () => {
-    await loadPty();
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-cli-')));
-    adapter = make();
-  });
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
-
-  const reply = (events: { t: string; text?: string }[]) =>
-    events.map((e) => (e.t === 'message.delta' ? e.text : '')).join('');
-
-  async function turn(a: PtyCliAdapter, h: SessionHandle, tap: EventTap, text: string) {
-    const from = tap.events.length;
-    await a.send(h, { text });
-    const end = await tap.waitFor(
-      (e) => e.t === 'status' && e.state !== 'running',
-      30_000,
-      from + 1,
-    );
-    return { end: end.event, events: tap.events.slice(from, end.index + 1) };
-  }
-
-  it('passes the P0 probes', { timeout: 120_000 }, async () => {
-    const results = await runConformance(adapter, {
-      session: { cwd: root },
-      replyPrompt: 'hello',
-      approvalPrompt: 'unused: approvals=none',
-      slowPrompt: 'SLOW',
-      timeoutMs: 30_000,
+    it("ends a turn when the prompt comes back, with that turn's output as the reply", {
+      timeout: 60_000,
+    }, async () => {
+      const h = await adapter.start({ cwd: root });
+      const tap = new EventTap(adapter.events(h));
+      const { end, events } = await turn(adapter, h, tap, 'first');
+      expect(end).toMatchObject({ state: 'idle' });
+      expect(events.filter((e) => e.t === 'message.delta')).toEqual([
+        { t: 'message.delta', text: 'echo: first' },
+      ]);
+      // Input sent during a turn is the next turn; several lines go as one.
+      await adapter.send(h, { text: 'SLOW' });
+      await adapter.send(h, { text: 'two\nlines' });
+      await tap.waitFor((e) => e.t === 'message.delta' && e.text.includes('two'), 30_000);
+      expect(tap.events.filter((e) => e.t === 'message.delta').at(-1)).toEqual({
+        t: 'message.delta',
+        text: 'echo: two lines',
+      });
+      await adapter.close(h);
     });
-    console.log(formatResults(results));
-    assertConformance(results);
-  });
 
-  it("ends a turn when the prompt comes back, with that turn's output as the reply", {
-    timeout: 60_000,
-  }, async () => {
-    const h = await adapter.start({ cwd: root });
-    const tap = new EventTap(adapter.events(h));
-    const { end, events } = await turn(adapter, h, tap, 'first');
-    expect(end).toMatchObject({ state: 'idle' });
-    expect(events.filter((e) => e.t === 'message.delta')).toEqual([
-      { t: 'message.delta', text: 'echo: first' },
-    ]);
-    // Input sent during a turn is the next turn; several lines go as one.
-    await adapter.send(h, { text: 'SLOW' });
-    await adapter.send(h, { text: 'two\nlines' });
-    await tap.waitFor((e) => e.t === 'message.delta' && e.text.includes('two'), 30_000);
-    expect(tap.events.filter((e) => e.t === 'message.delta').at(-1)).toEqual({
-      t: 'message.delta',
-      text: 'echo: two lines',
+    it('shows the terminal to a viewer, read-only', { timeout: 60_000 }, async () => {
+      const h = await adapter.start({ cwd: root });
+      const tap = new EventTap(adapter.events(h));
+      const term = adapter.terminal(h);
+      expect(term.scrollback()).toContain('fake>');
+      const seen: string[] = [];
+      const watching = (async () => {
+        for await (const chunk of term.output()) seen.push(chunk);
+      })();
+      await turn(adapter, h, tap, 'watched');
+      await adapter.close(h);
+      await watching;
+      expect(seen.join('')).toContain('echo: watched');
     });
-    await adapter.close(h);
-  });
 
-  it('shows the terminal to a viewer, read-only', { timeout: 60_000 }, async () => {
-    const h = await adapter.start({ cwd: root });
-    const tap = new EventTap(adapter.events(h));
-    const term = adapter.terminal(h);
-    expect(term.scrollback()).toContain('fake>');
-    const seen: string[] = [];
-    const watching = (async () => {
-      for await (const chunk of term.output()) seen.push(chunk);
-    })();
-    await turn(adapter, h, tap, 'watched');
-    await adapter.close(h);
-    await watching;
-    expect(seen.join('')).toContain('echo: watched');
-  });
-
-  it('gives the CLI an allowlist of the environment plus its preset', {
-    timeout: 60_000,
-  }, async () => {
-    const dropped: string[][] = [];
-    const a = make({ onEnvDropped: (n: string[]) => dropped.push(n) });
-    const h = await a.start({ cwd: root, env: { TACET_WORKER_MARKER: 'm-1' } });
-    const tap = new EventTap(a.events(h));
-    const { events } = await turn(a, h, tap, 'ENV');
-    const text = events.find((e) => e.t === 'message.delta');
-    const names = text?.t === 'message.delta' ? text.text.replace('names: ', '').split(',') : [];
-    expect(names).toEqual(expect.arrayContaining(['FAKE_SETTING', 'PATH', 'TACET_WORKER_MARKER']));
-    expect(names).not.toContain('OPENAI_API_KEY');
-    expect(dropped).toEqual([['OPENAI_API_KEY']]);
-    await a.close(h);
-  });
-
-  it('resumes the last session in the checkout through the preset resume arguments (#157)', {
-    timeout: 60_000,
-  }, async () => {
-    expect(adapter.capabilities().resume).toBe(false);
-    const cwd = realpathSync(mkdtempSync(join(root, 'wt-')));
-    const resumable = make({
-      preset: {
-        command: [process.execPath, FAKE],
-        readyPrompt: 'fake>',
-        resumeArgs: ['--continue-last'],
-      },
+    it('gives the CLI an allowlist of the environment plus its preset', {
+      timeout: 60_000,
+    }, async () => {
+      const dropped: string[][] = [];
+      const a = make({ onEnvDropped: (n: string[]) => dropped.push(n) });
+      const h = await a.start({ cwd: root, env: { TACET_WORKER_MARKER: 'm-1' } });
+      const tap = new EventTap(a.events(h));
+      const { events } = await turn(a, h, tap, 'ENV');
+      const text = events.find((e) => e.t === 'message.delta');
+      const names = text?.t === 'message.delta' ? text.text.replace('names: ', '').split(',') : [];
+      expect(names).toEqual(
+        expect.arrayContaining(['FAKE_SETTING', 'PATH', 'TACET_WORKER_MARKER']),
+      );
+      expect(names).not.toContain('OPENAI_API_KEY');
+      expect(dropped).toEqual([['OPENAI_API_KEY']]);
+      await a.close(h);
     });
-    expect(resumable.capabilities().resume).toBe(true);
-    const first = await resumable.start({ cwd });
-    expect(first.vendorSessionId).toBe(PTY_LAST_SESSION);
-    const tap1 = new EventTap(resumable.events(first));
-    await turn(resumable, first, tap1, 'REMEMBER blue');
-    await resumable.close(first);
 
-    // A new session starts empty; a resumed one continues the last one in that checkout.
-    const fresh = await resumable.start({ cwd });
-    const tap2 = new EventTap(resumable.events(fresh));
-    expect(reply((await turn(resumable, fresh, tap2, 'RECALL')).events)).toContain('(nothing)');
-    await resumable.close(fresh);
-    const resumed = await resumable.start({
-      cwd,
-      resume: { vendorSessionId: PTY_LAST_SESSION },
+    it('resumes the last session in the checkout through the preset resume arguments (#157)', {
+      timeout: 60_000,
+    }, async () => {
+      expect(adapter.capabilities().resume).toBe(false);
+      const cwd = realpathSync(mkdtempSync(join(root, 'wt-')));
+      const resumable = make({
+        preset: {
+          command: [process.execPath, FAKE],
+          readyPrompt: 'fake>',
+          resumeArgs: ['--continue-last'],
+        },
+      });
+      expect(resumable.capabilities().resume).toBe(true);
+      const first = await resumable.start({ cwd });
+      expect(first.vendorSessionId).toBe(PTY_LAST_SESSION);
+      const tap1 = new EventTap(resumable.events(first));
+      await turn(resumable, first, tap1, 'REMEMBER blue');
+      await resumable.close(first);
+
+      // A new session starts empty; a resumed one continues the last one in that checkout.
+      const fresh = await resumable.start({ cwd });
+      const tap2 = new EventTap(resumable.events(fresh));
+      expect(reply((await turn(resumable, fresh, tap2, 'RECALL')).events)).toContain('(nothing)');
+      await resumable.close(fresh);
+      const resumed = await resumable.start({
+        cwd,
+        resume: { vendorSessionId: PTY_LAST_SESSION },
+      });
+      const tap3 = new EventTap(resumable.events(resumed));
+      expect(reply((await turn(resumable, resumed, tap3, 'RECALL')).events)).toContain(
+        'recalled: blue',
+      );
+      await expect(
+        resumable.start({ cwd, resume: { vendorSessionId: PTY_LAST_SESSION, fork: true } }),
+      ).rejects.toThrow(/fork/);
+      await resumable.close(resumed);
+
+      // Resumed with nothing saved (the marker is set before the CLI saves anything): this fake
+      // CLI says so and starts empty; what a real CLI does then is its own (capability matrix).
+      const empty = realpathSync(mkdtempSync(join(root, 'wt-')));
+      const none = await resumable.start({
+        cwd: empty,
+        resume: { vendorSessionId: PTY_LAST_SESSION },
+      });
+      const tap4 = new EventTap(resumable.events(none));
+      expect(reply((await turn(resumable, none, tap4, 'RECALL')).events)).toContain('(nothing)');
+      await resumable.close(none);
     });
-    const tap3 = new EventTap(resumable.events(resumed));
-    expect(reply((await turn(resumable, resumed, tap3, 'RECALL')).events)).toContain(
-      'recalled: blue',
-    );
-    await expect(
-      resumable.start({ cwd, resume: { vendorSessionId: PTY_LAST_SESSION, fork: true } }),
-    ).rejects.toThrow(/fork/);
-    await resumable.close(resumed);
 
-    // Resumed with nothing saved (the marker is set before the CLI saves anything): this fake
-    // CLI says so and starts empty; what a real CLI does then is its own (capability matrix).
-    const empty = realpathSync(mkdtempSync(join(root, 'wt-')));
-    const none = await resumable.start({
-      cwd: empty,
-      resume: { vendorSessionId: PTY_LAST_SESSION },
+    it('refuses what a generic CLI cannot do, and reports a crash once', {
+      timeout: 60_000,
+    }, async () => {
+      await expect(
+        adapter.start({
+          cwd: root,
+          mcpServers: [{ name: 'tacet', url: 'http://127.0.0.1:1/mcp' }],
+        }),
+      ).rejects.toThrow(/MCP servers/);
+      await expect(adapter.start({ cwd: root, model: 'x' })).rejects.toThrow(/model/);
+      await expect(adapter.start({ cwd: root, resume: { vendorSessionId: 'x' } })).rejects.toThrow(
+        /resume/,
+      );
+      const h = await adapter.start({ cwd: root });
+      await expect(adapter.send(h, { text: '/quit' })).rejects.toThrow(/must not start/);
+      const events: { t: string; state?: string }[] = [];
+      const done = (async () => {
+        for await (const e of adapter.events(h)) events.push(e as { t: string; state?: string });
+      })();
+      await adapter.send(h, { text: 'EXIT' });
+      await done;
+      expect(events.filter((e) => e.t === 'status').map((e) => e.state)).toEqual([
+        'idle',
+        'running',
+        'error',
+      ]);
+      await adapter.close(h);
     });
-    const tap4 = new EventTap(resumable.events(none));
-    expect(reply((await turn(resumable, none, tap4, 'RECALL')).events)).toContain('(nothing)');
-    await resumable.close(none);
-  });
 
-  it('refuses what a generic CLI cannot do, and reports a crash once', {
-    timeout: 60_000,
-  }, async () => {
-    await expect(
-      adapter.start({ cwd: root, mcpServers: [{ name: 'tacet', url: 'http://127.0.0.1:1/mcp' }] }),
-    ).rejects.toThrow(/MCP servers/);
-    await expect(adapter.start({ cwd: root, model: 'x' })).rejects.toThrow(/model/);
-    await expect(adapter.start({ cwd: root, resume: { vendorSessionId: 'x' } })).rejects.toThrow(
-      /resume/,
-    );
-    const h = await adapter.start({ cwd: root });
-    await expect(adapter.send(h, { text: '/quit' })).rejects.toThrow(/must not start/);
-    const events: { t: string; state?: string }[] = [];
-    const done = (async () => {
-      for await (const e of adapter.events(h)) events.push(e as { t: string; state?: string });
-    })();
-    await adapter.send(h, { text: 'EXIT' });
-    await done;
-    expect(events.filter((e) => e.t === 'status').map((e) => e.state)).toEqual([
-      'idle',
-      'running',
-      'error',
-    ]);
-    await adapter.close(h);
-  });
-
-  it('after an interrupt, holds input until the CLI shows its prompt again', {
-    timeout: 60_000,
-  }, async () => {
-    const a = withEnv({ FAKE_SLOW_CANCEL: '1' });
-    const h = await a.start({ cwd: root });
-    const tap = new EventTap(a.events(h));
-    await a.send(h, { text: 'SLOW' });
-    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000);
-    await new Promise((r) => setTimeout(r, 700));
-    await a.interrupt(h);
-    expect(a.status(h)).toBe('cancelled');
-    // Sent while the CLI is still busy cancelling: typed only once its prompt is back.
-    await a.send(h, { text: 'after' });
-    await tap.waitFor((e) => e.t === 'message.delta' && e.text.includes('after'), 30_000);
-    const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
-    expect(deltas).toEqual(['echo: after']);
-    await a.close(h);
-  });
-
-  it("scrubs the preset's secret values from events", { timeout: 60_000 }, async () => {
-    for (const [env, secrets] of [
-      // Listed, and a shorter listed secret that starts it: the whole value goes.
-      [{ FAKE_SECRET: 'plain-value-1234' }, ['plain', 'plain-value-1234']],
-      // Not listed: the variable's name says it is one.
-      [{ FAKE_SECRET: 'plain-value-1234' }, undefined],
-    ] as const) {
-      const a = withEnv({ ...env }, secrets ? [...secrets] : undefined);
+    it('after an interrupt, holds input until the CLI shows its prompt again', {
+      timeout: 60_000,
+    }, async () => {
+      const a = withEnv({ FAKE_SLOW_CANCEL: '1' });
       const h = await a.start({ cwd: root });
       const tap = new EventTap(a.events(h));
-      const { events } = await turn(a, h, tap, 'PRINT_SECRET');
-      expect(events.find((e) => e.t === 'message.delta')).toEqual({
-        t: 'message.delta',
-        text: 'value: [redacted]',
-      });
+      await a.send(h, { text: 'SLOW' });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000);
+      await new Promise((r) => setTimeout(r, 700));
+      await a.interrupt(h);
+      expect(a.status(h)).toBe('cancelled');
+      // Sent while the CLI is still busy cancelling: typed only once its prompt is back.
+      await a.send(h, { text: 'after' });
+      await tap.waitFor((e) => e.t === 'message.delta' && e.text.includes('after'), 30_000);
+      const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+      expect(deltas).toEqual(['echo: after']);
       await a.close(h);
-    }
-  });
-});
+    });
+
+    it("scrubs the preset's secret values from events", { timeout: 60_000 }, async () => {
+      for (const [env, secrets] of [
+        // Listed, and a shorter listed secret that starts it: the whole value goes.
+        [{ FAKE_SECRET: 'plain-value-1234' }, ['plain', 'plain-value-1234']],
+        // Not listed: the variable's name says it is one.
+        [{ FAKE_SECRET: 'plain-value-1234' }, undefined],
+      ] as const) {
+        const a = withEnv({ ...env }, secrets ? [...secrets] : undefined);
+        const h = await a.start({ cwd: root });
+        const tap = new EventTap(a.events(h));
+        const { events } = await turn(a, h, tap, 'PRINT_SECRET');
+        expect(events.find((e) => e.t === 'message.delta')).toEqual({
+          t: 'message.delta',
+          text: 'value: [redacted]',
+        });
+        await a.close(h);
+      }
+    });
+  },
+);
 
 /** A scripted terminal: what the CLI prints is up to the test. */
 class ScriptedPty implements Pty {
