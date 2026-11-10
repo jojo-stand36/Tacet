@@ -84,35 +84,48 @@ interface ProcessIdentity {
 }
 
 /**
- * A process's start time and whether it is a zombie, or undefined when there is no such process.
- * Linux: `/proc/<pid>/stat` (state, and start time in clock ticks since boot). macOS: `ps -o
- * stat=,lstart=` in a fixed locale and time zone.
+ * Start time and zombie state of each of `pids` that exists. Linux: `/proc/<pid>/stat` (state,
+ * and start time in clock ticks since boot). macOS: one `ps -o pid=,stat=,lstart=` for all of
+ * them, in a fixed locale and time zone, so a round costs one process spawn however many pids.
  */
-function identity(pid: number): ProcessIdentity | undefined {
-  if (!Number.isInteger(pid) || pid <= 1) return undefined;
-  try {
-    if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-      const start = fields[19];
-      return start ? { start, zombie: fields[0] === 'Z' } : undefined;
+function identities(pids: readonly number[]): Map<number, ProcessIdentity> {
+  const out = new Map<number, ProcessIdentity>();
+  const valid = pids.filter((pid) => Number.isInteger(pid) && pid > 1);
+  if (valid.length === 0) return out;
+  if (process.platform === 'linux') {
+    for (const pid of valid) {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        const start = fields[19];
+        if (start) out.set(pid, { start, zombie: fields[0] === 'Z' });
+      } catch {
+        // Gone.
+      }
     }
-    const out = execFileSync('/bin/ps', ['-o', 'stat=,lstart=', '-p', String(pid)], {
+    return out;
+  }
+  let text = '';
+  try {
+    text = execFileSync('/bin/ps', ['-o', 'pid=,stat=,lstart=', '-p', valid.join(',')], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', TZ: 'UTC0' },
-    }).trim();
-    const m = out.match(/^(\S+)\s+(.+)$/);
-    return m ? { start: m[2] ?? '', zombie: (m[1] ?? '').startsWith('Z') } : undefined;
-  } catch {
-    // No such process (ps exits 1), or gone between the lookup and the read.
-    return undefined;
+    });
+  } catch (err) {
+    // ps exits 1 when none of them exists, and still prints the ones that do.
+    text = String((err as { stdout?: unknown }).stdout ?? '');
   }
+  for (const line of text.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/);
+    if (m) out.set(Number(m[1]), { start: m[3] ?? '', zombie: (m[2] ?? '').startsWith('Z') });
+  }
+  return out;
 }
 
 /** Whether `pid` is running: it exists and is not a zombie waiting to be reaped. */
 export function isProcessRunning(pid: number): boolean {
-  const id = identity(pid);
+  const id = identities([pid]).get(pid);
   return id !== undefined && !id.zombie;
 }
 
@@ -137,16 +150,22 @@ function signal(pid: number, sig: NodeJS.Signals): void {
  */
 export async function endMarkedProcesses(
   markers: readonly string[],
-  opts: { graceMs?: number } = {},
+  opts: {
+    graceMs?: number;
+    /** @internal Tests only: replaces the marker scan. */
+    find?: (markers: readonly string[]) => Map<string, number[]>;
+  } = {},
 ): Promise<{ found: number[]; left: number[] }> {
+  const find = opts.find ?? markedProcesses;
   const tracked = new Map<number, string>();
   const found: number[] = [];
   /** Newly marked processes, which are now tracked. */
   const scan = (): number[] => {
+    const pids = [...find(markers).values()].flat().filter((pid) => !tracked.has(pid));
+    const ids = identities(pids);
     const fresh: number[] = [];
-    for (const pid of [...markedProcesses(markers).values()].flat()) {
-      if (tracked.has(pid)) continue;
-      const id = identity(pid);
+    for (const pid of pids) {
+      const id = ids.get(pid);
       if (!id || id.zombie) continue;
       tracked.set(pid, id.start);
       found.push(pid);
@@ -155,13 +174,15 @@ export async function endMarkedProcesses(
     return fresh;
   };
   /** Tracked processes still running as the same process; the others stop being tracked. */
-  const running = (): number[] =>
-    [...tracked].flatMap(([pid, start]) => {
-      const id = identity(pid);
+  const running = (): number[] => {
+    const ids = identities([...tracked.keys()]);
+    return [...tracked].flatMap(([pid, start]) => {
+      const id = ids.get(pid);
       if (id && !id.zombie && id.start === start) return [pid];
       tracked.delete(pid);
       return [];
     });
+  };
   scan();
   if (tracked.size === 0) return { found: [], left: [] };
   for (const pid of running()) signal(pid, 'SIGTERM');

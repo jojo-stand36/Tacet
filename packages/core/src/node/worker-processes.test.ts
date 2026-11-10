@@ -63,18 +63,32 @@ describe.skipIf(process.platform === 'win32')('Worker processes by marker (#127)
   });
 
   it('counts a zombie as not running, though kill(pid, 0) still reaches it', async () => {
-    // `sleep 0` exits at once; the shell then becomes `sleep 5`, which never reaps it.
-    const parent = spawn('sh', ['-c', 'sleep 0 & echo $!; exec sleep 5'], {
+    // The shell becomes `sleep 5` before its child `sleep 1` exits, and `sleep` never reaps it.
+    const parent = spawn('sh', ['-c', 'sleep 1 & echo $!; exec sleep 5'], {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     started.push(parent);
     const zombie = await new Promise<number>((resolve) =>
       parent.stdout?.once('data', (b: Buffer) => resolve(Number.parseInt(b.toString(), 10))),
     );
-    await expect.poll(() => isProcessRunning(zombie)).toBe(false);
+    expect(isProcessRunning(zombie)).toBe(true);
+    await expect.poll(() => isProcessRunning(zombie), { timeout: 4000 }).toBe(false);
     expect(() => process.kill(zombie, 0)).not.toThrow();
     expect(isProcessRunning(parent.pid as number)).toBe(true);
     expect(isProcessRunning(2 ** 22 + 12345)).toBe(false);
+  });
+
+  it('follows a found process by pid, even once its marker can no longer be read', async () => {
+    const m = newWorkerMarker();
+    const w = worker(m, { ignoreTerm: true });
+    await w.grandchild;
+    const pid = w.leader.pid as number;
+    // The scan finds it once, then never again, as if its environment could no longer be read.
+    let scans = 0;
+    const find = () => new Map(scans++ === 0 ? [[m, [pid]]] : []);
+    const ended = await endMarkedProcesses([m], { graceMs: 300, find });
+    expect(ended).toEqual({ found: [pid], left: [] });
+    await expect.poll(() => alive(pid)).toBe(false);
   });
 
   it('finds the processes that carry a marker, and no others', async () => {
