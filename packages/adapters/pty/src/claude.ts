@@ -9,8 +9,9 @@ import { z } from 'zod';
  */
 export const CLAUDE_PTY_VERIFIED_VERSION = '2.1.319';
 
-/** Events delivered over HTTP. `SessionStart` supports only `command` hooks: see `forward`. */
-const HTTP_EVENTS = [
+/** Events Tacet's hooks report, each relayed by a `command` hook (`hook-forward`, #164). */
+const EVENTS = [
+  'SessionStart',
   'UserPromptSubmit',
   'PreToolUse',
   'PostToolUse',
@@ -32,34 +33,29 @@ const WITH_MATCHER = new Set([
 export const PERMISSION_TIMEOUT_S = 600;
 
 /**
- * The `--settings` file for one session: an `http` hook per event with the session's token as a
- * literal header (the file is 0600, outside the worktree), and a `command` hook that forwards
- * `SessionStart`. `--setting-sources ""` keeps the user's and the repo's own settings files, and
+ * The `--settings` file for one session: a `command` hook per event that relays it to Tacet's
+ * hook endpoint (`forward <event> <timeout>`, which reads the URL and token from the session's
+ * 0600 file, so neither the token nor anything else secret is in the settings or on a command
+ * line). Command hooks, not `http` ones: under Claude Code's Linux sandbox (#150) an `http` hook
+ * goes through the sandbox's proxy and fails, while a command hook runs outside it (#164, verified
+ * live on 2.1.319). `--setting-sources ""` keeps the user's and the repo's own settings files, and
  * so their hooks, out of a Worker (see `claudeArgs`).
  */
 export function claudeHookSettings(opts: {
-  url: string;
-  token: string;
-  /** Shell command that forwards a `command` hook's stdin to the endpoint. */
+  /** Shell command that relays a hook's stdin to the endpoint; the event and timeout are appended. */
   forward: string;
 }): object {
   const hooks: Record<string, unknown[]> = {};
-  for (const ev of HTTP_EVENTS) {
+  for (const ev of EVENTS) {
+    const timeout =
+      ev === 'PermissionRequest' ? PERMISSION_TIMEOUT_S : ev === 'SessionStart' ? 10 : 30;
     hooks[ev] = [
       {
         ...(WITH_MATCHER.has(ev) ? { matcher: '' } : {}),
-        hooks: [
-          {
-            type: 'http',
-            url: `${opts.url}/${ev}`,
-            headers: { Authorization: `Bearer ${opts.token}` },
-            timeout: ev === 'PermissionRequest' ? PERMISSION_TIMEOUT_S : 30,
-          },
-        ],
+        hooks: [{ type: 'command', command: `${opts.forward} ${ev} ${timeout}`, timeout }],
       },
     ];
   }
-  hooks.SessionStart = [{ hooks: [{ type: 'command', command: opts.forward, timeout: 10 }] }];
   return { hooks };
 }
 

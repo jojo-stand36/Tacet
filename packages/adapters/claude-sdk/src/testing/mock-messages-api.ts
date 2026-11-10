@@ -71,15 +71,29 @@ interface Body {
   tools?: { name?: string }[];
 }
 
+/** `text` without the `<system-reminder>` blocks Claude Code prepends. */
+function stripReminders(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, '');
+}
+
 function lastUser(body: Body): { text: string; toolResult: boolean } {
   const m = [...(body.messages ?? [])].reverse().find((x) => x.role === 'user');
   if (!m) return { text: '', toolResult: false };
-  if (typeof m.content === 'string') return { text: m.content, toolResult: false };
+  if (typeof m.content === 'string')
+    return { text: stripReminders(m.content).trim(), toolResult: false };
   return {
+    // Claude Code adds blocks of its own, e.g. a `<system-reminder>` with `git status` when the
+    // cwd is inside any git repository, even a stray one in a parent such as `/tmp/.git`: they
+    // are not the prompt, so assertions and the script see the user's text alone.
     text: m.content
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text ?? '')
-      .join('\n'),
+      .filter(
+        (b) =>
+          b.type === 'text' &&
+          !/^\s*<system-reminder>[\s\S]*<\/system-reminder>\s*$/.test(b.text ?? ''),
+      )
+      .map((b) => stripReminders(b.text ?? ''))
+      .join('\n')
+      .trim(),
     toolResult: m.content.some((b) => b.type === 'tool_result'),
   };
 }
