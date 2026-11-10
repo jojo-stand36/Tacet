@@ -66,6 +66,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Adapters: launch Workers with an environment allowlist** — `feature` `P2` `either`
 - [ ] **Mini-conductor: build Worker adapters from the effective config at startup** — `feature` `P1` `either`
 - [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
+- [ ] **PTY adapter: clean up per-session Claude config directories** — `feature` `P2` `either`
 
 ## M2 · Conductor & escalation
 
