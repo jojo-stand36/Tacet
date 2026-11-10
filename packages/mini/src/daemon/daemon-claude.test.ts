@@ -215,11 +215,22 @@ describe('Mini-conductor with a real Claude Worker', () => {
     // A crash: nothing is closed. Claude Code and the job its Bash tool left behind live on, the
     // job outside Claude Code's process group.
     first.crashForTest();
-    const before = [...markedProcesses(previous).values()].flat();
     // The job is found among them by what it runs: the pid it wrote (`$$`) is its pid inside the
-    // sandbox's PID namespace on Linux (#150), not the one the system knows it by.
-    const job = before.find((pid) => / sleep 600$/.test(psLine(pid)));
-    expect(job, before.map(psLine).join('\n')).toBeDefined();
+    // sandbox's PID namespace on Linux (#150), not the one the system knows it by. The Bash tool
+    // returns as soon as a background job is launched, and the escalation follows at once, so on
+    // a loaded machine the sandbox may not have started the job yet (#266): wait for it.
+    let before: number[] = [];
+    let job: number | undefined;
+    await expect
+      .poll(
+        () => {
+          before = [...markedProcesses(previous).values()].flat();
+          job = before.find((pid) => / sleep 600$/.test(psLine(pid)));
+          return job;
+        },
+        { timeout: 30_000, interval: 200, message: 'the background job never started' },
+      )
+      .toBeDefined();
     expect(before.length).toBeGreaterThan(1);
     expect(alive(job as number)).toBe(true);
 
