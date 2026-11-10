@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Autonomy, Id, openEnum, Timestamp, TokenCount, Usd } from './common.js';
+import { Effort } from './profile.js';
 
 /** Task priority, highest first. */
 /** Unknown values fall back to `p2`. */
@@ -17,7 +18,7 @@ export type Budget = z.infer<typeof Budget>;
 export const TierOverride = z.object({
   adapter: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
-  effort: z.string().min(1).optional(),
+  effort: Effort.optional(),
 });
 export type TierOverride = z.infer<typeof TierOverride>;
 
@@ -45,6 +46,12 @@ export const TaskExt = z.object({
   autonomy: Autonomy.optional(),
   tiers: z.record(z.string(), TierOverride).optional().describe('Tier overrides keyed by role'),
   deadline: Timestamp.optional(),
+  indivisible: z
+    .boolean()
+    .optional()
+    .describe(
+      'The work cannot be handed off cleanly part-way (e.g. one long read), so a larger context window may be used where config allows it (#110)',
+    ),
 });
 export type TaskExt = z.infer<typeof TaskExt>;
 

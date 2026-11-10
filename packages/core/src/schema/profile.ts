@@ -27,6 +27,28 @@ export const Effort = z.string().min(1).max(64);
 export type Effort = (typeof KNOWN_EFFORTS)[number] | (string & {});
 
 /**
+ * The known levels from least to most effort, for config bounds such as `max_effort` (#110).
+ * Codex's `persistent` is left out: where it sits in that order is not documented.
+ */
+export const EFFORT_LEVELS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Position of `effort` in `EFFORT_LEVELS`, or `undefined` for a level outside it. */
+export function effortRank(effort: string): number | undefined {
+  const i = (EFFORT_LEVELS as readonly string[]).indexOf(effort);
+  return i < 0 ? undefined : i;
+}
+
+/**
  * What a Worker session runs on (#110): the model, its reasoning effort and its context window.
  * Chosen per session by the Mini-conductor's policy within the bounds config sets, and recorded
  * with its reason in the `worker.profile` event.

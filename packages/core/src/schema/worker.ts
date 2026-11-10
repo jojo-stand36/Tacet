@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { Id, openEnum } from './common.js';
+import { Id, openEnum, TokenCount } from './common.js';
+import { Effort } from './profile.js';
 
 /**
  * Worker lifecycle events (`worker.*`, ARCHITECTURE.md §3). They are summary-grade: retention
@@ -32,6 +33,27 @@ export const WorkerStarted = z.object({
     ),
 });
 export type WorkerStarted = z.infer<typeof WorkerStarted>;
+
+/**
+ * Payload of `worker.profile`: the session profile the Mini-conductor's policy chose for a Worker
+ * session, and why (#110). Written before the session starts, after `worker.started`. A profile
+ * the adapter refused is recorded with `refused`; a retry gets its own event.
+ */
+export const WorkerProfile = z.object({
+  sessionId: Id,
+  model: z.string().min(1).optional(),
+  effort: Effort.optional(),
+  contextWindow: TokenCount.positive().optional(),
+  reasons: z.array(z.string().min(1)).min(1).describe('Why each part was chosen, in order'),
+  refused: z
+    .object({
+      field: z.string().min(1).describe('model, effort or contextWindow'),
+      message: z.string(),
+    })
+    .optional()
+    .describe('The adapter refused this profile (ProfileRefusedError)'),
+});
+export type WorkerProfile = z.infer<typeof WorkerProfile>;
 
 /** Payload of `worker.vendor_session`: the vendor's own session or thread id, once known. */
 export const WorkerVendorSession = z.object({
