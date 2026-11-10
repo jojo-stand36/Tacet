@@ -93,7 +93,11 @@ export interface AcpAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
-  /** Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL. Default 5000. */
+  /**
+   * Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL, and again for the
+   * rest of its process group (#181). Default 5000. Worst-case `close()` is about
+   * 0.5 s + 2 × this + 1 s.
+   */
   killTimeoutMs?: number;
   /** The repo the Workers belong to; keys the agent's own home (`agent.home`). Default: the cwd. */
   repoRoot?: string;
@@ -827,6 +831,13 @@ async function groupGone(proc: ChildProcess, ms: number): Promise<boolean> {
  * it), though `kill(-pgid, 0)` would still find it. Elsewhere, by signal 0.
  */
 function groupAlive(pgid: number): boolean {
+  // One syscall first: the common case is a group that is already gone.
+  try {
+    process.kill(-pgid, 0);
+  } catch {
+    // ESRCH: empty. (EPERM: no member we can signal; treated as gone, which cannot hang.)
+    return false;
+  }
   if (process.platform === 'linux') {
     try {
       return readdirSync('/proc').some((d) => {
@@ -844,13 +855,7 @@ function groupAlive(pgid: number): boolean {
       // No /proc: fall through.
     }
   }
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch {
-    // ESRCH: the group is empty. (EPERM would be a member we may not signal: not ours.)
-    return false;
-  }
+  return true;
 }
 
 /** Signal the process group `proc` leads (POSIX), or just `proc`. Already-gone is fine. */

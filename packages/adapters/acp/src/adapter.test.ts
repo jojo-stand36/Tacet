@@ -95,12 +95,26 @@ describe('AcpAdapter (fake ACP agent)', () => {
         killTimeoutMs: 300,
       },
     );
-    const h = await adapter.start({ cwd: join(root, 'wt') });
-    const pid = received()
-      .map((l) => (l as { childPid?: number }).childPid)
-      .find((p) => p !== undefined);
-    expect(pid).toBeTypeOf('number');
-    await adapter.close(h);
+    const childPid = () =>
+      received()
+        .map((l) => (l as { childPid?: number }).childPid)
+        .find((p) => p !== undefined);
+    let pid: number | undefined;
+    try {
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      pid = childPid();
+      expect(pid).toBeTypeOf('number');
+      await adapter.close(h);
+    } catch (err) {
+      // Never leave the SIGTERM-ignoring child running on the test machine.
+      const p = childPid();
+      if (p !== undefined) {
+        try {
+          process.kill(p, 'SIGKILL');
+        } catch {}
+      }
+      throw err;
+    }
     // Running, not a zombie its parent (here: an init that may not reap) has yet to collect.
     const alive = (() => {
       try {
