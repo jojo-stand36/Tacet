@@ -695,6 +695,23 @@ describe('MiniConductor', () => {
     await make().start();
   });
 
+  it('refuses an adapter that may not run Workers, here or in the planner (#183)', () => {
+    const refusing = Object.assign(new ScriptedAdapter('fake', script), {
+      workerRefused: 'not for Workers (#183)',
+    });
+    expect(() => make({ adapters: { fake: { adapter: refusing, authRoute: 'api_key' } } })).toThrow(
+      /adapter fake: refused for Workers: not for Workers \(#183\)/,
+    );
+    expect(
+      () =>
+        new AdapterPlanner({
+          worker: { adapter: refusing, authRoute: 'api_key' },
+          adapterId: 'acp:codex-acp',
+          cwd: dir,
+        }),
+    ).toThrow(/refused for the planner: not for Workers/);
+  });
+
   it('refuses a Worker adapter that is not on the api_key route', () => {
     expect(() =>
       make({

@@ -41,6 +41,7 @@ import {
   type Workspace,
   type Workspaces,
   WorktreeRefusedError,
+  workerRefusal,
 } from './ports.js';
 import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
 import { RESUME_PROMPT, safePrompt, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
@@ -184,6 +185,8 @@ export class MiniConductor {
           `adapter ${id}: Workers run unattended and must use the api_key route (#65)`,
         );
       }
+      const refused = workerRefusal(w);
+      if (refused) throw new Error(`adapter ${id}: refused for Workers: ${refused}`);
     }
     const worker = opts.config.tiers?.worker;
     if (!worker) throw new Error('config has no tiers.worker');
