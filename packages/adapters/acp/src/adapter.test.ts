@@ -554,6 +554,98 @@ describe('AcpAdapter (fake ACP agent)', () => {
         gemini().start({ cwd: join(root, 'wt'), resume: { vendorSessionId: 'x' } }),
       ).rejects.toThrow(/neither session\/resume nor session\/load/);
     });
+
+    describe('fork (#146)', () => {
+      // As a built-in spec declares it: custom agents may not declare fork.
+      const forking = (fork: 'native' | 'none'): AcpAgentSpec => {
+        const base = customAcpAgent('forker', { command: ['forker'] });
+        return { ...base, capabilities: { ...base.capabilities, resume: true, fork } };
+      };
+      const fork = { vendorSessionId: 'src-1', fork: true };
+
+      it('forks by session/fork when the spec declares it and the agent advertises it', async () => {
+        const adapter = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+        });
+        expect(adapter.capabilities().fork).toBe('native');
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork });
+        expect(h.vendorSessionId).toBe('src-1-fork');
+        const sent = methods().find((m) => m.method === 'session/fork');
+        expect(sent?.params).toMatchObject({ sessionId: 'src-1', cwd: join(root, 'wt') });
+        expect(methods().map((m) => m.method)).not.toContain('session/resume');
+        await adapter.close(h);
+      });
+
+      it('gives a fork the same MCP servers, _meta and mode pin as a new session (#181, #145)', async () => {
+        const meta = { claudeCode: { options: { settingSources: [] } } };
+        const spec: AcpAgentSpec = { ...forking('native'), sessionMeta: meta, sessionMode: 'ask' };
+        const adapter = make(spec, {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_SESSION: JSON.stringify({
+            modes: {
+              currentModeId: 'auto',
+              availableModes: [
+                { id: 'ask', name: 'Ask' },
+                { id: 'auto', name: 'Auto' },
+              ],
+            },
+          }),
+        });
+        const mcp = { name: 'tacet', url: 'http://127.0.0.1:1/mcp', headers: { 'x-t': 'v' } };
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork, mcpServers: [mcp] });
+        await adapter.close(h);
+        expect(methods().find((m) => m.method === 'session/fork')?.params).toMatchObject({
+          mcpServers: [
+            { type: 'http', name: 'tacet', url: mcp.url, headers: [{ name: 'x-t', value: 'v' }] },
+          ],
+          _meta: meta,
+        });
+        expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+          sessionId: 'src-1-fork',
+          modeId: 'ask',
+        });
+      });
+
+      it('refuses a fork the agent did not advertise, or the spec did not declare', async () => {
+        const quiet = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }),
+        });
+        await expect(quiet.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
+          /did not advertise session\/fork/,
+        );
+        const undeclared = make(forking('none'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+        });
+        await expect(undeclared.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
+          /does not fork sessions/,
+        );
+        // Gemini declares no fork: refused before anything starts, as before.
+        await expect(gemini().start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
+          /does not fork sessions/,
+        );
+        expect(methods().map((m) => m.method)).not.toContain('session/fork');
+      });
+
+      it('refuses a fork answered without a new session id', async () => {
+        const adapter = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_FORK_ID: 'same',
+        });
+        await expect(adapter.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
+          /without a new session id/,
+        );
+      });
+
+      it('never declares fork without resume, nor an emulated one', () => {
+        const base = customAcpAgent('x', { command: ['x'] });
+        const spec = (resume: boolean, fork: 'native' | 'emulated'): AcpAgentSpec => ({
+          ...base,
+          capabilities: { ...base.capabilities, resume, fork },
+        });
+        expect(() => make(spec(false, 'native'))).toThrow(/fork 'native' needs resume/);
+        expect(() => make(spec(true, 'emulated'))).toThrow(/not offered over ACP/);
+      });
+    });
   });
 
   it("scrubs the agent's configured secrets and its API key from events and stderr", async () => {
