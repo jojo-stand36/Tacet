@@ -43,6 +43,32 @@ function snapshot(dir: string): Record<string, string> {
   return out;
 }
 
+/**
+ * The model request of the Worker's own turn for a prompt: the last one whose user text holds
+ * `marker` and that offers tools. Claude Code also sends a title request quoting the first prompt
+ * (in `<session>`, with no tools), which can arrive after the turn's; and in a container with a
+ * parent `.git` the prompt is prefixed with a git status, so the text is matched, not compared.
+ */
+function turnRequest<R extends { text?: string; tools?: string[] }>(
+  requests: readonly R[],
+  marker: string,
+): R | undefined {
+  return requests.findLast((r) => (r.tools?.length ?? 0) > 0 && (r.text ?? '').includes(marker));
+}
+
+describe('turnRequest', () => {
+  it("picks the Worker's turn, not a title request that arrived after it", () => {
+    const turn = { text: 'gitStatus...\nSAY w', tools: ['Read'] };
+    const title = { text: '<session>\nSAY w\n</session>\nWrite the title', tools: [] };
+    expect(turnRequest([turn, title], 'SAY w')).toBe(turn);
+    expect(turnRequest([title, turn], 'SAY w')).toBe(turn);
+    expect(turnRequest([title], 'SAY w')).toBeUndefined();
+  });
+});
+
+/** What the mock Messages API records of a request, as the turn matcher reads it. */
+type Req206 = { text?: string; tools?: string[] };
+
 interface Case {
   name: string;
   /** A login of the user's own, as the vendor stores it, which a Worker must never use or change. */
@@ -217,9 +243,7 @@ for (const c of CASES) {
         await worker.send(h, { text: 'SAY tools206' });
         await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
         await worker.close(h);
-        const req = (api.requests as { text?: string; tools?: string[] }[]).findLast(
-          (r) => r.text === 'SAY tools206',
-        );
+        const req = turnRequest(api.requests as unknown as Req206[], 'SAY tools206');
         // Exactly the allowlist (MCP tools and the SDK's placeholder aside).
         const builtins = (req?.tools ?? []).filter(
           (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
@@ -513,7 +537,7 @@ for (const c of CASES) {
           await a.close(h);
           const mine = reqs().slice(from);
           // In this container a parent `.git` can prefix the prompt with a git status.
-          const said = mine.filter((r) => (r.text ?? '').includes(`SAY ${word}\n`)).at(-1);
+          const said = turnRequest(mine, `SAY ${word}\n`);
           const tools = (said?.tools ?? []).filter(
             (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
           );
