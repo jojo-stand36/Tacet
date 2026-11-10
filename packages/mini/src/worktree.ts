@@ -580,7 +580,10 @@ export class WorktreeManager implements Workspaces {
         continue;
       }
       // The newest of its creation and its last use (#238): an old checkout in use is kept.
-      const used = Math.max(info.createdAt, options.lastActivity?.get(info.id) ?? 0);
+      // An unreadable time reads as now: kept.
+      const at = (t: number | undefined) =>
+        t === undefined || Number.isFinite(t) ? (t ?? 0) : now;
+      const used = Math.max(at(info.createdAt), at(options.lastActivity?.get(info.id)));
       if (now - used < options.olderThanMs) {
         result.skipped.push({ id: info.id, reason: 'not stale' });
         continue;

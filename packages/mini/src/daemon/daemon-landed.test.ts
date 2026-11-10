@@ -583,7 +583,7 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
 
     it("passes each checkout its sessions' newest worker event as its last activity", async () => {
       const calls: GcOptions[] = [];
-      await runTask(commitWork, { remove_merged: false }, undefined, {
+      const { published } = await runTask(commitWork, undefined, undefined, {
         workspaces: recording(calls),
       });
       // A sweep after the task settled, so after its last worker event.
@@ -610,6 +610,84 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(last?.activeWorktreeIds).not.toContain(started.workspaceId);
       // Used recently: kept.
       expect(await manager.get(started.workspaceId)).toBeDefined();
+      // Eight days on, with its work on a branch outside tacet/* (so nothing is lost): removed.
+      git(repo, ['branch', 'kept-elsewhere', published.commit]);
+      const later = await manager.gc({
+        ...last,
+        olderThanMs: 7 * 86_400_000,
+        now: newest + 8 * 86_400_000,
+      });
+      expect(later.removed).toEqual([started.workspaceId]);
+    });
+
+    it('holds the checkouts of completed tasks as active with remove_merged off', async () => {
+      const calls: GcOptions[] = [];
+      await runTask(commitWork, { remove_merged: false }, undefined, {
+        workspaces: recording(calls),
+      });
+      const before = calls.length;
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(before), { timeout: 3_000 });
+      const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as {
+        workspaceId: string;
+      };
+      expect(calls.at(-1)?.activeWorktreeIds).toContain(started.workspaceId);
+    });
+
+    it("holds an unfinished task's checkout as active, however long it has been idle", async () => {
+      const calls: GcOptions[] = [];
+      const old = await manager.create('old');
+      // Planning never ends until the Mini-conductor stops: the task stays unfinished.
+      const planner: Planner = {
+        plan: (_task, opts) =>
+          new Promise((_, reject) =>
+            opts?.signal?.addEventListener('abort', () => reject(new Error('stopped'))),
+          ),
+      };
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: recording(calls),
+        integrator: new GitIntegrator(repo, env),
+        planner,
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        pollMs: 20,
+        landedSweepMs: 50,
+      });
+      await daemon.start();
+      const id = daemon.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      // A session of this task ran in `old` thirty days ago, and stopped for a restart.
+      const longAgo = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      const envelope = (type: string, data: unknown) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: longAgo,
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId: id,
+        type,
+        data,
+      });
+      store.append([
+        envelope('worker.started', { sessionId: 's-old', adapter: 'fake', workspaceId: old.id }),
+        envelope('worker.ended', { sessionId: 's-old', reason: 'restart' }),
+      ]);
+      const before = calls.length;
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(before), { timeout: 3_000 });
+      const last = calls.at(-1);
+      expect(last?.lastActivity?.get(old.id)).toBe(Date.parse(longAgo));
+      expect(last?.activeWorktreeIds).toContain(old.id);
+      expect(await manager.get(old.id)).toBeDefined();
     });
 
     it('runs no gc with idle_days 0', async () => {

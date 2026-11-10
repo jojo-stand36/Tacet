@@ -990,15 +990,17 @@ export class MiniConductor {
 
   /**
    * Remove Worker checkouts not used for `worktrees.idle_days` (#238; 0 turns it off), after the
-   * landed sweep. A checkout's last use is its sessions' newest `worker.*` event; one in use (a
-   * running or closing session) or whose task is unfinished is skipped. The worktree manager keeps any with local files or
-   * unintegrated work.
+   * landed sweep. A checkout's last use is its sessions' newest `worker.*` event. Skipped: one in
+   * use (a running or closing session), one whose task is unfinished, and, with
+   * `worktrees.remove_merged: false` (the user keeps finished work's checkouts), one whose task
+   * completed. The worktree manager keeps any with local files or unintegrated work.
    */
   async #sweepIdle(gen: number): Promise<void> {
     const days = this.#o.config.worktrees?.idle_days ?? 7;
     const gc = this.#o.workspaces.gc?.bind(this.#o.workspaces);
     if (!gc || days <= 0 || !this.#live(gen)) return;
     const v = this.#state();
+    const keepCompleted = this.#o.config.worktrees?.remove_merged === false;
     const lastActivity = new Map<string, number>();
     const active = new Set([
       ...[...this.#runs.values()].map((r) => r.workspace.id),
@@ -1009,6 +1011,7 @@ export class MiniConductor {
       // An unfinished task may still resume in it, however long it waits (an open escalation).
       const root = v.tasks[this.#rootOf(s.taskId)];
       if (!root || !TERMINAL.has(root.state)) active.add(s.workspaceId);
+      else if (keepCompleted && root.state === 'completed') active.add(s.workspaceId);
       if (s.activeAt === undefined) continue;
       lastActivity.set(s.workspaceId, Math.max(lastActivity.get(s.workspaceId) ?? 0, s.activeAt));
     }
