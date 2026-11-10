@@ -17,6 +17,7 @@ import {
   type AgentEvent,
   type ApprovalDecision,
   AsyncQueue,
+  DeltaScrubber,
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
@@ -94,6 +95,8 @@ interface Session {
   ended: boolean;
   /** Literal secrets of this session (MCP header values), scrubbed from every event. */
   secrets: string[];
+  /** Scrubs message text across delta boundaries (#109); made on the first event. */
+  deltas?: DeltaScrubber;
   model: string | undefined;
   /** Effort requested for this session (launch or the last `send`), if any. */
   effort: EffortLevel | undefined;
@@ -391,8 +394,20 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     return s;
   }
 
-  /** Every event leaves through here: known key formats and this session's secrets are scrubbed. */
+  /**
+   * Every event leaves through here: known key formats and this session's secrets are scrubbed.
+   * Message text is scrubbed across delta boundaries too (#109): a tail that could still be the
+   * start of a secret is held back, and goes out before the next event of any other kind.
+   */
   #emit(s: Session, e: AgentEvent): void {
+    s.deltas ??= new DeltaScrubber(s.secrets);
+    if (e.t === 'message.delta') {
+      const text = s.deltas.push(e.text);
+      if (text) s.events.push(redactSecrets({ ...e, text }));
+      return;
+    }
+    const held = s.deltas.flush();
+    if (held) s.events.push(redactSecrets({ t: 'message.delta', text: held }));
     s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
   }
 

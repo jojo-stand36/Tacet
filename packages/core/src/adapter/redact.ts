@@ -32,3 +32,49 @@ export function scrubLiterals<T>(value: T, secrets: readonly string[]): T {
   }
   return value;
 }
+
+/**
+ * Scrubs literal secrets from streamed text that arrives in pieces (#109): a secret split across
+ * two `message.delta` events is missed by scrubbing each event alone. `push` returns the text
+ * that is safe to emit now: everything seen so far with complete secrets replaced, minus the
+ * shortest tail that could still be the start of a secret, which is held back (at most the
+ * longest secret's length minus one). `flush` returns the held tail, for the end of the stream or
+ * before an event that must not overtake the text. Text that cannot begin a secret is never held,
+ * so ordinary streaming keeps its pace.
+ */
+export class DeltaScrubber {
+  readonly #secrets: readonly string[];
+  readonly #maxHold: number;
+  #held = '';
+
+  constructor(secrets: readonly string[]) {
+    // Longest first, as `scrubLiterals` expects; empty strings would match everywhere.
+    this.#secrets = [...new Set(secrets.filter((x) => x.length > 0))].sort(
+      (a, b) => b.length - a.length,
+    );
+    this.#maxHold = Math.max(0, (this.#secrets[0]?.length ?? 0) - 1);
+  }
+
+  push(text: string): string {
+    if (this.#secrets.length === 0) return text;
+    const scrubbed = scrubLiterals(this.#held + text, this.#secrets);
+    const hold = this.#holdLength(scrubbed);
+    this.#held = scrubbed.slice(scrubbed.length - hold);
+    return scrubbed.slice(0, scrubbed.length - hold);
+  }
+
+  flush(): string {
+    const out = this.#held;
+    this.#held = '';
+    return out;
+  }
+
+  /** Length of the longest tail of `text` that some secret starts with. */
+  #holdLength(text: string): number {
+    for (let k = Math.min(this.#maxHold, text.length); k > 0; k--) {
+      const tail = text.slice(text.length - k);
+      if (this.#secrets.some((sec) => sec.startsWith(tail))) return k;
+    }
+    return 0;
+  }
+}

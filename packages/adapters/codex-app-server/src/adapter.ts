@@ -11,6 +11,7 @@ import {
   type ApprovalDecision,
   type ApprovalOption,
   AsyncQueue,
+  DeltaScrubber,
   findSecrets,
   type InterruptResult,
   mcpHeaderSecrets,
@@ -123,6 +124,8 @@ interface Session {
   ended: boolean;
   model: string | undefined;
   secrets: string[];
+  /** Scrubs message text across delta boundaries (#109); made on the first event. */
+  deltas?: DeltaScrubber;
   exited: Promise<void>;
   /** Set synchronously on exit; after that the process group must never be signalled. */
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
@@ -462,8 +465,20 @@ export class CodexAppServerAdapter implements AgentAdapter {
     return s;
   }
 
-  /** Every event leaves through here: known key formats and this session's secrets are scrubbed. */
+  /**
+   * Every event leaves through here: known key formats and this session's secrets are scrubbed.
+   * Message text is scrubbed across delta boundaries too (#109): a tail that could still be the
+   * start of a secret is held back, and goes out before the next event of any other kind.
+   */
   #emit(s: Session, e: AgentEvent): void {
+    s.deltas ??= new DeltaScrubber(s.secrets);
+    if (e.t === 'message.delta') {
+      const text = s.deltas.push(e.text);
+      if (text) s.events.push(redactSecrets({ ...e, text }));
+      return;
+    }
+    const held = s.deltas.flush();
+    if (held) s.events.push(redactSecrets({ t: 'message.delta', text: held }));
     s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
   }
 
