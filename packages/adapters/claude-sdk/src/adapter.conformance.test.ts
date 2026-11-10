@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { ProfileRefusedError, type SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ClaudeSdkAdapter } from './adapter.js';
+import { ClaudeSdkAdapter, FILE_TOOLS } from './adapter.js';
 import { type MockMessagesApi, startMockMessagesApi } from './testing/mock-messages-api.js';
 
 /**
@@ -70,6 +70,50 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
       .map((e) => (e.t === 'message.delta' ? e.text : ''))
       .join('');
   }
+
+  it('an unattended Worker gets no shell, gets Glob and Grep, and is asked about in-cwd reads (#206)', {
+    timeout: 120_000,
+  }, async () => {
+    const worker = new ClaudeSdkAdapter({
+      authRoute: 'api_key',
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: join(root, 'home'),
+        CLAUDE_CONFIG_DIR: join(root, 'home', '.claude'),
+        ANTHROPIC_BASE_URL: api.url,
+        ANTHROPIC_API_KEY: 'placeholder-not-a-real-key',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        DISABLE_AUTOUPDATER: '1',
+      },
+      mcpConfigDir: join(root, 'run', 'mcp'),
+      fileToolsOnly: true,
+    });
+    writeFileSync(join(worktree, 'note.txt'), 'hello\n');
+    const h = await worker.start({ cwd: worktree, model: 'claude-sonnet-5-5' });
+    const tap = new EventTap(worker.events(h));
+    await worker.send(h, { text: 'SAY tools' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+    // What the model is offered: the file tools, and no shell of any kind.
+    const offered = api.requests.findLast((r) => r.text === 'SAY tools')?.tools ?? [];
+    // Exactly the allowlist: a built-in a later SDK adds must fail here, not slip in. The SDK
+    // also offers an inert `DeferredToolPlaceholder` (UNVERIFIED what it does).
+    const builtins = offered.filter(
+      (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
+    );
+    expect(builtins.sort()).toEqual([...FILE_TOOLS].sort());
+
+    // A read inside the working directory, which the SDK would otherwise run unasked.
+    const from = tap.events.length;
+    await worker.send(h, { text: `READ_TOOL ${join(worktree, 'note.txt')}` });
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000, from);
+    if (req.event.t !== 'approval.request') throw new Error('no approval request');
+    expect(req.event.toolName).toBe('Read');
+    await worker.respond(h, req.event.id, { kind: 'reject', persist: false, message: 'no' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index);
+    // Refused: the file's contents never went back to the model.
+    expect(api.requests.at(-1)?.raw).not.toContain('hello');
+    await worker.close(h);
+  });
 
   it('resume continues the conversation and fork branches it', { timeout: 120_000 }, async () => {
     const h1 = await adapter.start({ cwd: worktree, model: 'claude-sonnet-5-5' });

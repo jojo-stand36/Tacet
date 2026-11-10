@@ -3,6 +3,7 @@ import {
   type AcpAdapterOptions,
   type AcpAgentSpec,
   BUILTIN_ACP_AGENTS,
+  claudeAcpWorkerSpec,
   customAcpAgent,
 } from '@tacet/adapter-acp';
 import { ClaudeSdkAdapter, type ClaudeSdkAdapterOptions } from '@tacet/adapter-claude-sdk';
@@ -55,6 +56,14 @@ export interface BuildWorkerAdaptersOptions {
    * `AdapterPlanner`.
    */
   withPlanner?: boolean;
+}
+
+/**
+ * The ACP agent spec a Worker runs on: a Claude Worker over ACP gets the file tools only and no
+ * shell, as the SDK adapter's `fileToolsOnly` does (#206, `claudeAcpWorkerSpec`).
+ */
+function workerSpec(spec: AcpAgentSpec): AcpAgentSpec {
+  return spec.id === 'claude-acp' ? claudeAcpWorkerSpec(spec) : spec;
 }
 
 /** PTY presets built in, by slug; `agents.<slug>` may not reuse these names. */
@@ -123,7 +132,13 @@ export function buildWorkerAdapters(
     const dropped = (names: string[]) => opts.onEnvDropped?.(id, names);
     const common = { baseEnv, envPolicy, onEnvDropped: dropped };
     if (id === 'claude-sdk') {
-      return new ClaudeSdkAdapter({ ...opts.claude, ...common, authRoute: 'api_key' });
+      // Unattended: file tools only, no shell, reads asked about too (#206; policy #200).
+      return new ClaudeSdkAdapter({
+        ...opts.claude,
+        ...common,
+        authRoute: 'api_key',
+        fileToolsOnly: true,
+      });
     }
     if (id === 'codex-app-server') {
       return new CodexAppServerAdapter({
@@ -225,7 +240,7 @@ export function buildWorkerAdapters(
     const builtin = BUILTIN_ACP_AGENTS[slug];
     noShadow(slug, builtin !== undefined, 'acp', 'ACP agent');
     refuseForWorkers(slug, where);
-    if (builtin) return { agent: builtin, secrets: [] };
+    if (builtin) return { agent: workerSpec(builtin), secrets: [] };
     if (!preset) {
       throw new WorkerConfigError(
         `${where}: no ACP agent "${slug}" (built in: ${Object.keys(BUILTIN_ACP_AGENTS).join(', ')}; or add agents.${slug} with kind: acp)`,

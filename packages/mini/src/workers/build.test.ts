@@ -110,6 +110,31 @@ describe('buildWorkerAdapters', () => {
     ).toThrow(/tiers\.mini\.model/);
   });
 
+  it('builds Claude SDK Workers with file tools only and no shell (#206)', async () => {
+    let seen: Record<string, unknown> | undefined;
+    const query = ((args: { options?: Record<string, unknown> }) => {
+      seen = args.options;
+      return {
+        async *[Symbol.asyncIterator]() {},
+        close() {},
+      };
+    }) as never;
+    const built = buildWorkerAdapters(config({}), {
+      baseEnv: { ANTHROPIC_API_KEY: 'placeholder-not-a-key' },
+      claude: { query },
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'tacet-build-206-'));
+    try {
+      const adapter = built['claude-sdk']?.adapter;
+      const h = await adapter?.start({ cwd: dir, model: 'm' });
+      expect(seen?.tools).toEqual(['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep']);
+      expect(seen?.disallowedTools).toEqual(['Bash', 'PowerShell', 'Monitor']);
+      if (h) await adapter?.close(h);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
     for (const tiers of [
       { worker: { adapter: 'acp:codex-acp' } },

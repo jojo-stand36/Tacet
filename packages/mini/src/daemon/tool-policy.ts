@@ -129,6 +129,10 @@ function protectedConfig(rel: string): boolean {
   const segs = rel.split(sep).map(fold);
   const name = segs.at(-1) ?? '';
   if (PROTECTED_FILES.includes(name)) return true;
+  // Every config name lefthook reads, in any of its formats, local overrides included
+  // (github.com/evilmartians/lefthook docs/configuration.md "Config file name", checked
+  // 2026-11-10); the `.config/` copies are matched by name like the rest.
+  if (/^\.?lefthook(-local)?\.(yml|yaml|toml|json|jsonc)$/.test(name)) return true;
   for (let i = 0; i < segs.length; i++) {
     for (const dir of PROTECTED_DIRS) {
       if (dir.every((d, j) => segs[i + j] === d) && segs.length > i + dir.length - 1) {
@@ -330,9 +334,6 @@ function inside(root: string, given: string, p: string, writes: boolean): string
   if (/^[$%]/.test(p)) return { why: 'the path starts with $ or %' };
   const segs = p.split('/').filter((s) => s !== '' && s !== '.');
   if (segs.includes('..')) return { why: 'the path leaves the worktree (..)' };
-  const odd = segs.find(ntfsAlias);
-  if (odd !== undefined)
-    return { why: 'the path has a name another file system may read differently' };
   let rel: string[];
   if (isAbsolute(p)) {
     const norm = segs.join(sep);
@@ -345,6 +346,11 @@ function inside(root: string, given: string, p: string, writes: boolean): string
     return { why: 'the path is outside the worktree' };
   } else {
     rel = segs;
+  }
+  // Only names inside the checkout: the checkout's own parents (a WSL2 `/mnt/c/Users/JOHNSM~1`)
+  // are not the Worker's to choose (#213 review).
+  if (rel.some(ntfsAlias)) {
+    return { why: 'the path has a name another file system may read differently' };
   }
   if (rel.some(isGitName)) return { why: 'git internals are not open to Workers' };
   let cur = root;
@@ -372,6 +378,10 @@ function inside(root: string, given: string, p: string, writes: boolean): string
         return { why: 'the path goes through a symlink out of the worktree' };
       }
       if (r.split(sep).some(isGitName)) return { why: 'git internals are not open to Workers' };
+      // A link to `CLAUDE~1` on DrvFs reaches `.claude` as surely as the name itself would.
+      if (r !== '' && r.split(sep).some(ntfsAlias)) {
+        return { why: 'the path has a name another file system may read differently' };
+      }
       cur = real;
     } else {
       cur = next;
