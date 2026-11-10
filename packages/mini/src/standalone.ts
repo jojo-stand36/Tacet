@@ -1,14 +1,22 @@
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import type { TacetConfig, Task } from '@tacet/core';
 import {
+  defaultRunDir,
   type EventStore,
   loadConfig,
+  miniRuntimePath,
   openEventStore,
   type RepoStatePaths,
+  type RpcServer,
+  randomToken,
+  removeRuntimeFile,
   repoStatePaths,
   resolveStateDir,
   WorkerTokens,
+  writeRuntimeFile,
 } from '@tacet/core/node';
+import { startMiniControl } from './control/server.js';
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
@@ -42,6 +50,11 @@ export interface StandaloneOptions {
   workers?: Pick<BuildWorkerAdaptersOptions, 'acp' | 'codex' | 'claude' | 'ptyCli' | 'keychain'>;
   /** Tests only: these adapters instead of building them from config. */
   adapters?: Record<string, WorkerAdapter>;
+  /**
+   * Where the control port's runtime file goes (#201): `<runDir>/minis/<repo-hash>.json`. Default
+   * `<home>/.tacet/run` when `home` is given, else `~/.tacet/run`.
+   */
+  runDir?: string;
 }
 
 /** A running standalone Mini-conductor and what it owns. */
@@ -50,7 +63,12 @@ export interface Standalone {
   store: EventStore;
   config: TacetConfig;
   paths: RepoStatePaths;
-  /** Stop the Mini-conductor (open sessions recorded as `restart`), then the MCP server and log. */
+  /** The control port (#201) and its runtime file, which holds the port's token (mode 0600). */
+  control: { port: number; runtimeFile: string };
+  /**
+   * Remove the runtime file and close the control port, then stop the Mini-conductor (open
+   * sessions recorded as `restart`), then the MCP server and log.
+   */
   close(): Promise<void>;
 }
 
@@ -115,6 +133,10 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
 
   const store = openEventStore(paths.events);
   let server: MiniMcpServer | undefined;
+  let control: RpcServer | undefined;
+  let runtimeFile: string | undefined;
+  let started: MiniConductor | undefined;
+  const token = randomToken();
   try {
     server = await MiniMcpServer.start({
       backend: new EventLogBackend({ store, repo: paths.repoId, miniId: 'standalone' }),
@@ -136,16 +158,39 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       miniId: 'standalone',
     });
     await mini.start();
+    started = mini;
+    // The control port (#201), only once the Mini-conductor holds its lock: the runtime file
+    // tells a CLI which process to talk to, and its token rotates with every run.
+    control = await startMiniControl({
+      mini,
+      store,
+      contextId: paths.repoId,
+      token,
+      ...(o.onError ? { onError: (m) => o.onError?.(`control: ${m}`) } : {}),
+    });
+    runtimeFile = miniRuntimePath(
+      o.repoRoot,
+      o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
+    );
+    writeRuntimeFile({ path: runtimeFile, port: control.port, protocolVersions: [1], token });
     const mcp = server;
+    const port = control;
+    const file = runtimeFile;
     let closed: Promise<void> | undefined;
     return {
       mini,
       store,
       config,
       paths,
+      control: { port: port.port, runtimeFile: file },
       close: () => {
         closed ??= (async () => {
           try {
+            try {
+              removeRuntimeFile(file, token);
+            } finally {
+              await port.close();
+            }
             await mini.stop();
           } finally {
             await mcp.close();
@@ -156,6 +201,14 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       },
     };
   } catch (err) {
+    if (runtimeFile) {
+      try {
+        removeRuntimeFile(runtimeFile, token);
+      } catch {}
+    }
+    await control?.close();
+    // Started but not handed back: nobody else would stop it or release its lock.
+    await started?.stop().catch(() => {});
     await server?.close();
     store.close();
     throw err;
