@@ -63,4 +63,18 @@ describe('sandbox placeholders (#263)', () => {
     expect(readdirSync(join(cwd, '.claude')).sort()).toEqual(['agents', 'mine.md']);
     expect(readdirSync(join(cwd, 'node_modules'))).toEqual(['x']);
   });
+
+  it('never follows a symlinked parent out of the checkout', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'tacet-placeholders-out-'));
+    try {
+      mkdirSync(join(outside, 'agents'));
+      const before = placeholderSnapshot(cwd);
+      // The session made `.claude` a link to a directory elsewhere, holding an empty `agents/`.
+      symlinkSync(outside, join(cwd, '.claude'));
+      expect(removeSandboxPlaceholders(cwd, before)).toEqual([]);
+      expect(readdirSync(outside)).toEqual(['agents']);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
 });
