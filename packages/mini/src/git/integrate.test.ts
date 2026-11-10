@@ -15,7 +15,12 @@ import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { integrateWorktree, taskBranch, WorktreeRefusedError } from './integrate.js';
+import {
+  integrateWorktree,
+  taskBranch,
+  uncommittedChanges,
+  WorktreeRefusedError,
+} from './integrate.js';
 
 /**
  * Integration of Worker commits (#119) against real git: a Worker in a linked worktree commits on
@@ -98,6 +103,42 @@ describe('integrateWorktree', () => {
     git(repo, ['commit', '-qm', 'init']);
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('finds what a checkout changed, deleted or added beyond a commit, from the repo side (#261)', async () => {
+    const w = worker('u');
+    const main = git(repo, ['rev-parse', 'main']);
+    const changes = (commit?: string) =>
+      uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit, env });
+    expect(await changes(main)).toEqual([]);
+    writeFileSync(join(w.dir, '.gitignore'), 'build/\n');
+    mkdirSync(join(w.dir, 'build'));
+    writeFileSync(join(w.dir, 'build', 'out.js'), 'x');
+    writeFileSync(join(w.dir, 'README'), 'changed\n');
+    writeFileSync(join(w.dir, 'new.txt'), 'new\n');
+    // The Worker hides its change in its own index: the check never reads that index.
+    git(w.dir, ['update-index', '--assume-unchanged', 'README'], w.wenv);
+    const found = (await changes(main))?.sort((a, b) => (a.path < b.path ? -1 : 1));
+    expect(found).toEqual([
+      { path: '.gitignore', untracked: true },
+      { path: 'README', untracked: false },
+      { path: 'new.txt', untracked: true },
+    ]);
+    // Without a commit, the Worker's HEAD (here still main) is the one compared with.
+    expect((await changes())?.length).toBe(3);
+    // A deletion counts too.
+    rmSync(join(w.dir, 'README'));
+    expect((await changes(main))?.some((c) => c.path === 'README' && !c.untracked)).toBe(true);
+  });
+
+  it('cannot tell, rather than read the Worker store, for a commit only the Worker has (#261)', async () => {
+    const w = worker('v');
+    const own = commitIn(w, 'mine.txt', 'mine\n');
+    expect(hasObject(own)).toBe(false);
+    expect(await uncommittedChanges({ cwd: w.dir, repoRoot: repo, env })).toBeUndefined();
+    expect(
+      await uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit: own, env }),
+    ).toBeUndefined();
+  });
 
   it('brings a Worker commit into the repo under its task branch, and gc works again', async () => {
     const w = worker('t1');

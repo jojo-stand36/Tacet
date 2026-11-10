@@ -10,10 +10,12 @@ import {
   openSync,
   readdirSync,
   readSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inflateSync, constants as zlibConstants } from 'node:zlib';
 import {
@@ -434,11 +436,100 @@ function readRegular(dir: OpenDir, name: string, budget: number): Buffer {
   }
 }
 
+/** A path in a Worker's checkout that differs from the commit it was compared with (#261). */
+export interface UncommittedChange {
+  path: string;
+  /** New and not ignored, rather than changed or deleted. */
+  untracked: boolean;
+}
+
+/**
+ * What the Worker's checkout has that `commit` does not (#261): files changed, deleted or added
+ * (untracked and not ignored), compared without the Worker's own index, config, HEAD or objects.
+ * A throwaway index of `commit` (a commit already in the repo: the integrated one, or the base)
+ * is built in a directory Tacet owns, and `git status` compares the checkout's files with it,
+ * from the main repo (`GIT_DIR` = its common dir, `SAFE_GIT_ARGS`, only PATH and HOME), so the
+ * Worker's files are read as data. Throws `WorktreeRefusedError` for a forged worktree; undefined
+ * when `cwd` is not a worktree of the repo. At most `maxPaths` paths are returned.
+ */
+export async function uncommittedChanges(opts: {
+  cwd: string;
+  repoRoot: string;
+  /** Without one, the Worker's HEAD (read as data), when the repo has that commit. */
+  commit?: string | undefined;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+  maxPaths?: number;
+}): Promise<UncommittedChange[] | undefined> {
+  if (opts.commit !== undefined && !COMMIT_ID.test(opts.commit)) throw new Error('bad commit');
+  let wt: WorkerWorktree | undefined;
+  try {
+    wt = workerWorktree(opts.cwd, opts.repoRoot);
+  } catch (err) {
+    throw new WorktreeRefusedError((err as Error).message);
+  }
+  if (!wt) return undefined;
+  const env = opts.env ?? process.env;
+  const tmp = mkdtempSync(join(tmpdir(), 'tacet-status-'));
+  try {
+    const gitEnv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.commonDir,
+      GIT_INDEX_FILE: join(tmp, 'index'),
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
+    };
+    const git = (args: string[]) =>
+      run(['git', ...SAFE_GIT_ARGS, ...args], {
+        cwd: opts.repoRoot,
+        env: gitEnv,
+        timeoutMs: opts.timeoutMs ?? 120_000,
+        raw: true,
+      });
+    const commit =
+      opts.commit ?? (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    if (commit === undefined) return undefined;
+    // Only a commit the repo already has: a Worker's own commit is never read from its store.
+    if (
+      !(await git(['cat-file', '-e', `${commit}^{commit}`]).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      return undefined;
+    }
+    await git(['read-tree', commit]);
+    const out = await git([
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+      '--no-renames',
+      '--ignore-submodules=all',
+    ]);
+    const changes: UncommittedChange[] = [];
+    for (const entry of out.split('\0')) {
+      if (entry.length < 4) continue;
+      const xy = entry.slice(0, 2);
+      // `??` is untracked; otherwise the second column is the checkout against the index, which
+      // holds exactly `commit` (the first column compares the index with the main repo's HEAD).
+      if (xy !== '??' && xy[1] === ' ') continue;
+      changes.push({ path: entry.slice(3), untracked: xy === '??' });
+      if (changes.length >= (opts.maxPaths ?? 1000)) break;
+    }
+    return changes;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 interface RunOptions {
   cwd: string;
   env: Record<string, string>;
   timeoutMs: number;
   input?: string | undefined;
+  /** Stdout as is, not trimmed (porcelain output starts with significant spaces). */
+  raw?: boolean;
 }
 
 /** Run a command; resolves with its trimmed stdout, rejects with its stderr or a timeout. */
@@ -464,8 +555,10 @@ function run(argv: string[], o: RunOptions): Promise<string> {
     });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      if (code === 0) resolve(Buffer.concat(out).toString('utf8').trim());
-      else {
+      if (code === 0) {
+        const text = Buffer.concat(out).toString('utf8');
+        resolve(o.raw ? text : text.trim());
+      } else {
         const why = signal === 'SIGKILL' ? 'timed out' : Buffer.concat(err).toString('utf8').trim();
         reject(new Error(`${argv.slice(0, 5).join(' ')}: ${why.slice(0, 500)}`));
       }
@@ -597,6 +690,15 @@ export class GitIntegrator implements Integrator {
       return false;
     }
     return wt ? amendedInReflog(join(wt.gitDir, 'logs', 'HEAD'), later) : false;
+  }
+
+  uncommitted(workspace: Workspace, commit?: string): Promise<UncommittedChange[] | undefined> {
+    return uncommittedChanges({
+      cwd: workspace.path,
+      repoRoot: this.#repoRoot,
+      commit,
+      env: this.#env,
+    });
   }
 
   async publish(taskId: string, commit: string): Promise<string> {

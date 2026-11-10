@@ -389,6 +389,64 @@ describe('MiniConductor with git worktrees', () => {
     expect(() => git(repo, ['rev-parse', '--verify', '-q', resultBranch(id)])).toThrow();
   });
 
+  it('fails, without retrying, a sub-task whose changes were never committed (#261)', async () => {
+    const d = start((cwd) => {
+      writeFileSync(join(cwd, 'work.txt'), 'work\n');
+      // An empty placeholder of Claude's Linux sandbox (#263) is not a change.
+      writeFileSync(join(cwd, 'package.json'), '');
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const sub = `${id}/1`;
+    expect(tasks()[sub]?.state).toBe('failed');
+    const message = data<{ message?: string }>(sub, 'task.status').at(-1)?.message ?? '';
+    expect(message).toMatch(/^nothing was integrated: the Worker changed 1 file \(work\.txt\)/);
+    expect(message).not.toContain('package.json');
+    expect(data<{ outcome: string }>(sub, 'task.result').at(-1)?.outcome).toBe('failed');
+    // One attempt: retrying a Worker that cannot commit would only fail again.
+    expect(data(sub, 'worker.started')).toHaveLength(1);
+    expect(tasks()[id]?.state).toBe('failed');
+  });
+
+  it('counts no change for a checkout moved to a commit the repo already has (#261)', async () => {
+    // The same work done before: a commit already in the repo, with a file the base lacks.
+    git(repo, ['checkout', '-q', '-b', 'earlier']);
+    writeFileSync(join(repo, 'done.txt'), 'done\n');
+    git(repo, ['add', 'done.txt']);
+    git(repo, ['commit', '-qm', 'earlier work']);
+    const earlier = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['checkout', '-q', 'main']);
+    const d = start((cwd) => {
+      const wt = workerWorktree(cwd, repo);
+      if (!wt) throw new Error('not a worktree');
+      git(cwd, ['checkout', '-q', '--detach', earlier], workerGitEnv(wt));
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    // Compared with its own HEAD, not its base: done.txt is committed, not left over.
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+  });
+
+  it('says so when a completed sub-task changed nothing or left changes out (#261)', async () => {
+    const d = start((cwd, input) => {
+      if (input.includes('[a]')) {
+        commitFiles(cwd, { 'a.txt': 'a\n' });
+        writeFileSync(join(cwd, 'stray.txt'), 'left\n');
+      }
+    }, chain);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const note = (sub: string) => data<{ message?: string }>(sub, 'task.status').at(-1)?.message;
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+    expect(note(`${id}/1`)).toBe('1 file (stray.txt) left uncommitted, not in the result');
+    // A sub-task that only reviews is fine, and says it changed nothing.
+    expect(tasks()[`${id}/2`]?.state).toBe('completed');
+    expect(note(`${id}/2`)).toBe('no change: the Worker made no commit');
+  });
+
   it('carries work through a sub-task that commits nothing', async () => {
     const seen: Record<string, boolean> = {};
     const d = start((cwd, input) => {
