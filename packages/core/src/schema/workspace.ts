@@ -11,6 +11,8 @@ import { Id, openEnum } from './common.js';
 /**
  * Payload of `workspace.created`: written before the checkout is made (intent first), so a crash
  * leaves a record the next start reconciles; `migrated` for one imported from a pre-#126 file.
+ * `scratch` marks a throwaway checkout (a planner's, #238) that holds nothing of value: one a crash
+ * left registered is force-removed at the next start.
  */
 export const WorkspaceCreated = z.object({
   workspaceId: Id,
@@ -18,6 +20,7 @@ export const WorkspaceCreated = z.object({
   baseCommit: z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id'),
   baseBranch: z.string().min(1).optional(),
   migrated: z.literal(true).optional(),
+  scratch: z.literal(true).optional(),
 });
 export type WorkspaceCreated = z.infer<typeof WorkspaceCreated>;
 

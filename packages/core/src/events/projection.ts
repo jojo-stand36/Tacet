@@ -203,6 +203,8 @@ export interface WorkspaceView {
   /** When `workspace.created` was recorded (the envelope's `ts`). */
   createdAt: string;
   migrated?: true;
+  /** A throwaway checkout (#238): force-removed at the next start. */
+  scratch?: true;
 }
 
 export interface WorkspacesState {
@@ -232,6 +234,7 @@ export const workspacesProjection: Projection<WorkspacesState> = {
         ...(d.data.baseBranch !== undefined ? { baseBranch: d.data.baseBranch } : {}),
         createdAt: e.ts,
         ...(d.data.migrated ? { migrated: true as const } : {}),
+        ...(d.data.scratch ? { scratch: true as const } : {}),
       };
       return { ...state, live: { ...state.live, [id]: view } };
     }

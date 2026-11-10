@@ -24,6 +24,10 @@
     "migrated": {
       "type": "boolean",
       "const": true
+    },
+    "scratch": {
+      "type": "boolean",
+      "const": true
     }
   },
   "required": [
