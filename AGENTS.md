@@ -35,7 +35,7 @@ scripts/                      repo tooling (node, no dependencies)
 
 | Task | Command |
 |---|---|
-| Regenerate ROADMAP.md | `node scripts/gen-roadmap.mjs` |
+| Regenerate ROADMAP.md (and sort `roadmap/issues.json`) | `node scripts/gen-roadmap.mjs` |
 | Regenerate Copilot agents | `node scripts/sync-agents.mjs` |
 | Check generated files are current (CI runs this) | `pnpm check:generated` (roadmap, Copilot agents, and `@tacet/core` JSON Schemas) |
 | Check the capability matrix is fresh (CI runs this, separately) | `pnpm check:matrix` (warns a week ahead, fails when an active vendor surface was checked over 30 days ago; refresh it as the matrix's "Keeping it fresh" says) |
