@@ -1509,6 +1509,17 @@
         "agent:claude"
       ],
       "body": "#146 lets a built-in ACP spec declare `fork: 'native'` (with `resume`), and the adapter forks by the unstable `session/fork` only when the session's `initialize` advertises it. No built-in agent declares either yet. Gemini 0.67.0 does not advertise fork, and `claude-acp` / `codex-acp` declare no `resume` through this adapter. Both vendor adapters advertise `sessionCapabilities.resume` and `fork` (spike #62; `claude-agent-acp` 0.101.0 `unstable_forkSession` copies the transcript under a new id and passes `_meta` to the new session).\n\nDeclaring them needs a live check: the source suggests the following, but does not prove it.\n\n### Tasks\n- [ ] Live, against the mock Messages API (claude-agent-acp) and the mock Responses API (codex-acp), check that a resumed and a forked Worker session keep the Worker options:\n  - claude-acp: `settingSources: []`, `strictMcpConfig`, and the file-tools-only set (#181, #206);\n  - codex-acp: its isolated `CODEX_HOME` and the never-authenticate setup.\n- [ ] Check that Tacet re-pins `sessionMode` after a resume or fork (a fork starts with the permission mode it records), and that the source session is left untouched.\n- [ ] Check that sessions resume across processes: `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are kept per repo.\n- [ ] Declare `resume: true` and `fork: 'native'` on the specs that pass, with tests, and record it in the capability matrix (`verify-vendor-facts`).\n\n### Acceptance criteria\n- A resumed and a forked `acp:claude-acp` Worker run with the same restrictions as a new one, shown live against the mock API.\n- The capability matrix records the versions checked and the date.\n\n_See #146, #181, #206, docs/adapters/spikes/62-acp-adapters and docs/adapters/capability-matrix.md §4._"
+    },
+    {
+      "title": "Hold a task's pinned target commit with a ref so git gc cannot prune it",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #219 (PR #233). A task's `task.target` pins the commit its sub-tasks start from, but no ref holds that commit. Live checkouts keep it alive. But if the user resets or rewrites the branch during a long task and `git gc` prunes the commit, a later fresh checkout for the task (a retry, a new sub-task) fails to start (\"base commit does not name a commit\").\n\n### Tasks\n- [ ] When the Mini-conductor pins a target, also point `refs/tacet/<task>/target` at the commit. The repo's git side is behind a port (for example `Workspaces.pin?(taskId, commit)`), so the daemon stays git-free. The task id must be made ref-safe, as `taskBranch` does.\n- [ ] Delete the ref where the task's other Tacet refs are cleaned up. Today nothing deletes them: `tacet/*` branches are kept on purpose. At minimum, `tacet uninstall --purge --apply` removes every `refs/tacet/*` ref, which is internal and never a user branch, and its preview lists them.\n- [ ] Docs: ARCHITECTURE §2.4 and §3 (the `task.target` paragraph says no ref holds the commit today).\n\n### Acceptance criteria\n- After the pinned branch is reset and `git gc --prune=now` runs, a new checkout for the task still starts at the pinned commit (test).\n- `tacet uninstall --purge --apply` leaves no `refs/tacet/*` ref (test).\n\n_See #219, PR #233, packages/mini/src/daemon/daemon.ts (`#pinTarget`) and packages/cli/src/commands/purge-state.ts._"
     }
   ]
 }
