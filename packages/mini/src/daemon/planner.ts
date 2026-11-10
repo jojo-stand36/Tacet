@@ -109,6 +109,7 @@ export class AdapterPlanner implements Planner {
         label: 'planner',
         refusal: 'The planner is read-only.',
         timeoutMs: this.#o.timeoutMs ?? 600_000,
+        reads: { adapterId: this.#o.adapterId, cwd: this.#o.cwd },
       });
       let reply = await turns(plannerPrompt(task));
       let lastError: unknown;

@@ -1380,6 +1380,55 @@ describe('planning', () => {
   });
 });
 
+describe('AdapterPlanner reads (#206)', () => {
+  it('allows reads and searches inside its checkout, and nothing else', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'tacet-planner-reads-'));
+    try {
+      writeFileSync(join(cwd, 'a.ts'), 'x');
+      // The planner asks twice per plan (one retry), so two plans of two requests each.
+      const answered: string[] = [];
+      for (const steps of [
+        [
+          { do: 'approval', toolName: 'Read', grant: { input: { file_path: join(cwd, 'a.ts') } } },
+          { do: 'approval', toolName: 'Read', grant: { input: { file_path: '/etc/passwd' } } },
+        ],
+        [
+          { do: 'approval', toolName: 'Grep', grant: { input: { pattern: 'x' } } },
+          {
+            do: 'approval',
+            toolName: 'Write',
+            grant: { input: { file_path: 'b.ts', content: '' } },
+          },
+        ],
+      ] as Script[][]) {
+        const planner = new ScriptedAdapter(
+          'claude-sdk',
+          () => steps.shift() ?? { do: 'reply', text: '' },
+        );
+        const p = new AdapterPlanner({
+          worker: { adapter: planner, authRoute: 'api_key' },
+          adapterId: 'claude-sdk',
+          model: 'mid',
+          cwd,
+        });
+        await p
+          .plan({
+            id: 't',
+            goal: 'Do X',
+            acceptanceCriteria: ['X'],
+            priority: 'p2',
+            createdAt: new Date().toISOString(),
+          })
+          .catch(() => undefined);
+        answered.push(...planner.approvalsAnswered.map((d) => d.kind));
+      }
+      expect(answered).toEqual(['allow_once', 'reject', 'allow_once', 'reject']);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('MiniConductor review fixes', () => {
   const env = (taskId: string, type: string, data: unknown, sessionId?: string): EventEnvelope =>
     ({

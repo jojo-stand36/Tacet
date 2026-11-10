@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   type CanUseTool,
   type EffortLevel,
+  type HookCallback,
   type ModelInfo,
   type Options,
   type PermissionResult,
@@ -93,9 +94,33 @@ export interface ClaudeSdkAdapterOptions {
     Options,
     'settingSources' | 'pathToClaudeCodeExecutable' | 'permissionMode' | 'allowedTools'
   >;
+  /**
+   * Unattended Workers (#206): the session gets only Claude Code's file tools, with no shell at
+   * all, and every read and search goes through `approval.request` like an edit does, so the
+   * Mini-conductor's policy (#200) decides each one.
+   *
+   * - `tools` names exactly the file tools, so Bash, the web tools and the rest do not exist, and
+   *   `Glob` and `Grep` are present (absent by default on macOS, Linux and WSL, where Claude Code
+   *   searches with Bash instead). `disallowedTools` removes the shell tools from the model's
+   *   context as well, in case `tools` ever stops being an allowlist.
+   * - A `PreToolUse` hook asks Tacet about `Read`, `Glob` and `Grep`, which the SDK otherwise runs
+   *   without calling `canUseTool` (reads inside the working directory need no permission). It
+   *   fails closed (`onFailure: 'block'`).
+   *
+   * Verified 2026-11-10 against SDK 0.3.319 types and code.claude.com/docs (tools reference,
+   * agent-sdk permissions); see docs/adapters/capability-matrix.md.
+   */
+  fileToolsOnly?: boolean;
   /** Replaces the SDK's `query()`; for tests. */
   query?: typeof sdkQuery;
 }
+
+/** The tools an unattended Worker gets (`fileToolsOnly`). */
+export const FILE_TOOLS = ['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep'] as const;
+/** Shell tools removed outright for `fileToolsOnly`, whatever `tools` does. */
+export const SHELL_TOOLS = ['Bash', 'PowerShell', 'Monitor'] as const;
+/** File tools the SDK runs without `canUseTool` inside the working directory. */
+const SELF_APPROVED = ['Read', 'Glob', 'Grep'];
 
 interface PendingApproval {
   resolve: (r: PermissionResult) => void;
@@ -254,6 +279,29 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     let s: Session | undefined;
     const canUseTool: CanUseTool = (toolName, input, ctx) =>
       s ? this.#askApproval(s, toolName, input, ctx) : Promise.resolve(deny('session not ready'));
+    // `fileToolsOnly`: reads and searches asked about too, through the same approval round trip.
+    const askHook: HookCallback = async (input, _id, { signal }) => {
+      if (input.hook_event_name !== 'PreToolUse') return {};
+      const toolInput =
+        typeof input.tool_input === 'object' && input.tool_input !== null
+          ? (input.tool_input as Record<string, unknown>)
+          : {};
+      const r = s
+        ? await this.#askApproval(s, input.tool_name, toolInput, {
+            signal,
+            suggestions: [],
+            toolUseID: input.tool_use_id,
+            requestId: `hook-${input.tool_use_id}`,
+          })
+        : deny('session not ready');
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: r.behavior === 'allow' ? 'allow' : 'deny',
+          ...(r.behavior === 'deny' ? { permissionDecisionReason: r.message } : {}),
+        },
+      };
+    };
 
     let q: Query;
     try {
@@ -271,6 +319,25 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           env,
           includePartialMessages: true,
           canUseTool,
+          ...(this.#opts.fileToolsOnly
+            ? {
+                tools: [...FILE_TOOLS],
+                disallowedTools: [...SHELL_TOOLS],
+                // Never auto-approve: an `allowedTools` entry would skip `canUseTool`.
+                allowedTools: [],
+                permissionMode: 'default' as const,
+                hooks: {
+                  PreToolUse: [
+                    {
+                      matcher: SELF_APPROVED.join('|'),
+                      hooks: [askHook],
+                      timeout: 3600,
+                      onFailure: 'block' as const,
+                    },
+                  ],
+                },
+              }
+            : {}),
           ...(opts.model !== undefined ? { model: opts.model } : {}),
           ...(effort !== undefined ? { effort } : {}),
           ...(opts.contextWindow === CONTEXT_1M ? { betas: ['context-1m-2025-08-07'] } : {}),
