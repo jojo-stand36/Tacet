@@ -101,6 +101,10 @@ export const TacetConfig = z.strictObject({
     .strictObject({ warn: Fraction, handoff: Fraction, hard: Fraction })
     .partial()
     .optional(),
+  /**
+   * Commands that check a Worker's finished sub-task in its checkout (#19), run with `/bin/sh -c`
+   * as Worker code: the Worker environment, no vendor keys. The task layer may not set it.
+   */
   verify: z.array(NonEmpty).optional(),
   budget: z
     .strictObject({
@@ -169,6 +173,13 @@ export const TacetConfig = z.strictObject({
       stuck_after_s: z.number().int().positive(),
       nudge_grace_s: z.number().int().positive(),
       max_attempts: z.number().int().positive(),
+      /** Seconds one `verify` command may run before it is ended (#19). */
+      verify_timeout_s: z.number().int().positive(),
+      /**
+       * Times a failed verification goes back to the same Worker session to fix before the attempt
+       * fails (#19); 0 fails it at once.
+       */
+      verify_fix_attempts: z.number().int().nonnegative(),
       /**
        * Worker environment (#147). A Worker starts with an allowlist of the user's environment;
        * `pass` adds names, or prefixes ending in `*`. A prefix never passes a secret-looking
@@ -201,7 +212,14 @@ export const DEFAULT_CONFIG = {
   auth: { unattended: 'api_key', interactive: 'subscription' },
   policies: [],
   events: { retention: { transcript_days: 30 } },
-  workers: { max: 4, stuck_after_s: 300, nudge_grace_s: 900, max_attempts: 3 },
+  workers: {
+    max: 4,
+    stuck_after_s: 300,
+    nudge_grace_s: 900,
+    max_attempts: 3,
+    verify_timeout_s: 600,
+    verify_fix_attempts: 2,
+  },
 } satisfies TacetConfig;
 
 /** Checks that only make sense on the merged result. */

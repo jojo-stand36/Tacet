@@ -73,8 +73,10 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
 - [ ] **PTY adapters: don't leave a CLI's detached background processes running** — `feature` `P2` `claude`
 - [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
+- [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
 - [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
-- [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P2` `claude`
+- [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
+- [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 

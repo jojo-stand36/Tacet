@@ -112,6 +112,12 @@ export function mergeConfig(
       layerErrors.push(...taskRaisesWorkers(merged, layer), ...taskSetsTierBounds(layer));
     }
     layerErrors.push(...workerEnvErrors(layer));
+    if (layer.name === 'task' && layer.data.verify !== undefined) {
+      // A task could otherwise turn every check off (`[]`) or run shell outside any Worker (#19).
+      layerErrors.push(
+        `verify: the task layer (${layer.origin}) may not change the verify commands`,
+      );
+    }
     apply(merged, layer.data as Plain, layer, '', []);
   }
 
@@ -174,7 +180,14 @@ function taskRaisesWorkers(merged: Plain, layer: ConfigLayer): string[] {
       );
     }
   };
-  for (const key of ['max', 'stuck_after_s', 'nudge_grace_s', 'max_attempts'] as const) {
+  for (const key of [
+    'max',
+    'stuck_after_s',
+    'nudge_grace_s',
+    'max_attempts',
+    'verify_timeout_s',
+    'verify_fix_attempts',
+  ] as const) {
     check(key, w[key], below[key]);
   }
   for (const [id, cap] of Object.entries(w.per_adapter ?? {})) {
