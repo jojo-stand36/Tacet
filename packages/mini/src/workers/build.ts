@@ -235,7 +235,11 @@ export function buildWorkerAdapters(
       preset?.kind === 'acp'
         ? Object.values(BUILTIN_ACP_AGENTS).find(
             (a) =>
-              a.workerRefused && preset.command.some((w) => runsAgent(w, a.command[0] ?? '', a.id)),
+              a.workerRefused &&
+              // Each word of each argument, so `sh -c "exec codex-acp"` is caught too.
+              preset.command
+                .flatMap((arg) => arg.split(/\s+/))
+                .some((w) => runsAgent(w, a.command[0] ?? '', a.id)),
           )
         : undefined;
     const refused = builtin?.workerRefused ?? runs?.workerRefused;

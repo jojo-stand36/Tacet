@@ -102,6 +102,7 @@ describe('buildWorkerAdapters', () => {
       ['codex-acp'],
       ['/usr/local/bin/codex-acp', '--flag'],
       ['npx', '-y', '@agentclientprotocol/codex-acp@2.6.0'],
+      ['sh', '-c', 'exec codex-acp --x'],
     ]) {
       refusedFor({
         tiers: { worker: { adapter: 'acp:cx' } },
