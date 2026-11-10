@@ -454,7 +454,7 @@
         "priority:p1",
         "agent:claude"
       ],
-      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [ ] node-pty session manager with scrollback\n- [ ] Local HTTP endpoint receiving hook events\n- [ ] Installer that writes hook config into the worktree's settings (non-destructively)\n- [ ] Borrow (ADR-001): Run native PTY wrappers inside an OS sandbox (`bwrap` on Linux, `seatbelt` on macOS), as Omnigent does (`omnigent/sandbox/`); coordinate with #53\n- [ ] Borrow (ADR-001): Use Gas Town's agent preset schema (launch command, ready prompt, resume flag, process name) for per-CLI PTY config (`docs/agent-provider-integration.md` §Tier 1)\n- [ ] Borrow (ADR-001): Context-pressure injection through a `UserPromptSubmit` hook with a model id → window table, after Gas City (`cmd/gc/context_inject.go`); re-derive the table from vendor docs\n- [ ] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Run any interactive CLI in a PTY; derive status from hooks (Claude Code HTTP hooks: PermissionRequest, Notification, Stop, PreCompact, SessionStart) or output heuristics.\n\n### Tasks\n- [x] node-pty session manager with scrollback\n- [x] Local HTTP endpoint receiving hook events\n- [x] Installer that writes hook config into the worktree's settings (non-destructively): per-session `--settings` files outside the worktree instead\n- [x] Borrow (ADR-001): Run native PTY wrappers inside an OS sandbox (`bwrap` on Linux, `seatbelt` on macOS), as Omnigent does (`omnigent/sandbox/`): moved to #53, which has the same item\n- [x] Borrow (ADR-001): Use Gas Town's agent preset schema (launch command, ready prompt, resume flag, process name) for per-CLI PTY config (`docs/agent-provider-integration.md` §Tier 1): `agents.<slug>` with `kind: pty` (#157); no process name, since Worker processes are tracked by pid (#127)\n- [x] Borrow (ADR-001): Context-pressure injection through a `UserPromptSubmit` hook with a model id → window table, after Gas City (`cmd/gc/context_inject.go`); re-derive the table from vendor docs: moved to #255 (M3)\n- [x] Write the worker's MCP config (which holds its token) outside the worktree at mode 0600, and delete it when the session closes; test it is never inside the repo (owner decision 2026-11-09)\n\n### Acceptance criteria\n- Status (running/idle/waiting) correct for Claude Code in PTY mode\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Adapter: generic ACP client",
@@ -613,6 +613,17 @@
         "agent:claude"
       ],
       "body": "Found in #110 slice 2 (spike `docs/adapters/spikes/110-codex-effort/`, Codex 0.167.0, mock Responses API): `thread/fork` sent without a `model` came back on the catalog's default model (`gpt-6.1-sol`) with `reasoningEffort: null`, not on the source thread's model. The Codex adapter adopts the reported model, so its own state is consistent, but a forked Worker silently changes model and loses its effort unless the adapter sends them.\n\n### Tasks\n- [ ] Verify on the pinned Codex whether `thread/fork` honours `model` (and the thread config's `model_reasoning_effort`) in its params (`verify-vendor-facts`).\n- [ ] When forking without `SessionOptions.model`, send the source thread's model (and its effort, checked against `model/list`) so the fork continues on what the source ran.\n- [ ] Record the behaviour in the capability matrix Codex Resume/fork row.\n\n### Acceptance criteria\n- Against the mock Responses API, a fork of a thread that ran on `gpt-5.5` at `low`, started without a model or effort, sends its first request with model `gpt-5.5` and effort `low`.\n- A fork with an explicit `model` or `effort` still uses those, and an effort the model does not list is refused (`ProfileRefusedError`).\n\n_See docs/adapters/capability-matrix.md (Codex) and #110._"
+    },
+    {
+      "title": "Codex in a PTY: a prompt ending in @token is not submitted; check pasted image paths",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Found while working on #245. In live tests against the local mock Responses API, interactive Codex 0.167.0 in a PTY does not read an `@path` into a prompt. But when a Worker prompt ends in an `@token` (`… see @note.txt`), Codex opens its \"Mentions\" popup, and the Enter that Tacet types then inserts the selected completion instead of submitting. The prompt text changes (`@note.txt` became `note.txt`), and the turn is not submitted until Esc and then Enter. The `PtyCliAdapter` turn stalls, and the next prompt Tacet types lands in that composer. An `@` that is not the last word submits normally.\n\nSeparately, Codex source (`codex-rs/tui/src/bottom_pane/chat_composer.rs`, main) attaches a pasted path as an image when it names an image file (`handle_paste_image_path`). That would send an image from outside the checkout to the model. When this triggers, for example whether a prompt with surrounding text counts, is unverified.\n\n### Tasks\n- [ ] Reproduce the trailing-`@` popup with the PTY live setup, and decide how to fix it: close the popup before submitting, end the prompt with a character that doesn't complete, or disable `mentions_v2`. Verify any switch first (`verify-vendor-facts`).\n- [ ] Probe live whether a Worker prompt holding an image path attaches the image, both inside and outside the checkout.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- A Codex `pty:<slug>` Worker prompt that ends in `@<path>` is submitted with its text unchanged, shown live.\n- A prompt holding an image path outside the checkout attaches nothing, shown live or documented with a source.\n\n_See #245, #244 and docs/adapters/capability-matrix.md (\"Generic PTY presets\")._"
     },
     {
       "title": "Core: modelSwitch 'none' for adapters that cannot choose a model",
@@ -1027,6 +1038,17 @@
       "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
     },
     {
+      "title": "Worktree gc by activity, and cleanup of planner checkouts a crash left behind",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #126. Moving the worktree registry into the event log dropped `touch()` and `lastActivityAt`. They had no production caller, and logging every touch would be write volume with no consumer. So `WorktreeManager.gc()` now judges staleness by creation time. It also has no caller yet.\n\n### Tasks\n- [ ] Derive a worktree's last activity from the `worker.*` events the Mini-conductor already keeps (the newest `worker.started`/`worker.ended`/`worker.progress` of the sessions with that `workspaceId`), and have the caller of `gc` pass it in. Don't record new events for this.\n- [ ] Decide when gc runs, for example with the landed sweep (#210), and which worktrees count as active (in `#runs`, or closing).\n- [ ] Planner checkouts (`CheckoutPlanner`) are force-removed after planning, but a crash mid-plan leaves one registered as live. Remove those at start: they hold nothing of value.\n\n### Acceptance criteria\n- A worktree whose sessions have all been idle longer than the threshold, and that holds no unintegrated work, is removed by gc. One with recent session activity is kept, even if it is old (test).\n- After a crash mid-plan, the next start removes the orphaned planner checkout (test).\n\n_See #126, packages/mini/src/worktree.ts (`gc`), packages/mini/src/standalone.ts (`CheckoutPlanner`) and docs/ARCHITECTURE.md §2.4._"
+    },
+    {
       "title": "Worktree manager",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1342,6 +1364,17 @@
         "agent:either"
       ],
       "body": "Conductor=frontier, mini=mid, worker=cheap by default; overridable per repo/task type.\n\n### Tasks\n- [ ] Tier config schema\n- [ ] Effort/reasoning level mapping per vendor\n- [ ] Task-type rules (e.g. security → frontier)\n- [ ] Borrow (ADR-001): Capacity governor: a per-repo cap on concurrent workers, after Gas Town's scheduler `max_polecats` (`docs/design/scheduler.md`); coordinate with #17\n\n### Acceptance criteria\n- Tiers applied and visible per session\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "PTY Workers: context-pressure injection through a UserPromptSubmit hook",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Split from #15, whose remaining borrow item this is (ADR-001: borrow the idea, not the code).\n\nAn interactive `pty:claude` Worker reports no context usage through the SDK, so Tacet can't see when its context fills up. Gas City adds the session's context pressure to each prompt through a `UserPromptSubmit` hook, using a table from model id to context window (`cmd/gc/context_inject.go`). The same works for Tacet's PTY Workers. Tacet already gets `UserPromptSubmit` for every PTY turn (#15, #190).\n\n### Tasks\n- [ ] Re-derive the model id → context window table from vendor docs (`verify-vendor-facts`), not from Gas City's copy. Record it in the capability matrix with sources.\n- [ ] From the PTY hooks, work out context usage per turn (the transcript's usage, or what the hooks report). Report it as `agent.usage` with `context`, as the SDK adapters do.\n- [ ] Optionally answer `UserPromptSubmit` with `additionalContext` stating the remaining context, so the Worker can hand off early. Gate this behind a setting, off by default, until the automatic handoff thresholds (#31) use it.\n- [ ] Tests against the mock Messages API with a real PTY session: usage is reported, and the injection appears only when enabled.\n\n### Acceptance criteria\n- A `pty:claude` Worker's context usage shows up as `agent.usage` events, so automatic handoff (#31) can act on it.\n\n_See #15, #31, docs/ARCHITECTURE.md (PTY hook tokens, context handoff) and ADR-001._"
     },
     {
       "title": "Per-session model, effort and context-size selection",

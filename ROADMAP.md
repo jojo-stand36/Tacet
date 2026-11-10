@@ -56,6 +56,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
 - [ ] **Codex adapter: report a self-exit only once the process group is gone** — `feature` `P2` `claude`
 - [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
+- [ ] **Codex in a PTY: a prompt ending in @token is not submitted; check pasted image paths** — `feature` `P2` `claude`
 - [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
 - [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
 - [ ] **Delete a task's pinned-target ref once its result lands** — `feature` `P2` `claude`
@@ -92,6 +93,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
+- [ ] **Worktree gc by activity, and cleanup of planner checkouts a crash left behind** — `feature` `P2` `claude`
 - [ ] **Worktree manager** — `feature` `P0` `copilot`
 - [ ] **Worktree manager state into the event log** — `chore` `P2` `either`
 - [ ] **`tacet init` installer for repos** — `feature` `P0` `copilot`
@@ -130,6 +132,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
+- [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
 
 ## M4 · Visual & terminal UI

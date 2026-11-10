@@ -197,6 +197,7 @@ export function buildWorkerAdapters(
           `${where}: agents.${ptySlug} is of kind ${preset.kind}; use ${preset.kind}:${ptySlug}`,
         );
       }
+      refusePtyForWorkers(ptySlug, where);
       const env = resolveEnv(ptySlug, preset.env);
       return new PtyCliAdapter({
         ...opts.ptyCli,
@@ -208,6 +209,9 @@ export function buildWorkerAdapters(
           secrets: Object.values(env),
           ...(preset.ready_prompt !== undefined ? { readyPrompt: preset.ready_prompt } : {}),
           ...(preset.resume_flag !== undefined ? { resumeArgs: [preset.resume_flag].flat() } : {}),
+          // Gemini CLI reads an `@path` in a prompt unasked, or after a Yes-by-default question
+          // (#245): its prompts are typed with every `@` escaped.
+          ...(runs(preset.command, runsGemini) ? { escapeAt: true } : {}),
         },
       });
     }
@@ -305,6 +309,20 @@ export function buildWorkerAdapters(
     }
   }
 
+  /**
+   * Throws for a custom PTY preset that runs interactive Claude Code: it would get none of
+   * `pty:claude`'s Worker hardening (hooks asking Tacet about every tool, isolated settings, and
+   * no `@path` read into a prompt unasked, #226), so Workers use the built-in (#245).
+   */
+  function refusePtyForWorkers(slug: string, where: string): void {
+    const preset = config.agents?.[slug];
+    if (preset?.kind === 'pty' && runs(preset.command, runsClaudeCode)) {
+      throw new WorkerConfigError(
+        `${where}: agents.${slug} runs Claude Code; use pty:claude for Workers, which runs it with the Worker hardening (#245)`,
+      );
+    }
+  }
+
   /** Throws unless `id` names an adapter this function can build. */
   function buildable(id: string, where: string): void {
     if (id === 'claude-sdk' || id === 'codex-app-server') return;
@@ -319,6 +337,7 @@ export function buildWorkerAdapters(
     }
     const pty = PTY_ID.exec(id)?.[1];
     if (pty !== undefined && (BUILTIN_PTY.includes(pty) || config.agents?.[pty]?.kind === 'pty')) {
+      if (!BUILTIN_PTY.includes(pty)) refusePtyForWorkers(pty, where);
       return;
     }
     if (pty !== undefined) {
@@ -345,6 +364,107 @@ function runsClaudeAcp(word: string): boolean {
     ['claude-agent-acp', 'claude-code-acp'].includes(base) ||
     /(^|\/)(claude-agent-acp|claude-code-acp)(\/|@|$)/.test(word)
   );
+}
+
+/** Options whose value names a model, config or profile, never what a command runs. */
+const VALUE_OPTIONS = /^--?(m|model|config|profile|agent|provider)$/;
+
+/**
+ * Whether `command` may run what `test` recognises, failing closed (#245 review): any word of it,
+ * split at shell separators, unless it is the value of an option that names a model, config or
+ * profile (`aider --model claude`, `opencode --config ~/.config/claude`). So a launcher or wrapper
+ * Tacet does not model (`timeout 60 claude`, `caffeinate -i claude`, `bash -lc claude`) is still
+ * caught; `sh -c 'cd ~/claude && aider'` is too, a loud false positive in the safe direction. A
+ * wrapper script that hides the CLI is not caught.
+ */
+export function runs(command: string[], test: (word: string) => boolean): boolean {
+  if (commandWords(command).some(test)) return true;
+  const words = command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).filter(Boolean);
+  return words.some((w, i) => {
+    const eq = w.indexOf('=');
+    // `--model=claude`: the value after `=` of a value option.
+    if (eq > 0 && VALUE_OPTIONS.test(w.slice(0, eq))) return false;
+    const word = eq > 0 && !w.startsWith('-') ? w.slice(eq + 1) : w;
+    return test(word) && !VALUE_OPTIONS.test(words[i - 1] ?? '');
+  });
+}
+
+const LAUNCHERS = new Set(['env', 'npx', 'bunx', 'pnpx', 'node', 'deno', 'exec', 'nohup']);
+const RUNNERS = new Set(['npm', 'pnpm', 'yarn']);
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
+
+/**
+ * The words of a command line that name what it runs (#245 review): the executable, what a
+ * launcher runs (`env`, `npx`, `node`, `exec`, `pnpm dlx`: the first word that is not an option
+ * or a `NAME=value`), and each command of a `sh -c` script. Arguments are not, so
+ * `aider --model claude` runs aider. A wrapper script that hides the CLI is not seen through.
+ */
+export function commandWords(argv: string[], depth = 0): string[] {
+  const [head, ...rest] = argv;
+  if (head === undefined || depth > 5) return [];
+  const base = head.split('/').pop() ?? head;
+  if (SHELLS.has(base)) {
+    // `-c`, or combined short options that include it (`-lc`, `-ec`).
+    const c = rest.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+    const script = c < 0 ? undefined : rest[c + 1];
+    if (script === undefined) return [head];
+    return [
+      head,
+      ...script.split(/[;&|()\n]+/).flatMap((cmd) =>
+        commandWords(
+          cmd
+            .trim()
+            .split(/\s+/)
+            .map((w) => w.replace(/^["'`]+|["'`]+$/g, ''))
+            .filter(Boolean),
+          depth + 1,
+        ),
+      ),
+    ];
+  }
+  let args = rest;
+  if (RUNNERS.has(base)) {
+    const sub = args.findIndex((a) => !a.startsWith('-'));
+    if (sub < 0 || !['dlx', 'exec', 'x'].includes(args[sub] ?? '')) return [head];
+    args = args.slice(sub + 1);
+  } else if (!LAUNCHERS.has(base)) {
+    return [head];
+  }
+  const next = args.findIndex((a) => !a.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(a));
+  return next < 0 ? [head] : [head, ...commandWords(args.slice(next), depth + 1)];
+}
+
+/**
+ * Whether a command word runs Claude Code: the `claude` bin (by name or path), its npm package
+ * `@anthropic-ai/claude-code`, or the binary the Agent SDK bundles
+ * (`@anthropic-ai/claude-agent-sdk-<platform>-<arch>/claude`). A wrapper script that hides it is
+ * not caught.
+ */
+function runsClaudeCode(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return (
+    base === 'claude' ||
+    /(^|\/)@anthropic-ai\/claude-code(\/|@|$)/.test(word) ||
+    /(^|\/)@anthropic-ai\/claude-agent-sdk-[^/]+\/claude$/.test(word)
+  );
+}
+
+/**
+ * Whether a command word runs Gemini CLI: the `gemini` bin (by name or path) or its npm package
+ * `@google/gemini-cli` (`npx @google/gemini-cli`, `node .../@google/gemini-cli/bundle/gemini.js`).
+ * A wrapper script that hides it is not caught.
+ */
+export function runsGemini(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return base === 'gemini' || /(^|\/)@google\/gemini-cli(\/|@|$)/.test(word);
 }
 
 /** Whether one word of a command runs `bin` (by name, path or npm package). */

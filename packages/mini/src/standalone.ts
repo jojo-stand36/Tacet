@@ -100,39 +100,50 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       claude: { ...o.workers?.claude, stateDir },
     });
   const tiers = config.tiers ?? {};
-  const workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, { env: baseEnv });
+  // First: the worktree registry lives in the log (#126). The manager writes to it only once
+  // `mini.start()` holds the lock.
+  const store = openEventStore(paths.events);
+  let workspaces: WorktreeManager;
   let planner: Planner = new SingleStepPlanner();
-  const mini = tiers.mini;
-  if (!o.singleStep && mini) {
-    const worker = adapters[mini.adapter];
-    if (!worker) throw new Error(`tiers.mini.adapter ${mini.adapter} was not built`);
-    // Never in the user's checkout: some adapters write without asking (Codex's sandbox).
-    planner = new CheckoutPlanner(
-      workspaces,
-      (cwd) =>
-        new AdapterPlanner({
-          worker,
-          adapterId: mini.adapter,
-          ...(mini.model !== undefined ? { model: mini.model } : {}),
-          ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
-          cwd,
-        }),
-    );
-  }
   let reviewer: Reviewer | undefined;
-  if (config.review?.enabled && tiers.review) {
-    const worker = adapters[tiers.review.adapter];
-    if (!worker) throw new Error(`tiers.review.adapter ${tiers.review.adapter} was not built`);
-    reviewer = new AdapterReviewer({
-      worker,
-      adapterId: tiers.review.adapter,
-      ...(tiers.review.model !== undefined ? { model: tiers.review.model } : {}),
-      ...(tiers.review.effort !== undefined ? { effort: tiers.review.effort } : {}),
-      diff: { repoRoot: o.repoRoot, env: baseEnv },
+  try {
+    workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, {
+      env: baseEnv,
+      log: { store, repo: paths.repoId, miniId: 'standalone' },
     });
+    const mini = tiers.mini;
+    if (!o.singleStep && mini) {
+      const worker = adapters[mini.adapter];
+      if (!worker) throw new Error(`tiers.mini.adapter ${mini.adapter} was not built`);
+      // Never in the user's checkout: some adapters write without asking (Codex's sandbox).
+      planner = new CheckoutPlanner(
+        workspaces,
+        (cwd) =>
+          new AdapterPlanner({
+            worker,
+            adapterId: mini.adapter,
+            ...(mini.model !== undefined ? { model: mini.model } : {}),
+            ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
+            cwd,
+          }),
+      );
+    }
+    if (config.review?.enabled && tiers.review) {
+      const worker = adapters[tiers.review.adapter];
+      if (!worker) throw new Error(`tiers.review.adapter ${tiers.review.adapter} was not built`);
+      reviewer = new AdapterReviewer({
+        worker,
+        adapterId: tiers.review.adapter,
+        ...(tiers.review.model !== undefined ? { model: tiers.review.model } : {}),
+        ...(tiers.review.effort !== undefined ? { effort: tiers.review.effort } : {}),
+        diff: { repoRoot: o.repoRoot, env: baseEnv },
+      });
+    }
+  } catch (err) {
+    store.close();
+    throw err;
   }
 
-  const store = openEventStore(paths.events);
   let server: MiniMcpServer | undefined;
   let control: RpcServer | undefined;
   let runtimeFile: string | undefined;

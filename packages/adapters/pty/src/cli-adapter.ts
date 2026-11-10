@@ -77,6 +77,19 @@ export interface PtyPreset {
    * `vendorSessionId` is a marker, set at start.
    */
   resumeArgs?: string[];
+  /**
+   * For Gemini CLI (#245), which reads files named in a prompt into it with `ReadManyFiles`: a
+   * file in the workspace without asking, one outside after a confirmation whose default is Yes
+   * (the next Enter Tacet types would accept it). Two routes, both closed: an `@path` (also an
+   * `@agent` or MCP `@resource`), so every `@` is typed as `\@`, which Gemini takes as a literal
+   * at sign and sends as typed; and a paste made only of existing file paths (`./a.txt`, a quoted
+   * path), which Gemini turns into `@path` itself, so the prompt starts with `. ` and ends with
+   * ` .`: a segment that is a directory, never a file, which nothing before it can join (an
+   * unclosed quote or a trailing backslash in the text could join the suffix onto a path), and
+   * which the suffix keeps from ending in a backslash (Enter would add a newline). Verified live on Gemini CLI 0.67.0 against a local mock of
+   * its API (capability matrix, "Generic PTY presets: `@path` mentions").
+   */
+  escapeAt?: boolean;
 }
 
 /** `vendorSessionId` of a session whose CLI resumes by `resumeArgs`: there is no real id. */
@@ -167,6 +180,11 @@ const deadline = (ms: number) => new Promise((r) => setTimeout(r, ms).unref());
 export class PtyCliAdapter implements AgentAdapter {
   readonly id: string;
   readonly #opts: PtyCliAdapterOptions;
+
+  /** The preset this adapter runs, read-only. */
+  get preset(): Readonly<PtyPreset> {
+    return this.#opts.preset;
+  }
   readonly #sessions = new Map<string, Session>();
 
   constructor(opts: PtyCliAdapterOptions) {
@@ -314,7 +332,8 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.effort !== undefined) {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
-    const text = promptText(input.text);
+    const typed = promptText(input.text);
+    const text = this.#opts.preset.escapeAt ? `. ${typed.replaceAll('@', '\\@')} .` : typed;
     // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
     if (s.stalled) {
       s.stalled = false;

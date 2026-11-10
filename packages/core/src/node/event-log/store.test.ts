@@ -196,12 +196,26 @@ describe('event log', () => {
     expect(store.query({ typePrefix: 'agent.message' })).toHaveLength(0);
     expect(store.query({ typePrefix: 'agent.usage' })).toHaveLength(4);
     expect(store.replay(tasksProjection)).toEqual(expected);
+
     const raw = new Database(path);
     try {
       expect(() => raw.prepare('DELETE FROM events').run()).toThrow(/append-only/);
     } finally {
       raw.close();
     }
+  });
+
+  it('keeps the worktree registry (workspace.*) through retention (#126)', () => {
+    store.append({
+      v: 1,
+      id: '01J00000000000000000000W01',
+      ts: '2026-01-01T00:00:00.000Z',
+      source: { kind: 'mini', id: 'mini' },
+      type: 'workspace.created',
+      data: { workspaceId: 'w-1', workerId: 's-1', baseCommit: 'a'.repeat(40) },
+    });
+    store.compact({ before: '2100-01-01T00:00:00.000Z' });
+    expect(store.query({ typePrefix: 'workspace' })).toHaveLength(1);
   });
 
   it('refuses a database with a newer schema version', () => {

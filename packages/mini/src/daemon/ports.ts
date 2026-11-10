@@ -26,6 +26,11 @@ export interface Workspaces {
    */
   create(workerId: string, base?: string): Promise<Workspace>;
   /**
+   * Bring the checkout registry up to date with the disk (#126): called once at start, while the
+   * Mini-conductor holds its lock, before any checkout is looked up.
+   */
+  reconcile?(): Promise<void>;
+  /**
    * The repo's checked-out branch (absent when its HEAD is detached) and commit right now: where a
    * new task's sub-tasks start (#219). Without it, each sub-task starts at the main branch as it is
    * when the sub-task starts.
