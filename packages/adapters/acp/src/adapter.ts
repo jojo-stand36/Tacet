@@ -144,8 +144,8 @@ interface Session {
   drifts: number;
   exited: Promise<void>;
   /**
-   * Resolves once the agent has exited and its whole process group is gone: the one reap of the
-   * group, done by the exit handler (#218). Closing waits on it rather than polling the group
+   * Resolves once the agent has exited and the exit handler's reap of its process group has
+   * finished: the one reap of the group (#218). Closing waits on it rather than polling the group
    * again, since an id seen empty may belong to another group by then.
    */
   gone: Promise<void>;
@@ -226,11 +226,8 @@ export class AcpAdapter implements AgentAdapter {
     const handle: SessionHandle = { id: randomUUID() };
     let s: Session | undefined;
     const exitInfo: { value?: Session['exit']; reaped?: boolean } = {};
-    let markGone = () => {};
     // Resolves only after an `exit`: wait on it only once the process has exited.
-    const gone = new Promise<void>((r) => {
-      markGone = r;
-    });
+    const { promise: gone, resolve: markGone } = Promise.withResolvers<void>();
     const exited = new Promise<void>((resolve) => {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
@@ -811,7 +808,8 @@ export class AcpAdapter implements AgentAdapter {
     // The agent's own children (claude-agent-acp's Claude Code, its MCP servers) got SIGTERM
     // when it exited, but may still be shutting down and writing: wait for the whole group, so
     // nothing of a closed session is left running (#181 CI). The exit handler reaps the group,
-    // once (#218); a process that never exited (it failed to spawn) has no group to wait for.
+    // once (#218). A process that never exited (it failed to spawn) has no group to wait for; an
+    // `error` after a spawn without an `exit` cannot happen here (signals go through process.kill).
     await (hasExited() ? gone : this.#reapGroup(proc));
   }
 
