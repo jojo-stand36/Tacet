@@ -192,6 +192,13 @@ describe.skipIf(!gate.ok)(
       const tap = new EventTap(escaping.events(h));
       const { events } = await turn(escaping, h, tap, 'see @/etc/hosts and a@b.c');
       expect(reply(events)).toContain('echo: see \\@/etc/hosts and a\\@b.c');
+      // Text that already has backslashes before an `@` cannot undo the escape: every `@` typed
+      // still has a backslash right before it, which Gemini 0.67.0 reads as a literal at sign
+      // however many come before it (verified live with one, two and three).
+      const tricky = 'a \\@x b \\\\@y c \\ @z d @@w';
+      const typed = reply((await turn(escaping, h, tap, tricky)).events);
+      expect(typed).toContain(`echo: ${tricky.replaceAll('@', '\\@')}`);
+      expect(/(^|[^\\])@/.test(typed)).toBe(false);
       await escaping.close(h);
       // Without it, the text is typed as given.
       const h2 = await adapter.start({ cwd: root });
