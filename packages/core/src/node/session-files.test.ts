@@ -26,19 +26,19 @@ import { isProcessRunning } from './worker-processes.js';
 
 const DATA = '{"token":"Bearer t"}';
 /** A session file named after the session, as the adapters write them. */
-const write = (_: unknown, opts: { sessionId: string; worktree: string; dir?: string }) =>
+const write = (opts: { sessionId: string; worktree: string; dir?: string }) =>
   writeSessionFile(`${opts.sessionId}.json`, DATA, opts);
 
 describe('session files', () => {
   let root: string;
   beforeEach(() => {
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-mcp-')));
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-session-files-')));
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   it('writes a 0600 file in a 0700 directory outside the worktree, and removes it', () => {
     const dir = join(root, 'run', 'mcp');
-    const path = write(null, { sessionId: 's1', worktree: join(root, 'wt'), dir });
+    const path = write({ sessionId: 's1', worktree: join(root, 'wt'), dir });
     expect(path).toBe(join(dir, ownOwnerDirName(), 's1.json'));
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
@@ -49,10 +49,10 @@ describe('session files', () => {
 
   it('refuses a directory inside the worktree', () => {
     const wt = join(root, 'wt');
-    expect(() => write(null, { sessionId: 's1', worktree: wt, dir: wt })).toThrow(
+    expect(() => write({ sessionId: 's1', worktree: wt, dir: wt })).toThrow(
       /must be outside the worktree/,
     );
-    expect(() => write(null, { sessionId: 's1', worktree: wt, dir: join(wt, '.tacet') })).toThrow(
+    expect(() => write({ sessionId: 's1', worktree: wt, dir: join(wt, '.tacet') })).toThrow(
       /must be outside the worktree/,
     );
   });
@@ -62,19 +62,19 @@ describe('session files', () => {
     mkdirSync(wt);
     symlinkSync(wt, join(root, 'link'));
     // A symlinked parent of the directory points into the worktree.
-    expect(() =>
-      write(null, { sessionId: 's1', worktree: wt, dir: join(root, 'link', 'mcp') }),
-    ).toThrow(/must be outside the worktree/);
+    expect(() => write({ sessionId: 's1', worktree: wt, dir: join(root, 'link', 'mcp') })).toThrow(
+      /must be outside the worktree/,
+    );
     // The worktree itself is given through a symlink (as macOS tmpdir paths are).
     expect(() =>
-      write(null, {
+      write({
         sessionId: 's1',
         worktree: join(root, 'link'),
         dir: join(wt, '.x'),
       }),
     ).toThrow(/must be outside the worktree/);
     // A directory whose name starts with `..` is still inside.
-    expect(() => write(null, { sessionId: 's1', worktree: wt, dir: join(wt, '..cache') })).toThrow(
+    expect(() => write({ sessionId: 's1', worktree: wt, dir: join(wt, '..cache') })).toThrow(
       /must be outside the worktree/,
     );
     expect(readdirSync(wt)).toEqual([]);
@@ -88,7 +88,7 @@ describe('session files', () => {
     symlinkSync(join(wt, 'sub'), join(root, 'outside', 'link'));
     expect(realish(`${join(root, 'outside', 'link')}/..`)).toBe(realish(wt));
     expect(() =>
-      write(null, {
+      write({
         sessionId: 's1',
         worktree: wt,
         dir: `${join(root, 'outside', 'link')}/../mcp`,
@@ -97,7 +97,7 @@ describe('session files', () => {
     // A symlinked directory pointing outside the worktree is used through its real path.
     mkdirSync(join(root, 'real'));
     symlinkSync(join(root, 'real'), join(root, 'mcp'));
-    const path = write(null, { sessionId: 's2', worktree: wt, dir: join(root, 'mcp') });
+    const path = write({ sessionId: 's2', worktree: wt, dir: join(root, 'mcp') });
     expect(path).toBe(join(realish(join(root, 'real')), ownOwnerDirName(), 's2.json'));
   });
 
@@ -105,7 +105,7 @@ describe('session files', () => {
     const cwd = process.cwd();
     process.chdir(root);
     try {
-      const path = write(null, {
+      const path = write({
         sessionId: 's3',
         worktree: join(root, 'wt'),
         dir: 'rel/mcp',
@@ -119,9 +119,9 @@ describe('session files', () => {
 
   it('refuses to overwrite an existing file and rejects path-like session ids', () => {
     const dir = join(root, 'mcp');
-    write(null, { sessionId: 's1', worktree: join(root, 'wt'), dir });
-    expect(() => write(null, { sessionId: 's1', worktree: join(root, 'wt'), dir })).toThrow();
-    expect(() => write(null, { sessionId: '../x', worktree: join(root, 'wt'), dir })).toThrow(
+    write({ sessionId: 's1', worktree: join(root, 'wt'), dir });
+    expect(() => write({ sessionId: 's1', worktree: join(root, 'wt'), dir })).toThrow();
+    expect(() => write({ sessionId: '../x', worktree: join(root, 'wt'), dir })).toThrow(
       /invalid session file name/,
     );
   });
@@ -131,7 +131,7 @@ describe('session files', () => {
     const worktree = join(root, 'wt');
     const ns = ownOwnerDirName().split('-')[0];
     // This process's own file, and one of another live owner.
-    const mine = write(null, { sessionId: 'mine', worktree, dir });
+    const mine = write({ sessionId: 'mine', worktree, dir });
     const live = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
       stdio: 'ignore',
     });
@@ -150,6 +150,8 @@ describe('session files', () => {
       await deadExited;
       await expect.poll(() => isProcessRunning(dead.pid as number)).toBe(false);
       plant(deadOwner, 'b.json');
+      // Every file counts, not only MCP configs (e.g. a PTY hook settings file).
+      plant(deadOwner, 'b.hooks.settings');
       plant(deadOwner, 'c.json');
       // A live pid whose start time does not match: a reused pid, so a dead owner.
       plant(`${ns}-${live.pid}-000000000000`, 'd.json');
@@ -164,7 +166,7 @@ describe('session files', () => {
       symlinkSync(join(root, 'elsewhere'), join(dir, `${ns}-${dead.pid}-111111111111`));
       // Not an owner directory: never touched.
       writeFileSync(join(dir, 'legacy.json'), '{}');
-      expect(sweepStaleSessionFiles(dir)).toBe(4);
+      expect(sweepStaleSessionFiles(dir)).toBe(5);
       expect(readdirSync(dir).sort()).toEqual(
         [
           liveOwner,
@@ -184,10 +186,20 @@ describe('session files', () => {
     }
   });
 
+  it('accepts only plain file names', () => {
+    const opts = { worktree: join(root, 'wt'), dir: join(root, 'files') };
+    for (const name of ['', '.', '..', '.hidden', 'a/b', '../x', 'a\\b', 'a\nb']) {
+      expect(() => writeSessionFile(name, 'x', opts), name).toThrow(/invalid session file name/);
+    }
+    expect(writeSessionFile('s-1.hooks.json', 'x', opts)).toBe(
+      join(realish(join(root, 'files')), ownOwnerDirName(), 's-1.hooks.json'),
+    );
+  });
+
   it('removes the owner directory with its last file', () => {
     const dir = join(root, 'run', 'mcp');
-    const a = write(null, { sessionId: 'a', worktree: join(root, 'wt'), dir });
-    const b = write(null, { sessionId: 'b', worktree: join(root, 'wt'), dir });
+    const a = write({ sessionId: 'a', worktree: join(root, 'wt'), dir });
+    const b = write({ sessionId: 'b', worktree: join(root, 'wt'), dir });
     removeSessionFile(a);
     expect(existsSync(b)).toBe(true);
     removeSessionFile(b);

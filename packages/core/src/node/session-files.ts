@@ -24,7 +24,10 @@ import { processStartTime } from './worker-processes.js';
  * owning process, so a crashed owner's files can be swept (#108).
  */
 
-/** Where per-session files live: outside every repo, mode 0700. */
+/**
+ * Where per-session files live: outside every repo, mode 0700. Named `mcp` for compatibility:
+ * ADR-003 and the sandbox profile (#53) deny Workers this path.
+ */
 export function defaultSessionFileDir(): string {
   return join(homedir(), '.tacet', 'run', 'mcp');
 }
@@ -82,11 +85,12 @@ const startHash = (start: string): string =>
   createHash('sha256').update(start).digest('hex').slice(0, 12);
 
 /**
- * `<namespace>-<pid>-<hash>`: the process that writes a set of MCP config files, and a hash of its
+ * `<namespace>-<pid>-<hash>`: the process that writes a set of session files, and a hash of its
  * start time, so a later process that gets the same pid is not taken for it (#108). When the start
  * time cannot be read, the hash is `unknown`, and only the pid being gone lets a sweep remove the
  * directory.
  */
+/** @internal Exported for tests and the adapters' compatibility exports. */
 export function ownerDirName(pid = process.pid): string {
   const start = processStartTime(pid);
   return `${pidNamespace()}-${pid}-${start === undefined ? 'unknown' : startHash(start)}`;
@@ -94,6 +98,7 @@ export function ownerDirName(pid = process.pid): string {
 
 /** This process's owner directory name, worked out once, so all its files share one directory. */
 let ownName: string | undefined;
+/** @internal */
 export function ownOwnerDirName(): string {
   ownName ??= ownerDirName();
   return ownName;
