@@ -1,7 +1,7 @@
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionHandle } from '@tacet/core';
+import { ForkRefusedError, type SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { PTY_LAST_SESSION, PtyCliAdapter, stripEcho } from './cli-adapter.js';
@@ -167,7 +167,7 @@ describe.skipIf(!gate.ok)(
       );
       await expect(
         resumable.start({ cwd, resume: { vendorSessionId: PTY_LAST_SESSION, fork: true } }),
-      ).rejects.toThrow(/fork/);
+      ).rejects.toThrow(ForkRefusedError);
       await resumable.close(resumed);
 
       // Resumed with nothing saved (the marker is set before the CLI saves anything): this fake

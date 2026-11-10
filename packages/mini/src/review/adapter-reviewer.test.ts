@@ -192,8 +192,11 @@ describe('reviewDiff and AdapterReviewer', () => {
     expect(prompt).toContain(redactSecrets(raw.patch));
     expect(prompt).toContain('[redacted]');
     expect(prompt).toMatch(/<<<DIFF-([0-9a-f]{16})[\s\S]*DIFF-\1>>>/);
-    // Closed when done.
+    // Closed when done, and discarded: a review session is never resumed (#237).
     expect(adapter.status(s?.handle ?? { id: '' })).toBe('done');
+    expect(adapter.discarded).toEqual([
+      { vendorSessionId: s?.handle.vendorSessionId, cwd: s?.opts.cwd },
+    ]);
   });
 
   it('fails on blocking findings', async () => {

@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { AgentEvent } from '@tacet/core';
-import { ProfileRefusedError } from '@tacet/core';
+import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
 import { mcpAuthHeaders, repoStateDir, Secret } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -609,22 +609,39 @@ describe('AcpAdapter (fake ACP agent)', () => {
       });
 
       it('refuses a fork the agent did not advertise, or the spec did not declare', async () => {
-        const quiet = make(forking('native'), {
-          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }),
-        });
-        await expect(quiet.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
-          /did not advertise session\/fork/,
+        // An agent with a child that ignores SIGTERM: the refusal leaves none of it running.
+        const quiet = make(
+          forking('native'),
+          { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }), FAKE_CHILD: '1' },
+          { killTimeoutMs: 300 },
         );
+        // Typed, so a caller can fall back to a HandoffPacket (#228); not "failed to start".
+        const refused = await quiet.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        const child = received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+        const alive = child !== undefined && running(child);
+        if (alive) process.kill(child, 'SIGKILL');
+        expect(child).toBeTypeOf('number');
+        expect(alive).toBe(false);
+        expect(refused).toBeInstanceOf(ForkRefusedError);
+        expect(refused).toMatchObject({ adapterId: 'acp:forker' });
+        expect((refused as Error).message).toMatch(/did not advertise session\/fork/);
+        expect((refused as Error).message).not.toMatch(/failed to start/);
         const undeclared = make(forking('none'), {
           FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
         });
         await expect(undeclared.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
-          /does not fork sessions/,
+          ForkRefusedError,
         );
         // Gemini declares no fork: refused before anything starts, as before.
-        await expect(gemini().start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
-          /does not fork sessions/,
-        );
+        const before = methods().length;
+        const declined = await gemini()
+          .start({ cwd: join(root, 'wt'), resume: fork })
+          .catch((e) => e);
+        expect(declined).toBeInstanceOf(ForkRefusedError);
+        expect((declined as Error).message).toMatch(/does not fork sessions/);
+        expect(methods()).toHaveLength(before);
         expect(methods().map((m) => m.method)).not.toContain('session/fork');
       });
 
@@ -633,9 +650,10 @@ describe('AcpAdapter (fake ACP agent)', () => {
           FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
           FAKE_FORK_ID: 'same',
         });
-        await expect(adapter.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
-          /without a new session id/,
-        );
+        // The agent forked, badly: a start failure, not a refusal to fall back from.
+        const err = await adapter.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        expect((err as Error).message).toMatch(/without a new session id/);
+        expect(err).not.toBeInstanceOf(ForkRefusedError);
       });
 
       it('never declares fork without resume, nor an emulated one', () => {

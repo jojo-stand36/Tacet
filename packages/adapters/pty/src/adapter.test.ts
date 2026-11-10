@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ProfileRefusedError } from '@tacet/core';
+import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -223,6 +223,15 @@ describe('PtyAdapter (fake claude)', () => {
     );
     expect(f.args[f.args.indexOf('--session-id') + 1]).toBe(h.vendorSessionId);
     expect(f.opts.env.CLAUDE_CONFIG_DIR).toContain(join(root, 'state'));
+    // No `@path` mention is read into a prompt (#226).
+    expect(f.opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
+    // Set last: neither the base environment nor a session's own env can turn it off.
+    const off = make(
+      { CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0' },
+      { envPolicy: { pass: ['FAKE_*', 'CLAUDE_CODE_DISABLE_FILE_MENTIONS'] } },
+    );
+    await off.start({ cwd: join(root, 'wt'), env: { CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0' } });
+    expect(fake().opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
     expect(f.opts.env.NO_PROXY).toContain('127.0.0.1');
     expect(f.opts.env.OPENAI_API_KEY).toBeUndefined();
     expect(dropped).toEqual([['OPENAI_API_KEY']]);
@@ -253,7 +262,7 @@ describe('PtyAdapter (fake claude)', () => {
     await expect(ok.start({ cwd, effort: 'high' })).rejects.toThrow(ProfileRefusedError);
     const id = randomUUID();
     await expect(ok.start({ cwd, resume: { vendorSessionId: id, fork: true } })).rejects.toThrow(
-      /fork/,
+      ForkRefusedError,
     );
     await expect(ok.start({ cwd, resume: { vendorSessionId: '../../x' } })).rejects.toThrow(/UUID/);
     await expect(ok.start({ cwd, resume: { vendorSessionId: id } })).rejects.toThrow(

@@ -79,6 +79,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
       codex: { ...o.workers?.codex, stateDir },
       acp: { ...o.workers?.acp, stateDir },
+      claude: { ...o.workers?.claude, stateDir },
     });
   const tiers = config.tiers ?? {};
   // First: the worktree registry lives in the log (#126). The manager writes to it only once

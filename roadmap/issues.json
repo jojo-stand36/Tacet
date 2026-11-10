@@ -819,6 +819,18 @@
       "body": "Follow-up from #18. The Mini-conductor MCP backend keeps per-Worker state (latest progress, the one-handoff-per-session flag) in memory keyed by Worker session. Nothing removes it when the Worker ends and its token is revoked, so a long-running Mini-conductor grows without bound.\n\n### Tasks\n- [ ] Drop a Worker's in-memory state when its token is revoked or its session ends\n- [ ] Keep anything needed later in the event log, not in memory\n\n### Acceptance criteria\n- After a Worker's token is revoked, the backend holds no state for that Worker (test)\n- A new Worker with a new session id starts with clean state (test)\n\n_See docs/ARCHITECTURE.md and ADR-003 §6 for context._"
     },
     {
+      "title": "PtyCliAdapter: @path expansion in Gemini, Codex and claude presets",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "`PtyCliAdapter` (`packages/adapters/pty/src/cli-adapter.ts`) types Worker prompts through the same `promptText` as `pty:claude`, and has no mitigation for file mentions. The Gemini CLI docs say `@<path>` will \"Inject the content of the specified file … into your current prompt\" through `read_many_files` (github.com/google-gemini/gemini-cli `docs/reference/commands.md`, \"At commands\"). They don't say whether that is limited to the workspace. Codex's interactive `@` behaviour is unverified. A preset whose command is `claude` itself would not get the `CLAUDE_CODE_DISABLE_FILE_MENTIONS` that #226 sets for `pty:claude`. A Worker's next prompt can carry text a Worker wrote.\n\n### Tasks\n- [ ] Verify each CLI preset's interactive `@` behaviour from primary docs, and live where possible (`verify-vendor-facts`).\n- [ ] Per CLI: set its documented switch if one exists; otherwise neutralise or refuse mentions in Worker prompts. For a `claude` preset, refuse it or set the same variable.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- For each `PtyCliAdapter` preset, a Worker prompt containing `@<path outside the checkout>` reads nothing in, shown live or documented with a source.\n\n_See #226 and docs/ARCHITECTURE.md §2._"
+    },
+    {
       "title": "Rate-limit escalate and record_decision in the Mini-conductor MCP server",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1105,6 +1117,18 @@
         "agent:claude"
       ],
       "body": "Over the Claude Agent SDK and claude-agent-acp, an `@path` mention in a prompt is read into the prompt with no permission request, outside the checkout too. #214 closes that with `verbatimPrompts`, verified live. A Worker's next prompt can carry text the Worker wrote, such as a `verify` command's output or review findings.\n\n`pty:claude` (interactive Claude Code in a PTY) gets the same text. Its `promptText` (`packages/adapters/pty/src/adapter.ts`) refuses only a leading `/` or `!`. Interactive Claude Code probably expands `@path` too, and its `PreToolUse` hook does not see attachments. This is not verified: `node-pty` cannot build in the sessions that found it.\n\n### Tasks\n- [ ] Verify live, with the PTY conformance setup and the mock Messages API: does an `@<outside path>` pasted in a prompt reach the model? Check inside a ``` fence too.\n- [ ] If it does, refuse or neutralise `@` followed by a path character in Worker prompts. Alternatively, use an interactive-mode equivalent of verbatim prompts, if Claude Code has one: check the CLI reference (`verify-vendor-facts`).\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- A `pty:claude` Worker's prompt containing `@<path outside the checkout>` reads nothing into the prompt, shown live.\n\n_See #214, #200, #206 and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "The #226 review found that a `pty:claude` Worker prompt containing an image path (`@<png>`, a quoted path, or `../x.png`) makes interactive Claude Code 2.1.319 show \"Pasting…\". The input box ends up holding only the path and the prompt is never submitted, even after another Enter. Tacet types every prompt as a bracketed paste, so a Worker's prompt is a paste. The turn wedges, with or without `CLAUDE_CODE_DISABLE_FILE_MENTIONS`. No image was attached in that probe. However, the docs list pasted images as their own attachment route (code.claude.com/docs/en/permissions, \"What Read and Edit rules cover\"), and `CLAUDE_CODE_DISABLE_FILE_MENTIONS` covers only `@` mentions.\n\n### Tasks\n- [ ] Probe live with the PTY conformance setup: a real-size PNG; absolute, relative and quoted paths; inside and outside the checkout. Does anything get attached? What do Tacet's submit acknowledgement and timeout do with the stuck turn?\n- [ ] Evaluate `permissions.blockReadsOutsideWorkingDirectories: true` in Tacet's `--settings` file. The docs say attachments from refused paths are left out (v2.1.257+). Also evaluate `CLAUDE_CODE_DISABLE_ATTACHMENTS=1`. Verify each live before relying on it.\n- [ ] Make a stuck paste fail the turn visibly instead of hanging. Refusing or neutralising image paths in prompts is also acceptable.\n\n### Acceptance criteria\n- A `pty:claude` Worker prompt containing an image path outside the checkout attaches nothing and does not hang the turn, shown live.\n\n_See #226, docs/adapters/capability-matrix.md (PTY rows) and docs/ARCHITECTURE.md §2._"
     },
     {
       "title": "tacet cancel <task> in standalone mode",
