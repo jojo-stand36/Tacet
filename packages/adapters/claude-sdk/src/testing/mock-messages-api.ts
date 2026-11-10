@@ -34,6 +34,8 @@ export interface MockRequest {
   tools: string[];
   /** Which known credential authenticated it (see `startMockMessagesApi`); `none` if none. */
   credential: string;
+  /** The request body as sent, to check that some text never reached the model (#181). */
+  raw: string;
 }
 
 export interface MockMessagesApiOptions {
@@ -186,6 +188,7 @@ async function handle(
   }
   const beta = req.headers['anthropic-beta'];
   log.push({
+    raw,
     credential: credentialOf(req, known),
     model: body.model,
     text: lastUser(body).text,

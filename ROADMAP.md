@@ -74,6 +74,8 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **PTY adapters: don't leave a CLI's detached background processes running** — `feature` `P2` `claude`
 - [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
 - [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
+- [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
+- [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 - [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
 - [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
 - [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`

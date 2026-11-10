@@ -39,12 +39,28 @@ export const VerifyCommandResult = z.object({
 });
 export type VerifyCommandResult = z.infer<typeof VerifyCommandResult>;
 
+/** How a reviewer agent judged the work (#19). Unknown values fall back to `failed`. */
+export const ReviewStatus = openEnum(['passed', 'failed', 'not_run', 'error'], 'failed');
+export type ReviewStatus = z.infer<typeof ReviewStatus>;
+
+/** The reviewer agent's verdict on the last check (#19): counts, never the findings' text. */
+export const ReviewSummary = z.object({
+  status: ReviewStatus,
+  adapter: z.string().min(1),
+  model: z.string().min(1).optional(),
+  /** Findings that block completion (blocker and major). */
+  blocking: z.number().int().nonnegative(),
+});
+export type ReviewSummary = z.infer<typeof ReviewSummary>;
+
 export const Verification = z.object({
   status: VerificationStatus,
   commands: z.array(z.string().min(1)).default([]).describe('Commands that verify the work'),
   notes: z.string().optional(),
   /** Per command, as last run (#19). Optional: older producers and handoffs omit it. */
   results: z.array(VerifyCommandResult).optional(),
+  /** The reviewer agent's verdict, when review is on (#19). */
+  review: ReviewSummary.optional(),
 });
 export type Verification = z.infer<typeof Verification>;
 

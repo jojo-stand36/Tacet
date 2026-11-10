@@ -17,6 +17,9 @@
 //   after 300 ms, or ends `cancelled` on `session/cancel`. `ASK_DRIFT`: asks a permission, then
 //   reports the switch; ends once the permission is answered.
 // - `SLOW <text>`: replies `<text>` after 300 ms. Anything else: replies with the prompt text.
+// FAKE_CHILD=1: starts a child that ignores SIGTERM and outlives this process (as an agent's own
+// Claude Code or MCP server can while it shuts down), and logs its pid as `{ childPid }`.
+import { spawn } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
@@ -34,6 +37,12 @@ const say = (sessionId, text) =>
   });
 // Names only, never values.
 log({ argv: process.argv.slice(2), envNames: Object.keys(process.env).sort() });
+if (process.env.FAKE_CHILD === '1') {
+  const child = spawn('sh', ['-c', 'trap "" TERM; while :; do sleep 0.1; done'], {
+    stdio: 'ignore',
+  });
+  log({ childPid: child.pid });
+}
 if (process.env.FAKE_STDERR) {
   // In two writes, split mid-text, so a secret in it arrives in two chunks.
   const t = process.env.FAKE_STDERR;

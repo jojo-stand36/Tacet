@@ -81,7 +81,6 @@ describe('Mini-conductor with a real Claude Worker', () => {
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       },
       mcpConfigDir: join(root, 'run', 'mcp'),
-      sdkOptions: { settingSources: [] },
     });
     daemon = new MiniConductor({
       store,
@@ -151,7 +150,7 @@ describe('Mini-conductor with a real Claude Worker', () => {
       },
       mcpConfigDir: join(root, 'run', 'mcp'),
       // The Mini-conductor refuses every approval but its own tools: Bash is allowed up front.
-      sdkOptions: { settingSources: [], allowedTools: ['Bash'] },
+      sdkOptions: { allowedTools: ['Bash'] },
     });
     // Running and not a zombie: this test process is the parent of the Claude Code it started,
     // and on macOS a killed child it has not reaped yet still answers kill(pid, 0) (#127 flake).

@@ -187,6 +187,39 @@
               "status"
             ]
           }
+        },
+        "review": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "enum": [
+                "passed",
+                "failed",
+                "not_run",
+                "error"
+              ],
+              "x-tacet-fallback": "failed",
+              "type": "string"
+            },
+            "adapter": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "blocking": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "status",
+            "adapter",
+            "blocking"
+          ]
         }
       },
       "required": [
