@@ -346,10 +346,50 @@ export class WorktreeManager implements Workspaces {
    * is left (its Git admin directory and branch), then only that admin directory is deleted.
    */
   async remove(worktreeId: string, options: RemoveWorktreeOptions = {}): Promise<void> {
+    const found = await this.registeredEntry(worktreeId);
+    if (!found) return;
+    await this.removeWorktree(found.info, options.force === true, found.missing);
+  }
+
+  /**
+   * Why `remove(worktreeId)` without `force` would keep the checkout, or undefined when it would
+   * remove it (or there is nothing to remove). Runs the same checks and changes nothing (#211).
+   */
+  async check(worktreeId: string): Promise<WorktreeKeptError | undefined> {
+    const found = await this.registeredEntry(worktreeId);
+    if (!found) return undefined;
+    try {
+      await this.removeWorktree(found.info, false, found.missing, true);
+      return undefined;
+    } catch (error) {
+      if (error instanceof WorktreeKeptError) return error;
+      throw error;
+    }
+  }
+
+  /**
+   * Every checkout this manager registered, including ones deleted by hand (`missing`), which
+   * `list()` leaves out. For a full cleanup (#211).
+   */
+  async registered(): Promise<Array<WorktreeInfo & { missing: boolean }>> {
+    const { root } = await this.paths();
+    const result: Array<WorktreeInfo & { missing: boolean }> = [];
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      const id = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name)?.[1];
+      if (!entry.isFile() || !id) continue;
+      const found = await this.registeredEntry(id).catch(() => undefined);
+      if (found) result.push({ ...found.info, missing: found.missing });
+    }
+    return result;
+  }
+
+  private async registeredEntry(
+    worktreeId: string,
+  ): Promise<{ info: WorktreeInfo; missing: boolean } | undefined> {
     if (!worktreeIdPattern.test(worktreeId)) throw new Error('invalid worktree id');
     const { root } = await this.paths();
     const info = await this.readInfo(root, worktreeId);
-    if (!info || info.path !== path.join(root, worktreeId)) return;
+    if (!info || info.path !== path.join(root, worktreeId)) return undefined;
     let missing = false;
     try {
       if ((await realpath(info.path)) !== info.path) {
@@ -360,7 +400,7 @@ export class WorktreeManager implements Workspaces {
       if (errorCode(error) !== 'ENOENT') throw error;
       missing = true;
     }
-    await this.removeWorktree(info, options.force === true, missing);
+    return { info, missing };
   }
 
   async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
@@ -650,7 +690,12 @@ export class WorktreeManager implements Workspaces {
     return { baseBranch, baseCommit };
   }
 
-  private async removeWorktree(info: WorktreeInfo, force: boolean, missing = false): Promise<void> {
+  private async removeWorktree(
+    info: WorktreeInfo,
+    force: boolean,
+    missing = false,
+    dryRun = false,
+  ): Promise<void> {
     const { root } = await this.paths();
     const release = await this.lockRemoval(info.id);
     try {
@@ -688,6 +733,7 @@ export class WorktreeManager implements Workspaces {
         }
       }
       if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip);
+      if (dryRun) return;
       if (missing) {
         // Only this worktree's registration: `git worktree prune` would also prune the user's own.
         if (gitDirectory) await rm(gitDirectory, { recursive: true, force: true });
