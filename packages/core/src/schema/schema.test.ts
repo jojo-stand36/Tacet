@@ -218,12 +218,47 @@ describe('JSON Schema export', () => {
   });
 });
 
-describe('local event namespaces (#126)', () => {
-  it('keeps the worktree registry local, and forwards the rest', () => {
-    expect(isForwardable('workspace.created')).toBe(false);
-    expect(isForwardable('workspace.removed')).toBe(false);
-    expect(isForwardable('worker.started')).toBe(true);
-    expect(isForwardable('task.landed')).toBe(true);
-    expect(isForwardable('workspacex.created')).toBe(true);
+describe('forwarding upward: the ADR-003 §4 allowlist (#256)', () => {
+  it('forwards each allowlisted type', () => {
+    for (const type of [
+      'task.created',
+      'task.status',
+      'task.landed',
+      'escalation.raised',
+      'decision.recorded',
+      'handoff.created',
+      'worker.started',
+      'worker.ended',
+      'agent.usage',
+    ]) {
+      expect(isForwardable(type), type).toBe(true);
+    }
+  });
+
+  it('keeps everything else local, a new namespace included', () => {
+    for (const type of [
+      // Local namespaces (#126, #254).
+      'workspace.created',
+      'workspace.removed',
+      'maintenance.problem',
+      // Transcripts.
+      'agent.message.delta',
+      'agent.tool.call',
+      'agent.approval.request',
+      'agent.usage.extra',
+      // Not on the §4 list.
+      'budget.spent',
+      // Unknown, or only looking like an allowed one.
+      'workspacex.created',
+      'taskx.created',
+      'newthing.happened',
+      // Malformed.
+      'task',
+      'Task.created',
+      '',
+      '.task.created',
+    ]) {
+      expect(isForwardable(type), type).toBe(false);
+    }
   });
 });
