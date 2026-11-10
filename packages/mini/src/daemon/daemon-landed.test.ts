@@ -282,8 +282,11 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
   it('starts every sub-task from the target pinned when the task started (#219)', async () => {
     const mainTip = git(repo, ['rev-parse', 'HEAD']);
     const startedAt: Record<string, string> = {};
+    const pins: string[] = [];
     const planner: Planner = {
-      async plan() {
+      async plan(task) {
+        // Held by a ref of the task's while it runs, so git gc never prunes it (#236).
+        pins.push(git(repo, ['rev-parse', `refs/tacet/${task.id}/target`]));
         return {
           subtasks: [
             { key: 'a', goal: 'a', acceptanceCriteria: ['ok'] },
@@ -334,8 +337,7 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       branch: 'main',
       commit: mainTip,
     });
-    // Held by a ref of the task's, so git gc never prunes it (#236).
-    expect(git(repo, ['rev-parse', `refs/tacet/${id}/target`])).toBe(mainTip);
+    expect(pins).toEqual([mainTip]);
   });
 
   describe('the pinned target (#219)', () => {
@@ -539,6 +541,69 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(store.query({ taskId: id, typePrefix: 'task.target' })).toHaveLength(1);
       expect(bases).toEqual([pinned]);
       expect(startedAt).toBe(pinned);
+    });
+  });
+  describe("deleting a finished task's pin ref (#247)", () => {
+    const pinOf = (id: string) => {
+      try {
+        return git(repo, ['rev-parse', '--verify', '--quiet', `refs/tacet/${id}/target`]);
+      } catch {
+        return undefined;
+      }
+    };
+
+    it('deletes it once the task finishes, and keeps every other ref', async () => {
+      const head = git(repo, ['rev-parse', 'HEAD']);
+      git(repo, ['update-ref', 'refs/tacet/someone-else/target', head]);
+      // remove_merged off: the landed sweep does nothing, the refs still go.
+      const { id } = await runTask(commitWork, { remove_merged: false });
+      await vi.waitFor(() => expect(pinOf(id)).toBeUndefined(), { timeout: 3_000 });
+      expect(pinOf('someone-else')).toBe(head);
+      // Its checkout and result are untouched.
+      expect(await manager.list()).toHaveLength(1);
+      expect(git(repo, ['rev-parse', '--verify', `refs/heads/tacet/${id}/result`])).toMatch(
+        /^[0-9a-f]{40}$/,
+      );
+    });
+
+    it('keeps it while the task is unfinished', async () => {
+      const head = git(repo, ['rev-parse', 'HEAD']);
+      let planning = false;
+      const planner: Planner = {
+        plan: (_task, opts) => {
+          planning = true;
+          return new Promise((_, reject) =>
+            opts?.signal?.addEventListener('abort', () => reject(new Error('stopped'))),
+          );
+        },
+      };
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: manager,
+        integrator: new GitIntegrator(repo, env),
+        planner,
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        pollMs: 20,
+        landedSweepMs: 50,
+      });
+      await daemon.start();
+      const id = daemon.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await vi.waitFor(() => expect(planning).toBe(true), { timeout: 3_000 });
+      await severalSweeps();
+      expect(pinOf(id)).toBe(head);
     });
   });
 });

@@ -258,6 +258,8 @@ export class MiniConductor {
   readonly #sweepErrors = new Set<string>();
   /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
   readonly #closing = new Set<string>();
+  /** Finished tasks whose pin ref this process has deleted, or found none for (#247). */
+  readonly #unpinned = new Set<string>();
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -898,9 +900,11 @@ export class MiniConductor {
     const gen = this.#gen;
     this.#sweepingGen = gen;
     this.#track(
-      this.#sweepLanded(gen).finally(() => {
-        if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
-      }),
+      this.#sweepLanded(gen)
+        .then(() => this.#sweepPins(gen))
+        .finally(() => {
+          if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
+        }),
     );
   }
 
@@ -986,6 +990,36 @@ export class MiniConductor {
           .remove(id, { landed: [published.commit, ...superseded] })
           .catch(() => {});
       }
+    }
+  }
+
+  /**
+   * Delete the pin ref of each finished task (#247): a task's pinned target (#236) is where its new
+   * checkouts start, and a finished task (completed, failed, canceled or rejected) starts none.
+   * Its live checkouts keep their own commits, and its result branch its result. Each task once per
+   * process; a ref moved since (`unpin` deletes only one holding the pinned commit) is kept.
+   */
+  async #sweepPins(gen: number): Promise<void> {
+    const unpin = this.#o.workspaces.unpin?.bind(this.#o.workspaces);
+    if (!unpin) return;
+    for (const t of Object.values(this.#state().tasks)) {
+      if (!this.#live(gen)) return;
+      const id = t.task.id;
+      if (t.task.parentId || !TERMINAL.has(t.state) || this.#unpinned.has(id)) continue;
+      const target = this.#target(id);
+      if (target) {
+        try {
+          await unpin(id, target.commit);
+        } catch (err) {
+          const key = `unpin ${id} ${(err as Error).message}`;
+          if (!this.#sweepErrors.has(key)) {
+            this.#sweepErrors.add(key);
+            this.#errors.push(err);
+          }
+          continue;
+        }
+      }
+      this.#unpinned.add(id);
     }
   }
 

@@ -329,6 +329,21 @@ export class WorktreeManager implements Workspaces {
     await this.git(['update-ref', '--no-deref', targetRef(taskId), commit]);
   }
 
+  /**
+   * Delete `refs/tacet/<task>/target` if it holds `commit` (#247). A no-op when the ref is gone or
+   * was moved (a later pin of the same task); git deletes it atomically against `commit`.
+   */
+  async unpin(taskId: string, commit: string): Promise<void> {
+    if (!commitIdPattern.test(commit)) throw new Error('unpin: expected a full commit id');
+    const ref = targetRef(taskId);
+    const tip = await this.git(['rev-parse', '--verify', '--quiet', '--end-of-options', ref]).then(
+      (out) => out.trim(),
+      () => undefined,
+    );
+    if (tip !== commit) return;
+    await this.git(['update-ref', '--no-deref', '-d', ref, commit]);
+  }
+
   /** The repo's checked-out branch (absent when HEAD is detached) and its commit (#219). */
   async head(): Promise<{ branch?: string; commit: string }> {
     const { baseBranch, baseCommit } = await this.resolveBase(undefined);
