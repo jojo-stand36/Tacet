@@ -203,7 +203,7 @@ export function buildWorkerAdapters(
           ...(preset.resume_flag !== undefined ? { resumeArgs: [preset.resume_flag].flat() } : {}),
           // Gemini CLI reads an `@path` in a prompt unasked, or after a Yes-by-default question
           // (#245): its prompts are typed with every `@` escaped.
-          ...(commandWords(preset.command).some(runsGemini) ? { escapeAt: true } : {}),
+          ...(runs(preset.command, runsGemini) ? { escapeAt: true } : {}),
         },
       });
     }
@@ -308,7 +308,7 @@ export function buildWorkerAdapters(
    */
   function refusePtyForWorkers(slug: string, where: string): void {
     const preset = config.agents?.[slug];
-    if (preset?.kind === 'pty' && commandWords(preset.command).some(runsClaudeCode)) {
+    if (preset?.kind === 'pty' && runs(preset.command, runsClaudeCode)) {
       throw new WorkerConfigError(
         `${where}: agents.${slug} runs Claude Code; use pty:claude for Workers, which runs it with the Worker hardening (#245)`,
       );
@@ -358,6 +358,22 @@ function runsClaudeAcp(word: string): boolean {
   );
 }
 
+/**
+ * Whether `command` may run what `test` recognises, failing closed (#245 review): a word that
+ * names what it runs (`commandWords`), or any other word of it that is not an option's value, so a
+ * launcher `commandWords` does not model (`timeout 60 claude`, `env -u X claude`, `mise exec --
+ * gemini`) is still caught. `aider --model claude` is not; `sh -c 'cd ~/claude && aider'` is (a
+ * loud false positive is the safe direction).
+ */
+export function runs(command: string[], test: (word: string) => boolean): boolean {
+  if (commandWords(command).some(test)) return true;
+  const words = command.flatMap((arg) => arg.split(/[\s;&|"'`()<>=]+/)).filter(Boolean);
+  return words.some((w, i) => {
+    const prev = words[i - 1];
+    return test(w) && (prev === undefined || prev === '--' || !prev.startsWith('-'));
+  });
+}
+
 const LAUNCHERS = new Set(['env', 'npx', 'bunx', 'pnpx', 'node', 'deno', 'exec', 'nohup']);
 const RUNNERS = new Set(['npm', 'pnpm', 'yarn']);
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
@@ -373,8 +389,10 @@ export function commandWords(argv: string[], depth = 0): string[] {
   if (head === undefined || depth > 5) return [];
   const base = head.split('/').pop() ?? head;
   if (SHELLS.has(base)) {
-    const script = rest[rest.indexOf('-c') + 1];
-    if (!rest.includes('-c') || script === undefined) return [head];
+    // `-c`, or combined short options that include it (`-lc`, `-ec`).
+    const c = rest.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+    const script = c < 0 ? undefined : rest[c + 1];
+    if (script === undefined) return [head];
     return [
       head,
       ...script.split(/[;&|()\n]+/).flatMap((cmd) =>

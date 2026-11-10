@@ -16,9 +16,11 @@ Run with `node gemini-probe.mjs <repo> <path to gemini.js> <case> "-m gemini-2.5
 | `raw:bare-in` | `./note.txt` | Gemini turns the pasted path into `@./note.txt` and reads it in, without asking. |
 | `raw:bare-out` | `../outside-at.txt` | Same conversion, then the outside-workspace dialog (default Yes). |
 | `raw:quoted` | `'./my file.txt'` | Converted and read in, without asking. |
-| `at`, `at-line`, `at-trailing` | `@` mentions inline, on their own line, trailing, typed as `\@` with ` .` appended | Nothing read, no dialog. |
+| `at`, `at-line`, `at-trailing` | `@` mentions inline, on their own line, trailing, typed as Tacet types them: `. ` + text with every `@` as `\@` + ` .` | Nothing read, no dialog. |
 | `pre-escaped` | `\@<outside>` and `\\@note.txt` in the text, escaped again | Nothing read, no dialog: every `@` typed has a backslash right before it. |
-| `bare-in`, `bare-out`, `bare-two`, `quoted` | the raw cases, with ` .` appended | Nothing read, no dialog. `.` is a directory, so the paste is not "all files" and Gemini doesn't convert it. |
+| `bare-in`, `bare-out`, `bare-two`, `quoted` | the raw cases, typed as Tacet types them | Nothing read, no dialog. `.` is a directory, so the paste is not "all files" and Gemini doesn't convert it. |
+| `suffix-only:open-quote`, `suffix-only:backslash` | `'./lnk .` and `./lnk\ .`, with `lnk .` and `lnk ` in the checkout linking to the outside file | The quote or backslash joins the suffix onto the path, so Gemini converts the paste to `@./lnk\ .`, drops the final `.`, and shows the outside-workspace dialog. This is why Tacet also prefixes `. `. |
+| `open-quote`, `backslash` | the same text, typed as Tacet types them | Nothing read, no dialog: nothing before the `. ` prefix can join it. |
 
 From the 0.67.0 bundle and source:
 - `parseAllAtCommands` matches `(?<!\\)@`.

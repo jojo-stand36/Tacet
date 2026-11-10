@@ -28,7 +28,7 @@ import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
 import { TempWorkspaces } from '../daemon/testing.js';
-import { buildWorkerAdapters, commandWords, runsGemini, WorkerConfigError } from './build.js';
+import { buildWorkerAdapters, commandWords, runs, runsGemini, WorkerConfigError } from './build.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
@@ -171,6 +171,35 @@ describe('buildWorkerAdapters', () => {
     expect(escapes(['aider', '--model', 'gemini'])).toBe(false);
   });
 
+  it('catches a CLI behind launchers it does not model, failing closed (#245 review)', () => {
+    const claude = (w: string) => w.split('/').pop() === 'claude';
+    for (const command of [
+      ['bash', '-lc', 'claude'],
+      ['sh', '-ec', 'exec claude'],
+      ['sh', '-c', 'FOO=1 claude'],
+      ['bash', '-c', 'if true; then claude; fi'],
+      ['sh', '-c', 'echo `claude`'],
+      ['env', '-u', 'FOO', 'claude'],
+      ['env', '-C', '/w', 'claude'],
+      ['timeout', '3600', 'claude'],
+      ['nice', '-n', '5', 'claude'],
+      ['direnv', 'exec', '.', 'claude'],
+      ['mise', 'exec', '--', 'claude'],
+      ['pnpm', 'claude'],
+      // A false positive, refused loudly: the safe direction.
+      ['sh', '-c', 'cd ~/claude && aider'],
+    ]) {
+      expect(runs(command, claude), command.join(' ')).toBe(true);
+    }
+    for (const command of [
+      ['aider', '--model', 'claude'],
+      ['opencode', '--config', '/home/me/.config/claude'],
+      ['aider'],
+    ]) {
+      expect(runs(command, claude), command.join(' ')).toBe(false);
+    }
+  });
+
   it('reads only the words of a command that name what it runs (#245 review)', () => {
     expect(commandWords(['aider', '--model', 'claude'])).toEqual(['aider']);
     expect(commandWords(['opencode', '--config', '/home/me/.config/claude'])).toEqual(['opencode']);
@@ -213,7 +242,7 @@ describe('buildWorkerAdapters', () => {
       ['my-claude'],
       ['gemini'],
       ['aider', '--model', 'claude'],
-      ['sh', '-c', 'cd ~/claude && aider'],
+      ['opencode', '--config', '/home/me/.config/claude'],
     ]) {
       const built = buildWorkerAdapters(
         { tiers: { worker: { adapter: 'pty:mine' } }, agents: { mine: { kind: 'pty', command } } },

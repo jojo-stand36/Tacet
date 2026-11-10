@@ -1,7 +1,7 @@
 // Spike #245: does interactive Gemini CLI read files named in a pasted prompt into the request?
 // node probe.mjs <repo> <gemini.js> <case> [gemini args]; one fresh Gemini session per case.
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,7 +43,11 @@ const E = (t) => t.replaceAll('@', '\\@');
 writeFileSync(join(wt, 'my file.txt'), 'QUOTED-CONTENT\n');
 // `raw:` cases are typed as given (the hazard); the others as PtyCliAdapter types them for a
 // Gemini preset (escapeAt): every `@` as `\@`, and ` .` at the end.
-const T = (t) => `${E(t)} .`;
+const T = (t) => `. ${E(t)} .`;
+// Two links whose names end in ` .` and ` `, to a file outside the checkout (#245 review): an
+// unclosed quote or a trailing backslash would join a lone ` .` suffix onto `./lnk`.
+symlinkSync(outside, join(wt, 'lnk .'));
+symlinkSync(outside, join(wt, 'lnk '));
 const CASES = {
   'raw:at': `say probe see @${outside} and @note.txt please`,
   'raw:bare-in': './note.txt',
@@ -57,6 +61,10 @@ const CASES = {
   'bare-out': T('../outside-at.txt'),
   'bare-two': T('./note.txt ../outside-at.txt'),
   quoted: T("'./my file.txt'"),
+  'suffix-only:open-quote': `${E("'./lnk")} .`,
+  'suffix-only:backslash': `${E('./lnk\\')} .`,
+  'open-quote': T("'./lnk"),
+  backslash: T('./lnk\\'),
 };
 await send(kase, CASES[kase]);
 if (out.includes('outside your workspace')) console.log('DIALOG shown');
