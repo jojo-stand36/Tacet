@@ -568,7 +568,7 @@ describe('MiniConductor with git worktrees', () => {
     const id2 = e.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
     await e.settled();
     expect(data<{ message?: string }>(`${id2}/1`, 'task.status').at(-1)?.message).toMatch(
-      /could not be checked \(no commit of it to compare with\)$/,
+      /could not be checked \(no commit to compare with, or not a worktree of the repo\)$/,
     );
   });
 

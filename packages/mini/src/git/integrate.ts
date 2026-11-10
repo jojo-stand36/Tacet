@@ -454,8 +454,9 @@ const ATTR_SOURCE_GIT = '2.41';
  * data). A throwaway index of it is built in a directory Tacet owns and refreshed against the
  * checkout, from the main repo (`GIT_DIR` = its common dir, `SAFE_GIT_ARGS`, only PATH and HOME).
  * Attributes come from `commit`, never the checkout (`--attr-source`, git 2.41), so a Worker's
- * `.gitattributes` cannot make git run a filter; the filters the user's committed attributes name
- * still run. Ignore rules are the checkout's, so any `.gitignore` the Worker added, changed or
+ * `.gitattributes` cannot make git run a filter. Those `commit`'s attributes name still run, and
+ * `commit` may be the Worker's integrated one, so its attributes may be the Worker's: only filter
+ * drivers the user configured can be named, which a checkout of the work would run anyway. Ignore rules are the checkout's, so any `.gitignore` the Worker added, changed or
  * hid is itself reported. Submodules are not looked into.
  *
  * Throws `WorktreeRefusedError` for a forged worktree, and an error when git fails (older than

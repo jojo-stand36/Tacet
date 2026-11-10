@@ -45,6 +45,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Adapter: generic ACP client** — `feature` `P1` `claude`
 - [ ] **Adapters: launch Workers with an environment allowlist** — `feature` `P2` `either`
 - [ ] **AgentAdapter interface + conformance test suite** — `feature` `P0` `claude`
+- [ ] **Audit every local port Tacet opens: Worker commands reach all of host loopback, so tokens are the only boundary** — `feature` `P1` `claude`
 - [ ] **Browser session via hello frame instead of cookie (ADR-003 §3.4 addendum)** — `feature` `P0` `claude`
 - [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `claude`
 - [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
@@ -64,6 +65,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
 - [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude + human`
 - [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
+- [ ] **Linux Claude sandbox leaves empty placeholder files in the Worker checkout and the user's home** — `feature` `P1` `claude`
 - [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
 - [ ] **Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision…)** — `feature` `P0` `either`
 - [ ] **Mini-conductor daemon: task queue, planner, worker pool** — `feature` `P0` `either`
@@ -92,7 +94,9 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
+- [ ] **Worker job inside Claude's Linux sandbox sometimes not found by its marker after a crash (#127 test flake)** — `feature` `P2` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
+- [ ] **Worker-written code can read the control-port token and answer its own escalation** — `feature` `P1` `claude + human`
 - [ ] **Worktree gc by activity, and cleanup of planner checkouts a crash left behind** — `feature` `P2` `claude`
 - [ ] **Worktree manager** — `feature` `P0` `copilot`
 - [ ] **Worktree manager state into the event log** — `chore` `P2` `either`

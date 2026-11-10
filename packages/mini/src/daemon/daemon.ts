@@ -288,6 +288,10 @@ function commitMessage(task: Task, run: Run): string {
   return `${subject}\n\nCommitted by Tacet for a Worker that cannot run git (#260).\n\nTacet-Task: ${run.subtaskId}\nTacet-Session: ${run.sessionId}\n`;
 }
 
+/** Control and bidi characters, kept out of messages that quote Worker-chosen text. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching them is the point.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
 /** At most this many paths are looked for; reaching it means there may be more. */
 const MAX_UNCOMMITTED = 1000;
 
@@ -1870,6 +1874,7 @@ export class MiniConductor {
         left = await this.#uncommitted(run);
       } catch (err) {
         if (!(err instanceof WorktreeRefusedError)) throw err;
+        this.#errors.push(err);
         ended = true;
         await this.#refused(run);
         return;
@@ -1980,9 +1985,13 @@ export class MiniConductor {
     } catch (err) {
       if (err instanceof WorktreeRefusedError) throw err;
       this.#errors.push(err);
-      return { unknown: redactSecrets((err as Error).message).slice(0, 200) };
+      // Git's message can echo the Worker's paths: no control characters get through.
+      const why = redactSecrets((err as Error).message).replace(CONTROL, ' ');
+      return { unknown: why.slice(0, 200) };
     }
-    if (changes === undefined) return { unknown: 'no commit of it to compare with' };
+    if (changes === undefined) {
+      return { unknown: 'no commit to compare with, or not a worktree of the repo' };
+    }
     return {
       changes: changes.filter((c) => !(c.untracked && isSandboxPlaceholder(run, c.path))),
     };

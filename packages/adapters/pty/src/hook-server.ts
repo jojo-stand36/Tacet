@@ -91,7 +91,7 @@ export class HookServer {
       res.writeHead(code, { connection: 'close' }).end(() => req.destroy());
     };
     const port = this.#listener?.port ?? 0;
-    if (req.method !== 'POST' || !req.url?.startsWith('/hooks')) {
+    if (req.method !== 'POST' || !(req.url === '/hooks' || req.url?.startsWith('/hooks/'))) {
       deny(404);
       return;
     }
