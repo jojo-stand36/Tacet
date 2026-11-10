@@ -618,7 +618,9 @@ export async function commitWorktree(
   });
   const wt = workerWorktree(opts.cwd, opts.repoRoot);
   if (!changes || !wt) return undefined;
-  const paths = changes.filter((c) => !opts.skip?.(c)).map((c) => c.path);
+  // A nested repository (`dir/`) is not committed: it stays in the checkout, and is reported as
+  // left out (#261).
+  const paths = changes.filter((c) => !opts.skip?.(c) && !c.path.endsWith('/')).map((c) => c.path);
   if (paths.length === 0) return undefined;
   const blocked = paths.filter((p) => opts.protectedPath(p));
   if (blocked.length > 0) return { refused: { why: 'protected', paths: blocked } };
@@ -643,24 +645,37 @@ export async function commitWorktree(
       GIT_DIR: wt.commonDir,
       GIT_INDEX_FILE: join(tmp, 'index'),
       GIT_WORK_TREE: realpathSync.native(opts.cwd),
+      GIT_ATTR_NOSYSTEM: '1',
       GIT_AUTHOR_NAME: TACET_WORKER_IDENTITY.name,
       GIT_AUTHOR_EMAIL: TACET_WORKER_IDENTITY.email,
       GIT_COMMITTER_NAME: TACET_WORKER_IDENTITY.name,
       GIT_COMMITTER_EMAIL: TACET_WORKER_IDENTITY.email,
     };
+    let attrs: string[] = [];
     const git = (args: string[], input?: string) =>
-      run(['git', ...SAFE_GIT_ARGS, '-c', 'core.symlinks=true', ...args], {
-        cwd: opts.repoRoot,
-        env: gitEnv,
-        timeoutMs: opts.timeoutMs ?? 120_000,
-        input,
-      });
+      run(
+        [
+          'git',
+          ...attrs,
+          ...SAFE_GIT_ARGS,
+          '-c',
+          'core.symlinks=true',
+          '-c',
+          'core.attributesFile=/dev/null',
+          ...args,
+        ],
+        { cwd: opts.repoRoot, env: gitEnv, timeoutMs: opts.timeoutMs ?? 120_000, input },
+      );
     const parent =
       opts.parent ?? (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
     if (parent === undefined || !COMMIT_ID.test(parent)) return undefined;
+    // As in `uncommittedChanges`: attributes from the parent, so no Worker-named filter runs.
+    // Paths are literal: a name with `*` or `:(` is that file, never a pattern or magic.
+    attrs = [`--attr-source=${parent}`, '--literal-pathspecs'];
     await git(['read-tree', parent]);
+    // `--force`: a `.gitignore` that ignores itself is part of the change (#261 reports it).
     await git(
-      ['add', '-A', '--pathspec-from-file=-', '--pathspec-file-nul', '--literal-pathspecs'],
+      ['add', '-A', '--force', '--pathspec-from-file=-', '--pathspec-file-nul'],
       paths.join('\0'),
     );
     const tree = await git(['write-tree']);

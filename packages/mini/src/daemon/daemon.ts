@@ -276,9 +276,16 @@ type Uncommitted = { changes: { path: string; untracked: boolean }[] } | { unkno
 /** Why a sub-task that changed files but made no commit failed (#261). */
 function notIntegrated(run: Run, left: readonly { path: string }[]): string {
   const why = CANNOT_COMMIT.has(run.adapterId)
-    ? `${run.adapterId} Workers cannot commit yet, #260`
+    ? `${run.adapterId} Workers cannot run git, and Tacet's commit for it failed, #260`
     : 'the Worker must commit its work';
   return `nothing was integrated: the Worker changed ${pathsNote(left)} but made no commit, so the change never left its checkout (${why})`;
+}
+
+/** The message of a commit Tacet makes for a Worker (#260): the goal's first line, and who. */
+function commitMessage(task: Task, run: Run): string {
+  const line = task.goal.split('\n')[0]?.trim() || 'Worker changes';
+  const subject = line.length > 72 ? `${line.slice(0, 69)}...` : line;
+  return `${subject}\n\nCommitted by Tacet for a Worker that cannot run git (#260).\n\nTacet-Task: ${run.subtaskId}\nTacet-Session: ${run.sessionId}\n`;
 }
 
 /** At most this many paths are looked for; reaching it means there may be more. */
@@ -1838,6 +1845,23 @@ export class MiniConductor {
       }
       // Ended meanwhile (canceled, say): nothing more is run in its checkout.
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // A Worker that cannot run git gets its changes committed by Tacet (#260); a change Tacet
+      // will not commit waits on the user, with the session kept for the answer.
+      let committed: 'done' | 'waiting' | 'ended';
+      try {
+        committed = await this.#commitFor(run, view.task);
+      } catch (err) {
+        if (!(err instanceof WorktreeRefusedError)) throw err;
+        ended = true;
+        await this.#refused(run);
+        return;
+      }
+      if (committed === 'ended') {
+        ended = true;
+        return;
+      }
+      if (committed === 'waiting') return;
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
       // Work left in the checkout, not in a commit, never reaches the repo (#261). With no commit
       // at all, the sub-task did not do its work: it fails, not retried (a Worker that cannot
       // commit, #260, would only fail again). A sub-task that changed nothing (a review) is fine.
@@ -1962,6 +1986,55 @@ export class MiniConductor {
     return {
       changes: changes.filter((c) => !(c.untracked && isSandboxPlaceholder(run, c.path))),
     };
+  }
+
+  /**
+   * Commit the checkout's changes for a Worker that cannot run git (#260), onto the run's last
+   * commit (or its HEAD), as `worker.integrated`. `waiting` when a change is protected config or
+   * too big: the user is asked, and the answer goes to the same session. A git failure is logged
+   * and the turn goes on (#261 then fails a sub-task whose work never left its checkout); throws
+   * `WorktreeRefusedError` for a checkout that fails the integrity checks.
+   */
+  async #commitFor(run: Run, task: Task): Promise<'done' | 'waiting' | 'ended'> {
+    const integrator = this.#o.integrator;
+    if (!integrator?.commitFor || !CANNOT_COMMIT.has(run.adapterId)) return 'done';
+    let result: Awaited<ReturnType<NonNullable<Integrator['commitFor']>>>;
+    try {
+      result = await integrator.commitFor(run.subtaskId, run.workspace, {
+        ...(run.commit !== undefined ? { parent: run.commit } : {}),
+        message: commitMessage(task, run),
+        skip: (c) => c.untracked && isSandboxPlaceholder(run, c.path),
+      });
+    } catch (err) {
+      if (err instanceof WorktreeRefusedError) throw err;
+      this.#errors.push(err);
+      return 'done';
+    }
+    if (this.#runs.get(run.subtaskId) !== run || !this.#started) return 'ended';
+    if (result === undefined) return 'done';
+    if ('refused' in result) {
+      const r = result.refused;
+      const what =
+        r.why === 'protected'
+          ? `changed agent, hook or tool config, which Tacet does not commit for a Worker: ${pathsNote(r.paths.map((path) => ({ path })))}`
+          : `changed ${r.files} files (${r.bytes} bytes), more than Tacet commits for a Worker at once`;
+      this.#raise(
+        run.subtaskId,
+        `The Worker for ${run.subtaskId} ${what}. Nothing was committed. Your answer goes to the Worker: say what it should do (undo those changes, say, or split the work).`,
+        { urgency: 'high', category: 'blocked' },
+      );
+      return 'waiting';
+    }
+    run.commit = result.commit;
+    this.#o.store.append(
+      this.#env(
+        run.subtaskId,
+        'worker.integrated',
+        { sessionId: run.sessionId, commit: result.commit, ref: result.ref, by: 'tacet' },
+        run.sessionId,
+      ),
+    );
+    return 'done';
   }
 
   /**

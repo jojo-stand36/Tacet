@@ -16,6 +16,15 @@
     "ref": {
       "type": "string",
       "pattern": "^refs\\/heads\\/\\S+$"
+    },
+    "by": {
+      "description": "Who made the commit: the Worker (absent in older events), or Tacet, from the changes in the checkout of a Worker that cannot run git (#260), as 'Tacet Worker'",
+      "enum": [
+        "worker",
+        "tacet"
+      ],
+      "x-tacet-fallback": "worker",
+      "type": "string"
     }
   },
   "required": [

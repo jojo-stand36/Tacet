@@ -401,6 +401,12 @@ describe('MiniConductor with git worktrees', () => {
   });
 
   it('fails, without retrying, a sub-task whose changes were never committed (#261)', async () => {
+    // Tacet's own commit for the Worker (#260) fails: the work never leaves the checkout.
+    const failing = new (class extends GitIntegrator {
+      override commitFor = async (): Promise<never> => {
+        throw new Error('disk full');
+      };
+    })(repo, env);
     const d = start(
       (cwd) => {
         writeFileSync(join(cwd, 'work.txt'), 'work\n');
@@ -409,7 +415,7 @@ describe('MiniConductor with git worktrees', () => {
       },
       undefined,
       undefined,
-      { adapterId: 'claude-sdk' },
+      { adapterId: 'claude-sdk', integrator: failing },
     );
     await d.start();
     const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
@@ -418,7 +424,9 @@ describe('MiniConductor with git worktrees', () => {
     expect(tasks()[sub]?.state).toBe('failed');
     const message = data<{ message?: string }>(sub, 'task.status').at(-1)?.message ?? '';
     expect(message).toMatch(/^nothing was integrated: the Worker changed 1 file \("work\.txt"\)/);
-    expect(message).toContain('claude-sdk Workers cannot commit yet, #260');
+    expect(message).toContain(
+      "claude-sdk Workers cannot run git, and Tacet's commit for it failed",
+    );
     expect(message).not.toContain('package.json');
     expect(data<{ outcome: string }>(sub, 'task.result').at(-1)?.outcome).toBe('failed');
     // One attempt: retrying a Worker that cannot commit would only fail again.
@@ -431,6 +439,91 @@ describe('MiniConductor with git worktrees', () => {
     new (class extends GitIntegrator {
       override uncommitted = uncommitted;
     })(repo, env);
+
+  it("commits a claude-sdk Worker's changes for it, as Tacet's own Worker (#260)", async () => {
+    const d = start(
+      (cwd) => {
+        writeFileSync(join(cwd, 'work.txt'), 'work\n');
+        writeFileSync(join(cwd, 'package.json'), '');
+      },
+      undefined,
+      undefined,
+      { adapterId: 'claude-sdk' },
+    );
+    await d.start();
+    const id = d.submit({ goal: 'write the work\nin detail', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const sub = `${id}/1`;
+    expect(tasks()[sub]?.state).toBe('completed');
+    const integrated = data<{ commit: string; by?: string }>(sub, 'worker.integrated');
+    expect(integrated).toHaveLength(1);
+    expect(integrated[0]?.by).toBe('tacet');
+    const commit = integrated[0]?.commit ?? '';
+    expect(git(repo, ['rev-parse', taskBranch(sub)])).toBe(commit);
+    expect(git(repo, ['log', '-1', '--format=%an <%ae>|%s', commit])).toBe(
+      'Tacet Worker <worker@tacet.invalid>|write the work',
+    );
+    expect(git(repo, ['log', '-1', '--format=%B', commit])).toContain(`Tacet-Task: ${sub}`);
+    expect(git(repo, ['show', `${commit}:work.txt`])).toBe('work');
+    // The sandbox placeholder is not part of the work.
+    expect(() => git(repo, ['cat-file', '-e', `${commit}:package.json`])).toThrow();
+    expect(data<{ commits: string[] }>(sub, 'task.result').at(-1)?.commits).toEqual([commit]);
+    expect(data<{ message?: string }>(sub, 'task.status').at(-1)?.message).toBeUndefined();
+  });
+
+  it('asks the user, committing nothing, when a claude-sdk Worker changed protected config (#260)', async () => {
+    const inputs: string[] = [];
+    const d = start(
+      (cwd, input) => {
+        inputs.push(input);
+        if (input.includes('undo the config')) {
+          rmSync(join(cwd, '.claude'), { recursive: true, force: true });
+          return undefined;
+        }
+        mkdirSync(join(cwd, '.claude'), { recursive: true });
+        writeFileSync(join(cwd, '.claude', 'settings.json'), '{}\n');
+        writeFileSync(join(cwd, 'work.txt'), 'work\n');
+        return undefined;
+      },
+      undefined,
+      undefined,
+      { adapterId: 'claude-sdk' },
+    );
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const sub = `${id}/1`;
+    expect(tasks()[sub]?.state).toBe('input_required');
+    const raised = data<{ id: string; question: string; urgency: string }>(
+      sub,
+      'escalation.raised',
+    );
+    expect(raised).toHaveLength(1);
+    expect(raised[0]?.question).toContain('".claude/settings.json"');
+    expect(raised[0]?.question).not.toContain(root);
+    expect(raised[0]?.urgency).toBe('high');
+    expect(data(sub, 'worker.integrated')).toHaveLength(0);
+    expect(() => git(repo, ['rev-parse', '--verify', '-q', taskBranch(sub)])).toThrow();
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'conductor', id: 'test' },
+      taskId: sub,
+      type: 'escalation.resolved',
+      data: { escalationId: raised[0]?.id, answer: 'undo the config' },
+    });
+    await d.settled();
+    // The same session got the answer, undid the config, and its work was committed.
+    expect(data(sub, 'worker.started')).toHaveLength(1);
+    expect(inputs.at(-1)).toContain('undo the config');
+    expect(tasks()[sub]?.state).toBe('completed');
+    const commit = data<{ commit: string }>(sub, 'worker.integrated').at(-1)?.commit ?? '';
+    expect(git(repo, ['ls-tree', '-r', '--name-only', commit]).split('\n').sort()).toEqual([
+      'README',
+      'work.txt',
+    ]);
+  });
 
   it('quotes, redacts and shortens the paths it names, and counts placeholders outside the sandbox (#261)', async () => {
     const token = `sk-ant-api03-${'a'.repeat(40)}`;
