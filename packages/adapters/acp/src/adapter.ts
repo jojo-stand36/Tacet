@@ -219,7 +219,7 @@ export class AcpAdapter implements AgentAdapter {
     ].sort((a, b) => b.length - a.length);
     const handle: SessionHandle = { id: randomUUID() };
     let s: Session | undefined;
-    const exitInfo: { value?: Session['exit'] } = {};
+    const exitInfo: { value?: Session['exit']; reaped?: boolean } = {};
     const exited = new Promise<void>((resolve) => {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
@@ -227,10 +227,15 @@ export class AcpAdapter implements AgentAdapter {
         signalGroup(proc, 'SIGTERM');
         resolve();
         // Messages still buffered on stdout (a last prompt response) are read first.
-        void drained(proc).then(() => {
-          flushStderr();
-          if (s) this.#onExit(s);
-        });
+        // The session is reported ended only once its whole process group is gone, so nothing
+        // of it still runs (or writes into the worktree) after the error status.
+        void drained(proc)
+          .then(() => this.#reapGroup(proc))
+          .then(() => {
+            exitInfo.reaped = true;
+            flushStderr();
+            if (s) this.#onExit(s);
+          });
       });
       proc.on('error', () => resolve());
     });
@@ -340,8 +345,10 @@ export class AcpAdapter implements AgentAdapter {
     }
     this.#sessions.set(handle.id, s);
     s.ready = true;
-    if (s.exit) this.#onExit(s);
-    else this.#emit(s, { t: 'status', state: 'idle' });
+    // An agent that exited during start is reported once its group is gone (the exit handler).
+    if (s.exit) {
+      if (exitInfo.reaped) this.#onExit(s);
+    } else this.#emit(s, { t: 'status', state: 'idle' });
     return handle;
   }
 
@@ -389,10 +396,19 @@ export class AcpAdapter implements AgentAdapter {
   async close(h: SessionHandle): Promise<void> {
     const s = this.#sessions.get(h.id);
     if (!s || s.closing) return;
+    await this.#shutdown(s);
+  }
+
+  /**
+   * End the session and its whole process group. `error`, when the adapter ends the session itself,
+   * is reported only after the processes are gone, so a caller that sees it can rely on nothing of
+   * the session still running.
+   */
+  async #shutdown(s: Session, error?: string): Promise<void> {
     s.closing = true;
     s.queue.length = 0;
     this.#cancelApprovals(s);
-    if (!s.ended && s.init.agentCapabilities?.sessionCapabilities?.close) {
+    if (!s.ended && !s.exit && s.init.agentCapabilities?.sessionCapabilities?.close) {
       await Promise.race([
         s.conn.agent.request('session/close', { sessionId: s.acpSessionId }).catch(() => {}),
         new Promise((r) => setTimeout(r, 1000).unref()),
@@ -401,9 +417,10 @@ export class AcpAdapter implements AgentAdapter {
     s.conn.close();
     s.proc.stdin?.end();
     await this.#terminate(s.proc, s.exited, () => s.exit !== undefined);
+    if (error !== undefined) this.#setState(s, 'error', error);
     this.#setState(s, 'done');
     s.events.end();
-    this.#sessions.delete(h.id);
+    this.#sessions.delete(s.handle.id);
   }
 
   events(h: SessionHandle): AsyncIterable<AgentEvent> {
@@ -575,7 +592,7 @@ export class AcpAdapter implements AgentAdapter {
    * switch that fails or is not reported, or a third drift, ends the session.
    */
   #onDrift(s: Session, now: string): void {
-    if (!s.ready || s.restoring || s.closing || s.ended || !s.pinnedMode) return;
+    if (!s.ready || s.restoring || s.closing || s.ended || s.exit || !s.pinnedMode) return;
     s.restoring = true;
     s.drifts += 1;
     this.#restoreMode(s, now)
@@ -615,7 +632,8 @@ export class AcpAdapter implements AgentAdapter {
         failure = `it could not be set back: ${this.#scrub(errorMessage(err), s.secrets)}`;
       }
     }
-    if (s.closing || s.ended) return;
+    // An agent that exited is reported by the exit handler, with its own reason.
+    if (s.closing || s.ended || s.exit) return;
     if (failure === undefined) {
       this.#emit(s, {
         t: 'status',
@@ -624,8 +642,7 @@ export class AcpAdapter implements AgentAdapter {
       });
       return;
     }
-    this.#setState(s, 'error', `${left}; ${failure}: session ended`);
-    await this.close(s.handle);
+    await this.#shutdown(s, `${left}; ${failure}: session ended`);
   }
 
   async #setModel(s: Session, model: string): Promise<void> {
@@ -776,8 +793,16 @@ export class AcpAdapter implements AgentAdapter {
     // The agent's own children (claude-agent-acp's Claude Code, its MCP servers) got SIGTERM
     // when it exited, but may still be shutting down and writing: wait for the whole group, so
     // nothing of a closed session is left running (#181 CI).
-    // SIGKILL only right after seeing a running member: a pid is not reused while it is the id
-    // of a group with members, so this cannot reach a reused group id.
+    await this.#reapGroup(proc);
+  }
+
+  /**
+   * Once the leader has exited (and the group had SIGTERM), wait for the rest of its group, then
+   * SIGKILL what is left. SIGKILL only right after seeing a running member: a pid is not reused
+   * while it is the id of a group with members, so this cannot reach a reused group id.
+   */
+  async #reapGroup(proc: ChildProcess): Promise<void> {
+    const timeout = this.#opts.killTimeoutMs ?? 5000;
     if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
       if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
       await processGroupGone(proc.pid, 1000);
@@ -787,7 +812,9 @@ export class AcpAdapter implements AgentAdapter {
   #live(h: SessionHandle): Session {
     const s = this.#sessions.get(h.id);
     if (!s || s.closing) throw new Error(`unknown or closed session ${h.id}`);
-    if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
+    // Exited but not yet reported (its group is still being reaped) counts as ended.
+    if (s.ended || s.exit)
+      throw new Error(`session ${h.id} has ended (${s.exit ? 'exited' : s.state})`);
     return s;
   }
 }

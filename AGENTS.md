@@ -14,7 +14,7 @@ Read before non-trivial work:
 
 ## Current status
 
-Milestone **M0 · Foundations**. The monorepo is scaffolded (#1): TypeScript (`strict`, ESM) in a pnpm workspace with `packages/core`, `conductor`, `mini`, `adapters/*` (`claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty`), `web`, `tui` and `cli`, on Node.js 24 or later ([ADR-002](docs/adr/002-language-runtime.md)). The packages are placeholders until their roadmap issues land. Bun is not supported. Targets are macOS and Linux (Ubuntu) only. Do not add packages outside the issue that asks for it.
+Milestone **M0 · Foundations**. The monorepo is scaffolded (#1): TypeScript (`strict`, ESM) in a pnpm workspace with `packages/core`, `conductor`, `mini`, `adapters/*` (`claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty`), `web`, `tui` and `cli`, on Node.js 24 or later ([ADR-002](docs/adr/002-language-runtime.md)). The packages are placeholders until their roadmap issues land. Bun is not supported. Targets are macOS and Linux (Ubuntu), and Windows via WSL2: Tacet runs inside a WSL2 Linux distro as on Linux (#193). Native Windows is not a target until its ADR is accepted (#194). Do not add packages outside the issue that asks for it.
 
 ## Repo layout
 
