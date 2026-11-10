@@ -60,6 +60,11 @@ export interface AcpAgentSpec {
    * switch; `session/set_mode` answers nothing, so there the agent is trusted.
    */
   sessionMode?: string;
+  /**
+   * `_meta` sent with `session/new`, `session/load` and `session/resume`, for agent-specific
+   * session options (e.g. claude-agent-acp's `claudeCode.options`, #181).
+   */
+  sessionMeta?: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -72,7 +77,13 @@ export interface AcpAgentSpec {
  * argument parser.
  */
 export const GEMINI_WORKER_SETTINGS = {
-  security: { environmentVariableRedaction: { enabled: true } },
+  security: {
+    environmentVariableRedaction: { enabled: true },
+    // Already the default on 0.67.0, stated so a changed default cannot trust a checkout: an
+    // untrusted folder loads none of its `.gemini/settings.json` (MCP servers, hooks), GEMINI.md,
+    // skills, agents or `.gemini/.env` (#181, verified live).
+    folderTrust: { enabled: true },
+  },
   advanced: { ignoreLocalEnv: true },
 };
 
@@ -151,6 +162,10 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`
   // ("Manual: always ask before making changes") sends `session/request_permission` (verified).
   sessionMode: 'default',
+  // It loads the user's, the project's and the local settings by default: the checkout's hooks,
+  // permissions, env, CLAUDE.md and `.mcp.json`, all files a Worker can write. Client options in
+  // `_meta.claudeCode.options` override that (0.101.0 `acp-agent.js`; #181, verified live).
+  sessionMeta: { claudeCode: { options: { settingSources: [], strictMcpConfig: true } } },
 };
 
 /** The model provider codex-acp's Codex uses for Workers: the key comes from the environment. */

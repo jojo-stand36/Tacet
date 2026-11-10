@@ -487,14 +487,17 @@ export class AcpAdapter implements AgentAdapter {
   ): Promise<NewSessionResponse> {
     const caps = s.init.agentCapabilities;
     const vendorId = opts.resume?.vendorSessionId;
+    const sessionMeta = this.#opts.agent.sessionMeta;
+    const meta = sessionMeta ? { _meta: { ...sessionMeta } } : {};
     if (vendorId === undefined) {
-      return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers });
+      return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers, ...meta });
     }
     if (caps?.sessionCapabilities?.resume) {
       const r = await s.conn.agent.request('session/resume', {
         sessionId: vendorId,
         cwd: opts.cwd,
         mcpServers,
+        ...meta,
       });
       return { ...r, sessionId: vendorId };
     }
@@ -506,6 +509,7 @@ export class AcpAdapter implements AgentAdapter {
           sessionId: vendorId,
           cwd: opts.cwd,
           mcpServers,
+          ...meta,
         });
         return { ...(r ?? {}), sessionId: vendorId };
       } finally {
