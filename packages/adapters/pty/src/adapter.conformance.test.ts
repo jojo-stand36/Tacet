@@ -133,10 +133,15 @@ describe.skipIf(!gate.ok)(
       writeFileSync(join(cwd, 'note.txt'), 'INSIDE-AT-CONTENT\n');
       const outside = join(root, 'outside-at.txt');
       writeFileSync(outside, 'OUTSIDE-AT-CONTENT\n');
+      // A directory mention lists its entries (verified live without the variable).
+      const dir = join(root, 'outside-at-dir');
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'OUTSIDE-DIR-ENTRY.txt'), '');
       // Inline, at the start of a line, and inside a fence: each was read in before (verified live).
       for (const text of [
         `SAY inline see @${outside} and @note.txt`,
         `SAY line\n@${outside}`,
+        `SAY dir @${dir}/`,
         `SAY fenced\n\`\`\`\nsee @${outside} and @note.txt\n\`\`\``,
       ]) {
         const h = await adapter.start({ cwd });
@@ -145,8 +150,12 @@ describe.skipIf(!gate.ok)(
         expect(end).toEqual({ t: 'status', state: 'idle' });
         expect(events.some((e) => e.t === 'approval.request')).toBe(false);
         const raw = api.requests.at(-1)?.raw ?? '';
-        // Typed verbatim: the mentions reach the model as text, and nothing is read in.
-        expect(api.requests.at(-1)?.text).toContain(`@${outside}`);
+        // The typed text is kept as typed (Claude Code adds a note per mention telling the model
+        // to read it with its tools, which the policy then decides), and nothing is read in.
+        expect(api.requests.at(-1)?.text).toContain(
+          text.includes('dir @') ? `@${dir}` : `@${outside}`,
+        );
+        expect(raw).not.toContain('OUTSIDE-DIR-ENTRY');
         expect(raw).not.toContain('OUTSIDE-AT-CONTENT');
         expect(raw).not.toContain('INSIDE-AT-CONTENT');
         await adapter.close(h);

@@ -1531,6 +1531,30 @@
         "agent:claude"
       ],
       "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "The #226 review found that a `pty:claude` Worker prompt containing an image path (`@<png>`, a quoted path, or `../x.png`) makes interactive Claude Code 2.1.319 show \"Pasting…\". The input box ends up holding only the path and the prompt is never submitted, even after another Enter. Tacet types every prompt as a bracketed paste, so a Worker's prompt is a paste. The turn wedges, with or without `CLAUDE_CODE_DISABLE_FILE_MENTIONS`. No image was attached in that probe. However, the docs list pasted images as their own attachment route (code.claude.com/docs/en/permissions, \"What Read and Edit rules cover\"), and `CLAUDE_CODE_DISABLE_FILE_MENTIONS` covers only `@` mentions.\n\n### Tasks\n- [ ] Probe live with the PTY conformance setup: a real-size PNG; absolute, relative and quoted paths; inside and outside the checkout. Does anything get attached? What do Tacet's submit acknowledgement and timeout do with the stuck turn?\n- [ ] Evaluate `permissions.blockReadsOutsideWorkingDirectories: true` in Tacet's `--settings` file. The docs say attachments from refused paths are left out (v2.1.257+). Also evaluate `CLAUDE_CODE_DISABLE_ATTACHMENTS=1`. Verify each live before relying on it.\n- [ ] Make a stuck paste fail the turn visibly instead of hanging. Refusing or neutralising image paths in prompts is also acceptable.\n\n### Acceptance criteria\n- A `pty:claude` Worker prompt containing an image path outside the checkout attaches nothing and does not hang the turn, shown live.\n\n_See #226, docs/adapters/capability-matrix.md (PTY rows) and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "PtyCliAdapter: @path expansion in Gemini, Codex and claude presets",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "`PtyCliAdapter` (`packages/adapters/pty/src/cli-adapter.ts`) types Worker prompts through the same `promptText` as `pty:claude`, and has no mitigation for file mentions. The Gemini CLI docs say `@<path>` will \"Inject the content of the specified file … into your current prompt\" through `read_many_files` (github.com/google-gemini/gemini-cli `docs/reference/commands.md`, \"At commands\"). They don't say whether that is limited to the workspace. Codex's interactive `@` behaviour is unverified. A preset whose command is `claude` itself would not get the `CLAUDE_CODE_DISABLE_FILE_MENTIONS` that #226 sets for `pty:claude`. A Worker's next prompt can carry text a Worker wrote.\n\n### Tasks\n- [ ] Verify each CLI preset's interactive `@` behaviour from primary docs, and live where possible (`verify-vendor-facts`).\n- [ ] Per CLI: set its documented switch if one exists; otherwise neutralise or refuse mentions in Worker prompts. For a `claude` preset, refuse it or set the same variable.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- For each `PtyCliAdapter` preset, a Worker prompt containing `@<path outside the checkout>` reads nothing in, shown live or documented with a source.\n\n_See #226 and docs/ARCHITECTURE.md §2._"
     }
   ]
 }
