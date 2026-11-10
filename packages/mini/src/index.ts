@@ -59,4 +59,8 @@ export {
   type ToolOutput,
   ToolSchemas,
 } from './mcp/tools.js';
-export { CommandVerifier, type CommandVerifierOptions } from './verify/command-verifier.js';
+export {
+  CommandVerifier,
+  type CommandVerifierOptions,
+  commandVerifierFromConfig,
+} from './verify/command-verifier.js';

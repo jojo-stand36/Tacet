@@ -1,5 +1,12 @@
 import { spawn } from 'node:child_process';
-import { redactSecrets, type Task, type VerifyCommandResult } from '@tacet/core';
+import {
+  redactSecrets,
+  type TacetConfig,
+  type Task,
+  type VerifyCommandResult,
+  workerEnv,
+  workerEnvPolicy,
+} from '@tacet/core';
 import {
   endMarkedProcesses,
   SAFE_GIT_ARGS,
@@ -103,8 +110,8 @@ export class CommandVerifier implements Verifier {
       if (result.status !== 'passed') {
         const how =
           result.status === 'timed_out'
-            ? `ran longer than ${Math.round((this.#o.timeoutMs ?? 600_000) / 1000)} s and was stopped`
-            : `exited with ${result.exitCode !== undefined ? `code ${result.exitCode}` : 'a signal'}`;
+            ? `ran longer than ${Math.max(1, Math.round((this.#o.timeoutMs ?? 600_000) / 1000))} s and was stopped`
+            : `exited with ${result.exitCode !== undefined ? `code ${result.exitCode}` : `signal ${result.signal ?? 'unknown'}`}`;
         const shown = redactSecrets(output);
         const named = redactSecrets(command);
         return {
@@ -146,15 +153,38 @@ export class CommandVerifier implements Verifier {
       GIT_WORK_TREE: cwd,
     };
     const git = (args: string[]) =>
-      runCapture('git', [...SAFE_GIT_ARGS, '--no-optional-locks', ...args], { cwd, env });
+      runCapture(
+        'git',
+        [
+          ...SAFE_GIT_ARGS,
+          // A nested repo's own config (a clean filter) would run for a recursive status.
+          '-c',
+          'submodule.recurse=false',
+          '-c',
+          'core.untrackedCache=false',
+          '--no-optional-locks',
+          ...args,
+        ],
+        { cwd, env },
+      );
     const head = await git(['rev-parse', '--verify', 'HEAD^{commit}']);
     if (head.code !== 0) return 'the checkout has no commit checked out';
     if (commit !== undefined && head.out.trim() !== commit) {
       return `the checkout is at ${head.out.trim().slice(0, 12)}, not the integrated commit ${commit.slice(0, 12)}`;
     }
-    const status = await git(['status', '--porcelain=v1', '--untracked-files=all']);
+    const status = await git([
+      'status',
+      '--porcelain=v1',
+      '--untracked-files=all',
+      '--ignore-submodules=all',
+    ]);
     if (status.code !== 0) return 'git could not read the checkout';
     const lines = status.out.split('\n').filter(Boolean);
+    // Entries the index marks to be skipped are invisible to status: a Worker could hide changes.
+    const listed = await git(['ls-files', '-v']);
+    if (listed.code !== 0) return 'git could not read the checkout';
+    const hidden = listed.out.split('\n').filter((l) => /^([a-z]|S) /.test(l)).length;
+    if (hidden > 0) return `the checkout marks ${hidden} file(s) assume-unchanged or skip-worktree`;
     if (lines.length === 0) return undefined;
     const untracked = lines.filter((l) => l.startsWith('??')).length;
     const changed = lines.length - untracked;
@@ -194,31 +224,52 @@ export class CommandVerifier implements Verifier {
       }
     };
     let killTimer: NodeJS.Timeout | undefined;
+    // What the command started and left running (a dev server, a watcher, a daemon in a session
+    // of its own) carries the marker: ended with the group whenever the command ends.
+    const sweep = () => endMarkedProcesses([ctx.marker], { graceMs: 2000 }).catch(() => undefined);
     const stop = (why: 'timed_out' | 'aborted') => {
       if (ended) return;
       ended = why;
       group('SIGTERM');
+      void sweep();
       killTimer = setTimeout(() => group('SIGKILL'), this.#o.killGraceMs ?? 5000);
     };
     const timer = setTimeout(() => stop('timed_out'), this.#o.timeoutMs ?? 600_000);
     const onAbort = () => stop('aborted');
     ctx.signal.addEventListener('abort', onAbort, { once: true });
     if (ctx.signal.aborted) onAbort();
-    const code = await new Promise<number | null>((resolve) => {
-      child.on('error', () => resolve(null));
-      child.on('close', (c) => resolve(c));
-    });
+    // The shell's own exit ends the command: a child it left holding stdout or stderr must not
+    // keep the run waiting for the pipes to close.
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.on('error', () => resolve({ code: null, signal: null }));
+        child.on('exit', (code, sig) => resolve({ code, signal: sig }));
+      },
+    );
     clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
     ctx.signal.removeEventListener('abort', onAbort);
-    // Whatever the command started and left running (a dev server, a watcher) ends with it.
     group('SIGKILL');
-    await endMarkedProcesses([ctx.marker], { graceMs: 2000 }).catch(() => {});
-    const status = ended ?? (code === 0 ? 'passed' : 'failed');
+    await sweep();
+    // Its pipes close once nothing holds them; whatever still does is gone or ignored now.
+    await new Promise<void>((resolve) => {
+      if (child.stdout?.closed !== false && child.stderr?.closed !== false) return resolve();
+      const t = setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        resolve();
+      }, 2000);
+      child.on('close', () => {
+        clearTimeout(t);
+        resolve();
+      });
+    });
+    const status = ended ?? (exit.code === 0 ? 'passed' : 'failed');
     const result: VerifyCommandResult = {
       command,
       status,
-      ...(code !== null ? { exitCode: code } : {}),
+      ...(exit.code !== null ? { exitCode: exit.code } : {}),
+      ...(exit.signal ? { signal: exit.signal } : {}),
       durationMs: Date.now() - started,
     };
     return { result, output: buf.toString('utf8') };
@@ -243,5 +294,24 @@ function runCapture(
       clearTimeout(timer);
       resolve({ code, out });
     });
+  });
+}
+
+/**
+ * The verifier the effective config asks for (#19): its `verify` commands, its
+ * `workers.verify_timeout_s`, and the Worker environment allowlist (`workers.env.pass`, #147)
+ * taken from `baseEnv`, the same snapshot Workers get theirs from. For the entry point.
+ */
+export function commandVerifierFromConfig(
+  config: TacetConfig,
+  opts: { repoRoot: string; baseEnv?: Record<string, string | undefined> },
+): CommandVerifier {
+  const baseEnv = opts.baseEnv ?? process.env;
+  return new CommandVerifier({
+    repoRoot: opts.repoRoot,
+    commands: config.verify ?? [],
+    env: workerEnv(baseEnv, {}, workerEnvPolicy(config)).env,
+    timeoutMs: (config.workers?.verify_timeout_s ?? 600) * 1000,
+    gitEnv: baseEnv,
   });
 }

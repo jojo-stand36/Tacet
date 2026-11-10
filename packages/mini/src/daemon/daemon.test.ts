@@ -7,14 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import { MiniConductor, type MiniConductorOptions, VERIFY_CODEX_WORKERS } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
-import type {
-  Planner,
-  ProposedSubtask,
-  Verifier,
-  VerifyContext,
-  VerifyResult,
-  WorkerMcp,
-} from './ports.js';
+import type { Planner, ProposedSubtask, Verifier, VerifyContext, WorkerMcp } from './ports.js';
 import { type Script, ScriptedAdapter, TempWorkspaces } from './testing.js';
 
 const CONFIG: TacetConfig = {
@@ -196,6 +189,45 @@ describe('MiniConductor', () => {
       );
       expect(results.map((r) => r.outcome)).toEqual(['failed', 'failed']);
       expect(results[0]?.verification.notes).toBe('tests failed');
+      // The feedback meant for the Worker never goes up (review B2).
+      for (const e of ofType('task.result', `${id}/1`)) {
+        expect(Object.keys((e.data as { verification: object }).verification)).not.toContain(
+          'feedback',
+        );
+      }
+      // The fresh attempt is told why the last one failed (review S3).
+      expect(fake.sessions[1]?.inputs[0]).toContain('Verification of that attempt: tests failed');
+    });
+
+    it('keeps the fix-round budget across a restart in the middle of a fix (review S2)', async () => {
+      const { verifier } = scripted(['failed']);
+      // The fix turn holds, so the Mini-conductor restarts while the Worker is fixing.
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Verification failed') ? { do: 'hold' } : script(input),
+      );
+      const d1 = make({ config: VERIFY, verifier });
+      await d1.start();
+      const id = d1.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await expect
+        .poll(() => fake.sessions[0]?.inputs.some((x) => x.startsWith('Verification failed')))
+        .toBe(true);
+      await d1.stop();
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('The Mini-conductor restarted')
+          ? { do: 'reply', text: 'fixed' }
+          : script(input),
+      );
+      const d2 = make({ config: VERIFY, verifier });
+      await d2.start();
+      await d2.settled();
+      // One fix round in all (verify_fix_attempts: 1): the resumed session's failure fails the
+      // attempt instead of buying another round.
+      const resumed = fake.sessions.find((s) => s.opts.resume);
+      expect(resumed).toBeDefined();
+      expect(resumed?.inputs.filter((x) => x.startsWith('Verification failed'))).toEqual([]);
+      expect(
+        ofType('task.result', `${id}/1`).map((e) => (e.data as { outcome: string }).outcome)[0],
+      ).toBe('failed');
     });
 
     it('records the process marker while it runs, and stops a run when the Mini-conductor stops', async () => {

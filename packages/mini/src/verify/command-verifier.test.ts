@@ -6,7 +6,7 @@ import type { Task, VerifyCommandResult } from '@tacet/core';
 import { isProcessRunning, newWorkerMarker } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type VerifyContext, WorktreeRefusedError } from '../daemon/ports.js';
-import { CommandVerifier } from './command-verifier.js';
+import { CommandVerifier, commandVerifierFromConfig } from './command-verifier.js';
 
 const TASK = { id: 't/1' } as Task;
 
@@ -132,7 +132,7 @@ describe('CommandVerifier (#19)', () => {
     started.push(pid);
     expect(r.status).toBe('failed');
     expect(c.seen[0]?.status).toBe('timed_out');
-    expect(r.feedback).toMatch(/ran longer than 0 s and was stopped/);
+    expect(r.feedback).toMatch(/ran longer than 1 s and was stopped/);
     await expect.poll(() => isProcessRunning(pid)).toBe(false);
   });
 
@@ -148,6 +148,67 @@ describe('CommandVerifier (#19)', () => {
     started.push(pid);
     expect(r.status).toBe('passed');
     await expect.poll(() => isProcessRunning(pid)).toBe(false);
+  });
+
+  it('does not wait on children that hold its output, in its group or out of it (review B1)', async () => {
+    for (const cmd of ['sleep 60 & exit 0', 'setsid sleep 60 & exit 0']) {
+      const pidFile = join(root, 'pid');
+      const t0 = Date.now();
+      const r = await verifier([`${cmd.replace(' & exit 0', ` & echo $! > ${pidFile}; exit 0`)}`], {
+        timeoutMs: 20_000,
+      }).verify(TASK, ws(), ctx());
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      started.push(pid);
+      expect(r.status, cmd).toBe('passed');
+      expect(Date.now() - t0, cmd).toBeLessThan(10_000);
+      await expect.poll(() => isProcessRunning(pid)).toBe(false);
+    }
+  });
+
+  it("never runs a nested repo's config when it checks the checkout (review B3)", async () => {
+    const ran = join(root, 'filter-ran');
+    const sub = join(wt, 'sub');
+    execFileSync('git', ['init', '-q', sub]);
+    writeFileSync(join(sub, 'f'), 'a\n');
+    git(sub, 'add', 'f');
+    git(sub, 'commit', '-qm', 'sub');
+    git(sub, 'config', 'filter.x.clean', `touch ${ran}; cat`);
+    writeFileSync(join(sub, '.gitattributes'), '* filter=x\n');
+    git(wt, 'add', 'sub');
+    git(wt, 'commit', '-qm', 'gitlink');
+    writeFileSync(join(sub, 'f'), 'b\n');
+    const head = git(wt, 'rev-parse', 'HEAD');
+    await verifier(['true']).verify(TASK, ws(), ctx({ commit: head }));
+    expect(() => readFileSync(ran)).toThrow();
+  });
+
+  it('treats files the index hides from status as a dirty checkout', async () => {
+    git(wt, 'update-index', '--skip-worktree', 'README');
+    writeFileSync(join(wt, 'README'), 'hidden change\n');
+    const r = await verifier(['true']).verify(TASK, ws(), ctx());
+    expect(r.status).toBe('failed');
+    expect(r.feedback).toMatch(/assume-unchanged or skip-worktree/);
+  });
+
+  it('builds from config: its commands, its timeout, the Worker environment allowlist', async () => {
+    const out = join(root, 'env.txt');
+    const v = commandVerifierFromConfig(
+      { verify: [`env > ${out}`], workers: { verify_timeout_s: 7, env: { pass: ['MYAPP_*'] } } },
+      {
+        repoRoot: repo,
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: root,
+          MYAPP_MODE: 'x',
+          OPENAI_API_KEY: 'sk-proj-should-not-pass',
+          OTHER: 'y',
+        },
+      },
+    );
+    expect((await v.verify(TASK, ws(), ctx())).status).toBe('passed');
+    const seen = readFileSync(out, 'utf8');
+    expect(seen).toMatch(/^MYAPP_MODE=x$/m);
+    expect(seen).not.toMatch(/OPENAI_API_KEY|^OTHER=/m);
   });
 
   it('stops when aborted, and reports the run as not run', async () => {

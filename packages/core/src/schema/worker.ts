@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { Id, openEnum } from './common.js';
+import { VerifyCommandStatus } from './handoff.js';
 
 /**
  * Worker lifecycle events (`worker.*`, ARCHITECTURE.md §3). They are summary-grade: retention
@@ -86,13 +87,6 @@ export const WorkerIntegrated = z.object({
   ref: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
 });
 export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;
-
-/** How one `verify` command ended (#19). Unknown values fall back to `failed`. */
-export const VerifyCommandStatus = openEnum(
-  ['passed', 'failed', 'timed_out', 'aborted', 'not_run'],
-  'failed',
-);
-export type VerifyCommandStatus = z.infer<typeof VerifyCommandStatus>;
 
 /**
  * Payload of `worker.verification`: one `verify` command finished on a Worker's sub-task (#19).
