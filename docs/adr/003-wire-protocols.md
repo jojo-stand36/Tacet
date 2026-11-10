@@ -204,6 +204,10 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 
 - **Owner decision (accepted interim risk, 2026-11-09):** each Worker's MCP config, with its per-worker token, is a 0600 file in `~/.tacet/run/mcp/` (outside the worktree and deleted on close by the adapter, #11; the Mini-conductor revokes the token through `WorkerTokens` when the Worker ends). Workers share one OS user, so until the worker sandbox (#53) denies `~/.tacet/run/mcp` (alongside `~/.tacet/run`), a Worker that can run shell commands can read a sibling Worker's token and act as that Worker toward the Mini-conductor.
 
+### Addendum (2026-11-10, proposed, pending owner approval): `workspace.*` namespace (§1)
+
+`workspace.*` (`workspace.created`, `workspace.removed`) joins the event namespaces of §1: the Mini-conductor's worktree registry, moved from per-worktree state files into the log (#126). It is local to the Mini-conductor: not in the upward stream of §3, never forwarded to the Conductor, and its payloads carry ids, never paths. Additive under §2.
+
 ## Consequences
 
 - `docs/ARCHITECTURE.md` needs, in the PR that accepts this ADR:

@@ -308,6 +308,8 @@ export class MiniConductor {
       this.#unlock();
       throw err;
     }
+    // Under the lock, before a checkout is looked up: the registry catches up with the disk.
+    await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#errors.push(err));
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();

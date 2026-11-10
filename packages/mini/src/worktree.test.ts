@@ -1,8 +1,10 @@
 import { execFile } from 'node:child_process';
 import {
   chmod,
+  lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -13,10 +15,11 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { workerGitEnv, workerWorktree } from '@tacet/core/node';
+import { newUlid } from '@tacet/core';
+import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Workspaces } from './daemon/ports.js';
-import { WorktreeManager } from './worktree.js';
+import { type WorktreeLog, WorktreeManager } from './worktree.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -43,6 +46,8 @@ describe('WorktreeManager', () => {
   let temporaryDirectory: string;
   let repository: string;
   let manager: WorktreeManager;
+  let store: EventStore;
+  let log: WorktreeLog;
 
   beforeEach(async () => {
     temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'tacet-worktrees-'));
@@ -56,7 +61,9 @@ describe('WorktreeManager', () => {
     await writeFile(path.join(repository, 'file.txt'), 'base\n');
     await git(repository, ['add', '.']);
     await git(repository, ['commit', '-m', 'initial']);
-    manager = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'));
+    store = openEventStore(':memory:');
+    log = { store, miniId: 'test' };
+    manager = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), { log });
   });
 
   async function workerGit(worktreePath: string, args: string[]): Promise<string> {
@@ -165,8 +172,8 @@ describe('WorktreeManager', () => {
     const stale = await manager.create('stale');
     const dirty = await manager.create('dirty');
     const active = await manager.create('active');
-    const now = Date.now();
-    await Promise.all([stale, dirty, active].map(({ id }) => manager.touch(id, now - 10_000)));
+    // Staleness is by creation time (#126): all three are 10 s old by then.
+    const now = Date.now() + 10_000;
     await writeFile(path.join(dirty.path, 'untracked.txt'), 'keep me\n');
     await writeFile(path.join(active.path, '.env'), 'keep me too\n');
 
@@ -715,10 +722,13 @@ describe('WorktreeManager', () => {
   });
 
   it('protects the source and staging worktrees from every manager while a squash runs', async () => {
-    const other = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'));
+    const other = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      log,
+    });
     const skippedDuringMerge: Array<{ id: string; reason: string }> = [];
     let ids: { source: string; staging: string } | undefined;
     const hooked = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      log,
       onSquashStaging: async (seen) => {
         ids = seen;
         const later = Date.now() + 10_000;
@@ -756,6 +766,7 @@ describe('WorktreeManager', () => {
 
   it('cleans up the staging worktree and releases both worktrees when a squash fails', async () => {
     const failing = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      log,
       onSquashStaging: async () => {
         throw new Error('staging failed');
       },
@@ -854,6 +865,7 @@ describe('WorktreeManager', () => {
     await expect(manager.remove(worktree.id)).rejects.toThrow('already being removed');
     // A merge waits for the removal, then gives up while the lock is still live.
     const waiting = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      log,
       lockWaitMs: 300,
     });
     const started = Date.now();
@@ -877,7 +889,9 @@ describe('WorktreeManager', () => {
     const commit = (await git(repository, ['rev-parse', `refs/heads/${first.branchName}`])).trim();
     await git(repository, ['update-ref', `refs/heads/${second.branchName}`, commit]);
     await workerGit(first.path, ['checkout', '--detach', 'refs/heads/main']);
-    const other = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'));
+    const other = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      log,
+    });
 
     const results = await Promise.allSettled([manager.remove(first.id), other.remove(second.id)]);
 
@@ -1010,6 +1024,160 @@ describe('WorktreeManager', () => {
       );
       expect(await manager.get(worktree.id)).toBeDefined();
       expect(commit).toMatch(/^[0-9a-f]{40}$/);
+    });
+  });
+
+  describe('the registry in the event log (#126)', () => {
+    const root = () => path.join(temporaryDirectory, 'worktrees');
+    const events = (type: string) =>
+      store.query({ typePrefix: type }).map((e) => e.envelope.data as Record<string, unknown>);
+    const adminDir = async (id: string) =>
+      (
+        await git(repository, [
+          'rev-parse',
+          '--path-format=absolute',
+          '--git-path',
+          `worktrees/${id}`,
+        ])
+      ).trim();
+    async function workerCommit(worktreePath: string): Promise<void> {
+      const file = `w-${path.basename(worktreePath)}.txt`;
+      await writeFile(path.join(worktreePath, file), 'w\n');
+      await workerGit(worktreePath, ['add', file]);
+      await workerGit(worktreePath, ['commit', '-m', file]);
+    }
+
+    it('keeps no state files, with or without a log', async () => {
+      for (const m of [manager, new WorktreeManager(repository, root())]) {
+        const a = await m.create('a');
+        const b = await m.create('b');
+        await workerCommit(a.path);
+        const squash = await m.merge(a.id, 'squash-to-branch', 'main');
+        expect(squash.status).toBe('applied');
+        await m.remove(b.id);
+        for (const name of await readdir(root())) {
+          expect(name === '.tacet-locks' || /^[a-z0-9-]+$/.test(name), name).toBe(true);
+        }
+      }
+      // Never a path in an event: a checkout is <root>/<id>.
+      for (const e of store.query({ typePrefix: 'workspace' })) {
+        expect(JSON.stringify(e.envelope)).not.toContain(temporaryDirectory);
+      }
+    });
+
+    it('finds every live worktree from the log after a restart, and none removed', async () => {
+      await git(repository, ['checkout', '-q', '--detach']);
+      const detached = await manager.create('detached');
+      await git(repository, ['checkout', '-q', 'main']);
+      const onMain = await manager.create('on-main');
+      const removed = await manager.create('removed');
+      await manager.remove(removed.id);
+      expect(events('workspace.created')).toHaveLength(3);
+      expect(events('workspace.removed')).toEqual([{ workspaceId: removed.id, reason: 'removed' }]);
+
+      const restarted = new WorktreeManager(repository, root(), { log });
+      const live = await restarted.list();
+      expect(live.map(({ id }) => id).sort()).toEqual([detached.id, onMain.id].sort());
+      expect(await restarted.get(onMain.id)).toMatchObject({
+        baseBranch: 'main',
+        baseCommit: onMain.baseCommit,
+        path: onMain.path,
+        branchName: onMain.branchName,
+      });
+      expect((await restarted.get(detached.id))?.baseBranch).toBeUndefined();
+      expect(await restarted.get(removed.id)).toBeUndefined();
+    });
+
+    it('records intent first, and reconciles a crash on either side of git', async () => {
+      // Crashed before `git worktree add`: only the intent is there.
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'test' },
+        type: 'workspace.created',
+        data: { workspaceId: 'never-made-1', workerId: 'w', baseCommit: 'a'.repeat(40) },
+      });
+      // Crashed after removing it, before recording that.
+      const gone = await manager.create('gone');
+      await git(repository, ['worktree', 'remove', '--force', gone.path]);
+      // Deleted by hand: its admin directory is left, so it stays registered.
+      const byHand = await manager.create('by-hand');
+      await rm(byHand.path, { recursive: true, force: true });
+      const live = await manager.create('live');
+
+      await manager.reconcile();
+
+      expect(events('workspace.removed')).toEqual(
+        expect.arrayContaining([
+          { workspaceId: 'never-made-1', reason: 'gone' },
+          { workspaceId: gone.id, reason: 'gone' },
+        ]),
+      );
+      expect(events('workspace.removed')).toHaveLength(2);
+      expect((await manager.registered()).map(({ id, missing }) => [id, missing])).toEqual(
+        expect.arrayContaining([
+          [byHand.id, true],
+          [live.id, false],
+        ]),
+      );
+      expect(await manager.get(gone.id)).toBeUndefined();
+      expect(await lstat(await adminDir(byHand.id))).toBeTruthy();
+      await manager.reconcile();
+      expect(events('workspace.removed')).toHaveLength(2);
+    });
+
+    it('records a failed creation as gone', async () => {
+      await expect(manager.create('bad', 'f'.repeat(40))).rejects.toThrow();
+      // The base is checked before anything is recorded.
+      expect(events('workspace.created')).toEqual([]);
+    });
+
+    it('imports pre-#126 registry files once, deleting each only after it is in the log', async () => {
+      const old = await manager.create('old');
+      // As a pre-#126 manager left it: no event, a sidecar file.
+      const legacyStore = openEventStore(':memory:');
+      const legacy = new WorktreeManager(repository, root(), {
+        log: { store: legacyStore, miniId: 'x' },
+      });
+      const made = await legacy.create('legacy');
+      const sidecar = path.join(root(), `.tacet-${made.id}.json`);
+      await writeFile(sidecar, JSON.stringify({ ...made, createdAt: 1, lastActivityAt: 1 }));
+      expect((await manager.registered()).map(({ id }) => id)).toEqual(
+        expect.arrayContaining([old.id, made.id]),
+      );
+
+      await manager.reconcile();
+      expect(events('workspace.created').filter((e) => e.workspaceId === made.id)).toEqual([
+        {
+          workspaceId: made.id,
+          workerId: 'legacy',
+          baseCommit: made.baseCommit,
+          baseBranch: 'main',
+          migrated: true,
+        },
+      ]);
+      await expect(lstat(sidecar)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await manager.get(made.id)).toMatchObject({ baseCommit: made.baseCommit });
+
+      // A crash between the append and the delete: the file is back, the event is there.
+      await writeFile(sidecar, JSON.stringify({ ...made, createdAt: 1, lastActivityAt: 1 }));
+      await manager.reconcile();
+      expect(events('workspace.created').filter((e) => e.workspaceId === made.id)).toHaveLength(1);
+      await expect(lstat(sidecar)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
+    it('refuses to create or remove on a read-only log, before running git', async () => {
+      const live = await manager.create('live');
+      const reader = new WorktreeManager(repository, root(), {
+        log: { store, miniId: 'test', readonly: true },
+      });
+      await expect(reader.create('nope')).rejects.toThrow(/read-only/);
+      await expect(reader.remove(live.id)).rejects.toThrow(/read-only/);
+      await expect(reader.reconcile()).rejects.toThrow(/read-only/);
+      expect(await reader.check(live.id)).toBeUndefined();
+      expect((await readdir(root())).filter((n) => n.startsWith('nope'))).toEqual([]);
+      expect(await manager.get(live.id)).toBeDefined();
     });
   });
 

@@ -24,6 +24,11 @@ export interface Workspaces {
    * `base`, a commit in the repo (#134: its dependencies' work), or at the main branch.
    */
   create(workerId: string, base?: string): Promise<Workspace>;
+  /**
+   * Bring the checkout registry up to date with the disk (#126): called once at start, while the
+   * Mini-conductor holds its lock, before any checkout is looked up.
+   */
+  reconcile?(): Promise<void>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   /**

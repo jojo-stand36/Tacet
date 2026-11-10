@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SummaryPacket, TacetConfig, TaskLanded } from '@tacet/core';
@@ -55,7 +55,10 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     git(repo, ['add', 'README']);
     git(repo, ['commit', '-qm', 'init']);
     store = openEventStore(':memory:');
-    manager = new WorktreeManager(repo, join(root, 'worktrees'), { env });
+    manager = new WorktreeManager(repo, join(root, 'worktrees'), {
+      env,
+      log: { store, miniId: 'mini' },
+    });
   });
 
   afterEach(async () => {
@@ -260,5 +263,28 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       await severalSweeps();
       expect(await manager.list()).toHaveLength(1);
     });
+  });
+
+  it('finds every live checkout from the event log after a restart, with no state files (#126)', async () => {
+    const { id } = await runTask(commitWork, { remove_merged: false });
+    const started = store
+      .query({ taskId: `${id}/1`, typePrefix: 'worker.started' })
+      .map((e) => (e.envelope.data as { workspaceId: string }).workspaceId);
+    await daemon?.stop();
+    daemon = undefined;
+    expect(
+      readdirSync(join(root, 'worktrees')).filter(
+        (n) => n !== '.tacet-locks' && !started.includes(n),
+      ),
+    ).toEqual([]);
+
+    const restarted = new WorktreeManager(repo, join(root, 'worktrees'), {
+      env,
+      log: { store, miniId: 'mini' },
+    });
+    await restarted.reconcile();
+    for (const workspaceId of started) {
+      expect(await restarted.get(workspaceId)).toMatchObject({ id: workspaceId });
+    }
   });
 });

@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { workerGitEnv, workerWorktree } from '@tacet/core/node';
+import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { WorktreeManager } from '@tacet/mini';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Io } from '../io.js';
@@ -47,7 +47,15 @@ describe('tacet uninstall --purge: run state (#211)', () => {
   };
   const paths = () => statePaths(repo, join(home, '.tacet'), home);
   const root = () => repo;
-  const manager = () => new WorktreeManager(repo, paths().worktrees, { env });
+  let store: EventStore | undefined;
+  /** The run's worktree manager, on the repo's event log, which holds its registry (#126). */
+  const manager = () => {
+    store ??= openEventStore(paths().events);
+    return new WorktreeManager(repo, paths().worktrees, {
+      env,
+      log: { store, repo: paths().repoId, miniId: 'test' },
+    });
+  };
 
   /** A Worker checkout with a commit only its own store has: unintegrated work. */
   async function checkoutWithWork() {
@@ -88,11 +96,13 @@ describe('tacet uninstall --purge: run state (#211)', () => {
     git(repo, ['commit', '-qm', 'init']);
     expect((await tacet(['init', '--model', 'm'])).code).toBe(0);
     mkdirSync(paths().dir, { recursive: true });
-    writeFileSync(paths().events, 'not really a database');
+    store = openEventStore(paths().events);
     git(repo, ['branch', 'tacet/some-task/result']);
   });
 
   afterEach(() => {
+    store?.close();
+    store = undefined;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -228,7 +238,7 @@ describe('tacet uninstall --purge: run state (#211)', () => {
     }
     expect(tree(paths().dir)).toEqual(before);
     const r = await tacet(['uninstall', '--purge']);
-    expect(r.out).toMatch(/would remove run state .*: events\.db, worktrees/);
+    expect(r.out).toMatch(/would remove run state .*: events\.db.*, worktrees/);
   });
 
   it('refuses when a run takes the lock between the preview and the removal', async () => {
@@ -353,6 +363,40 @@ describe('tacet uninstall --purge: run state (#211)', () => {
       expect(r.code).toBe(1);
       expect(r.err).toContain(`kept checkout ${w.path}: Worker has commits no other ref contains`);
       expect(existsSync(w.path)).toBe(true);
+    });
+  });
+
+  describe('the worktree registry in the event log (#126)', () => {
+    it('still finds a checkout from a pre-#126 registry file when there is no log', async () => {
+      const legacy = new WorktreeManager(repo, paths().worktrees, {
+        env,
+        log: { store: openEventStore(':memory:'), miniId: 'old' },
+      });
+      const old = await legacy.create('old');
+      writeFileSync(
+        join(paths().worktrees, `.tacet-${old.id}.json`),
+        JSON.stringify({ ...old, lastActivityAt: old.createdAt }),
+      );
+      store?.close();
+      store = undefined;
+      for (const f of readdirSync(paths().dir)) {
+        if (f.startsWith('events.db')) rmSync(join(paths().dir, f));
+      }
+      const r = await tacet(['uninstall', '--purge']);
+      expect(r.out).toContain(`would remove checkout ${old.path}`);
+      expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(0);
+      expect(existsSync(old.path)).toBe(false);
+    });
+
+    it('records the removals that happened when some checkouts are refused', async () => {
+      const clean = await manager().create('clean');
+      const dirty = await checkoutWithWork();
+      expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(1);
+      const removed = (store as EventStore)
+        .query({ typePrefix: 'workspace.removed' })
+        .map((e) => (e.envelope.data as { workspaceId: string }).workspaceId);
+      expect(removed).toEqual([clean.id]);
+      expect(await manager().get(dirty.id)).toBeDefined();
     });
   });
 });

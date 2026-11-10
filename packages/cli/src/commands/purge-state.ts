@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, realpathSync, rmdirSync, rmSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import {
+  openEventStore,
   type RepoStatePaths,
   repoStatePaths,
   resolveStateDir,
@@ -73,9 +74,23 @@ const liveRunError = (pid: number) =>
     `a tacet run is live for this repo (process ${pid}): stop it before purging its state`,
   );
 
-async function manager(io: Io, root: string, paths: RepoStatePaths) {
+/**
+ * The worktree manager on the repo's event log, which holds its registry (#126): read-only for a
+ * preview (no lock is held), writable under the run lock. Without a log, only pre-#126 registry
+ * files are found.
+ */
+async function manager(io: Io, root: string, paths: RepoStatePaths, writable: boolean) {
   const { WorktreeManager } = await import('@tacet/mini');
-  return new WorktreeManager(root, paths.worktrees, { env: io.env ?? process.env });
+  const store = existsSync(paths.events)
+    ? openEventStore(paths.events, { readonly: !writable })
+    : undefined;
+  const worktrees = new WorktreeManager(root, paths.worktrees, {
+    env: io.env ?? process.env,
+    ...(store
+      ? { log: { store, repo: paths.repoId, miniId: 'tacet-uninstall', readonly: !writable } }
+      : {}),
+  });
+  return { worktrees, close: () => store?.close() };
 }
 
 /**
@@ -99,18 +114,22 @@ export async function planState(io: Io, root: string, userDir: string): Promise<
   plan.entries = readdirSync(paths.dir).sort();
   // Only looked at when it exists: the manager would create it.
   if (!existsSync(paths.worktrees)) return plan;
-  const worktrees = await manager(io, root, paths);
-  const tips = tacetTips(io, root);
-  for (const w of await worktrees.registered()) {
-    const kept = await worktrees.check(w.id, { landed: keptElsewhere(tips, w.branchName) });
-    const heldBy = await worktrees.holders(w.id);
-    plan.checkouts.push({
-      id: w.id,
-      path: w.path,
-      missing: w.missing,
-      ...(kept ? { kept: kept.message, forceable: true } : {}),
-      ...(heldBy.length > 0 ? { heldBy } : {}),
-    });
+  const { worktrees, close } = await manager(io, root, paths, false);
+  try {
+    const tips = tacetTips(io, root);
+    for (const w of await worktrees.registered()) {
+      const kept = await worktrees.check(w.id, { landed: keptElsewhere(tips, w.branchName) });
+      const heldBy = await worktrees.holders(w.id);
+      plan.checkouts.push({
+        id: w.id,
+        path: w.path,
+        missing: w.missing,
+        ...(kept ? { kept: kept.message, forceable: true } : {}),
+        ...(heldBy.length > 0 ? { heldBy } : {}),
+      });
+    }
+  } finally {
+    close();
   }
   return plan;
 }
@@ -148,25 +167,29 @@ export async function applyState(
   try {
     locked = await withStoppedMini(paths.lock, async () => {
       if (existsSync(paths.worktrees)) {
-        const worktrees = await manager(io, root, paths);
-        const tips = tacetTips(io, root);
-        for (const w of await worktrees.registered()) {
-          try {
-            await worktrees.remove(w.id, {
-              force,
-              keepBranch: true,
-              landed: keptElsewhere(tips, w.branchName),
-            });
-            result.removed.push(w.path);
-          } catch (err) {
-            result.refused.push({
-              id: w.id,
-              path: w.path,
-              missing: w.missing,
-              kept: err instanceof Error ? err.message : String(err),
-              forceable: err instanceof WorktreeKeptError && !force,
-            });
+        const { worktrees, close } = await manager(io, root, paths, true);
+        try {
+          const tips = tacetTips(io, root);
+          for (const w of await worktrees.registered()) {
+            try {
+              await worktrees.remove(w.id, {
+                force,
+                keepBranch: true,
+                landed: keptElsewhere(tips, w.branchName),
+              });
+              result.removed.push(w.path);
+            } catch (err) {
+              result.refused.push({
+                id: w.id,
+                path: w.path,
+                missing: w.missing,
+                kept: err instanceof Error ? err.message : String(err),
+                forceable: err instanceof WorktreeKeptError && !force,
+              });
+            }
           }
+        } finally {
+          close();
         }
       }
       if (result.refused.length > 0) return;
