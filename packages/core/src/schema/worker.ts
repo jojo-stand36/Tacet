@@ -53,7 +53,8 @@ export type ProfileReasons = z.infer<typeof ProfileReasons>;
  * Payload of `worker.profile`: the session profile the Mini-conductor's policy chose for a Worker
  * session, and why (#110). Written with `worker.started`, before the session starts. If the
  * adapter refuses it, it is written again with `refused`, and the profile the session then runs
- * on gets its own event: the last one for a session is the one in force.
+ * on gets its own event: the last one for a session is the one in force, unless it is the
+ * refused one, when no session ran (a refused model fails the sub-task).
  */
 export const WorkerProfile = z.object({
   sessionId: Id,

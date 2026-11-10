@@ -73,6 +73,7 @@ export function chooseProfile(i: ProfileInput): ChosenProfile {
     effortWhy = `${at}.effort`;
     if (tier.escalate_effort_on_retry && i.failedAttempts > 0) {
       if (max === undefined) {
+        // Config validation rejects this combination; kept for direct callers.
         effortWhy += `; not raised after ${i.failedAttempts} failed attempt(s): no ${at}.max_effort`;
       } else {
         rank = Math.min(base + i.failedAttempts, max);
