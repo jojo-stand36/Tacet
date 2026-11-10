@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
   type Decision,
@@ -21,7 +21,13 @@ import {
   type Verification,
   type VerificationStatus,
 } from '@tacet/core';
-import type { EventStore } from '@tacet/core/node';
+import {
+  type EventStore,
+  endMarkedProcesses,
+  isWorkerMarker,
+  newWorkerMarker,
+  WORKER_MARKER_VAR,
+} from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
 import {
   type Integrator,
@@ -52,6 +58,11 @@ export interface MiniConductorOptions {
   mcp: WorkerMcp;
   /** Single-instance lock, e.g. `<repoStateDir>/mini.lock`. */
   lockPath: string;
+  /**
+   * Where the process markers of running Worker sessions are kept (0600), so a restarted
+   * Mini-conductor can end what a crashed one left running (#127). Default `<lockPath>.workers`.
+   */
+  processFile?: string;
   /** Repo id stamped on events. */
   repo?: string;
   miniId?: string;
@@ -146,6 +157,8 @@ export class MiniConductor {
   readonly #planning = new Set<string>();
   /** Background work (plans, Worker event loops) that `stop()` waits for. */
   readonly #inflight = new Set<Promise<unknown>>();
+  /** Process markers of Worker sessions that may be running, by session (#127). */
+  readonly #markers = new Map<string, string>();
   /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
@@ -186,6 +199,13 @@ export class MiniConductor {
   async start(): Promise<void> {
     if (this.#started) return;
     this.#lock();
+    try {
+      // Before anything resumes: a Worker a crashed predecessor left running would race it.
+      await this.#endStaleWorkers();
+    } catch (err) {
+      this.#unlock();
+      throw err;
+    }
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -850,6 +870,11 @@ export class MiniConductor {
     let revoke = () => {};
     let mcpServerName = '';
     let handle: SessionHandle;
+    // Recorded before the vendor process exists, so a crash at any point after this leaves it
+    // findable (#127).
+    const marker = newWorkerMarker();
+    this.#markers.set(sessionId, marker);
+    this.#saveMarkers();
     try {
       const minted = this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId });
       revoke = minted.revoke;
@@ -861,9 +886,16 @@ export class MiniConductor {
         ...(tier.model !== undefined ? { model: tier.model } : {}),
         ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
         ...(resume ? { resume } : {}),
+        env: { [WORKER_MARKER_VAR]: marker },
       });
     } catch (err) {
       revoke();
+      // Whatever a failed start left running goes now, not at the next restart.
+      this.#track(
+        endMarkedProcesses([marker]).then(() => {
+          if (this.#markers.delete(sessionId)) this.#saveMarkers();
+        }),
+      );
       if (!this.#live(gen)) return;
       this.#errors.push(err);
       this.#o.store.append(
@@ -881,6 +913,7 @@ export class MiniConductor {
       // Stopped while the session started: give it back without registering it.
       revoke();
       await worker.adapter.close(handle).catch(() => {});
+      if (this.#markers.delete(sessionId)) this.#saveMarkers();
       return;
     }
     const run: Run = {
@@ -1210,6 +1243,65 @@ export class MiniConductor {
     await this.#o.adapters[run.adapterId]?.adapter
       .close(run.handle)
       .catch((err: unknown) => this.#errors.push(err));
+    // Closed by its adapter: nothing of it is left to end after a crash.
+    if (this.#markers.delete(run.sessionId)) this.#saveMarkers();
+  }
+
+  // ---- Worker processes (#127) -----------------------------------------------------------
+
+  get #processFile(): string {
+    return this.#o.processFile ?? `${this.#o.lockPath}.workers`;
+  }
+
+  #saveMarkers(): void {
+    const file = this.#processFile;
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify([...this.#markers.values()])}\n`, {
+        flag: 'wx',
+        mode: 0o600,
+      });
+      renameSync(tmp, file);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      this.#errors.push(err);
+    }
+  }
+
+  /**
+   * End the processes of Worker sessions a predecessor recorded and never closed: every process
+   * whose environment carries one of their markers, the vendor's tools included.
+   */
+  async #endStaleWorkers(): Promise<void> {
+    const file = this.#processFile;
+    // Temp files of a write a crash interrupted.
+    try {
+      const dir = dirname(file);
+      const prefix = `${basename(file)}.`;
+      for (const name of readdirSync(dir)) {
+        if (name.startsWith(prefix) && name.endsWith('.tmp'))
+          rmSync(join(dir, name), { force: true });
+      }
+    } catch {
+      // No directory yet.
+    }
+    let markers: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+      markers = (Array.isArray(parsed) ? parsed : []).filter(isWorkerMarker);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.#errors.push(err);
+    }
+    if (markers.length > 0) {
+      const { left } = await endMarkedProcesses(markers);
+      if (left.length > 0) {
+        this.#errors.push(
+          new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`),
+        );
+      }
+    }
+    this.#markers.clear();
+    this.#saveMarkers();
   }
 
   // ---- escalation answers ----------------------------------------------------------------

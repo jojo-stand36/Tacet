@@ -1,10 +1,17 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeSdkAdapter } from '@tacet/adapter-claude-sdk';
 import { type MockMessagesApi, startMockMessagesApi } from '@tacet/adapter-claude-sdk/testing';
+import type { SessionHandle, SessionOptions } from '@tacet/core';
 import { newUlid, tasksProjection } from '@tacet/core';
-import { type EventStore, openEventStore, WorkerTokens } from '@tacet/core/node';
+import {
+  type EventStore,
+  endMarkedProcesses,
+  markedProcesses,
+  openEventStore,
+  WorkerTokens,
+} from '@tacet/core/node';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import { MiniMcpServer } from '../mcp/server.js';
@@ -38,8 +45,20 @@ describe('Mini-conductor with a real Claude Worker', () => {
     ws = new TempWorkspaces();
   });
 
+  /** Every Worker marker a test recorded, so a failed test leaves no Worker running. */
+  const markerFiles: string[] = [];
+  const leftovers: string[] = [];
+
   afterAll(async () => {
     await daemon?.stop();
+    for (const f of markerFiles) {
+      try {
+        await endMarkedProcesses(JSON.parse(readFileSync(f, 'utf8')) as string[]);
+      } catch {
+        // No file: nothing was recorded.
+      }
+    }
+    await endMarkedProcesses(leftovers);
     await server?.close();
     store?.close();
     await api?.close();
@@ -110,5 +129,117 @@ describe('Mini-conductor with a real Claude Worker', () => {
     // The answer reached the model as the Worker's next message.
     expect(api.requests.some((r) => r.text?.includes('Use Postgres'))).toBe(true);
     expect(daemon.errors.map(String)).toEqual([]);
+  });
+
+  it('ends the Worker a crashed Mini-conductor left running before resuming (#127)', {
+    timeout: 120_000,
+  }, async () => {
+    // The first test's Mini-conductor shares the store: it must not pick this task up.
+    await daemon?.stop();
+    const home = join(root, 'home');
+    const options = () => ({
+      authRoute: 'api_key' as const,
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: home,
+        CLAUDE_CONFIG_DIR: join(home, '.claude'),
+        ANTHROPIC_BASE_URL: api.url,
+        ANTHROPIC_API_KEY: 'placeholder-not-a-real-key',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      },
+      mcpConfigDir: join(root, 'run', 'mcp'),
+      // The Mini-conductor refuses every approval but its own tools: Bash is allowed up front.
+      sdkOptions: { settingSources: [], allowedTools: ['Bash'] },
+    });
+    /** Running, not a zombie (in a container, PID 1 may never reap an orphan). */
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return false;
+      }
+      if (process.platform !== 'linux') return true;
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) !== 'Z';
+      } catch {
+        return false;
+      }
+    };
+    /** The previous run's Worker processes, as found when each new session started. */
+    const leftAtStart: number[][] = [];
+    let previous: string[] = [];
+    class Probe extends ClaudeSdkAdapter {
+      override async start(o: SessionOptions): Promise<SessionHandle> {
+        leftAtStart.push([...markedProcesses(previous).values()].flat());
+        return super.start(o);
+      }
+    }
+    const lockPath = join(root, 'crash', 'mini.lock');
+    markerFiles.push(`${lockPath}.workers`);
+    const make = (adapter: ClaudeSdkAdapter) =>
+      new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'claude-sdk', model: 'claude-sonnet-5-5' } } },
+        adapters: { 'claude-sdk': { adapter, authRoute: 'api_key' } },
+        workspaces: ws,
+        planner: new SingleStepPlanner(),
+        mcp: server,
+        lockPath,
+        pollMs: 50,
+      });
+    // The first Mini-conductor's Worker starts a background job, escalates, and stays open
+    // waiting for the answer.
+    const first = make(new ClaudeSdkAdapter(options()));
+    await first.start();
+    const id = first.submit({
+      goal: 'BACKGROUND_TOOL, then ESCALATE before choosing a queue',
+      acceptanceCriteria: ['ok'],
+    });
+    const sub = `${id}/1`;
+    const state = () => store.replay(tasksProjection).tasks[sub]?.state;
+    await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('input_required');
+    previous = JSON.parse(readFileSync(`${lockPath}.workers`, 'utf8')) as string[];
+    leftovers.push(...previous);
+    expect(previous).toHaveLength(1);
+    const workspaceId = (
+      store.query({ taskId: sub, typePrefix: 'worker.started' })[0]?.envelope.data as
+        | { workspaceId: string }
+        | undefined
+    )?.workspaceId;
+    const checkout = (await ws.get(workspaceId ?? ''))?.path ?? '';
+    const job = Number.parseInt(readFileSync(join(checkout, 'background.pid'), 'utf8'), 10);
+    // A crash: nothing is closed. Claude Code and the job its Bash tool left behind live on, the
+    // job outside Claude Code's process group.
+    first.crashForTest();
+    const before = [...markedProcesses(previous).values()].flat();
+    expect(before).toContain(job);
+    expect(before.length).toBeGreaterThan(1);
+    expect(alive(job)).toBe(true);
+
+    const escalationId = (
+      store.query({ taskId: sub, typePrefix: 'escalation.raised' })[0]?.envelope.data as
+        | { id: string }
+        | undefined
+    )?.id;
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'conductor', id: 'test' },
+      taskId: sub,
+      type: 'escalation.resolved',
+      data: { escalationId, answer: 'Use a durable queue' },
+    });
+    daemon = make(new Probe(options()));
+    await daemon.start();
+    // Gone as soon as start() returns, before any Worker session starts.
+    for (const pid of before) expect(alive(pid)).toBe(false);
+    await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('completed');
+    expect(leftAtStart.length).toBeGreaterThan(0);
+    expect(leftAtStart.flat()).toEqual([]);
+    await daemon.stop();
+    // Every session closed cleanly: nothing left to end next time.
+    expect(JSON.parse(readFileSync(`${lockPath}.workers`, 'utf8'))).toEqual([]);
   });
 });
