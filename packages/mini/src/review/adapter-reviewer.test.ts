@@ -233,6 +233,21 @@ describe('reviewDiff and AdapterReviewer', () => {
     expect(adapter.sessions).toHaveLength(0);
   });
 
+  it('refuses an agent refused for unattended sessions (#188)', () => {
+    const adapter = Object.assign(
+      new ScriptedAdapter('acp:codex-acp', () => ({ do: 'reply', text: APPROVE })),
+      { workerRefused: 'pending #183' },
+    );
+    expect(
+      () =>
+        new AdapterReviewer({
+          worker: { adapter, authRoute: 'api_key' },
+          adapterId: 'acp:codex-acp',
+          diff: { repoRoot: repo },
+        }),
+    ).toThrow(/refused for the reviewer: pending #183/);
+  });
+
   it('refuses an adapter whose tools cannot be refused', () => {
     const adapter = new ScriptedAdapter('pty:x', () => ({ do: 'reply', text: APPROVE }));
     adapter.capabilities = (): AdapterCapabilities => ({

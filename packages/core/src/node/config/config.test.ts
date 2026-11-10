@@ -425,6 +425,95 @@ describe('loadConfig', () => {
     });
   });
 
+  it('checks tier bounds on the merged config, and keeps them from the task layer (#110)', () => {
+    const user = {
+      tiers: {
+        worker: {
+          adapter: 'claude-sdk',
+          model: 'claude-sonnet-4-6',
+          models: ['claude-sonnet-4-6', 'claude-opus-4-6'],
+          effort: 'medium' as const,
+          max_effort: 'high' as const,
+        },
+      },
+    };
+    const ok = mergeConfig([{ name: 'user', origin: 'u', data: user }]);
+    expect(ok.errors).toEqual([]);
+    // The task layer may pick within the bounds...
+    const within = mergeConfig([
+      { name: 'user', origin: 'u', data: user },
+      {
+        name: 'task',
+        origin: 't',
+        data: { tiers: { worker: { adapter: 'claude-sdk', effort: 'high' } } },
+      },
+    ]);
+    expect(within.errors).toEqual([]);
+    // ...but not outside them, and not move them.
+    const outside = mergeConfig([
+      { name: 'user', origin: 'u', data: user },
+      {
+        name: 'task',
+        origin: 't',
+        data: { tiers: { worker: { adapter: 'claude-sdk', model: 'gpt-5.5', effort: 'max' } } },
+      },
+    ]);
+    expect(outside.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/tiers\.worker\.model: gpt-5\.5 is not in tiers\.worker\.models/),
+        expect.stringMatching(/tiers\.worker\.effort: max is above tiers\.worker\.max_effort/),
+      ]),
+    );
+    const widened = mergeConfig([
+      { name: 'user', origin: 'u', data: user },
+      {
+        name: 'task',
+        origin: 't',
+        data: {
+          tiers: {
+            worker: { adapter: 'claude-sdk', max_effort: 'max', max_context_window: 1_000_000 },
+          },
+        },
+      },
+    ]);
+    expect(widened.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/tiers\.worker\.max_effort: the task layer .* may not set it/),
+        expect.stringMatching(
+          /tiers\.worker\.max_context_window: the task layer .* may not set it/,
+        ),
+      ]),
+    );
+    // Raising effort needs a ceiling; the planner's tier takes no bounds.
+    const noCeiling = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: {
+          tiers: {
+            worker: { adapter: 'x', effort: 'low', escalate_effort_on_retry: true },
+            mini: { adapter: 'x', max_effort: 'high' },
+          },
+        },
+      },
+    ]);
+    expect(noCeiling.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/escalate_effort_on_retry: needs tiers\.worker\.max_effort/),
+        expect.stringMatching(/tiers\.mini\.max_effort: only Worker tiers take bounds/),
+      ]),
+    );
+    // Effort names outside the known levels are a config error, as for any enum in config.
+    const typo = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: { tiers: { worker: { adapter: 'x', effort: 'hgih' } } } as never,
+      },
+    ]);
+    expect(typo.errors.some((e) => e.startsWith('tiers.worker.effort'))).toBe(true);
+  });
+
   it('reports a merged config that no longer matches the schema', () => {
     const bad = mergeConfig([
       { name: 'user', origin: 'u', data: { secrets: { x: { env: 'A', keychain: 'b' } } } as never },

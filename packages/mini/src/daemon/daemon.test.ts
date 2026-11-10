@@ -1,7 +1,14 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { type EventEnvelope, newUlid, type TacetConfig, tasksProjection } from '@tacet/core';
+import {
+  type EventEnvelope,
+  newUlid,
+  ProfileRefusedError,
+  type SessionOptions,
+  type TacetConfig,
+  tasksProjection,
+} from '@tacet/core';
 import { type EventStore, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
@@ -723,6 +730,168 @@ describe('MiniConductor', () => {
     expect(all[id]?.result?.outcome).toBe('failed');
   });
 
+  it('chooses each session profile within the tier bounds and logs it as worker.profile (#110)', async () => {
+    let first = true;
+    fake = new ScriptedAdapter('fake', (input) => {
+      if (input.includes('flaky') && first) {
+        first = false;
+        return { do: 'error', message: 'transient' };
+      }
+      return script(input);
+    });
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: {
+          worker: {
+            adapter: 'fake',
+            model: 'cheap',
+            effort: 'medium',
+            max_effort: 'high',
+            escalate_effort_on_retry: true,
+            max_context_window: 1_000_000,
+          },
+        },
+      },
+      planner: new FixedPlanner([
+        { key: 'flaky', goal: 'flaky step', acceptanceCriteria: ['ok'] },
+        { key: 'read', goal: 'one long read', acceptanceCriteria: ['ok'], indivisible: true },
+      ]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'profiles', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    const opts = (goal: string) =>
+      fake.sessions
+        .filter((x) => x.inputs.some((i) => i.includes(goal)))
+        .map(({ opts: o }) => ({
+          model: o.model,
+          effort: o.effort,
+          contextWindow: o.contextWindow,
+        }));
+    // The retry runs one effort level higher; only the indivisible sub-task gets the large window.
+    expect(opts('flaky step')).toEqual([
+      { model: 'cheap', effort: 'medium', contextWindow: undefined },
+      { model: 'cheap', effort: 'high', contextWindow: undefined },
+    ]);
+    expect(opts('one long read')).toEqual([
+      { model: 'cheap', effort: 'medium', contextWindow: 1_000_000 },
+    ]);
+    // Every session has its profile, with the reasons, in the log, after its worker.started.
+    const profiles = ofType('worker.profile', `${id}/2`);
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0]?.data).toMatchObject({
+      contextWindow: 1_000_000,
+      reasons: { contextWindow: expect.stringMatching(/cannot be handed off cleanly/) },
+    });
+    expect(
+      ofType('worker.profile', `${id}/1`).map((e) => (e.data as { effort: string }).effort),
+    ).toEqual(['medium', 'high']);
+  });
+
+  it('runs at the default effort, and logs why, when the adapter refuses the effort (#110)', async () => {
+    class NoHigh extends ScriptedAdapter {
+      override async start(opts: SessionOptions) {
+        if (opts.effort === 'high') throw new ProfileRefusedError('effort', 'no high here');
+        return super.start(opts);
+      }
+    }
+    fake = new NoHigh('fake', script);
+    const d = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap', effort: 'high' } } },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'refused effort', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(fake.sessions.map((x) => x.opts.effort)).toEqual([undefined]);
+    const profiles = ofType('worker.profile').map((e) => e.data as Record<string, unknown>);
+    // Chosen, then the same profile marked refused, then the one the session ran on.
+    expect(profiles).toHaveLength(3);
+    expect(profiles[0]).toMatchObject({ effort: 'high' });
+    expect(profiles[0]).not.toHaveProperty('refused');
+    expect(profiles[1]).toMatchObject({
+      effort: 'high',
+      refused: { field: 'effort', message: 'no high here' },
+    });
+    expect(profiles[2]).not.toHaveProperty('effort');
+    expect(profiles[2]).toMatchObject({
+      reasons: { effort: expect.stringMatching(/^the model's default; the adapter refused high/) },
+    });
+    // Not a failed attempt.
+    expect(ofType('worker.ended').map((e) => (e.data as { reason: string }).reason)).not.toContain(
+      'failed',
+    );
+  });
+
+  it('drops a refused context window and fails at once on a refused model (#110)', async () => {
+    class Picky extends ScriptedAdapter {
+      starts = 0;
+      override async start(opts: SessionOptions) {
+        this.starts++;
+        if (opts.model === 'nope') throw new ProfileRefusedError('model', 'no such model');
+        if (opts.contextWindow !== undefined) {
+          throw new ProfileRefusedError('contextWindow', 'not for this model');
+        }
+        return super.start(opts);
+      }
+    }
+    const picky = new Picky('fake', script);
+    fake = picky;
+    const window = make({
+      config: {
+        ...CONFIG,
+        tiers: { worker: { adapter: 'fake', model: 'cheap', max_context_window: 1_000_000 } },
+      },
+      planner: new FixedPlanner([
+        { key: 'read', goal: 'one long read', acceptanceCriteria: ['ok'], indivisible: true },
+      ]),
+    });
+    await window.start();
+    const id = window.submit({ goal: 'window', acceptanceCriteria: ['ok'] });
+    await window.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(picky.sessions.map((x) => x.opts.contextWindow)).toEqual([undefined]);
+    const last = ofType('worker.profile').at(-1)?.data as { reasons: { contextWindow: string } };
+    expect(last.reasons.contextWindow).toMatch(/refused 1000000; hand off at the threshold/);
+    await window.stop();
+
+    // A refused model: one start, then the sub-task fails without using up its retries.
+    picky.starts = 0;
+    const model = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'nope' } } },
+    });
+    await model.start();
+    const id2 = model.submit({ goal: 'bad model', acceptanceCriteria: ['ok'] });
+    await model.settled();
+    expect(picky.starts).toBe(1);
+    expect(tasks()[`${id2}/1`]?.state).toBe('failed');
+    expect(ofType('task.status', `${id2}/1`).at(-1)?.data).toMatchObject({
+      message: expect.stringMatching(/session profile refused: the adapter refused the model/),
+    });
+    expect(
+      ofType('worker.profile', `${id2}/1`).map((e) => (e.data as { refused?: unknown }).refused),
+    ).toEqual([undefined, { field: 'model', message: 'no such model' }]);
+  });
+
+  it('fails a sub-task whose profile is outside the bounds, before any session (#110)', async () => {
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: { worker: { adapter: 'fake', effort: 'max', max_effort: 'high' } },
+      },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'out of bounds', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[`${id}/1`]?.state).toBe('failed');
+    expect(ofType('task.status', `${id}/1`).at(-1)?.data).toMatchObject({
+      message: expect.stringMatching(/session profile refused: effort max is above/),
+    });
+    expect(fake.sessions).toHaveLength(0);
+  });
+
   it('marks a Worker that ends its turn on an open escalation input_required, then delivers the answer', async () => {
     const escId = newUlid();
     fake = new ScriptedAdapter('fake', (input, s) => {
@@ -996,6 +1165,23 @@ describe('MiniConductor', () => {
     await make().start();
   });
 
+  it('refuses an adapter that may not run Workers, here or in the planner (#183)', () => {
+    const refusing = Object.assign(new ScriptedAdapter('fake', script), {
+      workerRefused: 'not for Workers (#183)',
+    });
+    expect(() => make({ adapters: { fake: { adapter: refusing, authRoute: 'api_key' } } })).toThrow(
+      /adapter fake: refused for Workers: not for Workers \(#183\)/,
+    );
+    expect(
+      () =>
+        new AdapterPlanner({
+          worker: { adapter: refusing, authRoute: 'api_key' },
+          adapterId: 'acp:codex-acp',
+          cwd: dir,
+        }),
+    ).toThrow(/refused for the planner: not for Workers/);
+  });
+
   it('refuses a Worker adapter that is not on the api_key route', () => {
     expect(() =>
       make({
@@ -1015,6 +1201,12 @@ describe('planning', () => {
       ).subtasks.map((s) => s.key),
     ).toEqual(['a', 'b']);
     expect(() => parseProposal('Here is my plan')).toThrow(/not JSON/);
+    // `indivisible` is kept only when true (#110).
+    expect(
+      parseProposal(
+        '{"subtasks":[{"key":"a","goal":"g","acceptanceCriteria":["c"],"indivisible":true},{"key":"b","goal":"h","acceptanceCriteria":["d"],"indivisible":false}]}',
+      ).subtasks.map((s) => s.indivisible),
+    ).toEqual([true, undefined]);
     expect(() =>
       parseProposal(
         '{"subtasks":[{"key":"a","goal":"g","acceptanceCriteria":["c"],"dependsOn":["a"]}]}',

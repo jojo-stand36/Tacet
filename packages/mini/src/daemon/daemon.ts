@@ -8,6 +8,7 @@ import {
   type EventEnvelope,
   newUlid,
   type Priority,
+  type ProfileField,
   redactSecrets,
   type SessionHandle,
   type SummaryPacket,
@@ -17,6 +18,7 @@ import {
   TaskPlan,
   type TaskState,
   type TaskView,
+  type TierConfig,
   tasksProjection,
   type Verification,
   type VerificationStatus,
@@ -44,7 +46,9 @@ import {
   type Workspace,
   type Workspaces,
   WorktreeRefusedError,
+  workerRefusal,
 } from './ports.js';
+import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
 import { RESUME_PROMPT, safePrompt, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
 
@@ -113,6 +117,8 @@ interface View {
   tasks: Record<string, TaskView>;
   sessions: Map<string, SessionRecord>;
   kinds: Map<string, string>;
+  /** Sub-tasks the planner marked indivisible (#110). */
+  indivisible: Set<string>;
   escalations: Map<string, EscalationRecord>;
   decisions: Map<string, string>;
   progress: Map<string, string>;
@@ -242,6 +248,8 @@ export class MiniConductor {
           `adapter ${id}: Workers run unattended and must use the api_key route (#65)`,
         );
       }
+      const refused = workerRefusal(w);
+      if (refused) throw new Error(`adapter ${id}: refused for Workers: ${refused}`);
     }
     const worker = opts.config.tiers?.worker;
     if (!worker) throw new Error('config has no tiers.worker');
@@ -408,6 +416,7 @@ export class MiniConductor {
               acceptanceCriteria: s.acceptanceCriteria,
               kind: s.kind ?? 'implement',
               dependsOn: (s.dependsOn ?? []).map((d) => idOf.get(d) ?? d),
+              ...(s.indivisible ? { indivisible: true } : {}),
             })),
             ...(proposal.planner ? { planner: proposal.planner } : {}),
             ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
@@ -601,15 +610,12 @@ export class MiniConductor {
     );
   }
 
-  #tierFor(kind: string | undefined): { adapter: string; model?: string; effort?: string } {
+  #tierFor(kind: string | undefined): TierConfig & { role: string } {
     const tiers = this.#o.config.tiers ?? {};
-    const tier = (kind === 'review' ? tiers.review : undefined) ?? tiers.worker;
+    const review = kind === 'review' ? tiers.review : undefined;
+    const tier = review ?? tiers.worker;
     if (!tier) throw new Error('config has no tiers.worker');
-    return {
-      adapter: tier.adapter,
-      ...(tier.model !== undefined ? { model: tier.model } : {}),
-      ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
-    };
+    return { ...tier, role: review ? 'review' : 'worker' };
   }
 
   /** Pending sub-tasks behind a failed one can never run: fail them. */
@@ -889,6 +895,26 @@ export class MiniConductor {
     }
     const tier = this.#tierFor(v.kinds.get(subtaskId));
     const worker = this.#o.adapters[tier.adapter] as WorkerAdapter;
+    // Model, effort and context window within the tier's bounds (#110); outside them, the
+    // sub-task fails before any session starts.
+    let profile: ChosenProfile;
+    try {
+      profile = chooseProfile({
+        role: tier.role,
+        tier,
+        capabilities: worker.adapter.capabilities(),
+        failedAttempts: failed,
+        indivisible: v.indivisible.has(subtaskId),
+      });
+    } catch (err) {
+      this.#o.store.append(
+        this.#env(subtaskId, 'task.status', {
+          state: 'failed',
+          message: `session profile refused: ${(err as Error).message}`,
+        }),
+      );
+      return;
+    }
     const last = history.at(-1);
     // Reuse the checkout of an earlier run: a restart or a retry continues the same work.
     // Never one whose checkout failed the integrity checks: that run gets a fresh checkout.
@@ -931,7 +957,7 @@ export class MiniConductor {
         {
           sessionId,
           adapter: tier.adapter,
-          ...(tier.model !== undefined ? { model: tier.model } : {}),
+          ...(profile.model !== undefined ? { model: profile.model } : {}),
           workspaceId: workspace.id,
           attempt: failed + 1,
           ...(last ? { previousSessionId: last.sessionId } : {}),
@@ -939,12 +965,15 @@ export class MiniConductor {
         },
         sessionId,
       ),
+      this.#env(subtaskId, 'worker.profile', { sessionId, ...profile }, sessionId),
       ...(view.state !== 'working'
         ? [this.#env(subtaskId, 'task.status', { state: 'working' })]
         : []),
     ]);
     let revoke = () => {};
     let mcpServerName = '';
+    /** Set when the adapter refused a part with no fallback: the sub-task fails, no retry. */
+    let profileRefused: string | undefined;
     let handle: SessionHandle;
     // Recorded before the vendor process exists, so a crash at any point after this leaves it
     // findable (#127).
@@ -955,15 +984,46 @@ export class MiniConductor {
       const minted = this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId });
       revoke = minted.revoke;
       mcpServerName = minted.config.name;
-      handle = await worker.adapter.start({
-        cwd: workspace.path,
-        systemPrompt: WORKER_SYSTEM_PROMPT,
-        mcpServers: [minted.config],
-        ...(tier.model !== undefined ? { model: tier.model } : {}),
-        ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
-        ...(resume ? { resume } : {}),
-        env: { [WORKER_MARKER_VAR]: marker },
-      });
+      const launch = (p: ChosenProfile) =>
+        worker.adapter.start({
+          cwd: workspace.path,
+          systemPrompt: WORKER_SYSTEM_PROMPT,
+          mcpServers: [minted.config],
+          ...(p.model !== undefined ? { model: p.model } : {}),
+          ...(p.effort !== undefined ? { effort: p.effort } : {}),
+          ...(p.contextWindow !== undefined ? { contextWindow: p.contextWindow } : {}),
+          ...(resume ? { resume } : {}),
+          env: { [WORKER_MARKER_VAR]: marker },
+        });
+      // A refused part (#110) is logged and dropped or lowered, and the session started again:
+      // a cost lever is not worth a failed attempt. A refused model has no fallback.
+      for (;;) {
+        try {
+          handle = await launch(profile);
+          break;
+        } catch (err) {
+          const field = refusedField(err);
+          if (field === undefined || !this.#live(gen)) throw err;
+          const message = redactSecrets((err as Error).message);
+          this.#o.store.append(
+            this.#env(
+              subtaskId,
+              'worker.profile',
+              { sessionId, ...profile, refused: { field, message } },
+              sessionId,
+            ),
+          );
+          const next = afterRefusal(profile, field, tier.role, tier);
+          if (!next) {
+            profileRefused = `the adapter refused the ${field}: ${message}`;
+            throw err;
+          }
+          profile = next;
+          this.#o.store.append(
+            this.#env(subtaskId, 'worker.profile', { sessionId, ...profile }, sessionId),
+          );
+        }
+      }
     } catch (err) {
       revoke();
       // Whatever a failed start left running goes now, not at the next restart.
@@ -984,6 +1044,17 @@ export class MiniConductor {
       );
       // A resume that failed is not tried again (the next run starts afresh): drop its state.
       if (resume) await this.#discard(tier.adapter, resume.vendorSessionId, workspace.path);
+      if (profileRefused !== undefined) {
+        // The same profile would be refused every time: fail now instead of using up retries.
+        this.#o.store.append(
+          this.#env(subtaskId, 'task.status', {
+            state: 'failed',
+            message: `session profile refused: ${profileRefused}`,
+          }),
+        );
+        this.#kick();
+        return;
+      }
       this.#afterFailure(subtaskId);
       return;
     }
@@ -1717,6 +1788,7 @@ export class MiniConductor {
     const tasks = this.#o.store.replay(tasksProjection).tasks;
     const sessions = new Map<string, SessionRecord>();
     const kinds = new Map<string, string>();
+    const indivisible = new Set<string>();
     const escalations = new Map<string, EscalationRecord>();
     const decisions = new Map<string, string>();
     const progress = new Map<string, string>();
@@ -1755,7 +1827,14 @@ export class MiniConductor {
         }
       } else if (e.type === 'task.planned') {
         const plan = TaskPlan.safeParse(e.data);
-        if (plan.success) for (const s of plan.data.subtasks) kinds.set(s.id, s.kind);
+        if (plan.success) {
+          for (const s of plan.data.subtasks) {
+            kinds.set(s.id, s.kind);
+            // Each plan is the full current one, so a replan can also clear the mark.
+            if (s.indivisible) indivisible.add(s.id);
+            else indivisible.delete(s.id);
+          }
+        }
       } else if (e.type === 'escalation.raised') {
         const id = str('id');
         if (id && e.taskId) {
@@ -1794,7 +1873,17 @@ export class MiniConductor {
         if (text !== undefined) x.answer = text;
       }
     }
-    this.#view = { count, tasks, sessions, kinds, escalations, decisions, progress, progressAt };
+    this.#view = {
+      count,
+      tasks,
+      sessions,
+      kinds,
+      indivisible,
+      escalations,
+      decisions,
+      progress,
+      progressAt,
+    };
     return this.#view;
   }
 
@@ -1860,6 +1949,13 @@ export class MiniConductor {
     if (!HELD_LOCKS.delete(this.#o.lockPath)) return;
     rmSync(this.#o.lockPath, { force: true });
   }
+}
+
+/** The part an adapter's `ProfileRefusedError` names; matched by name, as across package copies. */
+function refusedField(err: unknown): ProfileField | undefined {
+  if (!(err instanceof Error) || err.name !== 'ProfileRefusedError') return undefined;
+  const field = (err as { field?: unknown }).field;
+  return field === 'model' || field === 'effort' || field === 'contextWindow' ? field : undefined;
 }
 
 function answerText(x: EscalationRecord): string {

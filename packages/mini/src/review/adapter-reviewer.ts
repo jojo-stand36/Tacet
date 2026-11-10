@@ -5,12 +5,13 @@ import { join } from 'node:path';
 import { redactSecrets, type Task } from '@tacet/core';
 import { WORKER_MARKER_VAR } from '@tacet/core/node';
 import { z } from 'zod';
-import type {
-  ReviewContext,
-  Reviewer,
-  ReviewFinding,
-  ReviewResult,
-  WorkerAdapter,
+import {
+  type ReviewContext,
+  type Reviewer,
+  type ReviewFinding,
+  type ReviewResult,
+  type WorkerAdapter,
+  workerRefusal,
 } from '../daemon/ports.js';
 import { sessionTurns } from '../daemon/turns.js';
 import { type ReviewDiffOptions, reviewDiff } from '../git/diff.js';
@@ -159,6 +160,9 @@ export class AdapterReviewer implements Reviewer {
     if (opts.worker.authRoute !== 'api_key') {
       throw new Error('the reviewer runs unattended and must use the api_key route (#65)');
     }
+    // Agents refused for unattended sessions (codex-acp until #183) are refused here too (#188).
+    const refused = workerRefusal(opts.worker);
+    if (refused) throw new Error(`adapter ${opts.adapterId}: refused for the reviewer: ${refused}`);
     if (opts.worker.adapter.capabilities().approvals !== 'roundtrip') {
       throw new Error(`${opts.adapterId} cannot have its tools refused, so it cannot review`);
     }
