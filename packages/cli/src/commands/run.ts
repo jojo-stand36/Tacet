@@ -79,8 +79,12 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
       ...io.standalone,
     });
   } catch (err) {
-    io.err(terminalSafe(err instanceof Error ? err.message : String(err)));
-    if (!existsSync(join(repoRoot, '.tacet', 'tacet.yaml'))) {
+    const message = err instanceof Error ? err.message : String(err);
+    io.err(terminalSafe(message));
+    if (
+      message === 'config has no tiers.worker' &&
+      !existsSync(join(repoRoot, '.tacet', 'tacet.yaml'))
+    ) {
       io.err('this repo has no .tacet/tacet.yaml: run `tacet init` first');
     }
     return EXIT.failed;

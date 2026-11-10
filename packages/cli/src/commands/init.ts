@@ -8,13 +8,14 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, delimiter, join } from 'node:path';
+import { basename, delimiter, dirname, join, resolve, sep } from 'node:path';
 import { TacetConfig } from '@tacet/core';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
@@ -53,14 +54,19 @@ export const WORKER_ADAPTERS = {
 >;
 export type WorkerAdapterId = keyof typeof WORKER_ADAPTERS;
 
-/** Agent CLIs looked for on PATH, for the report. Their logins are never read. */
-const AGENT_CLIS = ['claude', 'codex', 'gemini', 'opencode', 'goose', 'claude-agent-acp'] as const;
+/**
+ * Agent CLIs looked for on PATH, for the report; each command name is the one the adapters and
+ * the capability matrix use. Their logins are never read.
+ */
+const AGENT_CLIS = ['claude', 'codex', 'gemini', 'opencode', 'claude-agent-acp'] as const;
 
 /** First line of every file `tacet init` writes; the hash is of the lines after it. */
-const HEADER = '# Written by tacet init';
+const header = (hash: string) => `# Written by tacet init (sha256 ${hash}); edit freely.`;
+const HEADER_LINE = /^# Written by tacet init \(sha256 ([0-9a-f]{16})\); edit freely\.$/;
 
 export interface InitOptions {
   repo?: string;
+  'user-dir'?: string;
   worker?: string;
   model?: string;
   json?: boolean;
@@ -68,6 +74,7 @@ export interface InitOptions {
 
 export interface UninstallOptions {
   repo?: string;
+  'user-dir'?: string;
   apply?: boolean;
   purge?: boolean;
   json?: boolean;
@@ -94,32 +101,37 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
     );
     return 2;
   }
-  if (o.model !== undefined && !spec.needsModel) {
+  let model = o.model?.trim();
+  if (model === '') {
+    io.err('--model needs a model name');
+    return 2;
+  }
+  if (model !== undefined && !spec.needsModel) {
     io.err(`--model: ${worker} cannot choose a model (its command fixes it)`);
     return 2;
   }
 
-  const root = repoRootFrom(o.repo ?? io.cwd);
-  if (!existsSync(join(root, '.git'))) {
-    io.err(`${terminalSafe(root)} is not in a git repository: Tacet works on a git repo`);
-    return 1;
-  }
-
-  let model = o.model;
-  const configPath = join(root, '.tacet', 'tacet.yaml');
-  if (model === undefined && spec.needsModel && !pathExists(configPath) && io.prompt) {
-    const answer = await io.prompt(
-      `Model for ${worker} Workers (as the vendor names it; Enter to set it later): `,
-    );
-    if (answer?.trim()) model = answer.trim();
-  }
-
   try {
+    const root = repoFor(io, o);
     const tacetDir = join(root, '.tacet');
-    if (pathExists(tacetDir)) requireDirectory(tacetDir, '.tacet');
-    else mkdirSync(tacetDir);
-    const config = writeOnce(configPath, configBody(worker, model, root));
+    const configPath = join(tacetDir, 'tacet.yaml');
+    const dirExists = pathExists(tacetDir);
+    if (dirExists) requireDirectory(tacetDir, '.tacet');
+    const configExists = dirExists && pathExists(configPath);
+    if (configExists) requireRegularFile(configPath, '.tacet/tacet.yaml');
+
+    if (!configExists && model === undefined && spec.needsModel && io.prompt && !o.json) {
+      const answer = await io.prompt(
+        `Model for ${worker} Workers (as the vendor names it; Enter to set it later): `,
+      );
+      if (answer?.trim()) model = answer.trim();
+    }
+    // Validated before anything is created, so a bad model leaves nothing behind.
+    const body = configExists ? undefined : configBody(worker, model, root);
+    if (!dirExists) mkdirSync(tacetDir);
+    const config = body === undefined ? 'kept' : writeOnce(configPath, body);
     const ignore = writeOnce(join(tacetDir, '.gitignore'), IGNORE_BODY);
+    const flagsIgnored = config === 'kept' && (o.worker !== undefined || o.model !== undefined);
 
     const path = env.PATH ?? '';
     const adapters = Object.entries(WORKER_ADAPTERS).map(([id, a]) => ({
@@ -131,6 +143,9 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
     const modelMissing = config === 'written' && spec.needsModel && model === undefined;
     const workerKeySet = spec.keys.some((k) => Boolean(env[k]));
 
+    if (flagsIgnored) {
+      io.err('note: --worker and --model are ignored: .tacet/tacet.yaml already exists (edit it)');
+    }
     if (o.json) {
       io.out(
         safeJson({
@@ -165,16 +180,14 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
       io.err(`next: set tiers.worker.model in .tacet/tacet.yaml; ${worker} needs a model`);
     }
     if (!workerKeySet && config === 'written') {
-      io.err(`next: set ${spec.keys.join(' or ')}: unattended Workers run on your API key`);
+      const cloud =
+        worker === 'claude-sdk' ? ', or a cloud provider (Bedrock, Vertex, Foundry)' : '';
+      io.err(`next: set ${spec.keys.join(' or ')}${cloud}: unattended Workers run on your API key`);
     }
     io.err('then: tacet run "<task>"');
     return 0;
   } catch (err) {
-    if (err instanceof InitError) {
-      io.err(terminalSafe(err.message));
-      return 1;
-    }
-    throw err;
+    return failed(io, err);
   }
 }
 
@@ -182,24 +195,24 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
  * `tacet uninstall` (#20). A preview by default; `--apply` acts. Without `--purge` it removes only
  * the files `tacet init` wrote that are still unchanged, then `.tacet/` if that leaves it empty.
  * `--purge` removes the whole `.tacet/` after copying it to
- * `~/.tacet/backups/<repo>-<hash>/uninstall-<time>/`. Run state outside the repo is not touched.
+ * `<user dir>/backups/<repo>-<hash>/uninstall-<time>/`. Run state outside the repo is not touched.
  */
 export function uninstall(io: Io, o: UninstallOptions): number {
-  const root = repoRootFrom(o.repo ?? io.cwd);
-  const tacetDir = join(root, '.tacet');
+  let backup: string | undefined;
   try {
+    const root = repoFor(io, o);
+    const tacetDir = join(root, '.tacet');
     const removals: string[] = [];
     const kept: string[] = [];
-    let backup: string | undefined;
     if (pathExists(tacetDir)) {
       requireDirectory(tacetDir, '.tacet');
       if (o.purge) {
         removals.push(tacetDir);
+        const canonical = realpathSync(root);
         backup = join(
-          io.home ?? homedir(),
-          '.tacet',
+          userDirOf(io, o),
           'backups',
-          `${basename(root)}-${sha256(root).slice(0, 12)}`,
+          `${basename(canonical)}-${sha256(canonical).slice(0, 12)}`,
           `uninstall-${new Date().toISOString().replaceAll(/[:.]/g, '-')}`,
         );
       } else {
@@ -213,7 +226,7 @@ export function uninstall(io: Io, o: UninstallOptions): number {
 
     if (o.apply && removals.length > 0) {
       if (backup !== undefined) {
-        mkdirSync(join(backup, '..'), { recursive: true, mode: 0o700 });
+        mkdirSync(dirname(backup), { recursive: true, mode: 0o700 });
         mkdirSync(backup, { mode: 0o700 });
         try {
           cpSync(tacetDir, join(backup, '.tacet'), {
@@ -224,6 +237,7 @@ export function uninstall(io: Io, o: UninstallOptions): number {
           });
         } catch (err) {
           rmSync(backup, { recursive: true, force: true });
+          backup = undefined;
           throw err;
         }
         rmSync(tacetDir, { recursive: true });
@@ -257,11 +271,52 @@ export function uninstall(io: Io, o: UninstallOptions): number {
     if (kept.length > 0 && !o.purge) io.err('--purge removes all of .tacet/ (after a backup)');
     return 0;
   } catch (err) {
-    if (err instanceof InitError) {
-      io.err(terminalSafe(err.message));
-      return 1;
+    const code = failed(io, err);
+    if (backup !== undefined && o.apply) io.err(`the backup is at ${terminalSafe(backup)}`);
+    return code;
+  }
+}
+
+/** Prints a failure without a stack trace; exit code 1. */
+function failed(io: Io, err: unknown): number {
+  io.err(terminalSafe(err instanceof Error ? err.message : String(err)));
+  return 1;
+}
+
+function userDirOf(io: Io, o: { 'user-dir'?: string }): string {
+  return resolve(o['user-dir'] ?? join(io.home ?? homedir(), '.tacet'));
+}
+
+/**
+ * The git repo `.tacet/` belongs to. Refused when the repo's `.tacet/` would be Tacet's own user
+ * directory (a home directory kept in git, say), which holds the user config, run state and
+ * backups: init would write into it and a purge would delete it.
+ */
+function repoFor(io: Io, o: { repo?: string; 'user-dir'?: string }): string {
+  const root = repoRootFrom(o.repo ?? io.cwd);
+  if (!existsSync(join(root, '.git'))) {
+    throw new InitError(`${root} is not in a git repository: Tacet works on a git repo`);
+  }
+  const tacetDir = canonical(join(root, '.tacet'));
+  for (const user of new Set([userDirOf(io, {}), userDirOf(io, o)])) {
+    const u = canonical(user);
+    if (u === tacetDir || u.startsWith(`${tacetDir}${sep}`) || tacetDir.startsWith(`${u}${sep}`)) {
+      throw new InitError(
+        `${join(root, '.tacet')} is, or overlaps, Tacet's user directory ${user}: run this in a project repo, not in your home directory`,
+      );
     }
-    throw err;
+  }
+  return root;
+}
+
+/** `path` with symbolic links resolved, as far as it exists. */
+function canonical(path: string): string {
+  const abs = resolve(path);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const up = dirname(abs);
+    return up === abs ? abs : join(canonical(up), basename(abs));
   }
 }
 
@@ -275,7 +330,10 @@ export function configBody(
   root: string,
 ): string {
   const spec = WORKER_ADAPTERS[worker];
-  const tier: Record<string, string> = { adapter: worker, ...(model ? { model } : {}) };
+  const tier: Record<string, string> = {
+    adapter: worker,
+    ...(model !== undefined ? { model } : {}),
+  };
   const parsed = TacetConfig.safeParse({ tiers: { worker: tier } });
   if (!parsed.success) throw new InitError(`invalid --model: ${parsed.error.issues[0]?.message}`);
   const verify = suggestedVerify(root);
@@ -292,6 +350,12 @@ export function configBody(
     '  # A planner that splits tasks into sub-tasks; without it each task is one sub-task.',
     '  # mini:',
     `  #   adapter: ${worker}`,
+    ...(spec.needsModel ? ['  #   model: <a model>'] : []),
+    '',
+    '# A reviewer on another vendor checks each sub-task once verify passes; off by default.',
+    '# review:',
+    '#   enabled: true',
+    '# (with tiers.review: { adapter: <an adapter of another vendor>, model: <a model> })',
     '',
     '# Commands that check each finished sub-task in its checkout, with /bin/sh -c. A Worker',
     '# checkout is a fresh git worktree: install dependencies first if a command needs them.',
@@ -323,7 +387,7 @@ function suggestedVerify(root: string): string[] {
 }
 
 function withHeader(body: string): string {
-  return `${HEADER} (sha256 ${sha256(body).slice(0, 16)}); edit freely.\n${body}`;
+  return `${header(sha256(body).slice(0, 16))}\n${body}`;
 }
 
 /** Writes `path` only when it does not exist. */
@@ -345,9 +409,7 @@ function isUnchangedInitFile(path: string): boolean {
   const text = readFileSync(path, 'utf8');
   const nl = text.indexOf('\n');
   if (nl < 0) return false;
-  const m = /^# Written by tacet init \(sha256 ([0-9a-f]{16})\); edit freely\.$/.exec(
-    text.slice(0, nl),
-  );
+  const m = HEADER_LINE.exec(text.slice(0, nl));
   return m !== null && sha256(text.slice(nl + 1)).slice(0, 16) === m[1];
 }
 
@@ -375,7 +437,9 @@ function requireDirectory(path: string, label: string): void {
 function requireRegularFile(path: string, label: string): void {
   const stat = lstatSync(path);
   if (!stat.isFile()) {
-    throw new InitError(`${label} must be a regular file, not a symbolic link: ${path}`);
+    throw new InitError(
+      `${label} must be a regular file (not a directory or symbolic link): ${path}`,
+    );
   }
 }
 
