@@ -91,8 +91,16 @@ export interface Integrator {
    * Throws `MergeConflictError` when they conflict.
    */
   combine(commits: readonly string[]): Promise<string | undefined>;
-  /** Which of `paths` `commit` (a commit the repo has) has, as any kind of entry (#263). */
-  tracked?(commit: string, paths: readonly string[]): Promise<Set<string>>;
+  /**
+   * Which of `paths` the checkout's `base` or its HEAD has, as any kind of entry (#263);
+   * undefined when it cannot tell (its HEAD is a commit the repo does not have, say). Throws
+   * `WorktreeRefusedError` for a checkout that fails the integrity checks.
+   */
+  tracked?(
+    workspace: Workspace,
+    base: string,
+    paths: readonly string[],
+  ): Promise<Set<string> | undefined>;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
   /**

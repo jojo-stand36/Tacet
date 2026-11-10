@@ -2227,7 +2227,7 @@ export class MiniConductor {
    * Remove the empty placeholders Claude Code's sandbox left in the checkouts of sessions that
    * never closed (a crash), which their adapter removes only at a close (#263). Only for those
    * adapters, after the sessions' processes are ended, and never a path the checkout's base
-   * commit has: what is removed is each `SANDBOX_PLACEHOLDERS` entry that is still an empty file
+   * commit or its HEAD has (none at all when its HEAD cannot be told): what is removed is each `SANDBOX_PLACEHOLDERS` entry that is still an empty file
    * or directory (`removeSandboxPlaceholders`), as the adapter's close would have.
    */
   async #removeCrashPlaceholders(): Promise<void> {
@@ -2240,9 +2240,10 @@ export class MiniConductor {
       try {
         const ws = await this.#o.workspaces.get(s.workspaceId);
         if (!ws) continue;
-        const keep = await tracked(s.baseCommit, SANDBOX_PLACEHOLDERS);
-        removeSandboxPlaceholders(ws.path, keep);
+        const keep = await tracked(ws, s.baseCommit, SANDBOX_PLACEHOLDERS);
+        if (keep) removeSandboxPlaceholders(ws.path, keep);
       } catch (err) {
+        // Logged; the session is recorded as ended next, so this is not tried again.
         this.#errors.push(err);
       }
     }

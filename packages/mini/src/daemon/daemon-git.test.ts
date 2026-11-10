@@ -417,13 +417,35 @@ describe('MiniConductor with git worktrees', () => {
     };
     const claude = await crashed('s1', 'claude-sdk');
     const codex = await crashed('s2', 'codex-app-server');
+    const pty = await crashed('s3', 'pty:claude');
+    // An earlier session committed an empty .env, in a commit the repo has: it stays.
+    git(repo, ['checkout', '-q', '-b', 'earlier']);
+    writeFileSync(join(repo, '.env'), '');
+    git(repo, ['add', '.env']);
+    git(repo, ['commit', '-qm', 'env']);
+    const earlier = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['checkout', '-q', 'main']);
+    const moved = await crashed('s4', 'claude-sdk');
+    const movedWt = workerWorktree(moved, repo);
+    if (!movedWt) throw new Error('not a worktree');
+    git(moved, ['checkout', '-q', '--detach', '-f', earlier], workerGitEnv(movedWt));
+    writeFileSync(join(moved, 'package.json'), '');
+    // A HEAD only the Worker has: it cannot tell what that tracks, so nothing is removed.
+    const own = await crashed('s5', 'claude-sdk');
+    const ownWt = workerWorktree(own, repo);
+    if (!ownWt) throw new Error('not a worktree');
+    git(own, ['commit', '-q', '--allow-empty', '-m', 'mine'], workerGitEnv(ownWt));
     const d = start(() => undefined, undefined, undefined, { workspaces });
     await d.start();
     for (const f of ['package.json', '.env', 'yarn.lock', 'node_modules']) {
       expect(existsSync(join(claude, f))).toBe(false);
       // Not a Claude sandbox: nothing of it is a placeholder.
       expect(existsSync(join(codex, f))).toBe(true);
+      expect(existsSync(join(pty, f))).toBe(false);
+      expect(existsSync(join(own, f))).toBe(true);
     }
+    expect(existsSync(join(moved, '.env'))).toBe(true);
+    expect(existsSync(join(moved, 'package.json'))).toBe(false);
     expect(existsSync(join(claude, '.npmrc'))).toBe(true);
     expect(existsSync(join(claude, '.gitmodules'))).toBe(true);
     const wt = workerWorktree(claude, repo);

@@ -611,8 +611,38 @@ export class GitIntegrator implements Integrator {
     return combineCommits(commits, { repoRoot: this.#repoRoot, env: this.#env });
   }
 
-  tracked(commit: string, paths: readonly string[]): Promise<Set<string>> {
-    return trackedPaths({ repoRoot: this.#repoRoot, commit, paths, env: this.#env });
+  async tracked(
+    workspace: Workspace,
+    base: string,
+    paths: readonly string[],
+  ): Promise<Set<string> | undefined> {
+    const o = { repoRoot: this.#repoRoot, paths, env: this.#env };
+    const keep = await trackedPaths({ ...o, commit: base });
+    // What its HEAD has too (an earlier session may have committed): read as data, and only a
+    // commit the repo already has; otherwise it cannot tell.
+    let wt: WorkerWorktree | undefined;
+    try {
+      wt = workerWorktree(workspace.path, this.#repoRoot);
+    } catch (err) {
+      throw new WorktreeRefusedError((err as Error).message);
+    }
+    if (!wt) return undefined;
+    const env = {
+      ...(this.#env.PATH !== undefined ? { PATH: this.#env.PATH } : {}),
+      ...(this.#env.HOME !== undefined ? { HOME: this.#env.HOME } : {}),
+    };
+    const git = (args: string[]) =>
+      run(['git', ...SAFE_GIT_ARGS, ...args], { cwd: this.#repoRoot, env, timeoutMs: 30_000 });
+    const head = (await workerHead(wt, git))?.commit;
+    if (head === undefined) return undefined;
+    if (head === base) return keep;
+    const has = await git(['cat-file', '-e', `${head}^{commit}`]).then(
+      () => true,
+      () => false,
+    );
+    if (!has) return undefined;
+    for (const p of await trackedPaths({ ...o, commit: head })) keep.add(p);
+    return keep;
   }
 
   /** Results found not landed, by result and target, with the target tip they were checked at. */

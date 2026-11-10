@@ -68,7 +68,7 @@ export function placeholderSnapshot(cwd: string): Set<string> {
  * nothing behind a symlinked parent is touched, so a Worker's own file is never removed unless it
  * is empty and has one of these names (an empty `.env` it wrote is removed too). For a session
  * that never closed (a crash), the Mini-conductor calls it at its next start with the paths the
- * checkout's base commit has as `before` (#263). Returns what was removed, relative to `cwd`;
+ * checkout's base commit or HEAD has as `before` (#263). Returns what was removed, relative to `cwd`;
  * errors leave the path in place.
  */
 export function removeSandboxPlaceholders(cwd: string, before: ReadonlySet<string>): string[] {
