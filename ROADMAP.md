@@ -78,6 +78,10 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 - [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
 - [ ] **Codex adapter: report a self-exit only once the process group is gone** — `feature` `P2` `claude`
+- [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
+- [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
+- [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
+- [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
