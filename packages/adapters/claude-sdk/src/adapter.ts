@@ -29,7 +29,7 @@ import {
   type UserInput,
 } from '@tacet/core';
 import { authEnv, type ClaudeAuthRoute } from './auth.js';
-import { removeMcpConfig, writeMcpConfig } from './mcp-config.js';
+import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
 
 const CONTEXT_1M = 1_000_000;
 
@@ -65,6 +65,11 @@ export interface ClaudeSdkAdapterOptions {
   baseEnv?: Record<string, string | undefined>;
   /** Directory for per-session MCP config files. Default `~/.tacet/run/mcp`. */
   mcpConfigDir?: string;
+  /**
+   * Told how many stale MCP config files (of Mini-conductors no longer running) were removed when
+   * this adapter started its first session (#108). Only the count: never names or contents.
+   */
+  onSweep?: (removedFiles: number) => void;
   /** SDK options passed through unchanged, e.g. `settingSources` or `pathToClaudeCodeExecutable`. */
   sdkOptions?: Pick<
     Options,
@@ -147,6 +152,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   readonly #sessions = new Map<string, Session>();
   /** Last cumulative cost seen per vendor session, so resume and fork report deltas. */
   readonly #costTotals = new Map<string, number>();
+  #swept = false;
 
   constructor(opts: ClaudeSdkAdapterOptions = {}) {
     this.#opts = opts;
@@ -195,6 +201,12 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       sessionOpts.sessionId = vendorSessionId;
     }
 
+    if (!this.#swept) {
+      // Once per adapter, which lives as long as its Mini-conductor: files a crashed one left.
+      this.#swept = true;
+      const removed = sweepStaleMcpConfigs(this.#opts.mcpConfigDir);
+      this.#opts.onSweep?.(removed);
+    }
     const mcpConfigPath = opts.mcpServers?.length
       ? writeMcpConfig(opts.mcpServers, {
           sessionId: id,

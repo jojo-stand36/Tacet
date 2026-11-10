@@ -8,4 +8,10 @@ export {
   toPermissionResult,
 } from './adapter.js';
 export { AuthRoutingError, authEnv, type ClaudeAuthRoute, chooseAuthRoute } from './auth.js';
-export { defaultMcpConfigDir, removeMcpConfig, writeMcpConfig } from './mcp-config.js';
+export {
+  defaultMcpConfigDir,
+  ownerDirName,
+  removeMcpConfig,
+  sweepStaleMcpConfigs,
+  writeMcpConfig,
+} from './mcp-config.js';

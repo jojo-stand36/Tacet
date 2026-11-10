@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -13,6 +21,7 @@ import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeSdkAdapter, toPermissionResult } from './adapter.js';
 import { AuthRoutingError } from './auth.js';
+import { ownerDirName } from './mcp-config.js';
 
 // Fake values only.
 const FAKE_KEY = 'fake-key-for-tests';
@@ -113,7 +122,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     const opts = stub.calls[0];
     expect(opts?.mcpServers).toBeUndefined();
     const path = opts?.extraArgs?.['mcp-config'];
-    expect(path).toBe(join(root, 'mcp', `${h.id}.json`));
+    expect(path).toBe(join(root, 'mcp', ownerDirName(), `${h.id}.json`));
     expect(existsSync(path as string)).toBe(true);
     expect(opts?.includePartialMessages).toBe(true);
     expect(opts?.sessionId).toBe(h.vendorSessionId);
@@ -121,6 +130,21 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(existsSync(path as string)).toBe(false);
     expect(stub.isClosed()).toBe(true);
     expect(adapter.status(h)).toBe('done');
+  });
+
+  it('sweeps the MCP files of a dead Mini-conductor once, at its first session (#108)', async () => {
+    const stale = join(root, 'mcp', '999999999-000000000000');
+    mkdirSync(stale, { recursive: true });
+    writeFileSync(join(stale, 'old.json'), '{"token":"leftover"}');
+    const swept: unknown[] = [];
+    const stub = stubQuery();
+    const adapter = make(stub, { onSweep: (n: number) => swept.push(n) });
+    const h1 = await adapter.start({ cwd: join(root, 'wt') });
+    const h2 = await adapter.start({ cwd: join(root, 'wt') });
+    expect(swept).toEqual([1]);
+    expect(existsSync(stale)).toBe(false);
+    await adapter.close(h1);
+    await adapter.close(h2);
   });
 
   it('routes auth through the environment without storing anything', async () => {
