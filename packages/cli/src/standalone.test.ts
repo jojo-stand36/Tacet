@@ -677,10 +677,13 @@ describe('tacet standalone (#21)', () => {
 
     const secret = readRuntimeFile(runtimeFile).token.reveal();
 
-    // The session ends: so does attach, handing the user's terminal back as it was.
-    expect((await tacet(['cancel', ...user(), id])).code).toBe(0);
+    // The session ends: so does attach, handing the user's terminal back as it was. The run ends
+    // with its only task, closing its port as the cancel is answered (#201).
+    const c = await tacet(['cancel', ...user(), id]);
+    expect(c.code, c.err).toBe(0);
+    expect(c.out).toBe(`${id} canceled\n${id}/1 canceled`);
     const a = await attaching;
-    expect(a.code).toBe(0);
+    expect(a.code, a.err).toBe(0);
     expect(a.err).toContain('the Worker session ended');
     expect(a.out).toBe('');
     expect(text().startsWith('$ make test\r\n\x1b[32mok\x1b[0m 12 tests')).toBe(true);

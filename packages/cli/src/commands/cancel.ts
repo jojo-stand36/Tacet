@@ -57,9 +57,9 @@ export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<
   }
 }
 
-/** The task's unfinished parts, from `GetTask`'s status extension. */
-async function openParts(client: RpcClient, taskId: string): Promise<Map<string, string>> {
-  const task = A2ATask.parse(await client.call('GetTask', { id: taskId, historyLength: 0 }));
+/** A task and its sub-tasks' states, from an A2A task's status extension. */
+function parts(value: unknown): Map<string, string> {
+  const task = A2ATask.parse(value);
   const ext = StatusExt.parse(task.metadata?.[STATUS_EXT_URI]);
   return new Map([[task.id, ext.state], ...ext.subtasks.map((x) => [x.id, x.state] as const)]);
 }
@@ -74,10 +74,10 @@ async function cancelLive(
   o: CancelOptions,
 ): Promise<number> {
   try {
-    const before = await openParts(client, taskId);
-    // Ending the task's Worker sessions can take a while.
-    await client.call('CancelTask', { id: taskId }, { timeoutMs: 120_000 });
-    const after = await openParts(client, taskId);
+    const before = parts(await client.call('GetTask', { id: taskId, historyLength: 0 }));
+    // Ending the task's Worker sessions can take a while. The answer is the task as canceled: a
+    // run whose last task this was ends and closes its port right after, so nothing more is asked.
+    const after = parts(await client.call('CancelTask', { id: taskId }, { timeoutMs: 120_000 }));
     const canceled = [...before]
       .filter(([id, state]) => !ENDED.has(state) && after.get(id) === 'canceled')
       .map(([id]) => id);
