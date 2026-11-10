@@ -1,14 +1,17 @@
 import { execFileSync, spawn } from 'node:child_process';
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   realpathSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -16,12 +19,14 @@ import { newUlid } from '@tacet/core';
 import {
   miniRuntimePath,
   openEventStore,
+  readRuntimeFile,
   repoStatePaths,
   workerGitEnv,
   workerWorktree,
 } from '@tacet/core/node';
 import { type Script, ScriptedAdapter } from '@tacet/mini/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SpawnDetached } from './commands/detach.js';
 import type { Io } from './io.js';
 import { main } from './main.js';
 
@@ -650,6 +655,179 @@ describe('tacet standalone (#21)', () => {
     expect(bad.code).toBe(1);
     expect(bad.err).toContain('tiers.worker');
     expect(JSON.parse((await tacet(['status', ...user(), '--json'])).out).running).toBeNull();
+  });
+
+  describe('tacet run --detach (#201)', () => {
+    const runtimeFile = () => miniRuntimePath(repo, join(root, 'home', '.tacet', 'run'));
+    const logFile = () => runtimeFile().replace(/\.json$/, '.log');
+    /** The background run, in this process: what it was started with, and how it ended. */
+    const started: { argv: string[]; env: Record<string, string | undefined> }[] = [];
+    let child: Promise<number> | undefined;
+    const inProcess: SpawnDetached = (argv, childEnv) => {
+      started.push({ argv, env: childEnv });
+      // Its output to the log, as the real one's: its own descriptor, as a child inherits one.
+      const fd = openSync(logFile(), 'a');
+      const write = (t: string) => writeSync(fd, `${t}\n`);
+      const abort = new AbortController();
+      child = main(argv, {
+        out: write,
+        err: write,
+        cwd: repo,
+        env: childEnv,
+        home: join(root, 'home'),
+        pollMs: 20,
+        signal: abort.signal,
+        standalone: { adapters: { 'claude-sdk': { adapter: fake(), authRoute: 'api_key' } } },
+      }).finally(() => closeSync(fd));
+      return { pid: process.pid, exited: child, stop: () => abort.abort() };
+    };
+    beforeEach(() => {
+      started.length = 0;
+      child = undefined;
+    });
+
+    it('runs in the background, waits for an answer instead of stopping, and passes no secret', async () => {
+      const paths = repoStatePaths(repo, state);
+      let escId = '';
+      script = (cwd, input) => {
+        if (input.includes('Answer to your escalation')) {
+          commit(cwd, `${input.split(': ').at(-1)}\n`);
+          return undefined;
+        }
+        escId = raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      const r = await tacet(['run', ...user(), '--detach', '--json', '--', '--pick a database'], {
+        spawnDetached: inProcess,
+      });
+      expect(r.code, r.err).toBe(0);
+      const out = JSON.parse(r.out) as { tasks: string[]; pid: number; log: string };
+      expect(out).toEqual({ tasks: [expect.any(String)], pid: process.pid, log: logFile() });
+      const id = out.tasks[0] as string;
+      // The run as given (a task text after `--` stays text), with the user's environment as it is.
+      expect(started).toHaveLength(1);
+      expect(started[0]?.argv).toEqual([
+        'run',
+        '--detached-child',
+        ...user(),
+        '--',
+        '--pick a database',
+      ]);
+      expect(started[0]?.env).toBe(env);
+      expect(statSync(logFile()).mode & 0o777).toBe(0o600);
+
+      // It waits for the answer: no terminal, and it does not stop.
+      await vi.waitFor(() => expect(escId).not.toBe(''), { timeout: 10_000 });
+      let ended = false;
+      void child?.then(() => {
+        ended = true;
+      });
+      await vi.waitFor(() =>
+        expect(readFileSync(logFile(), 'utf8')).toContain(`tacet answer ${escId}`),
+      );
+      await new Promise((r) => setTimeout(r, 300));
+      expect(ended).toBe(false);
+      const secret = readRuntimeFile(runtimeFile()).token.reveal();
+      // A second background run beside it is refused.
+      const again = await tacet(['run', ...user(), '--detach', 'another'], {
+        spawnDetached: inProcess,
+      });
+      expect(again.code).toBe(1);
+      expect(again.err).toContain('already live');
+      expect(started).toHaveLength(1);
+
+      const a = await tacet(['answer', ...user(), escId, 'Postgres']);
+      expect(a.code, a.err).toBe(0);
+      expect(await child).toBe(0);
+      const branch = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/tacet/'])
+        .split('\n')
+        .find((b) => b.includes(id)) as string;
+      expect(git(repo, ['show', `${branch}:work.txt`])).toBe('Postgres');
+      expect(existsSync(runtimeFile())).toBe(false);
+      // The port's token, made by the background run itself, was never given to it, shown, or
+      // written to its log.
+      const holds = (v: unknown) => String(v).includes(secret);
+      expect(started[0]?.argv.some(holds)).toBe(false);
+      expect(Object.entries(started[0]?.env ?? {}).some(([k, v]) => holds(k) || holds(v))).toBe(
+        false,
+      );
+      expect([r.out, r.err, again.err, a.out, a.err].some(holds)).toBe(false);
+      expect(holds(readFileSync(logFile(), 'utf8'))).toBe(false);
+    });
+
+    it('stops a background run it gave up on, and says why', async () => {
+      // One that never comes up: a start that times out, then one that is interrupted.
+      const stopped: number[] = [];
+      const never: SpawnDetached = () => {
+        let done: (code: string) => void = () => {};
+        const exited = new Promise<number | string>((r) => {
+          done = r;
+        });
+        return {
+          pid: 2 ** 22 + 7,
+          exited,
+          stop: () => {
+            stopped.push(1);
+            done('signal SIGTERM');
+          },
+        };
+      };
+      const late = await tacet(['run', ...user(), '--detach', 'x'], {
+        spawnDetached: never,
+        detachStartTimeoutMs: 200,
+      });
+      expect(late.code).toBe(1);
+      expect(late.err).toContain('did not start within 0.2s');
+      expect(late.err).toContain('is stopped');
+      const abort = new AbortController();
+      setTimeout(() => abort.abort(), 100);
+      const interrupted = await tacet(['run', ...user(), '--detach', 'x'], {
+        spawnDetached: never,
+        signal: abort.signal,
+      });
+      expect(interrupted.code).toBe(130);
+      expect(interrupted.err).toContain('interrupted while it started');
+      expect(stopped).toEqual([1, 1]);
+    });
+
+    it('says why when the background run ends at once, and answers what needs no run', async () => {
+      const failing = await tacet(['run', ...user(), '--detach', 'x'], {
+        spawnDetached: (_argv, _env, fd) => {
+          writeSync(fd, 'config has no tiers.worker\n');
+          return { pid: 2 ** 22 + 1, exited: Promise.resolve(1), stop: () => {} };
+        },
+      });
+      expect(failing.code).toBe(1);
+      expect(failing.err).toContain('ended at once (exit 1)');
+      expect(failing.err).toContain('config has no tiers.worker');
+      // Done before it was followed: not a failure.
+      const quick = await tacet(['run', ...user(), '--detach', 'x'], {
+        spawnDetached: (_argv, _env, fd) => {
+          writeSync(fd, 'task x completed\n');
+          return { pid: 2 ** 22 + 2, exited: Promise.resolve(0), stop: () => {} };
+        },
+      });
+      expect(quick.code).toBe(0);
+      expect(quick.err).toContain('already done');
+      // Nothing to resume: no background run at all.
+      let spawned = 0;
+      const none = await tacet(['run', ...user(), '--detach', '--resume'], {
+        spawnDetached: () => {
+          spawned++;
+          return { pid: 1, exited: Promise.resolve(0), stop: () => {} };
+        },
+      });
+      expect(none.code).toBe(0);
+      expect(none.err).toContain('nothing to resume');
+      expect(spawned).toBe(0);
+      expect((await tacet(['run', ...user(), '--detach'])).code).toBe(2);
+      // The internal flag is not for a terminal.
+      const forged = await tacet(['run', ...user(), '--detached-child', 'x'], {
+        prompt: async () => '',
+      });
+      expect(forged.code).toBe(2);
+      expect(forged.err).toContain('internal');
+    });
   });
 });
 
