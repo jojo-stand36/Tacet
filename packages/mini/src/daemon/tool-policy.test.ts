@@ -448,6 +448,21 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Write', { file_path: '.local/notes.md', content: '' }).allow).toBe(false);
   });
 
+  it('resolves `..` in a dangling link after its symlinks, as the kernel does (#227 review)', () => {
+    const w = (p: string) => ask('Write', { file_path: p, content: '' }).allow;
+    mkdirSync(join(wt, 'deep', 'dir'), { recursive: true });
+    symlinkSync('deep/dir', join(wt, 'lnk'));
+    mkdirSync(join(wt, '.tacet'));
+    symlinkSync('../lnk/../cfg.yaml', join(wt, '.tacet', 'tacet.yaml'));
+    expect(w('deep/cfg.yaml')).toBe(false);
+    expect(w('cfg.yaml')).toBe(true);
+    mkdirSync(join(wt, 'a', 'b'), { recursive: true });
+    symlinkSync('a/b', join(wt, 'l2'));
+    symlinkSync('l2/../t', join(wt, '.claude'));
+    expect(w('a/t/settings.json')).toBe(false);
+    expect(w('t/settings.json')).toBe(true);
+  });
+
   it('fails closed on a symlink loop in protected config (#227 review)', () => {
     symlinkSync('b', join(wt, '.tacet'));
     symlinkSync('.tacet', join(wt, 'b'));

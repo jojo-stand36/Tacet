@@ -396,7 +396,19 @@ function landing(p: string, depth = 0): string | null {
   }
   const from = landing(dirname(p), depth + 1);
   if (from === null) return null;
-  return landing(isAbsolute(to) ? to : join(from, to), depth + 1);
+  // One segment at a time, as the kernel does: `..` after a linked directory leaves its target.
+  let cur = isAbsolute(to) ? sep : from;
+  for (const seg of to.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      cur = dirname(cur); // `cur` is real, or missing below a real prefix: no link to leave.
+      continue;
+    }
+    const next = landing(join(cur, seg), depth + 1);
+    if (next === null) return null;
+    cur = next;
+  }
+  return cur;
 }
 
 /** Whether `at` (relative to the real root) is one of `targets` or inside one, names folded. */
