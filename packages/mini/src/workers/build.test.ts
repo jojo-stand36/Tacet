@@ -91,6 +91,21 @@ describe('buildWorkerAdapters', () => {
     }
   });
 
+  it('also builds the planner tier when asked, with the same checks (#21)', () => {
+    const tiers = {
+      mini: { adapter: 'codex-app-server', model: 'm' },
+      worker: { adapter: 'claude-sdk', model: 'm' },
+    };
+    const built = buildWorkerAdapters(config({ tiers }), { baseEnv: {}, withPlanner: true });
+    expect(Object.keys(built).sort()).toEqual(['claude-sdk', 'codex-app-server']);
+    expect(() =>
+      buildWorkerAdapters(config({ tiers: { ...tiers, mini: { adapter: 'codex-app-server' } } }), {
+        baseEnv: {},
+        withPlanner: true,
+      }),
+    ).toThrow(/tiers\.mini\.model/);
+  });
+
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
     for (const tiers of [
       { worker: { adapter: 'acp:codex-acp' } },

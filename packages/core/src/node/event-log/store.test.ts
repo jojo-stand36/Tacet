@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -94,6 +94,43 @@ describe('event log', () => {
     store = openEventStore(path);
     expect(store.count()).toBe(30);
     expect(store.replay(tasksProjection)).toEqual(expected);
+  });
+
+  it('opens read-only beside the writer: sees its appends, never writes (#21)', () => {
+    store.append(fixture.slice(0, 10));
+    const reader = openEventStore(path, { readonly: true });
+    try {
+      expect(reader.count()).toBe(10);
+      store.append(fixture.slice(10));
+      expect(reader.count()).toBe(30);
+      expect(reader.replay(tasksProjection)).toEqual(expected);
+      expect(reader.query({ afterSeq: 29 })).toHaveLength(1);
+      expect(() => reader.append(fixture[0])).toThrow(/read-only/);
+      expect(() => reader.compact({ before: '2100-01-01T00:00:00.000Z' })).toThrow(/read-only/);
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('reads a closed log read-only without changing it (#21)', () => {
+    store.append(fixture);
+    store.close();
+    const reader = openEventStore(path, { readonly: true });
+    try {
+      expect(reader.replay(tasksProjection)).toEqual(expected);
+    } finally {
+      reader.close();
+    }
+    // Only SQLite's own sidecars may appear, beside the log.
+    expect(readdirSync(dir).every((f) => /^events\.db(-wal|-shm)?$/.test(f))).toBe(true);
+    store = openEventStore(path);
+    expect(store.count()).toBe(30);
+  });
+
+  it('refuses to open a missing log read-only, and creates nothing (#21)', () => {
+    const missing = join(dir, 'nope', 'events.db');
+    expect(() => openEventStore(missing, { readonly: true })).toThrow();
+    expect(() => statSync(join(dir, 'nope'))).toThrow();
   });
 
   it('replays identically when events arrive one at a time', () => {
