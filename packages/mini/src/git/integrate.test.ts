@@ -15,7 +15,12 @@ import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 import { workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { integrateWorktree, taskBranch, WorktreeRefusedError } from './integrate.js';
+import {
+  integrateWorktree,
+  taskBranch,
+  uncommittedChanges,
+  WorktreeRefusedError,
+} from './integrate.js';
 
 /**
  * Integration of Worker commits (#119) against real git: a Worker in a linked worktree commits on
@@ -98,6 +103,109 @@ describe('integrateWorktree', () => {
     git(repo, ['commit', '-qm', 'init']);
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('finds what a checkout changed, deleted or added beyond a commit, from the repo side (#261)', async () => {
+    const w = worker('u');
+    const main = git(repo, ['rev-parse', 'main']);
+    const changes = (commit?: string) =>
+      uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit, env });
+    expect(await changes(main)).toEqual([]);
+    writeFileSync(join(w.dir, '.gitignore'), 'build/\n');
+    mkdirSync(join(w.dir, 'build'));
+    writeFileSync(join(w.dir, 'build', 'out.js'), 'x');
+    writeFileSync(join(w.dir, 'README'), 'changed\n');
+    writeFileSync(join(w.dir, 'new.txt'), 'new\n');
+    // The Worker hides its change in its own index: the check never reads that index.
+    git(w.dir, ['update-index', '--assume-unchanged', 'README'], w.wenv);
+    const found = (await changes(main))?.sort((a, b) => (a.path < b.path ? -1 : 1));
+    expect(found).toEqual([
+      { path: '.gitignore', untracked: true },
+      { path: 'README', untracked: false },
+      { path: 'new.txt', untracked: true },
+    ]);
+    // Without a commit, the Worker's HEAD (here still main) is the one compared with.
+    expect((await changes())?.length).toBe(3);
+    // A deletion counts too.
+    rmSync(join(w.dir, 'README'));
+    expect((await changes(main))?.some((c) => c.path === 'README' && !c.untracked)).toBe(true);
+  });
+
+  it("never runs a filter a Worker's .gitattributes names, and reports a self-ignoring .gitignore (#261)", async () => {
+    // A clean filter in the user's own config, which a Worker-written attribute would name.
+    const ran = join(root, 'filter-ran');
+    git(repo, ['config', '--global', 'filter.evil.clean', `touch ${ran}; cat`]);
+    const w = worker('attr');
+    const main = git(repo, ['rev-parse', 'main']);
+    writeFileSync(join(w.dir, '.gitattributes'), '* filter=evil\n');
+    writeFileSync(join(w.dir, 'README'), 'changed\n');
+    const found = await uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit: main, env });
+    expect(existsSync(ran)).toBe(false);
+    expect(found?.map((c) => c.path).sort()).toEqual(['.gitattributes', 'README']);
+    // A new .gitignore that ignores everything, itself included, still shows.
+    const v = worker('ign');
+    writeFileSync(join(v.dir, '.gitignore'), '*\n');
+    mkdirSync(join(v.dir, 'sub'));
+    writeFileSync(join(v.dir, 'sub', '.gitignore'), '*\n');
+    writeFileSync(join(v.dir, 'hidden.txt'), 'x\n');
+    const hidden = await uncommittedChanges({ cwd: v.dir, repoRoot: repo, commit: main, env });
+    expect(hidden?.map((c) => c.path).sort()).toEqual(['.gitignore', 'sub/.gitignore']);
+    // The compared commit's attributes are the ones used: a filter it names does run.
+    const x = worker('attr2');
+    writeFileSync(join(x.dir, '.gitattributes'), '* filter=evil\n');
+    git(x.dir, ['add', '.gitattributes'], x.wenv);
+    git(x.dir, ['commit', '-qm', 'attrs'], x.wenv);
+    await integrateWorktree({ cwd: x.dir, repoRoot: repo, ref: taskBranch('attr2'), env });
+    const own = git(repo, ['rev-parse', taskBranch('attr2')]);
+    writeFileSync(join(x.dir, 'README'), 'changed\n');
+    await uncommittedChanges({ cwd: x.dir, repoRoot: repo, commit: own, env });
+    expect(existsSync(ran)).toBe(true);
+  });
+
+  it('honours a committed .gitignore, stops at maxPaths, and reads FIFOs and symlinks as data (#261)', async () => {
+    writeFileSync(join(repo, '.gitignore'), 'build/\n');
+    git(repo, ['add', '.gitignore']);
+    git(repo, ['commit', '-qm', 'ignore build']);
+    const main = git(repo, ['rev-parse', 'main']);
+    const w = worker('cap');
+    mkdirSync(join(w.dir, 'build'));
+    writeFileSync(join(w.dir, 'build', 'out.js'), 'x');
+    for (let i = 0; i < 30; i += 1) writeFileSync(join(w.dir, `f${i}.txt`), `${i}\n`);
+    const all = await uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit: main, env });
+    expect(all).toHaveLength(30);
+    expect(all?.some((c) => c.path.startsWith('build/'))).toBe(false);
+    const some = await uncommittedChanges({
+      cwd: w.dir,
+      repoRoot: repo,
+      commit: main,
+      env,
+      maxPaths: 7,
+    });
+    expect(some).toHaveLength(7);
+    // A FIFO does not hang the check (git cannot track one, so it is no change); a symlink to a
+    // file outside is a change of its own, not followed.
+    const v = worker('odd');
+    execFileSync('mkfifo', [join(v.dir, 'pipe')]);
+    writeFileSync(join(root, 'outside.txt'), 'secret\n');
+    symlinkSync(join(root, 'outside.txt'), join(v.dir, 'link'));
+    const odd = await uncommittedChanges({
+      cwd: v.dir,
+      repoRoot: repo,
+      commit: main,
+      env,
+      timeoutMs: 20_000,
+    });
+    expect(odd).toEqual([{ path: 'link', untracked: true }]);
+  });
+
+  it('cannot tell, rather than read the Worker store, for a commit only the Worker has (#261)', async () => {
+    const w = worker('v');
+    const own = commitIn(w, 'mine.txt', 'mine\n');
+    expect(hasObject(own)).toBe(false);
+    expect(await uncommittedChanges({ cwd: w.dir, repoRoot: repo, env })).toBeUndefined();
+    expect(
+      await uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit: own, env }),
+    ).toBeUndefined();
+  });
 
   it('brings a Worker commit into the repo under its task branch, and gc works again', async () => {
     const w = worker('t1');
