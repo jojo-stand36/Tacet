@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
 } from 'node:fs';
@@ -95,6 +96,8 @@ describe('Claude Worker tool environment', () => {
     // If the command did not run, what the Bash tool reported says why.
     const reported = api.requests.flatMap((r) => (r.toolOutput ? [r.toolOutput] : []));
     expect(existsSync(file), `tool output: ${JSON.stringify(reported)}`).toBe(true);
+    // Nothing else in the checkout: the sandbox leaves no mount points behind (#150).
+    expect(readdirSync(cwd)).toEqual(['tool-env.txt']);
     const out = readFileSync(file, 'utf8');
     expect(out).toContain('MYAPP_SETTING=kept');
     expect(out).not.toContain(KEY);

@@ -234,16 +234,16 @@ describe('PtyAdapter (fake claude)', () => {
     writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
     writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
     const adapter = make({ PATH: bin }, { subprocessScrub: true });
+    if (process.platform === 'linux') {
+      // Not on Linux yet: the sandbox blocks the hooks (#164).
+      await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+        /can't run on Linux yet.*#164/,
+      );
+      return;
+    }
     const h = await adapter.start({ cwd: join(root, 'wt') });
     expect(fake().opts.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
     await adapter.close(h);
-    if (process.platform === 'linux') {
-      await expect(
-        make({ PATH: join(root, 'empty') }, { subprocessScrub: true }).start({
-          cwd: join(root, 'wt'),
-        }),
-      ).rejects.toThrow(/bubblewrap/);
-    }
   });
 
   it('refuses what it cannot do safely', async () => {

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   authEnv,
   claudeEnvAllow,
+  SubprocessScrubError,
   withSubprocessScrub,
   writeMcpConfig,
 } from '@tacet/adapter-claude-sdk/launch';
@@ -251,8 +252,15 @@ export class PtyAdapter implements AgentAdapter {
     this.#opts.onEnvDropped?.(filtered.dropped);
     const keyed = authEnv('api_key', { ...filtered.env, ...opts.env });
     // The commands the Worker runs never see its key (#150).
-    const env =
-      this.#opts.subprocessScrub === false && this.#opts.spawn ? keyed : withSubprocessScrub(keyed);
+    const scrub = !(this.#opts.subprocessScrub === false && this.#opts.spawn);
+    if (scrub && process.platform === 'linux') {
+      // Seen on Ubuntu CI: under the sandbox the scrub needs, the `Stop` hook gets an HTTP 500 that
+      // Tacet never sent, so no turn ever ends for it. Fail closed until #164 (coordinator, #150).
+      throw new SubprocessScrubError(
+        "interactive Claude Workers (pty:claude) can't run on Linux yet: Claude Code's sandbox, which keeps the API key from the commands they run, blocks the hooks that report back to Tacet (#164); use the claude-sdk adapter",
+      );
+    }
+    const env = scrub ? withSubprocessScrub(keyed) : keyed;
 
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
