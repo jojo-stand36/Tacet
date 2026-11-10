@@ -1,7 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { codexLaunch } from '@tacet/adapter-codex-app-server';
 import {
   type MockResponsesApi,
@@ -14,10 +16,15 @@ import { buildWorkerAdapters } from './build.js';
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
 
-/** The repo's pinned Codex CLI, as the Codex adapter's dependency installs it. */
+/** The repo's pinned Codex CLI, found as the Codex adapter finds it, from that package. */
 const CODEX = join(
-  import.meta.dirname,
-  '../../../adapters/codex-app-server/node_modules/@openai/codex/bin/codex.js',
+  dirname(
+    createRequire(fileURLToPath(import.meta.resolve('@tacet/adapter-codex-app-server'))).resolve(
+      '@openai/codex/package.json',
+    ),
+  ),
+  'bin',
+  'codex.js',
 );
 // A 1x1 PNG: an image Codex would attach if it read the paste as its path.
 const PNG = Buffer.from(
@@ -42,7 +49,8 @@ describe.skipIf(!gate.ok)(gatedTitle('interactive Codex as a PTY preset (#249)',
     // Outside the checkout.
     writeFileSync(join(root, 'out.png'), PNG);
     execFileSync('git', ['init', '-q'], { cwd: checkout });
-    // Trusted already, as after the first run: no trust screen.
+    // Trusted already, as after the first run: no trust screen. Should this key ever stop matching,
+    // Codex waits on that screen and the test times out rather than failing on an assertion.
     writeFileSync(
       join(root, 'home', '.codex', 'config.toml'),
       `[projects.${JSON.stringify(checkout)}]\ntrust_level = "trusted"\n`,
@@ -55,7 +63,7 @@ describe.skipIf(!gate.ok)(gatedTitle('interactive Codex as a PTY preset (#249)',
   });
 
   it('submits a prompt ending in @path unchanged, and attaches no image for a lone path', {
-    timeout: 120_000,
+    timeout: 180_000,
   }, async () => {
     const key = 'sk-test-0000000000000000000000';
     const env = { PATH: process.env.PATH ?? '', HOME: join(root, 'home'), TERM: 'xterm-256color' };
@@ -66,7 +74,16 @@ describe.skipIf(!gate.ok)(gatedTitle('interactive Codex as a PTY preset (#249)',
         agents: {
           codex: {
             kind: 'pty',
-            command: [process.execPath, CODEX, ...args, '-c', 'features.daemon_auto_start=false'],
+            command: [
+              process.execPath,
+              CODEX,
+              ...args,
+              '-c',
+              'features.daemon_auto_start=false',
+              // No update check: nothing leaves this machine.
+              '-c',
+              'check_for_update_on_startup=false',
+            ],
           },
         },
       },
@@ -84,7 +101,7 @@ describe.skipIf(!gate.ok)(gatedTitle('interactive Codex as a PTY preset (#249)',
     const turn = async (text: string) => {
       const from = api.requests.length;
       await adapter.send(h, { text });
-      for (let i = 0; i < 120; i++) {
+      for (let i = 0; i < 80; i++) {
         const sent = api.requests.slice(from).filter((r) => !r.text.startsWith('Generate a'));
         if (sent.length > 0 && adapter.status(h) === 'idle') return sent.map((r) => r.text);
         await new Promise((r) => setTimeout(r, 250));

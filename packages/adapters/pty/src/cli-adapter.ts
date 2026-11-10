@@ -94,9 +94,8 @@ export interface PtyPreset {
    * For Codex CLI (#249), whose composer reads two things into a paste. A paste that ends in an
    * `@token` leaves its Mentions popup open, and the Enter Tacet types then inserts a completion
    * instead of submitting; a trailing space keeps it closed, and Codex trims it, so the text is
-   * sent unchanged. A paste that Codex reads as one path (`normalize_pasted_path`: one shell word
-   * after trimming, a quoted string, a `file:` URL, a Windows path) is attached as an image when
-   * it names one, inside the checkout or not; such a prompt gets a first line saying it is text,
+   * sent unchanged. A paste that Codex reads as one image path (`codexReadsAsPath`) is attached
+   * as an image, inside the checkout or not; such a prompt gets a first line saying it is text,
    * after which it is several words. Verified live on Codex CLI 0.167.0 against a local mock of
    * its API (capability matrix, "Generic PTY presets: `@path` mentions").
    */
@@ -345,6 +344,7 @@ export class PtyCliAdapter implements AgentAdapter {
     }
     const typed = promptText(input.text);
     const escaped = this.#opts.preset.escapeAt ? `. ${typed.replaceAll('@', '\\@')} .` : typed;
+    // Both can be set (a command running both CLIs): the escaped text is several words, so safe.
     const text = this.#opts.preset.codexPaste ? codexPasteText(escaped) : escaped;
     // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
     if (s.stalled) {
@@ -466,7 +466,8 @@ export class PtyCliAdapter implements AgentAdapter {
 
   #type(s: Session, text: string): void {
     const line = this.#line(s, text);
-    s.typed = s.pasteMode ? text : line;
+    // A space a preset adds at the end (`codexPaste`) is not echoed: matched without it.
+    s.typed = s.pasteMode ? text.trimEnd() : line;
     s.turnOutput = '';
     s.inTurn = true;
     s.stalled = false;
@@ -602,17 +603,27 @@ export function codexPasteText(text: string): string {
   return `${body} `;
 }
 
+/** Extensions the `image` crate 0.25.9 (Codex 0.167.0's) decodes: `ImageFormat::from_extension`. */
+const IMAGE_EXTENSION =
+  /\.(avif|jpe?g|jfif|a?png|gif|webp|tiff?|tga|dds|bmp|ico|hdr|exr|p[abgnp]m|ff|qoi)$/i;
+
 /**
- * Whether Codex CLI 0.167.0 would read a paste of `text` as one path (`normalize_pasted_path` in
- * `codex-rs/tui/src/clipboard_paste.rs`): after trimming, a string in matching quotes, a `file:`
- * URL, a Windows path, or at most one word as the Rust `shlex` crate splits it (a `#` starting a
- * word comments out the rest of its line). Errs towards yes.
+ * Whether Codex CLI 0.167.0 would attach a paste of `text` as an image (#249). Its composer
+ * (`apply_paste` in `chat_composer/paste_input.rs`) checks a paste of 2 to 1000 characters with
+ * `normalize_pasted_path` (`clipboard_paste.rs`): after trimming, a string in matching quotes, a
+ * `file:` URL (the URL parser drops tabs and newlines anywhere), a Windows path, or exactly one
+ * word as the Rust `shlex` crate splits it (a `#` starting a word comments out its line). It then
+ * attaches the file when the `image` crate decodes it, whose format comes from the extension
+ * alone (`ImageReader::open`). So: any `file:` URL (it can hide its extension), or such a path
+ * ending in an image extension once quotes, backslashes, tabs and newlines are taken out. Errs
+ * towards yes; a word like `continue` or `y` is not one.
  */
 export function codexReadsAsPath(text: string): boolean {
   const t = text.trim();
-  if (/^(["'])[\s\S]*\1$/.test(t)) return true;
-  if (/^file:/i.test(t) || /^[A-Za-z]:[\\/]|^\\\\/.test(t)) return true;
-  return shellWords(t) <= 1;
+  if (/^file:/i.test(t.replace(/[\t\n\r]/g, ''))) return true;
+  const onePath =
+    /^(["'])[\s\S]*\1$/.test(t) || /^[A-Za-z]:[\\/]|^\\\\/.test(t) || shellWords(t) <= 1;
+  return onePath && IMAGE_EXTENSION.test(t.replace(/[\t\n\r\\'"]/g, ''));
 }
 
 /** How many words a POSIX shell splitter like the Rust `shlex` crate yields before an error. */
