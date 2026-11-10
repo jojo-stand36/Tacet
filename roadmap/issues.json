@@ -1235,6 +1235,17 @@
         "agent:claude"
       ],
       "body": "Follow-up from #157. A `pty:<slug>` preset's `resume_flag` continues the CLI's last session in the Worker's checkout. That is only safe if the CLI's resume picks among the sessions of its working directory: a wider scope (a project root shared by sibling worktrees) would let a Worker continue another Worker's session. From help text only: codex-cli 0.167.0 `resume --last` is cwd-filtered (`--all` disables it); Gemini CLI 0.67.0 `--resume latest` is per \"project\", and whether a git worktree is its own project is unknown. Gemini is therefore not given as a `resume_flag` example.\n\n### Tasks\n- [ ] Live, against the local mock APIs: two sibling git worktrees of one repo, a session in each, then resume in one with `codex resume --last` and with `gemini --resume latest`; record which session each continues\n- [ ] Record what each CLI does when asked to resume with no saved session in that directory (exit code, message, or a fresh session)\n- [ ] Update capability matrix §1 (\"Generic PTY presets: resume\") and, if Gemini scopes to the worktree, add it back as an example\n\n### Acceptance criteria\n- Both behaviours recorded with versions and the commands used; each UNVERIFIED mark in that row is resolved or kept with a reason\n- If a CLI scopes wider than the worktree, the docs say not to set `resume_flag` for it\n\n_See packages/adapters/pty/src/cli-adapter.ts (`resumeArgs`) and docs/adapters/capability-matrix.md._"
+    },
+    {
+      "title": "PTY adapters: don't leave a CLI's detached background processes running",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #168. On Linux, interactive codex-cli 0.167.0 starts a managed daemon (`codex app-server --listen unix:// --analytics-default-enabled --managed-daemon`, plus `codex app-server daemon pid-update-loop`; feature `daemon_auto_start`, stable and on by default) that outlives the PTY session: after `PtyCliAdapter.close` it keeps running, re-parented to PID 1. That breaks the adapters rule \"never leave orphaned PTYs/processes\". `-c features.daemon_auto_start=false` prevents it for Codex (verified live, `docs/adapters/spikes/168-resume-scope/`), but any CLI run as a `pty:<slug>` preset could detach a helper the same way.\n\n### Tasks\n- [ ] Recommend `-c features.daemon_auto_start=false` in Codex preset examples, and say why\n- [ ] Decide how the adapter limits detached processes: its own process group or session for the CLI and signalling the group on close (a `setsid` child escapes that), a cgroup or `prctl(PR_SET_CHILD_SUBREAPER)`-style subreaper, or documenting it per preset; verify what node-pty already does (the PTY child is a session leader)\n- [ ] Check whether the Codex daemon sends telemetry during a run (`--analytics-default-enabled`)\n\n### Acceptance criteria\n- A test or recorded live run shows no process a preset's CLI started is left running after `close()`, or the docs state the limit per platform\n\n_See packages/adapters/pty/src/cli-adapter.ts, .github/instructions/adapters.instructions.md and docs/adapters/capability-matrix.md (\"Generic PTY presets: resume\")._"
     }
   ]
 }

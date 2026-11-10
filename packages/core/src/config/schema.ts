@@ -45,7 +45,7 @@ export const AgentPreset = z.strictObject({
     .union([NonEmpty, z.array(NonEmpty).min(1)])
     .optional()
     .describe(
-      "PTY: argument(s) added to the command to continue the CLI's last session in the Worker's checkout, e.g. [resume, --last] (Codex). Only for a CLI whose resume picks among the sessions of its working directory: otherwise a Worker could continue another Worker's session",
+      "PTY: argument(s) added to the command to continue the CLI's last session in the Worker's checkout, e.g. [resume, --last] (Codex) or [--resume, latest] (Gemini CLI), both checked per worktree (capability matrix, #168). Only for a CLI whose resume picks among the sessions of its working directory: otherwise a Worker could continue another Worker's session",
     ),
 });
 export type AgentPreset = z.infer<typeof AgentPreset>;
