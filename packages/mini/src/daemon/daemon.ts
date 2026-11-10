@@ -89,6 +89,8 @@ interface View {
   escalations: Map<string, EscalationRecord>;
   decisions: Map<string, string>;
   progress: Map<string, string>;
+  /** When each Worker session last reported progress (ms), for the heartbeat. */
+  progressAt: Map<string, number>;
 }
 
 interface Run {
@@ -107,6 +109,14 @@ interface Run {
   commit?: string;
   /** A turn is running: answers wait until it ends. */
   turnActive: boolean;
+  /** Last sign of life from the Worker (ms): any event, or a progress report. */
+  lastActivity: number;
+  /** When it was nudged, if it has been silent since. */
+  nudgedAt?: number | undefined;
+  /** Tool calls that started and have not finished: a long test run is not a stuck Worker. */
+  openTools: Map<string, number>;
+  /** The latest progress report already counted (its timestamp). */
+  progressSeen?: number | undefined;
   /** The turn's end is being handled, so it is handled once. */
   settling: boolean;
 }
@@ -364,6 +374,7 @@ export class MiniConductor {
       if (!this.#live(gen)) return;
       await this.#deliverAnswers(run);
     }
+    this.#checkHealth(gen);
     this.#failBlocked();
     this.#rollUp();
     for (const id of this.#ready()) {
@@ -378,6 +389,61 @@ export class MiniConductor {
           }),
         );
       });
+    }
+  }
+
+  /**
+   * Worker health (#17, after Gas Town's Witness; ADR-001): one heartbeat per session, fed by
+   * every adapter event and every `report_progress`. A Worker silent in the middle of a turn for
+   * `stuck_after_s` is nudged; still silent `nudge_grace_s` later, its session is replaced (a
+   * `stuck` attempt). A session between turns (waiting on an answer) is not judged; nor is one
+   * inside a tool call, until the call has been open for `stuck_after_s + nudge_grace_s` (a hung
+   * test watcher or editor prompt).
+   *
+   * The nudge is recorded, not sent: the Claude and Codex adapters queue input sent during a turn
+   * as the next turn, so a hung Worker would never read it, and a slow one would start an extra
+   * turn while its checkout is integrated and verified.
+   */
+  #checkHealth(gen: number): void {
+    const w = this.#o.config.workers ?? {};
+    const stuckMs = (w.stuck_after_s ?? 300) * 1000;
+    const graceMs = (w.nudge_grace_s ?? 900) * 1000;
+    const now = this.#now().getTime();
+    const v = this.#state();
+    for (const run of [...this.#runs.values()]) {
+      if (!this.#live(gen)) return;
+      if (!run.turnActive || run.settling || this.#runs.get(run.subtaskId) !== run) continue;
+      const oldestTool = Math.min(...run.openTools.values());
+      if (run.openTools.size > 0 && now - oldestTool < stuckMs + graceMs) continue;
+      const progress = v.progressAt.get(run.sessionId);
+      // A new report is a sign of life when the daemon sees it. Its timestamp comes from the MCP
+      // backend's clock, so it only identifies the report and is never trusted as a time.
+      if (progress !== undefined && progress !== run.progressSeen) {
+        run.progressSeen = progress;
+        run.lastActivity = Math.max(run.lastActivity, Math.min(progress, now));
+        run.nudgedAt = undefined;
+      }
+      const silent = now - run.lastActivity;
+      if (run.nudgedAt === undefined) {
+        if (silent < stuckMs) continue;
+        run.nudgedAt = now;
+        this.#o.store.append(
+          this.#env(
+            run.subtaskId,
+            'worker.nudged',
+            { sessionId: run.sessionId, silentForMs: silent },
+            run.sessionId,
+          ),
+        );
+      } else if (now - run.nudgedAt >= graceMs) {
+        this.#track(
+          this.#end(run, 'stuck', `silent for ${Math.round(silent / 1000)} s after a nudge`).then(
+            () => {
+              if (this.#live(gen)) this.#afterFailure(run.subtaskId);
+            },
+          ),
+        );
+      }
     }
   }
 
@@ -641,6 +707,9 @@ export class MiniConductor {
       text: '',
       turnActive: true,
       settling: false,
+      // Seeded now, also after a restart: the log's last event says nothing about this process.
+      lastActivity: this.#now().getTime(),
+      openTools: new Map(),
     };
     this.#runs.set(subtaskId, run);
     this.#noteVendorSession(run);
@@ -686,6 +755,11 @@ export class MiniConductor {
       for await (const e of worker.adapter.events(run.handle)) {
         if (this.#runs.get(run.subtaskId) !== run || !this.#live(gen)) return;
         this.#record(run, e);
+        run.lastActivity = this.#now().getTime();
+        run.nudgedAt = undefined;
+        if (e.t === 'tool.call') run.openTools.set(e.id, run.lastActivity);
+        else if (e.t === 'tool.result') run.openTools.delete(e.id);
+        else if (e.t === 'status' && e.state !== 'running') run.openTools.clear();
         if (e.t === 'approval.request') {
           // Calls to the Mini-conductor's own MCP tools are what a Worker is for; anything else
           // is refused until policies exist (#25). A refused Worker can escalate.
@@ -975,6 +1049,9 @@ export class MiniConductor {
     const worker = this.#o.adapters[run.adapterId];
     if (!worker) return;
     run.turnActive = true;
+    // A new turn starts now: the hours spent waiting on the answer are not silence.
+    run.lastActivity = this.#now().getTime();
+    run.nudgedAt = undefined;
     try {
       await worker.adapter.send(run.handle, { text: answers.map(answerText).join('\n') });
     } catch (err) {
@@ -1013,10 +1090,16 @@ export class MiniConductor {
     const escalations = new Map<string, EscalationRecord>();
     const decisions = new Map<string, string>();
     const progress = new Map<string, string>();
+    const progressAt = new Map<string, number>();
     for (const { envelope: e } of this.#o.store.query({})) {
       const d = (e.data ?? {}) as Record<string, unknown>;
       const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
-      if (e.type.startsWith('worker.')) {
+      if (e.type === 'worker.progress') {
+        // Written by the MCP backend: the session is on the envelope, the report is the data.
+        const summary = str('summary');
+        if (summary && e.taskId) progress.set(e.taskId, summary);
+        if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
+      } else if (e.type.startsWith('worker.')) {
         const id = str('sessionId');
         if (!id || !e.taskId) continue;
         if (e.type === 'worker.started') {
@@ -1036,9 +1119,6 @@ export class MiniConductor {
           else if (e.type === 'worker.ended') {
             s.ended = str('reason') ?? 'failed';
             if (d.workspaceRefused === true) s.refused = true;
-          } else if (e.type === 'worker.progress') {
-            const summary = str('summary') ?? str('message');
-            if (summary) progress.set(e.taskId, summary);
           }
         }
       } else if (e.type === 'task.planned') {
@@ -1081,7 +1161,7 @@ export class MiniConductor {
         if (text !== undefined) x.answer = text;
       }
     }
-    this.#view = { count, tasks, sessions, kinds, escalations, decisions, progress };
+    this.#view = { count, tasks, sessions, kinds, escalations, decisions, progress, progressAt };
     return this.#view;
   }
 

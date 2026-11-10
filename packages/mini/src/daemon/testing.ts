@@ -16,7 +16,7 @@ import type { Workspace, Workspaces } from './ports.js';
 
 /**
  * What a scripted Worker does with one input. `reply` ends the turn idle with that text;
- * `error` ends the session in error; `hold` keeps the turn running until `release()`;
+ * `error` ends the session in error; `hold` keeps the turn running until `release()`; `tool-hold` starts a tool call that never ends;
  * `approval` asks for an approval first, then replies with whether it was granted.
  */
 export type Script =
@@ -24,6 +24,7 @@ export type Script =
   | { do: 'error'; message: string }
   | { do: 'hold' }
   | { do: 'vanish' }
+  | { do: 'tool-hold' }
   | { do: 'auth' }
   | { do: 'approval'; toolName?: string; grant?: unknown };
 
@@ -159,6 +160,16 @@ export class ScriptedAdapter implements AgentAdapter {
       s.events.end();
     } else if (step.do === 'auth') {
       this.#emit(s, { t: 'status', state: 'auth_required', message: 'invalid API key' });
+    } else if (step.do === 'tool-hold') {
+      this.#emit(s, {
+        t: 'tool.call',
+        id: `tool-${s.handle.id}`,
+        name: 'Bash',
+        input: { command: 'pnpm test' },
+      });
+      await new Promise<void>((resolve) => {
+        s.held = resolve;
+      });
     } else if (step.do === 'hold') {
       await new Promise<void>((resolve) => {
         s.held = resolve;
