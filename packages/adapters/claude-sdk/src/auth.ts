@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 import type { EnvAllow } from '@tacet/core';
 
 /**
@@ -108,4 +111,82 @@ export function claudeEnvAllow(env: Record<string, string | undefined>): EnvAllo
     );
   }
   return { names, prefixes, credentialPrefixes };
+}
+
+/**
+ * The commands a Claude Code Worker runs (its Bash tool, hooks, stdio MCP servers) must not see
+ * its API key (#150). Claude Code strips credentials from them with
+ * `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, which on Linux needs bubblewrap: verified live on
+ * 2.1.319, without `bwrap` Claude Code refuses to start ("bubblewrap is required for subprocess
+ * env scrubbing and isolation"). Owner decision (#150): fail closed, so a Linux user without
+ * bubblewrap is told to install it rather than running Workers whose commands see the key.
+ * Returns `env` with the scrub on; throws `SubprocessScrubError` when it cannot work.
+ */
+export function withSubprocessScrub(
+  env: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  if (platform === 'linux') {
+    const problem = sandboxProblem(env.PATH);
+    if (problem) {
+      throw new SubprocessScrubError(
+        `Claude's sandbox can't run here: ${problem}. Claude Workers on Linux run their commands in it, so those never see the API key; it needs bubblewrap and socat (e.g. \`sudo apt-get install bubblewrap socat\`) and user namespaces (see docs/ARCHITECTURE.md §6, #150)`,
+      );
+    }
+  }
+  return { ...env, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1' };
+}
+
+/** Probe results by PATH: the probe runs bwrap once per process and PATH. */
+const probed = new Map<string, string | undefined>();
+
+/**
+ * Why Claude Code's Linux sandbox cannot run, or `undefined` if it can. With the scrub on, Claude
+ * Code 2.1.319 makes the sandbox mandatory: without `bwrap` it refuses to start, and without
+ * `socat` it starts but refuses every Bash command ("Sandbox dependencies not available: socat
+ * not installed", seen on CI, #150). Both must be on the Worker's PATH, and bwrap must be able to
+ * make its namespaces (AppArmor or a sysctl can forbid that), checked by running it once.
+ */
+function sandboxProblem(path: string | undefined): string | undefined {
+  const key = path ?? '';
+  if (probed.has(key)) return probed.get(key);
+  const bwrap = onPath('bwrap', path);
+  let problem: string | undefined;
+  if (!bwrap) problem = 'bubblewrap (bwrap) is not on PATH';
+  else if (!onPath('socat', path)) problem = 'socat is not on PATH';
+  else {
+    try {
+      execFileSync(
+        bwrap,
+        ['--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--unshare-all', 'true'],
+        { stdio: ['ignore', 'ignore', 'pipe'], timeout: 10_000 },
+      );
+    } catch (err) {
+      const stderr = (err as { stderr?: Buffer }).stderr?.toString().trim().split('\n')[0];
+      problem = `bubblewrap cannot create its sandbox (${stderr || (err as Error).message})`;
+    }
+  }
+  probed.set(key, problem);
+  return problem;
+}
+
+export class SubprocessScrubError extends Error {
+  override name = 'SubprocessScrubError';
+}
+
+/** The executable `name` in an absolute PATH entry, or `undefined`. */
+function onPath(name: string, path: string | undefined): string | undefined {
+  // Absolute entries only: a relative one would resolve against Tacet's own directory.
+  for (const dir of (path ?? '').split(delimiter)) {
+    if (!isAbsolute(dir)) continue;
+    try {
+      const file = join(dir, name);
+      if (!statSync(file).isFile()) continue;
+      accessSync(file, constants.X_OK);
+      return file;
+    } catch {
+      // Not here.
+    }
+  }
+  return undefined;
 }

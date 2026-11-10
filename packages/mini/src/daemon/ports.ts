@@ -52,6 +52,12 @@ export interface Workspaces {
    * the commit a task's sub-tasks start from (#236).
    */
   pin?(taskId: string, commit: string): Promise<void>;
+  /**
+   * Delete each task's pin ref that still holds its `commit` (#247): once a task is finished, no
+   * new checkout starts there. Refs gone or holding another commit are left; throws when the refs
+   * cannot be read, so the caller tries again.
+   */
+  unpin?(pins: ReadonlyArray<{ taskId: string; commit: string }>): Promise<void>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   /**

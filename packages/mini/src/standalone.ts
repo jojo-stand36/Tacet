@@ -153,7 +153,15 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
   const token = randomToken();
   try {
     server = await MiniMcpServer.start({
-      backend: new EventLogBackend({ store, repo: paths.repoId, miniId: 'standalone' }),
+      backend: new EventLogBackend({
+        store,
+        repo: paths.repoId,
+        miniId: 'standalone',
+        // A Worker's handoff (#129): the Mini-conductor, made below, decides and reseeds.
+        canHandoff: (b) =>
+          started ? started.handoffRefusal(b.workerSessionId) : 'not running yet',
+        onHandoff: (b) => started?.handoff(b.workerSessionId),
+      }),
       tokens: new WorkerTokens(),
       ...(o.onError ? { onError: o.onError } : {}),
     });

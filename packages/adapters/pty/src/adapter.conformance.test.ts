@@ -37,7 +37,37 @@ function claudeBinary(): string {
  * Runs the real, interactive Claude Code binary in a PTY against a local mock of the Messages
  * API (#15): no credentials, no network. State comes from Claude Code's hooks.
  */
-describe.skipIf(!gate.ok)(
+/**
+ * On Linux, interactive Claude Workers refuse to start until #164: Claude Code's sandbox (needed so
+ * the commands they run never see the API key, #150) blocks the hooks that report back to Tacet.
+ * There the refusal is what is tested; the real sessions run on macOS.
+ */
+const linux = process.platform === 'linux';
+
+describe.runIf(linux && gate.ok)('PtyAdapter on Linux (#164)', () => {
+  it('refuses to start an interactive Claude Worker, saying why', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-linux-')));
+    try {
+      const adapter = new PtyAdapter({
+        command: [claudeBinary()],
+        stateDir: join(root, 'state'),
+        sessionFileDir: join(root, 'run'),
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: root,
+          ANTHROPIC_API_KEY: 'sk-ant-placeholder-not-a-real-key-0123456789',
+        },
+      });
+      await expect(adapter.start({ cwd: root })).rejects.toThrow(
+        /can't run on Linux yet.*#164.*claude-sdk/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!gate.ok || linux)(
   gatedTitle('PtyAdapter conformance (interactive Claude Code in a PTY, mock Messages API)', gate),
   () => {
     let api: MockMessagesApi;
@@ -92,6 +122,19 @@ describe.skipIf(!gate.ok)(
       for (const [i, t] of screens.entries()) {
         if (i >= screens.length - 3) console.log(`--- screen of session ${i}:\n${plain(t)}`);
       }
+      // What reached the model: tells a prompt never sent from hooks that never came back.
+      console.log(
+        `--- last mock API requests:\n${api.requests
+          .slice(-6)
+          .map((r) =>
+            JSON.stringify({
+              text: r.text.slice(0, 80),
+              tools: r.tools.length,
+              out: r.toolOutput?.slice(0, 300),
+            }),
+          )
+          .join('\n')}`,
+      );
       if (process.env.TACET_PTY_SCREENS) {
         writeFileSync(process.env.TACET_PTY_SCREENS, JSON.stringify(screens));
       }

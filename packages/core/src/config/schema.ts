@@ -188,6 +188,12 @@ export const TacetConfig = z.strictObject({
       stuck_after_s: z.number().int().positive(),
       nudge_grace_s: z.number().int().positive(),
       max_attempts: z.number().int().positive(),
+      /**
+       * Handoffs one sub-task may request (#129). They never count as attempts, so this bounds a
+       * chain of fresh sessions; past it `request_handoff` is refused and the Worker is told to
+       * finish or escalate.
+       */
+      max_handoffs: z.number().int().positive(),
       /** Seconds one `verify` command may run before it is ended (#19). */
       verify_timeout_s: z.number().int().positive(),
       /**
@@ -245,6 +251,7 @@ export const DEFAULT_CONFIG = {
     stuck_after_s: 300,
     nudge_grace_s: 900,
     max_attempts: 3,
+    max_handoffs: 3,
     verify_timeout_s: 600,
     verify_fix_attempts: 2,
   },
