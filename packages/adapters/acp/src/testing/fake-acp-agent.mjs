@@ -179,6 +179,13 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     send({ id: m.id, result: null });
   } else if (m.method === 'session/resume') {
     send({ id: m.id, result: {} });
+  } else if (m.method === 'session/fork') {
+    // FAKE_FORK_ID: the new session's id (default `<source>-fork`); `same` answers the source id.
+    const id =
+      process.env.FAKE_FORK_ID === 'same'
+        ? m.params.sessionId
+        : (process.env.FAKE_FORK_ID ?? `${m.params.sessionId}-fork`);
+    send({ id: m.id, result: { sessionId: id } });
   } else if (m.method === 'session/prompt') {
     prompt(m);
   } else if (m.method === 'session/cancel') {

@@ -17,6 +17,13 @@ import {
   type RequestPermissionRequest,
   type SessionNotification,
 } from '@agentclientprotocol/sdk';
+// Types only: the unstable `session/fork` and `sessionCapabilities.fork` (#146). The runtime stays
+// on the stable entrypoint.
+import type {
+  ForkSessionRequest,
+  ForkSessionResponse,
+  AgentCapabilities as UnstableAgentCapabilities,
+} from '@agentclientprotocol/sdk/unstable';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -171,6 +178,11 @@ export class AcpAdapter implements AgentAdapter {
   }
 
   constructor(opts: AcpAdapterOptions) {
+    const { fork, resume } = opts.agent.capabilities;
+    // The adapter forks by `session/fork` only (#146): no emulation, and never without resume.
+    if (fork === 'emulated' || (fork === 'native' && !resume)) {
+      throw new Error(`${opts.agent.id}: fork '${fork}' is not offered over ACP without resume`);
+    }
     this.#opts = opts;
     this.id = opts.agent.id;
   }
@@ -189,8 +201,9 @@ export class AcpAdapter implements AgentAdapter {
       throw new ProfileRefusedError('contextWindow', `${spec.id} over ACP has one context size`);
     }
     if (opts.resume && !caps.resume) throw new Error(`${spec.id} does not resume sessions`);
-    if (opts.resume?.fork)
-      throw new Error(`${spec.id}: forking over ACP is not supported yet (#146)`);
+    if (opts.resume?.fork && caps.fork !== 'native') {
+      throw new Error(`${spec.id} does not fork sessions over ACP`);
+    }
 
     const env = this.#env(opts);
     const command = [
@@ -522,6 +535,27 @@ export class AcpAdapter implements AgentAdapter {
     const meta = sessionMeta ? { _meta: { ...sessionMeta } } : {};
     if (vendorId === undefined) {
       return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers, ...meta });
+    }
+    if (opts.resume?.fork) {
+      // Unstable ACP (#146): only when this agent advertised it in this session's `initialize`.
+      if (!(caps as UnstableAgentCapabilities | undefined)?.sessionCapabilities?.fork) {
+        throw new Error(`${this.id} did not advertise session/fork in its initialize response`);
+      }
+      // The stable entrypoint sends any method; only its types leave out the unstable ones.
+      const request = s.conn.agent.request as unknown as (
+        method: 'session/fork',
+        params: ForkSessionRequest,
+      ) => Promise<ForkSessionResponse>;
+      const r = await request.call(s.conn.agent, 'session/fork', {
+        sessionId: vendorId,
+        cwd: opts.cwd,
+        mcpServers,
+        ...meta,
+      });
+      if (typeof r?.sessionId !== 'string' || r.sessionId === '' || r.sessionId === vendorId) {
+        throw new Error(`${this.id} answered session/fork without a new session id`);
+      }
+      return r as NewSessionResponse;
     }
     if (caps?.sessionCapabilities?.resume) {
       const r = await s.conn.agent.request('session/resume', {
