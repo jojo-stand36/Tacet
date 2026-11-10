@@ -72,9 +72,9 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 ```ts
 interface AgentAdapter {               // packages/core/src/adapter/types.ts (#10)
   id: string;                         // "claude-sdk", "codex-app-server", "acp", "pty"
-  capabilities(): AdapterCapabilities; // streaming, liveInput, approvals, interrupt, resume, fork, usage, modelSwitch, injectContext
-  start(opts: SessionOptions): Promise<SessionHandle>;   // resolves when ready; opts.resume continues or forks a vendor session
-  send(h: SessionHandle, input: UserInput, opts?: { model?: string }): Promise<void>;
+  capabilities(): AdapterCapabilities; // streaming, liveInput, approvals, interrupt, resume, fork, usage, modelSwitch, injectContext, effortSwitch?, contextSizes?
+  start(opts: SessionOptions): Promise<SessionHandle>;   // resolves when ready; opts.resume continues or forks a vendor session; model, effort and contextWindow form the SessionProfile
+  send(h: SessionHandle, input: UserInput, opts?: { model?: string; effort?: Effort }): Promise<void>;
   interrupt(h: SessionHandle): Promise<{ stillQueued?: string[] }>;
   respond(h: SessionHandle, req: ApprovalId, decision: ApprovalDecision): Promise<void>;
   close(h: SessionHandle): Promise<void>;
@@ -102,7 +102,7 @@ type ApprovalDecision = { kind: "allow_once" | "allow_always" | "reject" | "canc
 
 The shared schemas (`AgentEvent`, `Task`, `Escalation`, `Decision`, `HandoffPacket`, the event envelope and the A2A extension metadata) are zod 4 schemas in `@tacet/core`, exported as JSON Schema 2020-12 in `packages/core/schema/v1/` (#5, [ADR-003 §7](adr/003-wire-protocols.md#7-json-schema-stubs-acceptance-item-deferred-to-the-scaffold)). On `usage`, token and cost fields are per-call deltas (adapters convert cumulative vendor totals), `contextUsed`/`contextMax` are gauges, and context and cost are optional because not every vendor reports them ([capability matrix §7](adapters/capability-matrix.md)). `ApprovalDecision` (an adapter's answer to a tool-approval request) is distinct from `Decision` (a recorded answer to an escalation, reused as precedent). Receivers parse agent events with `parseAgentEvent`, which ignores unknown kinds. Enum fields read an unknown value as their documented fallback, for example `urgency` as `normal` and `kind` as `reject` ([ADR-003 enum addendum](adr/003-wire-protocols.md#addendum-2026-11-09-enum-evolution-2)).
 
-Every adapter must pass the conformance bench in `@tacet/core/testing` (`runConformance`), run against recorded fixtures or a local mock, never live vendor calls in CI. Its probes compare declared capabilities with observed behaviour and report `drift` when they disagree; P0 probes (start, valid events, stream, usage, approval round-trip, interrupt, close) gate CI, and P1 probes (live input, resume, injected context, model switch) only report (#10, after Omnigent's harness bench, ADR-001).
+Every adapter must pass the conformance bench in `@tacet/core/testing` (`runConformance`), run against recorded fixtures or a local mock, never live vendor calls in CI. Its probes compare declared capabilities with observed behaviour and report `drift` when they disagree; P0 probes (start, valid events, stream, usage, approval round-trip, interrupt, close) gate CI, and P1 probes (live input, resume, injected context, model switch, effort, context sizes) only report (#10, after Omnigent's harness bench, ADR-001). An adapter that cannot honour a profile field (an effort level the model lacks, an unlisted context window) throws `ProfileRefusedError` rather than ignore it (#110).
 
 All events go to an append-only **event log** (SQLite) → UI timelines, replay, audit, cost.
 

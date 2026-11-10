@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import {
   type CanUseTool,
+  type EffortLevel,
+  type ModelInfo,
   type Options,
   type PermissionResult,
   type PermissionUpdate,
@@ -17,6 +19,7 @@ import {
   AsyncQueue,
   type InterruptResult,
   mcpHeaderSecrets,
+  ProfileRefusedError,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
@@ -27,6 +30,8 @@ import {
 } from '@tacet/core';
 import { authEnv, type ClaudeAuthRoute } from './auth.js';
 import { removeMcpConfig, writeMcpConfig } from './mcp-config.js';
+
+const CONTEXT_1M = 1_000_000;
 
 /**
  * Capabilities verified against the Claude Agent SDK in spike #64
@@ -43,6 +48,11 @@ export const CLAUDE_SDK_CAPABILITIES: AdapterCapabilities = {
   usage: { live: true, context: true, cost: 'estimated' },
   modelSwitch: 'mid-session',
   injectContext: false,
+  // Verified on SDK 0.3.319 against the mock API (#110): `applyFlagSettings({ effortLevel })`
+  // changes the next request's `output_config.effort`.
+  effortSwitch: 'per-turn',
+  // The `context-1m-2025-08-07` beta; refused for models the SDK does not document it for.
+  contextSizes: [CONTEXT_1M],
 };
 
 export interface ClaudeSdkAdapterOptions {
@@ -85,6 +95,12 @@ interface Session {
   /** Literal secrets of this session (MCP header values), scrubbed from every event. */
   secrets: string[];
   model: string | undefined;
+  /** Effort requested for this session (launch or the last `send`), if any. */
+  effort: EffortLevel | undefined;
+  /** Context window opted into at launch, if any. */
+  contextWindow: number | undefined;
+  /** `supportedModels()`, fetched once when effort first needs checking. */
+  models: Promise<ModelInfo[]> | undefined;
   /**
    * Last cumulative `total_cost_usd`, to turn it into per-turn deltas. `undefined` when resuming
    * a session whose earlier total this adapter never saw: the first turn then sets the baseline
@@ -103,6 +119,13 @@ interface Session {
 }
 
 const CLIENT_APP = 'tacet/0.0.0';
+const EFFORT_LEVELS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+/**
+ * Models the SDK documents the 1M beta for ("Sonnet 4/4.5 only"). The binary sends the beta
+ * header for any model, so the adapter refuses the rest rather than let the request fail or
+ * silently run with the default window.
+ */
+const CONTEXT_1M_MODELS = /^claude-sonnet-4(-5)?(-\d{8})?$/;
 /** Vendor sessions whose cost baseline is remembered for resume; the oldest is dropped. */
 const COST_TOTALS_MAX = 1000;
 
@@ -134,12 +157,25 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   }
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
+    const effort = opts.effort === undefined ? undefined : effortLevel(opts.effort);
+    if (opts.contextWindow !== undefined) {
+      if (opts.contextWindow !== CONTEXT_1M) {
+        throw new ProfileRefusedError(
+          'contextWindow',
+          `Claude supports only a ${CONTEXT_1M}-token window opt-in, not ${opts.contextWindow}`,
+        );
+      }
+      check1m(opts.model);
+    }
     const id = randomUUID();
     const env = authEnv(this.#opts.authRoute ?? 'api_key', {
       ...(this.#opts.baseEnv ?? process.env),
       ...opts.env,
       CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     });
+    // Tacet owns the effort: this variable overrides the `effort` option and later
+    // `applyFlagSettings` calls without any sign that it did.
+    delete env.CLAUDE_CODE_EFFORT_LEVEL;
 
     // A fresh session gets its vendor id up front, so the handle can be resumed even if it
     // closes before the first turn. A fork gets a new id; a plain resume keeps the old one.
@@ -186,6 +222,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           includePartialMessages: true,
           canUseTool,
           ...(opts.model !== undefined ? { model: opts.model } : {}),
+          ...(effort !== undefined ? { effort } : {}),
+          ...(opts.contextWindow === CONTEXT_1M ? { betas: ['context-1m-2025-08-07'] } : {}),
           ...(opts.systemPrompt !== undefined
             ? {
                 systemPrompt: { type: 'preset', preset: 'claude_code', append: opts.systemPrompt },
@@ -214,6 +252,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       ended: false,
       secrets: mcpHeaderSecrets(opts.mcpServers),
       model: opts.model,
+      effort,
+      contextWindow: opts.contextWindow,
+      models: undefined,
       costSoFar: opts.resume ? this.#costTotals.get(opts.resume.vendorSessionId) : 0,
       call: undefined,
       contextMax: undefined,
@@ -225,15 +266,42 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     this.#sessions.set(id, s);
     this.#setState(s, 'idle');
     s.loop = this.#read(s);
+    if (effort !== undefined) {
+      try {
+        await this.#checkEffort(s, s.model, effort);
+      } catch (err) {
+        await this.close(handle);
+        throw err;
+      }
+    }
     return handle;
   }
 
   async send(h: SessionHandle, input: UserInput, opts?: SendOptions): Promise<void> {
     const s = this.#live(h);
+    const effort = opts?.effort === undefined ? s.effort : effortLevel(opts.effort);
+    const model = opts?.model || s.model;
+    // The SDK silently drops (or lowers) an effort the model lacks, so check before switching.
+    if (effort !== undefined && (effort !== s.effort || model !== s.model)) {
+      await this.#checkEffort(s, model, effort);
+    }
+    // The 1M beta stays on the session's requests, so a new model must take it too.
+    if (opts?.model && s.contextWindow === CONTEXT_1M) check1m(opts.model);
+    // Effort first, so a failed model switch can be rolled back to the previous state.
+    const effortChanged = effort !== undefined && effort !== s.effort;
+    if (effortChanged) await s.q.applyFlagSettings({ effortLevel: effort });
     if (opts?.model) {
-      await s.q.setModel(opts.model);
+      try {
+        await s.q.setModel(opts.model);
+      } catch (err) {
+        if (effortChanged) {
+          await s.q.applyFlagSettings({ effortLevel: s.effort ?? null }).catch(() => {});
+        }
+        throw err;
+      }
       s.model = opts.model;
     }
+    if (effortChanged) s.effort = effort;
     const uuid = randomUUID();
     s.pending.set(uuid, input.text);
     s.inbox.push({
@@ -293,6 +361,21 @@ export class ClaudeSdkAdapter implements AgentAdapter {
 
   status(h: SessionHandle): SessionState {
     return this.#sessions.get(h.id)?.state ?? 'done';
+  }
+
+  /** Refuse an effort level the model does not list, rather than let the SDK drop or lower it. */
+  async #checkEffort(s: Session, model: string | undefined, effort: EffortLevel): Promise<void> {
+    s.models ??= s.q.supportedModels();
+    const models = await s.models;
+    const name = model ?? 'default';
+    const info =
+      models.find((m) => m.value === name) ?? models.find((m) => m.resolvedModel === name);
+    if (!info) {
+      throw new ProfileRefusedError('effort', `cannot confirm effort support for ${name}`);
+    }
+    if (!info.supportsEffort || !info.supportedEffortLevels?.includes(effort)) {
+      throw new ProfileRefusedError('effort', `${name} does not support effort ${effort}`);
+    }
   }
 
   #session(h: SessionHandle): Session {
@@ -504,6 +587,24 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     // Inputs sent during the turn run next.
     if (s.pending.size > 0) this.#setState(s, 'running');
   }
+}
+
+/** Refuse the 1M window for models the SDK does not document it for. */
+function check1m(model: string | undefined): void {
+  if (!model || !CONTEXT_1M_MODELS.test(model)) {
+    throw new ProfileRefusedError(
+      'contextWindow',
+      `the 1M-token window is documented for Sonnet 4 and 4.5 only, not ${model ?? 'the default model'}`,
+    );
+  }
+}
+
+/** A Tacet effort name as the SDK's level, or a refusal for names Claude does not have. */
+function effortLevel(effort: string): EffortLevel {
+  if (!EFFORT_LEVELS.includes(effort)) {
+    throw new ProfileRefusedError('effort', `Claude has no effort level ${effort}`);
+  }
+  return effort as EffortLevel;
 }
 
 function deny(message: string, interrupt = false): PermissionResult {

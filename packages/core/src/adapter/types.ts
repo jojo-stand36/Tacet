@@ -1,4 +1,5 @@
 import type { AgentEvent, ApprovalDecision, SessionState } from '../schema/agent-event.js';
+import type { Effort } from '../schema/profile.js';
 
 /**
  * What an adapter honestly supports (ARCHITECTURE.md §3, capability matrix §7). The conformance
@@ -42,6 +43,12 @@ export interface AdapterCapabilities {
    * `per-session` only `SessionOptions.effort`. Absent: the adapter does not support effort.
    */
   effortSwitch?: 'per-turn' | 'per-session';
+  /**
+   * Context windows (tokens) the adapter can select through `SessionOptions.contextWindow`,
+   * beyond the model's default (#110). Absent or empty: only the default window. An adapter
+   * refuses a window it does not list instead of silently running on the default.
+   */
+  contextSizes?: number[];
 }
 
 /** An MCP server the Worker session should connect to, e.g. the Mini-conductor's (ADR-003 §6). */
@@ -56,8 +63,13 @@ export interface SessionOptions {
   /** Working directory, normally the Worker's git worktree. */
   cwd: string;
   model?: string;
-  /** Reasoning effort, a vendor value such as `low` or `high`; see `effortSwitch`. */
-  effort?: string;
+  /** Reasoning effort; see `effortSwitch`. Refused (`ProfileRefusedError`, `./errors.ts`) if unsupported. */
+  effort?: Effort;
+  /**
+   * Context window in tokens, larger than the model's default; must be one of
+   * `capabilities().contextSizes`, otherwise `start()` refuses it (#110).
+   */
+  contextWindow?: number;
   systemPrompt?: string;
   /** Extra environment for the vendor process. Credentials come from the user's environment. */
   env?: Record<string, string>;
@@ -80,8 +92,11 @@ export interface UserInput {
 export interface SendOptions {
   /** Model for this and later turns, if `modelSwitch` allows it. */
   model?: string;
-  /** Reasoning effort for this and later turns, if `effortSwitch` is `per-turn`. */
-  effort?: string;
+  /**
+   * Reasoning effort for this and later turns, if `effortSwitch` is `per-turn`. Applies from the
+   * vendor's next model call: sent while a turn runs, it also reaches that turn's remaining calls.
+   */
+  effort?: Effort;
 }
 
 export interface InterruptResult {

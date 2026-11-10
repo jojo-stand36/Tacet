@@ -12,11 +12,24 @@ import type { AddressInfo } from 'node:net';
  *   ToolSearch, so they are usually not offered by name).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the requested model id.
- * Requests are recorded (model and last user text only) for assertions.
+ * Requests are recorded (model, last user text, offered tool names, and the effort and beta
+ * settings the binary sent; never headers that carry credentials) for assertions.
  */
+export interface MockRequest {
+  model: string | undefined;
+  text: string;
+  messages: number;
+  /** `output_config.effort` as sent, if any. */
+  effort?: unknown;
+  /** The `anthropic-beta` header values. */
+  betas: string[];
+  /** Names of the tools offered. */
+  tools: string[];
+}
+
 export interface MockMessagesApi {
   url: string;
-  requests: { model: string | undefined; text: string; messages: number; tools: string[] }[];
+  requests: MockRequest[];
   close(): Promise<void>;
 }
 
@@ -26,6 +39,7 @@ type Block =
 
 interface Body {
   model?: string;
+  output_config?: { effort?: unknown };
   stream?: boolean;
   messages?: { role: string; content: string | { type: string; text?: string }[] }[];
   tools?: { name?: string }[];
@@ -99,10 +113,16 @@ async function handle(
   if (!(req.method === 'POST' && req.url?.startsWith('/v1/messages'))) {
     return json(404, { type: 'error', error: { type: 'not_found_error', message: 'mock' } });
   }
+  const beta = req.headers['anthropic-beta'];
   log.push({
     model: body.model,
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
+    ...(body.output_config?.effort !== undefined ? { effort: body.output_config.effort } : {}),
+    betas: (Array.isArray(beta) ? beta.join(',') : (beta ?? ''))
+      .split(',')
+      .map((b) => b.trim())
+      .filter(Boolean),
     tools: (body.tools ?? []).map((t) => t.name ?? ''),
   });
   const blocks = plan(body);
