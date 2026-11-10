@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -26,6 +27,32 @@ import {
 } from './agents.js';
 
 const FAKE = join(import.meta.dirname, 'testing', 'fake-acp-agent.mjs');
+
+/**
+ * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
+ * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
+ * where `kill(pid, 0)` also finds a zombie.
+ */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+  } catch {
+    if (process.platform === 'linux') return false;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    return state.trim() !== '' && !state.trim().startsWith('Z');
+  } catch {
+    // `ps` exits non-zero once the pid is gone.
+    return false;
+  }
+}
 const TOKEN = 'worker-token-0123456789abcdef';
 
 async function until(ok: () => boolean, ms = 5000): Promise<void> {
@@ -115,20 +142,8 @@ describe('AcpAdapter (fake ACP agent)', () => {
       }
       throw err;
     }
-    // Running, not a zombie its parent (here: an init that may not reap) has yet to collect.
-    const alive = (() => {
-      try {
-        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-        return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
-      } catch {
-        try {
-          process.kill(pid as number, 0);
-          return process.platform !== 'linux';
-        } catch {
-          return false;
-        }
-      }
-    })();
+    // Running, not a zombie its parent has yet to collect.
+    const alive = running(pid as number);
     if (alive) process.kill(pid as number, 'SIGKILL');
     expect(alive).toBe(false);
   });
@@ -378,6 +393,39 @@ describe('AcpAdapter (fake ACP agent)', () => {
       expect(statuses.filter((e) => e.t === 'status' && e.state === 'error')).toHaveLength(1);
       expect(adapter.status(h)).toBe('error');
       await adapter.close(h);
+    });
+
+    it('ends the events of a crashed agent only once its group is gone', async () => {
+      const adapter = make(
+        GEMINI_AGENT,
+        { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const done = (async () => {
+          for await (const _ of adapter.events(h));
+        })();
+        await adapter.send(h, { text: 'CRASH' });
+        await done;
+        expect(adapter.status(h)).toBe('error');
+        // The SIGTERM-ignoring child got SIGKILL before the error was reported.
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(false);
+        await adapter.close(h);
+      } finally {
+        const p = childPid();
+        if (p !== undefined) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
     });
 
     it('resumes by session/load without replaying the history as new output', async () => {
@@ -645,6 +693,45 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await adapter.send(h, { text: 'DRIFT' });
       const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
       expect(err.event).toMatchObject({ message: expect.stringMatching(/3 times/) });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'done', 5000, err.index);
+    });
+
+    it('reports a session it ends itself only once its processes are gone (macOS CI)', async () => {
+      const adapter = make(
+        spec('ask'),
+        { FAKE_SESSION: JSON.stringify(select('ask')), FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const tap = new EventTap(adapter.events(h));
+        for (let i = 1; i <= 3; i++) {
+          await adapter.send(h, { text: 'DRIFT' });
+          if (i < 3) {
+            await until(
+              () =>
+                tap.events.filter((e) => e.t === 'status' && /set back/.test(e.message ?? ''))
+                  .length === i,
+            );
+          }
+        }
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+        // The SIGTERM-ignoring child is gone by the time the error is seen, not just after.
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(false);
+      } finally {
+        const p = childPid();
+        if (p !== undefined) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
     });
 
     it('answers an open permission cancelled when the agent leaves the mode', async () => {
