@@ -52,5 +52,5 @@ The next session, of either vendor, starts with the `pick-up-issue` skill, which
 ## Keeping the setup in sync
 
 - Agents: edit `.claude/agents/`, run `node scripts/sync-agents.mjs`.
-- Roadmap: edit `roadmap/issues.json`, run `node scripts/gen-roadmap.mjs`.
+- Roadmap: edit `roadmap/issues.json`, run `node scripts/gen-roadmap.mjs`. It also sorts `issues.json` (milestone, epics first, title), so entries added on different branches land apart and merge cleanly (#231).
 - CI (`agent-config-check`) fails if either generated output is stale or if a skill's frontmatter is invalid.
