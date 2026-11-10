@@ -1330,6 +1330,17 @@
         "needs-human"
       ],
       "body": "Placeholder for a later milestone: implementing native Windows support as the native-Windows ADR decides. Blocked on that ADR (#194) being accepted; its tasks are written from the decision.\n\n### Tasks\n- [ ] Split into issues once the ADR is accepted.\n\n### Acceptance criteria\n- Defined by the accepted ADR.\n\n_See #194, #193 (WSL2) and docs/adr/002-language-runtime.md._"
+    },
+    {
+      "title": "Codex adapter: report a self-exit only once the process group is gone",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "The ACP adapter reports a session it ends itself (the agent crashing or exiting) only once the agent's whole process group is gone (fixed on branch `claude/macos-acp-close`; it caused the macOS CI ENOTEMPTY after #185). The Codex adapter still has the gap: when app-server exits by itself, `#onExit` reports the error and ends the events as soon as the leader has exited (`void exited.then(() => this.#onExit(session))`), while a member of its group (a shell command, an MCP server) may still run and write into the worktree. A caller that cleans up on the error can then race it. `close()` already waits for the group (#191); only the self-exit path does not.\n\n### Tasks\n- [ ] On a self-exit, SIGTERM the group, wait for it (`processGroupGone`), SIGKILL what is left, and only then report the error and end the events, as the ACP adapter does.\n- [ ] A regression test with the fake app-server's SIGTERM-ignoring child (`child-term`): after a crash, the child is gone when the error is seen. The liveness check must not count a zombie as running on macOS (`ps -o stat=`, as the ACP test does).\n\n### Acceptance criteria\n- After app-server exits by itself, no member of its process group is running when the error status is emitted, on Linux and macOS.\n\n_See packages/adapters/acp/src/adapter.ts (`#reapGroup`), packages/core/src/node/process-group.ts and #191._"
     }
   ]
 }
