@@ -64,6 +64,8 @@ export interface WorktreeGcResult {
 }
 
 export interface WorktreeManagerOptions {
+  /** PATH, HOME and setup-command variables are taken from here. Default: `process.env`. */
+  env?: Readonly<Record<string, string | undefined>>;
   /** @internal Test seam: runs once a squash's staging worktree exists, before it is filled. */
   onSquashStaging?: (ids: { source: string; staging: string }) => Promise<void>;
 }
@@ -151,11 +153,15 @@ function gitFailure(error: unknown): Error {
   return new Error(`git command failed${code}`);
 }
 
-async function runGit(cwd: string, args: readonly string[]): Promise<string> {
+async function runGit(
+  cwd: string,
+  args: readonly string[],
+  baseEnv: Readonly<Record<string, string | undefined>>,
+): Promise<string> {
   try {
     const env = {
-      PATH: process.env.PATH ?? '',
-      HOME: process.env.HOME ?? '',
+      PATH: baseEnv.PATH ?? '',
+      HOME: baseEnv.HOME ?? '',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
     };
@@ -180,7 +186,7 @@ async function runGit(cwd: string, args: readonly string[]): Promise<string> {
     const gitEnv = trustedGitEnv(
       repository,
       { gitDir: commonDirectory, commonDir: commonDirectory },
-      process.env,
+      baseEnv,
     );
     return await runCommand(
       'git',
@@ -252,6 +258,10 @@ export class WorktreeManager implements Workspaces {
     private readonly options: WorktreeManagerOptions = {},
   ) {}
 
+  private get env(): Readonly<Record<string, string | undefined>> {
+    return this.options.env ?? process.env;
+  }
+
   /**
    * A fresh detached checkout for `workerId`, at `base`: a full commit id, or a local branch
    * name. Without `base`, it starts at the repository's current branch, or its HEAD commit
@@ -309,7 +319,16 @@ export class WorktreeManager implements Workspaces {
     const { root } = await this.paths();
     const info = await this.readInfo(root, worktreeId);
     if (!info || info.path !== path.join(root, worktreeId)) return;
-    const missing = (await realpath(info.path).catch(() => undefined)) !== info.path;
+    let missing = false;
+    try {
+      if ((await realpath(info.path)) !== info.path) {
+        throw new Error('worktree path no longer resolves to its managed location');
+      }
+    } catch (error) {
+      // Only a checkout that is really gone skips the checks that need it.
+      if (errorCode(error) !== 'ENOENT') throw error;
+      missing = true;
+    }
     await this.removeWorktree(info, options.force === true, missing);
   }
 
@@ -553,7 +572,7 @@ export class WorktreeManager implements Workspaces {
           'LANG',
           'LC_ALL',
         ]) {
-          const value = process.env[name];
+          const value = this.env[name];
           if (value !== undefined) env[name] = value;
         }
         Object.assign(env, options.setup.env);
@@ -923,11 +942,15 @@ export class WorktreeManager implements Workspaces {
     if (this.pathsPromise) return this.pathsPromise;
     const pathsPromise = (async () => {
       const repository = await realpath(
-        (await runGit(this.repositoryPath, ['rev-parse', '--show-toplevel'])).trim(),
+        (await runGit(this.repositoryPath, ['rev-parse', '--show-toplevel'], this.env)).trim(),
       );
       const commonDirectory = await realpath(
         (
-          await runGit(repository, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+          await runGit(
+            repository,
+            ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+            this.env,
+          )
         ).trim(),
       );
       const digest = createHash('sha256').update(repository).digest('hex').slice(0, 12);
@@ -964,7 +987,7 @@ export class WorktreeManager implements Workspaces {
     const env = trustedGitEnv(
       repository,
       { gitDir: commonDirectory, commonDir: commonDirectory },
-      process.env,
+      this.env,
     );
     try {
       return await runCommand(
@@ -1042,7 +1065,7 @@ export class WorktreeManager implements Workspaces {
         [...managerGitArgs, ...args],
         repository,
         commandTimeoutMs,
-        trustedGitEnv(info.path, worktree, process.env),
+        trustedGitEnv(info.path, worktree, this.env),
       );
     } catch (error) {
       throw gitFailure(error);
@@ -1081,9 +1104,14 @@ export class WorktreeManager implements Workspaces {
 
   /** The checked-out branch, or undefined when the repository HEAD is detached. */
   private async currentBranch(): Promise<string | undefined> {
-    const branch = (
-      await this.git(['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(() => '')
-    ).trim();
+    let branch: string;
+    try {
+      branch = (await this.git(['symbolic-ref', '--quiet', '--short', 'HEAD'])).trim();
+    } catch (error) {
+      // `--quiet` exits 1, and only 1, for a detached HEAD.
+      if (error instanceof Error && error.message.endsWith('(exit 1)')) return undefined;
+      throw error;
+    }
     return branch || undefined;
   }
 

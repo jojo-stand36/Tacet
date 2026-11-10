@@ -81,7 +81,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       acp: { ...o.workers?.acp, stateDir },
     });
   const tiers = config.tiers ?? {};
-  const workspaces = new WorktreeManager(o.repoRoot, paths.worktrees);
+  const workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, { env: baseEnv });
   let planner: Planner = new SingleStepPlanner();
   const mini = tiers.mini;
   if (!o.singleStep && mini) {
