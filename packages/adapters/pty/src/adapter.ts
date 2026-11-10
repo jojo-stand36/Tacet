@@ -18,6 +18,7 @@ import {
   type AgentTerminal,
   type ApprovalDecision,
   AsyncQueue,
+  ForkRefusedError,
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
@@ -245,7 +246,9 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.contextWindow !== undefined) {
       throw new ProfileRefusedError('contextWindow', 'the PTY adapter does not set a context size');
     }
-    if (opts.resume?.fork) throw new Error('the PTY adapter does not fork sessions');
+    if (opts.resume?.fork) {
+      throw new ForkRefusedError(this.id, 'the PTY adapter does not fork sessions');
+    }
     // It names a directory and goes on the command line: only a session id Claude Code made.
     if (opts.resume && !UUID.test(opts.resume.vendorSessionId)) {
       throw new Error('a PTY session to resume is named by its UUID');

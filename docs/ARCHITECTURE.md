@@ -216,6 +216,8 @@ Adapters declare what they can honour: `effortSwitch` (`per-turn` or `per-sessio
 
 When an adapter refuses a part, the Mini-conductor logs it and starts the session again without counting a failed attempt. A refused effort steps down one level, but never below the tier's `effort`; below that, the model's default effort is used, which is the vendor's choice and is not checked against `max_effort`. A refused context window falls back to the default. A refused model has no fallback, so the sub-task fails at once. The `mini` tier (the planner) does not go through the policy and takes no bounds. Budget headroom is not an input yet: the cost ledger is #35. Task-type rules and per-task overrides are #33.
 
+A fork the adapter will not do for a session is refused with `ForkRefusedError` (#228), with nothing left running: `fork: 'none'` (PTY), or a declared `native` fork that the vendor does not offer for that session (an ACP agent whose `initialize` does not advertise `session/fork`). Other start failures keep their errors, so a caller can tell the refusal apart and seed a new session from a HandoffPacket instead. The Mini-conductor does not fork sessions today.
+
 ## 5. Packages (monorepo)
 
 | Package | Purpose |
