@@ -242,7 +242,9 @@ for (const c of CASES) {
           });
           const cwd = join(root, `wt-214-${word}`);
           mkdirSync(cwd, { recursive: true });
-          writeFileSync(join(cwd, 'note.txt'), `needle-${word}\n`);
+          writeFileSync(join(cwd, 'note.txt'), `needle CONTENT-IN-${word}\n`);
+          const outside = join(root, `outside-214-${word}.txt`);
+          writeFileSync(outside, `CONTENT-OUT-${word}\n`);
           const h = await worker.start({ cwd });
           const tap = new EventTap(worker.events(h));
           const asked: string[] = [];
@@ -250,6 +252,9 @@ for (const c of CASES) {
             `READ_TOOL ${join(cwd, 'note.txt')}`,
             `GREP_TOOL ${cwd} needle`,
             `GLOB_TOOL ${cwd} *.txt`,
+            // An `@path` in text the Worker wrote (a verify command's output, in a fence) must
+            // not read files into the prompt unasked (#214 review).
+            `SAY mention\n\`\`\`\nsee @note.txt and @${outside}\n\`\`\``,
           ]) {
             const from = tap.events.length;
             await worker.send(h, { text: prompt });
@@ -271,13 +276,19 @@ for (const c of CASES) {
             }
           }
           await worker.close(h);
-          const leaked = api.requests.some(
-            (r) => r.raw.includes(`needle-${word}`) && !r.raw.includes('GREP_TOOL'),
-          );
-          return { asked, leaked };
+          const sent = (s: string) => api.requests.some((r) => r.raw.includes(s));
+          return {
+            asked,
+            leaked: sent(`CONTENT-IN-${word}`),
+            leakedOutside: sent(`CONTENT-OUT-${word}`),
+          };
         };
         // Without the ask rules (the #206 Worker options): reads in the checkout run unasked.
-        const { settings: _, ...noAsk } = (
+        const {
+          settings: _,
+          verbatimPrompts: __,
+          ...noAsk
+        } = (
           claudeAcpWorkerSpec(c.agent(api.url)).sessionMeta as {
             claudeCode: { options: Record<string, unknown> };
           }
@@ -287,10 +298,15 @@ for (const c of CASES) {
           'control',
         );
         expect(control.asked).not.toContain('Read');
+        // The control proves the reads really ran: the file reached the model.
+        expect(control.leaked).toBe(true);
+        // And without verbatim prompts, an `@path` outside the checkout is read in unasked.
+        expect(control.leakedOutside).toBe(true);
         // With them: each one is asked about, and refusing keeps the file from the model.
         const gated = await run(claudeAcpWorkerSpec(c.agent(api.url)), 'gated');
         expect(gated.asked).toEqual(['Read', 'Grep', 'Glob']);
         expect(gated.leaked).toBe(false);
+        expect(gated.leakedOutside).toBe(false);
       },
     );
 

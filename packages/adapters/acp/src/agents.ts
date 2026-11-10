@@ -176,8 +176,10 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
 /**
  * claude-agent-acp session options for an unattended Worker (#206), merged into
  * `_meta.claudeCode.options` (passed to the SDK's `query()`, 0.101.0 `acp-agent.js`): the file
- * tools only and no shell. Not `Glob` or `Grep`: the SDK runs them without asking, and over ACP
- * there is no hook to ask with. Verified against the mock API by the vendor conformance test.
+ * tools only, no shell, every read and search asked about (an ask rule, #214), and prompts taken
+ * verbatim, so an `@path` in text the Worker wrote (a `verify` command's output, say) is not read
+ * into the prompt unasked (`verbatimPrompts`, SDK 0.3.318). Verified against the mock API by the
+ * vendor conformance test.
  */
 export const CLAUDE_ACP_WORKER_OPTIONS = {
   tools: ['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep'],
@@ -187,6 +189,7 @@ export const CLAUDE_ACP_WORKER_OPTIONS = {
   // `session/request_permission` (#214). Inline: the flag layer, which `settingSources: []` does
   // not drop; never a path, which would resolve inside the Worker's checkout.
   settings: { permissions: { ask: ['Read', 'Glob', 'Grep'] } },
+  verbatimPrompts: true,
 } as const;
 
 /** `spec` with `CLAUDE_ACP_WORKER_OPTIONS` merged into its `_meta.claudeCode.options`. */
@@ -205,6 +208,7 @@ export function claudeAcpWorkerSpec(spec: AcpAgentSpec): AcpAgentSpec {
           settings: {
             permissions: { ask: [...CLAUDE_ACP_WORKER_OPTIONS.settings.permissions.ask] },
           },
+          verbatimPrompts: CLAUDE_ACP_WORKER_OPTIONS.verbatimPrompts,
         },
       },
     },
