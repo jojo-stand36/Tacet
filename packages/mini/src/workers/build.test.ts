@@ -91,6 +91,48 @@ describe('buildWorkerAdapters', () => {
     }
   });
 
+  it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
+    for (const tiers of [
+      { worker: { adapter: 'acp:codex-acp' } },
+      { worker: { adapter: 'claude-sdk', model: 'm' }, review: { adapter: 'acp:codex-acp' } },
+    ]) {
+      expect(() => buildWorkerAdapters({ tiers }, { baseEnv: {} })).toThrow(
+        expect.objectContaining({
+          name: 'WorkerConfigError',
+          message: expect.stringMatching(
+            /tiers\.(worker|review)\.adapter: acp:codex-acp is refused for Workers: .*#183/,
+          ),
+        }),
+      );
+    }
+    // Nor as a cap, nor as a custom agent whose command runs it (by name, path or npm package).
+    const refusedFor = (cfg: TacetConfig) =>
+      expect(() => buildWorkerAdapters(cfg, { baseEnv: {} })).toThrow(
+        /is refused for Workers: .*#183/,
+      );
+    refusedFor({
+      tiers: { worker: { adapter: 'claude-sdk', model: 'm' } },
+      workers: { per_adapter: { 'acp:codex-acp': 1 } },
+    });
+    for (const command of [
+      ['codex-acp'],
+      ['/usr/local/bin/codex-acp', '--flag'],
+      ['npx', '-y', '@agentclientprotocol/codex-acp@2.6.0'],
+      ['sh', '-c', 'exec codex-acp --x'],
+    ]) {
+      refusedFor({
+        tiers: { worker: { adapter: 'acp:cx' } },
+        agents: { cx: { kind: 'acp', command } },
+      });
+    }
+    // The other built-in ACP agents still build.
+    const ok = buildWorkerAdapters(
+      { tiers: { worker: { adapter: 'acp:gemini' } } },
+      { baseEnv: { GEMINI_API_KEY: 'placeholder' } },
+    );
+    expect(Object.keys(ok)).toEqual(['acp:gemini']);
+  });
+
   it('names the tier or config path for everything it cannot build', () => {
     const cases: [Partial<TacetConfig>, RegExp][] = [
       [{ tiers: {} }, /no tiers\.worker/],
