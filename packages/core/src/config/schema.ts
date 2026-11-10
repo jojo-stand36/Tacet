@@ -214,6 +214,14 @@ export const TacetConfig = z.strictObject({
     })
     .partial()
     .optional(),
+  /**
+   * Worker worktrees (#16). With `remove_merged` on, garbage collection may remove a worktree once
+   * the event log records that its task's work landed in the target branch (merged or
+   * squash-merged), even when no ref contains its commits (#210). Worktrees whose work never
+   * landed are kept either way. Owner decision: on by default; `tacet init` asks. The task layer
+   * may not set it.
+   */
+  worktrees: z.strictObject({ remove_merged: z.boolean() }).partial().optional(),
 });
 /** One config file as written: every key is optional. */
 export type TacetConfig = z.infer<typeof TacetConfig>;
@@ -235,6 +243,7 @@ export const DEFAULT_CONFIG = {
     verify_timeout_s: 600,
     verify_fix_attempts: 2,
   },
+  worktrees: { remove_merged: true },
 } satisfies TacetConfig;
 
 /** Checks that only make sense on the merged result. */

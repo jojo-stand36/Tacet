@@ -36,6 +36,12 @@ export interface RemoveWorktreeOptions {
   force?: boolean;
   /** Keep the checkout's `tacet/<id>` branch, whatever it holds (#211: a purge keeps branches). */
   keepBranch?: boolean;
+  /**
+   * Commits that landed in their target (#210): the event log records the task's published result
+   * as merged or squash-merged. Work they contain counts as kept, as if a branch held them. Each
+   * must be a full commit id (else the worktree is kept); one not in the repository covers nothing.
+   */
+  landed?: readonly string[];
 }
 
 export interface WorktreeInfo {
@@ -352,6 +358,7 @@ export class WorktreeManager implements Workspaces {
     if (!found) return;
     await this.removeWorktree(found.info, options.force === true, found.missing, false, {
       keepBranch: options.keepBranch === true,
+      landed: options.landed ?? [],
     });
   }
 
@@ -699,7 +706,7 @@ export class WorktreeManager implements Workspaces {
     force: boolean,
     missing = false,
     dryRun = false,
-    options: { keepBranch?: boolean } = {},
+    options: { keepBranch?: boolean; landed?: readonly string[] } = {},
   ): Promise<void> {
     const { root } = await this.paths();
     // A dry run writes nothing: no lock, and stale markers are left where they are.
@@ -738,7 +745,7 @@ export class WorktreeManager implements Workspaces {
           );
         }
       }
-      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip);
+      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip, options.landed ?? []);
       if (dryRun) return;
       if (missing) {
         // Only this worktree's registration: `git worktree prune` would also prune the user's own.
@@ -790,6 +797,7 @@ export class WorktreeManager implements Workspaces {
     info: WorktreeInfo,
     gitDirectory: string | undefined,
     branchTip: string | undefined,
+    landed: readonly string[] = [],
   ): Promise<void> {
     const unverifiable = (reason: string) =>
       new WorktreeKeptError(
@@ -840,7 +848,14 @@ export class WorktreeManager implements Workspaces {
       }
     }
 
-    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits]);
+    // Landed commits go to `rev-list --stdin`: anything but a full commit id could be read there as
+    // a revision expression or an option.
+    if (landed.some((commit) => !commitIdPattern.test(commit))) {
+      throw unverifiable('a landed commit is not a full commit id');
+    }
+    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits, ...landed]);
+    // One that is gone (pruned by git gc) covers nothing, and keeps nothing either.
+    const covering = landed.filter((commit) => shared.has(commit));
     if (privateCommits.some((commit) => !shared.has(commit))) {
       // Integration copies only what HEAD reaches: commits left behind by an amend or a reset
       // can never be integrated, so say how to let them go.
@@ -875,7 +890,7 @@ export class WorktreeManager implements Workspaces {
     const unique = (
       await this.git(
         ['rev-list', '--max-count=1', '--stdin'],
-        `${[...candidates, ...others.map((tip) => `^${tip}`)].join('\n')}\n`,
+        `${[...candidates, ...[...others, ...covering].map((tip) => `^${tip}`)].join('\n')}\n`,
       )
     ).trim();
     if (unique) {

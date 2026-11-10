@@ -40,6 +40,11 @@
       "description": "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
       "type": "string",
       "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
+    },
+    "baseBranch": {
+      "description": "Local branch a new checkout started from, when it started from one: the target its task lands in (#210)",
+      "type": "string",
+      "minLength": 1
     }
   },
   "required": [

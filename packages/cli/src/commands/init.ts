@@ -71,6 +71,8 @@ export interface InitOptions {
   'user-dir'?: string;
   worker?: string;
   model?: string;
+  /** Keep Worker checkouts after their task's work is merged (`worktrees.remove_merged: false`). */
+  'keep-merged-worktrees'?: boolean;
   json?: boolean;
 }
 
@@ -130,12 +132,19 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
       );
       if (answer?.trim()) model = answer.trim();
     }
+    // Owner decision on #210: on by default, asked once at setup, and changeable in config later.
+    let removeMerged = o['keep-merged-worktrees'] !== true;
+    if (!configExists && o['keep-merged-worktrees'] === undefined && io.prompt && !o.json) {
+      removeMerged = await askRemoveMerged(io.prompt);
+    }
     // Validated before anything is created, so a bad model leaves nothing behind.
-    const body = configExists ? undefined : configBody(worker, model, root);
+    const body = configExists ? undefined : configBody(worker, model, root, removeMerged);
     if (!dirExists) mkdirSync(tacetDir);
     const config = body === undefined ? 'kept' : writeOnce(configPath, body);
     const ignore = writeOnce(join(tacetDir, '.gitignore'), IGNORE_BODY);
-    const flagsIgnored = config === 'kept' && (o.worker !== undefined || o.model !== undefined);
+    const flagsIgnored =
+      config === 'kept' &&
+      (o.worker !== undefined || o.model !== undefined || o['keep-merged-worktrees'] !== undefined);
 
     const path = env.PATH ?? '';
     const adapters = Object.entries(WORKER_ADAPTERS).map(([id, a]) => ({
@@ -148,7 +157,9 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
     const workerKeySet = spec.keys.some((k) => Boolean(env[k]));
 
     if (flagsIgnored) {
-      io.err('note: --worker and --model are ignored: .tacet/tacet.yaml already exists (edit it)');
+      io.err(
+        'note: --worker, --model and --keep-merged-worktrees are ignored: .tacet/tacet.yaml already exists (edit it)',
+      );
     }
     if (o.json) {
       io.out(
@@ -157,6 +168,7 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
           files: { '.tacet/tacet.yaml': config, '.tacet/.gitignore': ignore },
           worker,
           modelMissing,
+          ...(config === 'written' ? { removeMerged } : {}),
           adapters,
           clis,
         }),
@@ -461,13 +473,17 @@ export function configBody(
   worker: WorkerAdapterId,
   model: string | undefined,
   root: string,
+  removeMerged = true,
 ): string {
   const spec = WORKER_ADAPTERS[worker];
   const tier: Record<string, string> = {
     adapter: worker,
     ...(model !== undefined ? { model } : {}),
   };
-  const parsed = TacetConfig.safeParse({ tiers: { worker: tier } });
+  const parsed = TacetConfig.safeParse({
+    tiers: { worker: tier },
+    worktrees: { remove_merged: removeMerged },
+  });
   if (!parsed.success) throw new InitError(`invalid --model: ${parsed.error.issues[0]?.message}`);
   const verify = suggestedVerify(root);
   const lines = [
@@ -495,8 +511,37 @@ export function configBody(
     '# verify:',
     ...(verify.length > 0 ? verify.map((c) => `#   - ${c}`) : ['#   - <command>']),
     '',
+    // Only an opt-out is written as a setting, so the committed file never fixes the default.
+    ...(removeMerged
+      ? [
+          "# Worker checkouts are removed once their task's work is merged into its branch.",
+          '# To keep them, set this here, or in local.yaml for yourself only:',
+          '# worktrees:',
+          '#   remove_merged: false',
+        ]
+      : [
+          "# Worker checkouts are kept after their task's work is merged (tacet init",
+          '# --keep-merged-worktrees). Delete this to have them removed.',
+          'worktrees:',
+          '  remove_merged: false',
+        ]),
+    '',
   );
   return lines.join('\n');
+}
+
+/** Asks once more after an answer it cannot read, then takes the default (remove). */
+async function askRemoveMerged(prompt: NonNullable<Io['prompt']>): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const answer = (
+      (await prompt('Remove worktrees automatically after their work is merged? [Y/n] ')) ?? ''
+    )
+      .trim()
+      .toLowerCase();
+    if (answer === '' || answer === 'y' || answer === 'yes') return true;
+    if (answer === 'n' || answer === 'no') return false;
+  }
+  return true;
 }
 
 /** Suggested verify commands from package.json scripts; only suggested, never switched on. */
