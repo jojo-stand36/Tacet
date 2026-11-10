@@ -21,6 +21,8 @@ export interface Io {
   standalone?: Partial<StandaloneOptions>;
   /** Tests only: how `tacet run --detach` starts its background run (#201). */
   spawnDetached?: SpawnDetached;
+  /** Tests only: how long `tacet run --detach` waits for it to start, in ms. Default 60000. */
+  detachStartTimeoutMs?: number;
   /** Tests only: what the WSL checks read (#193). Default: this machine's. */
   wslProbe?: WslProbe;
 }

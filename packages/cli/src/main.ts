@@ -117,16 +117,17 @@ export async function main(argv: string[], io: Io): Promise<number> {
           io.err('give a task or --resume, not both');
           return 2;
         }
+        if (values['detached-child'] && (values.detach || io.prompt)) {
+          // Internal: only a background run started by --detach, with no terminal to ask on.
+          io.err('--detached-child is internal: use tacet run --detach');
+          return 2;
+        }
         if (values.detach) {
           if (positionals.length === 0 && !values.resume) {
             io.err('tacet run needs a task, or --resume');
             return 2;
           }
-          return await detach(
-            io,
-            rest.filter((a) => a !== '--detach'),
-            v,
-          );
+          return await detach(io, positionals.length > 0 ? positionals.join(' ') : undefined, v);
         }
         return await run(io, positionals.length > 0 ? positionals.join(' ') : undefined, v);
       case 'cancel':
