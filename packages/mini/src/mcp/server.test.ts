@@ -218,6 +218,25 @@ describe('Mini-conductor MCP server', () => {
     expect(await post(config.headers ?? {})).toBe(401);
   });
 
+  it('makes the backend forget a Worker when its token is revoked (#122)', async () => {
+    await server.close();
+    const forgotten: string[] = [];
+    const backend = new EventLogBackend({ store });
+    const forget = backend.forget.bind(backend);
+    backend.forget = (id: string) => {
+      forgotten.push(id);
+      forget(id);
+    };
+    server = await MiniMcpServer.start({ backend, tokens });
+    const one = server.workerConfig({ workerSessionId: 'w-1', taskId: 'task-1' });
+    server.workerConfig({ workerSessionId: 'w-2', taskId: 'task-1' });
+    await backend.reportProgress({ workerSessionId: 'w-1', taskId: 'task-1' }, { summary: 'a' });
+    expect(backend.workersWithState).toBe(1);
+    one.revoke();
+    expect(forgotten).toEqual(['w-1']);
+    expect(backend.workersWithState).toBe(0);
+  });
+
   it('answers /.well-known/* with a fast 404, without a token', async () => {
     expect(await fetchStatus(server.port, '/.well-known/oauth-protected-resource', {})).toBe(404);
     expect(await fetchStatus(server.port, '/.well-known/oauth-authorization-server/mcp', {})).toBe(

@@ -116,6 +116,45 @@ describe('EventLogBackend', () => {
     ).toEqual(['a', 'c', 'd']);
   });
 
+  it('keeps no state for a Worker it was told to forget (#122)', async () => {
+    const b = make({ progressIntervalMs: 1000 });
+    await b.reportProgress(W1, { summary: 'a' });
+    await b.reportProgress({ workerSessionId: 'w-2', taskId: 'task-1' }, { summary: 'b' });
+    expect(b.workersWithState).toBe(2);
+    b.forget(W1.workerSessionId);
+    expect(b.workersWithState).toBe(1);
+    // Starts clean: within the same interval, its next report is stored at once (it would be
+    // held back if anything of the forgotten state were left).
+    await b.reportProgress(W1, { summary: 'c' });
+    // w-2 was not forgotten: still held back.
+    await b.reportProgress({ workerSessionId: 'w-2', taskId: 'task-1' }, { summary: 'd' });
+    expect(
+      store
+        .query({ typePrefix: 'worker.progress' })
+        .map((e) => (e.envelope.data as { summary: string }).summary),
+    ).toEqual(['a', 'b', 'c']);
+  });
+
+  it('does not keep progress state past the interval, whatever was not forgotten', async () => {
+    const b = make({ progressIntervalMs: 1000 });
+    for (let i = 0; i < 50; i++) {
+      await b.reportProgress({ workerSessionId: `w-${i}`, taskId: 'task-1' }, { summary: 'x' });
+    }
+    expect(b.workersWithState).toBe(50);
+    // Just inside the interval: nothing is dropped, and the limit still holds.
+    clock += 999;
+    await b.reportProgress({ workerSessionId: 'w-0', taskId: 'task-1' }, { summary: 'held' });
+    expect(b.workersWithState).toBe(50);
+    clock += 1;
+    await b.reportProgress(W1, { summary: 'later' });
+    expect(b.workersWithState).toBe(1);
+    expect(
+      store
+        .query({ typePrefix: 'worker.progress' })
+        .map((e) => (e.envelope.data as { summary: string }).summary),
+    ).not.toContain('held');
+  });
+
   it('refuses unknown tasks and other tasks’ escalations', async () => {
     const b = make();
     await expect(b.readTask({ workerSessionId: 'w', taskId: 'nope' })).rejects.toBeInstanceOf(
