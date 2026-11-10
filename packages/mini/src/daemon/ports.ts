@@ -37,10 +37,11 @@ export interface Workspaces {
    */
   pin?(taskId: string, commit: string): Promise<void>;
   /**
-   * Delete the task's pin ref if it still holds `commit` (#247): once the task is finished, no new
-   * checkout starts there. A no-op when the ref is gone or holds another commit.
+   * Delete each task's pin ref that still holds its `commit` (#247): once a task is finished, no
+   * new checkout starts there. Refs gone or holding another commit are left; throws when the refs
+   * cannot be read, so the caller tries again.
    */
-  unpin?(taskId: string, commit: string): Promise<void>;
+  unpin?(pins: ReadonlyArray<{ taskId: string; commit: string }>): Promise<void>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   /**

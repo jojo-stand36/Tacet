@@ -330,18 +330,33 @@ export class WorktreeManager implements Workspaces {
   }
 
   /**
-   * Delete `refs/tacet/<task>/target` if it holds `commit` (#247). A no-op when the ref is gone or
-   * was moved (a later pin of the same task); git deletes it atomically against `commit`.
+   * Delete each `refs/tacet/<task>/target` that holds its task's `commit` (#247), reading the refs
+   * once. A ref gone or moved (a later pin of the same task) is left; git deletes each atomically
+   * against `commit`. Throws when the refs cannot be listed or a delete fails.
    */
-  async unpin(taskId: string, commit: string): Promise<void> {
-    if (!commitIdPattern.test(commit)) throw new Error('unpin: expected a full commit id');
-    const ref = targetRef(taskId);
-    const tip = await this.git(['rev-parse', '--verify', '--quiet', '--end-of-options', ref]).then(
-      (out) => out.trim(),
-      () => undefined,
+  async unpin(pins: ReadonlyArray<{ taskId: string; commit: string }>): Promise<void> {
+    for (const { commit } of pins) {
+      if (!commitIdPattern.test(commit)) throw new Error('unpin: expected a full commit id');
+    }
+    if (pins.length === 0) return;
+    const out = await this.git([
+      'for-each-ref',
+      '--format=%(refname) %(objectname)',
+      'refs/tacet/',
+    ]);
+    const tips = new Map(
+      out
+        .split('\n')
+        .map((line) => line.trim().split(' '))
+        .filter((parts): parts is [string, string] => parts.length === 2),
     );
-    if (tip !== commit) return;
-    await this.git(['update-ref', '--no-deref', '-d', ref, commit]);
+    const failed: string[] = [];
+    for (const { taskId, commit } of pins) {
+      const ref = targetRef(taskId);
+      if (tips.get(ref) !== commit) continue;
+      await this.git(['update-ref', '--no-deref', '-d', ref, commit]).catch(() => failed.push(ref));
+    }
+    if (failed.length > 0) throw new Error(`could not delete ${failed.join(', ')}`);
   }
 
   /** The repo's checked-out branch (absent when HEAD is detached) and its commit (#219). */

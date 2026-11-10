@@ -873,7 +873,15 @@ export class MiniConductor {
     } catch (err) {
       throw new Error(`cannot hold the task's target commit: ${(err as Error).message}`);
     }
-    if (dropped() || this.#target(taskId)) return;
+    if (dropped() || this.#target(taskId)) {
+      // Not recorded, so nothing else would find this ref to delete it (#247).
+      if (!this.#target(taskId)) {
+        await this.#o.workspaces
+          .unpin?.([{ taskId, commit: target.data.commit }])
+          .catch((err: unknown) => this.#errors.push(err));
+      }
+      return;
+    }
     this.#o.store.append(this.#env(taskId, 'task.target', target.data));
   }
 
@@ -1001,26 +1009,30 @@ export class MiniConductor {
    */
   async #sweepPins(gen: number): Promise<void> {
     const unpin = this.#o.workspaces.unpin?.bind(this.#o.workspaces);
-    if (!unpin) return;
+    if (!unpin || !this.#live(gen)) return;
+    const done: string[] = [];
+    const pins: Array<{ taskId: string; commit: string }> = [];
     for (const t of Object.values(this.#state().tasks)) {
-      if (!this.#live(gen)) return;
       const id = t.task.id;
       if (t.task.parentId || !TERMINAL.has(t.state) || this.#unpinned.has(id)) continue;
+      done.push(id);
       const target = this.#target(id);
-      if (target) {
-        try {
-          await unpin(id, target.commit);
-        } catch (err) {
-          const key = `unpin ${id} ${(err as Error).message}`;
-          if (!this.#sweepErrors.has(key)) {
-            this.#sweepErrors.add(key);
-            this.#errors.push(err);
-          }
-          continue;
-        }
-      }
-      this.#unpinned.add(id);
+      if (target) pins.push({ taskId: id, commit: target.commit });
     }
+    if (done.length === 0) return;
+    try {
+      // One read of the refs for all of them: a start with many finished tasks stays cheap.
+      await unpin(pins);
+    } catch (err) {
+      // Tried again at the next sweep.
+      const key = `unpin ${(err as Error).message}`;
+      if (!this.#sweepErrors.has(key)) {
+        this.#sweepErrors.add(key);
+        this.#errors.push(err);
+      }
+      return;
+    }
+    for (const id of done) this.#unpinned.add(id);
   }
 
   /**

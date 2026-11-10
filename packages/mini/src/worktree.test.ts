@@ -1035,16 +1035,20 @@ describe('WorktreeManager', () => {
     await manager.pin('done', first);
     await manager.pin('moved', second);
     await manager.pin('other', first);
-    await manager.unpin('done', first);
-    // Pinned again at another commit since: kept.
-    await manager.unpin('moved', first);
-    // Never pinned: nothing to do.
-    await manager.unpin('never', first);
+    await manager.unpin([
+      { taskId: 'done', commit: first },
+      // Pinned again at another commit since: kept.
+      { taskId: 'moved', commit: first },
+      // Never pinned: nothing to do.
+      { taskId: 'never', commit: first },
+    ]);
     expect(await refs()).toEqual([
       `refs/tacet/moved/target ${second}`,
       `refs/tacet/other/target ${first}`,
     ]);
-    await expect(manager.unpin('other', 'HEAD')).rejects.toThrow('expected a full commit id');
+    await expect(manager.unpin([{ taskId: 'other', commit: 'HEAD' }])).rejects.toThrow(
+      'expected a full commit id',
+    );
   });
 
   it('holds a pinned target with a ref, so git gc never prunes it (#236)', async () => {

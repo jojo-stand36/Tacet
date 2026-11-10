@@ -551,6 +551,44 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
         return undefined;
       }
     };
+    function start(o: {
+      script?: (input: string) => Script;
+      planner?: Planner;
+      workspaces?: Workspaces;
+    }): MiniConductor {
+      const d = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter(
+              'fake',
+              (input): Script => (o.script ? o.script(input) : { do: 'reply', text: 'done' }),
+            ),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: o.workspaces ?? manager,
+        integrator: new GitIntegrator(repo, env),
+        planner: o.planner ?? new SingleStepPlanner(),
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        pollMs: 20,
+        landedSweepMs: 50,
+      });
+      daemon = d;
+      return d;
+    }
+    const state = (id: string) =>
+      store
+        .query({ taskId: id, typePrefix: 'task.status' })
+        .map((e) => (e.envelope.data as { state: string }).state)
+        .at(-1);
 
     it('deletes it once the task finishes, and keeps every other ref', async () => {
       const head = git(repo, ['rev-parse', 'HEAD']);
@@ -564,45 +602,82 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(git(repo, ['rev-parse', '--verify', `refs/heads/tacet/${id}/result`])).toMatch(
         /^[0-9a-f]{40}$/,
       );
+      // A restart on the same log, with the ref gone: nothing to do, nothing goes wrong.
+      await daemon?.stop();
+      const again = start({});
+      await again.start();
+      await severalSweeps();
+      expect(pinOf(id)).toBeUndefined();
+      expect(pinOf('someone-else')).toBe(head);
     });
 
-    it('keeps it while the task is unfinished', async () => {
-      const head = git(repo, ['rev-parse', 'HEAD']);
-      let planning = false;
-      const planner: Planner = {
-        plan: (_task, opts) => {
-          planning = true;
-          return new Promise((_, reject) =>
-            opts?.signal?.addEventListener('abort', () => reject(new Error('stopped'))),
-          );
+    it('deletes it for a task canceled mid-run', async () => {
+      let id = '';
+      const d = start({ script: () => ({ do: 'hold' }) });
+      await d.start();
+      id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await vi.waitFor(
+        () => expect(store.query({ typePrefix: 'worker.started' })).toHaveLength(1),
+        {
+          timeout: 3_000,
+        },
+      );
+      expect(pinOf(id)).toMatch(/^[0-9a-f]{40}$/);
+      await d.cancel(id);
+      await vi.waitFor(() => expect(pinOf(id)).toBeUndefined(), { timeout: 3_000 });
+      expect(state(id)).toBe('canceled');
+    });
+
+    it('deletes a ref written while the task was being canceled, with no target recorded', async () => {
+      let d: MiniConductor | undefined;
+      const canceling: Workspaces = {
+        create: (workerId, base) => manager.create(workerId, base),
+        get: (id) => manager.get(id),
+        remove: (id, o) => manager.remove(id, o),
+        head: () => manager.head(),
+        unpin: (pins) => manager.unpin(pins),
+        pin: async (taskId, commit) => {
+          await manager.pin(taskId, commit);
+          // Canceled while the ref was being written: cancel records it at once.
+          void d?.cancel(taskId);
         },
       };
-      daemon = new MiniConductor({
-        store,
-        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
-        adapters: {
-          fake: {
-            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
-            authRoute: 'api_key',
-          },
+      d = start({ workspaces: canceling });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await vi.waitFor(() => expect(state(id)).toBe('canceled'), { timeout: 3_000 });
+      await vi.waitFor(() => expect(pinOf(id)).toBeUndefined(), { timeout: 3_000 });
+      expect(store.query({ taskId: id, typePrefix: 'task.target' })).toEqual([]);
+    });
+
+    it('keeps it while the task is unfinished, though a sub-task finished', async () => {
+      const head = git(repo, ['rev-parse', 'HEAD']);
+      const planner: Planner = {
+        async plan() {
+          return {
+            subtasks: [
+              { key: 'a', goal: 'a', acceptanceCriteria: ['ok'] },
+              { key: 'b', goal: 'b', acceptanceCriteria: ['ok'] },
+            ],
+            rationale: 'two',
+            planner: { adapter: 'test' },
+          };
         },
-        workspaces: manager,
-        integrator: new GitIntegrator(repo, env),
+      };
+      // One sub-task finishes, the other never does.
+      let turns = 0;
+      const d = start({
         planner,
-        mcp: {
-          workerConfig: () => ({
-            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
-            revoke: () => {},
-          }),
-        },
-        lockPath: join(root, 'mini.lock'),
-        pollMs: 20,
-        landedSweepMs: 50,
+        script: () => (++turns === 1 ? { do: 'reply', text: 'done' } : { do: 'hold' }),
       });
-      await daemon.start();
-      const id = daemon.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
-      await vi.waitFor(() => expect(planning).toBe(true), { timeout: 3_000 });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await vi.waitFor(
+        () => expect(store.query({ typePrefix: 'worker.ended' }).length).toBeGreaterThan(0),
+        { timeout: 3_000 },
+      );
       await severalSweeps();
+      expect(state(id)).not.toBe('completed');
       expect(pinOf(id)).toBe(head);
     });
   });
