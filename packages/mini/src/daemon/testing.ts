@@ -51,6 +51,8 @@ export class ScriptedAdapter implements AgentAdapter {
   failSends = 0;
   /** Milliseconds `start()` takes. */
   startDelayMs = 0;
+  /** When set, `start()` waits for it: a test decides when a session finishes starting. */
+  startGate: Promise<void> | undefined;
   readonly #script: (input: string, session: FakeSession) => Script;
   readonly #open = new Set<FakeSession>();
   #n = 0;
@@ -69,6 +71,7 @@ export class ScriptedAdapter implements AgentAdapter {
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
     if (this.startDelayMs > 0) await new Promise((r) => setTimeout(r, this.startDelayMs));
+    if (this.startGate) await this.startGate;
     if (this.failResumes && opts.resume) throw new Error('no such session to resume');
     const n = ++this.#n;
     const handle: SessionHandle = {

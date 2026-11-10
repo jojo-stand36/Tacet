@@ -14,6 +14,8 @@ export { WorktreeManager } from './worktree.js';
 export const packageName = '@tacet/mini' as const;
 
 export {
+  type CancelStoppedOptions,
+  cancelStopped,
   isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,
