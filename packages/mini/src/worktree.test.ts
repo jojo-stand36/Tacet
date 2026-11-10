@@ -47,14 +47,26 @@ describe('WorktreeManager', () => {
 
   it('creates ten parallel workers with unique branches and paths', async () => {
     const worktrees = await Promise.all(
-      Array.from({ length: 10 }, (_, index) => manager.create(`worker-${index}`)),
+      Array.from({ length: 10 }, (_, index) =>
+        manager.create(`worker-${index}`, { baseBranch: 'main' }),
+      ),
     );
+    const firstWorktree = worktrees[0];
+    if (!firstWorktree) {
+      throw new Error('Expected at least one worktree');
+    }
 
     expect(new Set(worktrees.map(({ branchName }) => branchName)).size).toBe(10);
     expect(worktrees.every(({ branch, branchName }) => branch === branchName)).toBe(true);
     expect(new Set(worktrees.map(({ path: worktreePath }) => worktreePath)).size).toBe(10);
     expect((await manager.list()).length).toBe(10);
     expect(worktrees.every(({ baseBranch }) => baseBranch === 'main')).toBe(true);
+    await expect(manager.get(firstWorktree.id)).resolves.toMatchObject({
+      id: firstWorktree.id,
+      path: firstWorktree.path,
+      branch: firstWorktree.branch,
+    });
+    await expect(manager.get('missing-worker')).resolves.toBeUndefined();
   });
 
   it('rejects a worktree root inside the repository', async () => {
@@ -170,7 +182,7 @@ describe('WorktreeManager', () => {
     await rm(path.join(worktree.path, '.git'));
     await symlink(sentinel, path.join(worktree.path, '.git'));
 
-    await manager.remove(worktree.id);
+    await manager.remove(worktree.id, { force: true });
 
     expect(await readFile(sentinel, 'utf8')).toBe('do not overwrite\n');
     await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
@@ -221,9 +233,7 @@ describe('WorktreeManager', () => {
     await writeFile(path.join(adminDirectory, 'gitdir'), `${temporaryDirectory}/elsewhere/.git\n`);
 
     expect((await manager.list()).map(({ id }) => id)).toContain(worktree.id);
-    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
-      'worktree Git directory does not point to its manager-owned worktree',
-    );
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(/refusing worktree/);
     expect(await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).toMatchObject({
       removed: [],
       skipped: [{ id: worktree.id, reason: 'worktree Git metadata is invalid' }],
@@ -248,9 +258,7 @@ describe('WorktreeManager', () => {
     await mkdir(logsDirectory);
     await symlink(sentinel, path.join(logsDirectory, 'HEAD'));
 
-    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
-      'worktree Git reflog path must not be a symlink',
-    );
+    await expect(manager.checkConflicts(worktree.id, 'main')).resolves.toEqual([]);
     expect(await readFile(sentinel, 'utf8')).toBe('keep\n');
   });
 
@@ -311,12 +319,8 @@ describe('WorktreeManager', () => {
     );
     await writeFile(path.join(worktree.path, '.gitattributes'), 'file.txt filter=hostile\n');
 
-    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
-      'worktree-specific Git config is not allowed',
-    );
-    await expect(manager.remove(worktree.id)).rejects.toThrow(
-      'worktree-specific Git config is not allowed',
-    );
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(/refusing worktree/);
+    await expect(manager.remove(worktree.id)).rejects.toThrow(/refusing worktree/);
     await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
@@ -324,7 +328,7 @@ describe('WorktreeManager', () => {
     const worktree = await manager.create('extension-config-worker');
     await git(repository, ['config', 'extensions.worktreeConfig', 'true']);
     await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
-      'extensions.worktreeConfig is not allowed for managed worktrees',
+      /extensions\.worktreeConfig/,
     );
   });
 
@@ -356,14 +360,10 @@ describe('WorktreeManager', () => {
     await writeFile(commondirFile, `${hostileCommonDirectory}\n`);
     expect(await readFile(commondirFile, 'utf8')).not.toBe(`${commonDirectory}\n`);
 
-    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(
-      'worktree common directory is not the manager-owned directory',
-    );
+    await expect(manager.checkConflicts(worktree.id, 'main')).rejects.toThrow(/refusing worktree/);
     await expect(readFile(marker, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
 
-    await expect(manager.remove(worktree.id, { force: true })).rejects.toThrow(
-      'worktree common directory is not the manager-owned directory',
-    );
+    await manager.remove(worktree.id, { force: true });
   });
 
   it('detects conflicts without modifying the target', async () => {
