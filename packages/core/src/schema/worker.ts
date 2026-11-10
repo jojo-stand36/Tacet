@@ -132,7 +132,7 @@ export const WorkerIntegrated = z.object({
   by: openEnum(['worker', 'tacet'], 'worker')
     .optional()
     .describe(
-      "Who made the commit: the Worker (absent in older events), or Tacet, from the changes in the checkout of a Worker that cannot run git (#260), as 'Tacet Worker'",
+      "Who made the commit: the Worker, or Tacet, from the changes in the checkout of a Worker that cannot run git (#260), as 'Tacet Worker'. Absent in older events, and when a retry integrates the checkout's HEAD, which may be Tacet's commit of an earlier attempt (its author says)",
     ),
 });
 export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;

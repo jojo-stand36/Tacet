@@ -260,6 +260,21 @@ describe('integrateWorktree', () => {
       expect(next.paths).toEqual(['more.txt']);
     });
 
+    it('commits again when the checkout was left at its parent after a failed HEAD write', async () => {
+      const w = worker('c6');
+      const main = git(repo, ['rev-parse', 'main']);
+      writeFileSync(join(w.dir, 'work.txt'), 'work\n');
+      const first = await commitFor(w, 'c6');
+      if (!first || !('commit' in first)) throw new Error('no commit');
+      // The index moved, then the HEAD write failed: HEAD is still the parent.
+      git(w.dir, ['update-ref', '--no-deref', 'HEAD', main], w.wenv);
+      const again = await commitFor(w, 'c6');
+      if (!again || !('commit' in again)) throw new Error('no second commit');
+      expect(again.paths).toEqual(['work.txt']);
+      expect(git(w.dir, ['rev-parse', 'HEAD'], w.wenv)).toBe(again.commit);
+      expect(git(w.dir, ['status', '--porcelain'], w.wenv)).toBe('');
+    });
+
     it('stores a symlink as a link, never what it points at', async () => {
       const w = worker('c2');
       writeFileSync(join(root, 'outside.txt'), 'secret\n');

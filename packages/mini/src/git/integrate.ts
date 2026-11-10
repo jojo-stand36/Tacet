@@ -21,7 +21,6 @@ import { inflateSync, constants as zlibConstants } from 'node:zlib';
 import {
   readWorkerFile,
   SAFE_GIT_ARGS,
-  trustedGitEnv,
   type WorkerWorktree,
   workerWorktree,
 } from '@tacet/core/node';
@@ -599,9 +598,9 @@ export interface CommitWorktreeOptions {
  * `git add` of exactly the changed paths (their contents read as data; a symlink is stored as a
  * link, never followed), `write-tree`, and `commit-tree` with the parent, unsigned, by
  * `TACET_WORKER_IDENTITY`; the objects go to the shared store and the Worker's own store is never
- * read. Then `ref` points at the commit, and the Worker's HEAD (detached) and index at it too, so
- * the checkout is clean at the commit, as after a commit of its own. Refuses, committing nothing, when a changed path is
- * protected config or the change is too big. Undefined when there is nothing to commit or no
+ * read. Then `ref` points at the commit, and the Worker's index and HEAD (detached) at it too,
+ * so the checkout is clean at the commit, as after a commit of its own. Refuses, committing
+ * nothing, when a changed path is protected config or the change is too big. Undefined when there is nothing to commit or no
  * parent the repo has.
  */
 export async function commitWorktree(
@@ -698,11 +697,17 @@ export async function commitWorktree(
     ]);
     if (!COMMIT_ID.test(commit)) throw new Error('commit-tree gave no commit id');
     await setTaskBranch(opts.ref, commit, { repoRoot: opts.repoRoot, env });
-    // Then the checkout is at the commit, as a Worker's own commit would leave it: its HEAD and
-    // index, in its git dir, which Tacet writes from outside (a Worker with no shell cannot
-    // reach it). The branch comes first: if this fails, the checkout still shows the changes.
-    const wenv = {
-      ...trustedGitEnv(realpathSync.native(opts.cwd), wt, env),
+    // Then the checkout is at the commit, as a Worker's own commit would leave it: its index and
+    // HEAD, in its git dir, which Tacet writes from outside (a Worker with no shell cannot reach
+    // it). Not through the Worker's object store: the commit is in the shared one. The branch
+    // comes first, and the index before HEAD: if either step fails, HEAD is still the parent, so
+    // the next turn finds the changes again and commits them again.
+    const wenv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.gitDir,
+      GIT_COMMON_DIR: wt.commonDir,
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
       GIT_ATTR_NOSYSTEM: '1',
     };
     const inWorker = (args: string[]) =>
@@ -717,6 +722,8 @@ export async function commitWorktree(
         ],
         { cwd: opts.repoRoot, env: wenv, timeoutMs: opts.timeoutMs ?? 120_000 },
       );
+    // No refresh: it would hash files with the commit's attributes, which may be the Worker's.
+    await inWorker(['read-tree', commit]);
     await inWorker([
       'update-ref',
       '--no-deref',
@@ -724,8 +731,6 @@ export async function commitWorktree(
       commit,
       ...(head !== undefined ? [head] : []),
     ]);
-    // No refresh: it would hash files with the commit's attributes, which may be the Worker's.
-    await inWorker(['read-tree', commit]);
     return { commit, ref: opts.ref, paths };
   } finally {
     rmSync(tmp, { recursive: true, force: true });
