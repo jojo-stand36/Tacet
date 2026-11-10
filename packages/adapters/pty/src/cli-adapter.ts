@@ -51,7 +51,8 @@ export interface PtyPreset {
   env?: Record<string, string>;
   /**
    * Values the caller resolved from secret references: scrubbed from every event. Values of
-   * variables whose name looks secret are scrubbed too, listed here or not.
+   * variables whose name looks secret are scrubbed too, listed here or not. Values shorter than
+   * four characters are not.
    */
   secrets?: string[];
   /**
@@ -130,6 +131,11 @@ interface Session {
 }
 
 const MAX_TEXT = 64 * 1024;
+/**
+ * Shorter secret values are not scrubbed: replacing every occurrence of one to three characters
+ * would garble the reply and hide almost nothing.
+ */
+const MIN_SECRET = 4;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const deadline = (ms: number) => new Promise((r) => setTimeout(r, ms).unref());
 
@@ -190,14 +196,17 @@ export class PtyCliAdapter implements AgentAdapter {
       ),
     };
     env.TERM ??= 'xterm-256color';
+    // Longest first, so a secret that starts another does not leave that one's end showing.
     const secrets = [
       ...new Set([
-        ...(preset.secrets ?? []).filter((v) => v !== ''),
+        ...(preset.secrets ?? []),
         ...Object.entries(env)
-          .filter(([k, v]) => looksSecret(k) && v.length >= 8)
+          .filter(([k]) => looksSecret(k))
           .map(([, v]) => v),
       ]),
-    ];
+    ]
+      .filter((v) => v.length >= MIN_SECRET)
+      .sort((a, b) => b.length - a.length);
     const cols = this.#opts.cols ?? 200;
     const rows = this.#opts.rows ?? 50;
     const [file, ...args] = preset.command as [string, ...string[]];
@@ -273,6 +282,13 @@ export class PtyCliAdapter implements AgentAdapter {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
     const text = promptText(input.text);
+    // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
+    if (s.stalled) {
+      s.stalled = false;
+      this.#setState(s, 'running');
+      s.pty.write(`${this.#line(s, text)}\r`);
+      return;
+    }
     // During a turn, and after an interrupt until the CLI takes input again.
     if (s.inTurn || s.cancelledAt !== 0) {
       s.queue.push(text);
@@ -376,11 +392,16 @@ export class PtyCliAdapter implements AgentAdapter {
    * the CLI turned that on; otherwise they are joined by spaces, since a line-based CLI would
    * take each line as its own input.
    */
-  #type(s: Session, text: string): void {
+  /** Text as typed: one paste if the CLI turned that on, else one line. */
+  #line(s: Session, text: string): string {
     // Outside a paste, a tab is a key (completion in a readline-style CLI): type a space.
-    const line = s.pasteMode
+    return s.pasteMode
       ? `\x1b[200~${text}\x1b[201~`
       : text.replace(/\s*\n\s*/g, ' ').replace(/\t/g, ' ');
+  }
+
+  #type(s: Session, text: string): void {
+    const line = this.#line(s, text);
     s.typed = s.pasteMode ? text : line;
     s.turnOutput = '';
     s.inTurn = true;
@@ -410,7 +431,7 @@ export class PtyCliAdapter implements AgentAdapter {
         this.#setState(
           s,
           'waiting_input',
-          `no prompt from ${this.id} for ${Math.round(stallMs / 1000)} s; it may be waiting for input in the terminal`,
+          `no prompt from ${this.id} for ${Math.round(stallMs / 1000)} s; it may be asking something: the next input is typed as the answer, or interrupt the turn`,
         );
       }
     }, 50);
@@ -469,7 +490,8 @@ export class PtyCliAdapter implements AgentAdapter {
 
   /** Known key formats, and the session's own secret values, are scrubbed from every event. */
   #emit(s: Session, e: AgentEvent): void {
-    s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
+    // Literal values first: a pattern that matched only part of one would leave the rest.
+    s.events.push(redactSecrets(scrubLiterals(e, s.secrets)));
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {

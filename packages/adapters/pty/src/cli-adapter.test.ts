@@ -169,9 +169,10 @@ describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
 
   it("scrubs the preset's secret values from events", { timeout: 60_000 }, async () => {
     for (const [env, secrets] of [
-      [{ FAKE_SECRET: 'plain-value-1234' }, ['plain-value-1234']],
-      // No secret list: the variable's name says it is one.
-      [{ FAKE_SECRET: 'plain-value-1234', FAKE_API_KEY: 'plain-value-1234' }, undefined],
+      // Listed, and a shorter listed secret that starts it: the whole value goes.
+      [{ FAKE_SECRET: 'plain-value-1234' }, ['plain', 'plain-value-1234']],
+      // Not listed: the variable's name says it is one.
+      [{ FAKE_SECRET: 'plain-value-1234' }, undefined],
     ] as const) {
       const a = withEnv({ ...env }, secrets ? [...secrets] : undefined);
       const h = await a.start({ cwd: root });
@@ -316,9 +317,12 @@ describe('PtyCliAdapter (scripted terminal)', () => {
     await adapter.send(h, { text: 'go' });
     pty().print('Overwrite? [y/N] ');
     const w = await tap.waitFor((e) => e.t === 'status' && e.state === 'waiting_input', 5000);
-    expect(w.event).toMatchObject({ message: expect.stringContaining('terminal') });
-    pty().print('y\r\ndone\r\n');
+    expect(w.event).toMatchObject({ message: expect.stringContaining('typed as the answer') });
+    // The next input is the answer, typed at once although the turn has not ended.
+    await adapter.send(h, { text: 'y' });
+    expect(pty().writes.at(-1)).toBe('y\r');
     await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, w.index + 1);
+    pty().print('y\r\ndone\r\n');
     pty().print('> ');
     await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, w.index + 1);
     await adapter.close(h);

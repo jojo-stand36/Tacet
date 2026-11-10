@@ -148,5 +148,7 @@ export interface AgentTerminal {
    * too far behind sees its stream end early; check `status()` before taking that as the end of
    * the session, and call `output()` again (with `scrollback()` to redraw) to go on watching.
    */
+  // Neither stream is scrubbed of secrets: it is the Worker's own terminal, shown to its user.
+  // Never log it or write it to the event log.
   output(): AsyncIterable<string>;
 }
