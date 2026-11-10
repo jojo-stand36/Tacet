@@ -61,7 +61,15 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
           $SUDO apt-get update -qq
-          $SUDO apt-get install -y -qq curl git ca-certificates build-essential python3
+          # bubblewrap and socat: Claude Workers on Linux run their commands in Claude Code's
+          # sandbox, which needs both, and refuse to start without them (#150, #163).
+          $SUDO apt-get install -y -qq curl git ca-certificates build-essential python3 bubblewrap socat
+          # The namespaces that sandbox uses must work in WSL2 too: fail here, with the reason,
+          # rather than in every Claude test. Not skipped if they don't (coordinator, #163 follow-up).
+          id -un
+          bwrap --version
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>/dev/null || true
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all true && echo "bwrap sandbox: ok"
           rm -rf ~/tacet && mkdir ~/tacet && cd ~/tacet
           git init -q
           git fetch -q --depth 1 'https://github.com/${{ github.repository }}.git' '${{ github.sha }}'
