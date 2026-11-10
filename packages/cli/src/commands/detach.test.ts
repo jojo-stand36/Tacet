@@ -4,6 +4,14 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawnDetachedWith } from './detach.js';
 
+/**
+ * Variables the OS itself adds to every process it starts, whatever its parent passed: macOS's
+ * CoreFoundation sets its text encoding (seen on the macOS CI runner).
+ */
+const OS_ADDED: Partial<Record<NodeJS.Platform, string[]>> = {
+  darwin: ['__CF_USER_TEXT_ENCODING'],
+};
+
 /** The real background start (#201), on a script that reports what it was given. */
 describe('spawnDetachedWith', () => {
   let dir: string;
@@ -11,6 +19,15 @@ describe('spawnDetachedWith', () => {
     dir = mkdtempSync(join(tmpdir(), 'tacet-detach-'));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // A secret in this process's environment, as a user's API key would be.
+  const SENTINEL = 'TACET_DETACH_TEST_SECRET';
+  beforeEach(() => {
+    process.env[SENTINEL] = 'sk-not-for-the-child';
+  });
+  afterEach(() => {
+    delete process.env[SENTINEL];
+  });
 
   it('starts it in a session of its own, with exactly the given environment, no stdin, output to the log', async () => {
     const script = join(dir, 'report.cjs');
@@ -43,11 +60,12 @@ describe('spawnDetachedWith', () => {
       ownGroup: boolean;
     };
     expect(got.argv).toEqual(['run', 'a task', '--detached-child']);
-    // Node may add a few variables of its own; nothing else of this process's environment.
+    // Exactly the given environment. The OS may add a variable of its own to every process it
+    // starts (named here, per platform); nothing of this process's environment gets through.
     expect(got.env.ONLY_THIS).toBe('yes');
-    for (const k of Object.keys(process.env)) {
-      if (!(k in env)) expect(got.env[k], k).toBeUndefined();
-    }
+    expect(got.env[SENTINEL]).toBeUndefined();
+    const added = Object.keys(got.env).filter((k) => !(k in env));
+    expect(added.filter((k) => !(OS_ADDED[process.platform] ?? []).includes(k))).toEqual([]);
     expect(got.stdin).toBe(0);
     expect(got.ownGroup).toBe(true);
     expect(rest.join('\n')).toContain('to the log too');
