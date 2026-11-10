@@ -71,6 +71,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
 - [ ] **Resolve keychain secret references in config** — `feature` `P2` `claude`
 - [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
+- [ ] **PTY adapters: don't leave a CLI's detached background processes running** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation
 
