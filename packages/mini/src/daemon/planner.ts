@@ -13,6 +13,7 @@ const Proposal = z.object({
         acceptanceCriteria: z.array(z.string().min(1)).min(1),
         kind: z.enum(['implement', 'review', 'explore']).optional(),
         dependsOn: z.array(z.string()).optional(),
+        indivisible: z.boolean().optional(),
       }),
     )
     .min(1)
@@ -50,6 +51,7 @@ export function parseProposal(text: string): {
       acceptanceCriteria: s.acceptanceCriteria,
       ...(s.kind ? { kind: s.kind } : {}),
       ...(s.dependsOn ? { dependsOn: s.dependsOn } : {}),
+      ...(s.indivisible ? { indivisible: true } : {}),
     })),
     ...(rationale !== undefined ? { rationale } : {}),
   };

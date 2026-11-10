@@ -36,8 +36,9 @@ export type WorkerStarted = z.infer<typeof WorkerStarted>;
 
 /**
  * Payload of `worker.profile`: the session profile the Mini-conductor's policy chose for a Worker
- * session, and why (#110). Written before the session starts, after `worker.started`. A profile
- * the adapter refused is recorded with `refused`; a retry gets its own event.
+ * session, and why (#110). Written with `worker.started`, before the session starts. If the
+ * adapter refuses it, it is written again with `refused`, and the profile the session then runs
+ * on gets its own event: the last one for a session is the one in force.
  */
 export const WorkerProfile = z.object({
   sessionId: Id,

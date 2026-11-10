@@ -31,6 +31,12 @@ export const TierConfig = z.strictObject({
     .optional()
     .describe('Models the policy may choose; `model` (the default) must be one of them'),
   max_effort: z.enum(EFFORT_LEVELS).optional().describe('Highest effort the policy may choose'),
+  escalate_effort_on_retry: z
+    .boolean()
+    .optional()
+    .describe(
+      'Raise effort one level per failed attempt, up to max_effort. Off by default; the retry policy itself is #34',
+    ),
   max_context_window: z
     .number()
     .int()

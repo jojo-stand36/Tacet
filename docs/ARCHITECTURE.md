@@ -126,7 +126,14 @@ Example repo config:
 ```yaml
 tiers:
   mini:    { adapter: claude-sdk, model: sonnet, effort: medium }
-  worker:  { adapter: codex-app-server, model: gpt-codex-mini, effort: low }
+  worker:                   # bounds: what the session-profile policy may choose (#110)
+    adapter: codex-app-server
+    model: gpt-5.5            # the default; must be one of models
+    models: [gpt-5.5, gpt-6-luna]
+    effort: low
+    max_effort: high
+    # escalate_effort_on_retry: true   # off by default; the retry policy is #34
+    # max_context_window: 1000000      # absent: never a larger window; hand off instead
   review:  { adapter: claude-sdk, model: opus, cross_vendor: true }
 escalation:
   autonomy: medium
@@ -166,11 +173,26 @@ events:
 **Merge semantics** (#7, `@tacet/core` `mergeConfig`, loaded by `loadConfig` in `@tacet/core/node`):
 
 - Precedence, lowest first: built-in defaults, user, repo, local, task. Objects merge key by key; a higher layer's scalar or array replaces the lower one.
+- The task layer may not set the tier bounds (`tiers.*.models`, `max_effort`, `max_context_window`), and the merged `model` and `effort` must lie within them (#110).
 - The task layer may only **lower** `workers.*`, never raise it, because the Worker pool is repo-wide (owner decision, 2026-11-09): a raise is a config error. It may not set `workers.env` at all, and the committed repo layer may not name a secret-looking variable in `workers.env.pass` (#147, §6).
 - Exception: `policies`, `escalation.always_ask` and `workers.env.pass` are **unioned** across layers, so a repo or local file cannot silently drop a safety rule or a toolchain variable set elsewhere. Policy evaluation (#25) checks task, local, repo, then user rules, and a `deny` anywhere wins.
 - Config is validated strictly: an unknown key or enum value is an error with file, line and column, and all errors are reported at once.
 - Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A keychain reference is read at startup from the OS keychain (#160): `security find-generic-password` on macOS, or `secret-tool lookup` (a Secret Service keyring such as gnome-keyring) on Linux. It is never unlocked by Tacet; the value must be printable ASCII (one trailing newline is dropped); and a missing, locked or unreadable item is a startup error naming its config path, never a value (details: [spike #160](adapters/spikes/160-keychain/README.md)). A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
 - `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
+
+**Session profile** (#110). Each Worker session runs on a profile, `SessionProfile { model, effort?, contextWindow? }` in `@tacet/core`. The Mini-conductor chooses it with `chooseProfile` (`packages/mini/src/daemon/profile.ts`) from the tier and its bounds, the sub-task and its failed attempts:
+
+- **Model:** the tier's `model`, else the first of `models`.
+- **Effort:** the tier's `effort`. With `escalate_effort_on_retry` it rises one level per failed attempt, up to `max_effort`. Levels are ordered `none` < `minimal` < `low` < `medium` < `high` < `xhigh` < `max` < `ultra` (`EFFORT_LEVELS`).
+- **Context window:** a cost lever, off by default. Tacet hands off at the `handoff` threshold (§2.3, #31). It opts into a larger window only for a sub-task the planner marked `indivisible`, when `max_context_window` allows it and the adapter lists such a size (`contextSizes`).
+
+Every choice is written as a `worker.profile` event with a reason for each part, next to `worker.started`. A profile outside the bounds fails the sub-task before any session starts.
+
+Adapters declare what they can honour: `effortSwitch` (`per-turn` or `per-session`) and `contextSizes`. Anything they cannot honour they refuse with `ProfileRefusedError` instead of ignoring it (capability matrix §7):
+- Claude refuses levels the model lacks, and the 1M window outside Sonnet 4/4.5.
+- Codex checks every level against `model/list` and refuses every window.
+
+When an adapter refuses the effort, the Mini-conductor runs the session at the model's default effort and logs the refusal; that is not a failed attempt. Budget headroom is not an input yet: the cost ledger is #35. Task-type rules and per-task overrides are #33.
 
 ## 5. Packages (monorepo)
 
