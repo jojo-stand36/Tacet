@@ -5,6 +5,7 @@ export {
   isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,
+  miniLockHolder,
   VERIFY_CODEX_WORKERS,
 } from './daemon/daemon.js';
 export {
@@ -37,13 +38,13 @@ export {
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
 export { type ReviewDiff, type ReviewDiffOptions, reviewDiff } from './git/diff.js';
-export { GitWorktrees, type GitWorktreesOptions } from './git/worktrees.js';
 export {
   GitIntegrator,
   type Integration,
   integrateWorktree,
   taskBranch,
 } from './git/integrate.js';
+export { GitWorktrees, type GitWorktreesOptions } from './git/worktrees.js';
 export {
   type EscalationGate,
   EventLogBackend,
