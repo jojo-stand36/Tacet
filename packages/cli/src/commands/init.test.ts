@@ -74,7 +74,24 @@ beforeEach(() => {
     JSON.stringify({ scripts: { test: 'vitest', lint: 'biome check' } }),
   );
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+/**
+ * Gives the owner write access to every directory under `root`. A test that makes a directory
+ * read-only leaves read-only copies too (a backup keeps modes), which `rmSync` cannot empty unless
+ * the tests run as root.
+ */
+function makeWritable(root: string): void {
+  for (const e of readdirSync(root, { withFileTypes: true })) {
+    if (!e.isDirectory()) continue;
+    const at = join(root, e.name);
+    chmodSync(at, 0o700);
+    makeWritable(at);
+  }
+}
+
+afterEach(() => {
+  makeWritable(dir);
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe('tacet init (#20)', () => {
   it('writes only .tacet/ and leaves the repo’s agent files and .gitignore byte-identical', async () => {
@@ -424,7 +441,8 @@ describe('tacet uninstall (#20)', () => {
         expect(at && existsSync(join(at, '.tacet', 'sub', 'f'))).toBe(true);
       }
     } finally {
-      if (existsSync(sub)) chmodSync(sub, 0o700);
+      // The backup keeps sub's mode too; afterEach makes both writable again.
+      makeWritable(dir);
     }
   });
 
