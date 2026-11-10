@@ -183,6 +183,23 @@ export function parseClaudeHook(body: unknown): ClaudeHook | undefined {
   return r.success ? r.data : undefined;
 }
 
+/**
+ * The `PreToolUse` answer for a tool call: every tool but Tacet's own MCP tools must ask, so the
+ * decision reaches Tacet as a `PermissionRequest`, even for tools Claude Code would run without
+ * asking (Read, Glob, ...). Matches the Mini-conductor's policy until the escalation gate (#25)
+ * decides per tool. Tacet's tools follow Claude Code's own flow.
+ */
+export function preToolUseDecision(toolName: string): object | undefined {
+  if (toolName.startsWith('mcp__tacet__')) return undefined;
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'ask',
+      permissionDecisionReason: 'Tacet decides every tool call',
+    },
+  };
+}
+
 /** `PermissionRequest` answers (capability matrix §1). */
 export const allowPermission = () => ({
   hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },

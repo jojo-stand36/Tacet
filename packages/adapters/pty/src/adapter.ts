@@ -38,6 +38,7 @@ import {
   denyPermission,
   parseClaudeHook,
   prepareClaudeConfigDir,
+  preToolUseDecision,
 } from './claude.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
@@ -431,16 +432,12 @@ export class PtyAdapter implements AgentAdapter {
     switch (ev.hook_event_name) {
       case 'SessionStart':
         s.ready();
-        {
-          reply();
-          return;
-        }
+        reply();
+        return;
       case 'UserPromptSubmit':
         if (s.state !== 'running') this.#setState(s, 'running');
-        {
-          reply();
-          return;
-        }
+        reply();
+        return;
       case 'PreToolUse':
         s.lastToolUseId = ev.tool_use_id;
         this.#emit(s, {
@@ -449,17 +446,13 @@ export class PtyAdapter implements AgentAdapter {
           name: ev.tool_name,
           input: ev.tool_input ?? {},
         });
-        {
-          reply();
-          return;
-        }
+        reply(preToolUseDecision(ev.tool_name));
+        return;
       case 'PostToolUse':
       case 'PostToolUseFailure':
         this.#toolResult(s, ev.tool_use_id, ev.hook_event_name === 'PostToolUse');
-        {
-          reply();
-          return;
-        }
+        reply();
+        return;
       case 'PermissionRequest': {
         const id = `perm-${randomUUID()}`;
         s.approvals.set(id, { reply, toolUseId: s.lastToolUseId });
@@ -485,10 +478,8 @@ export class PtyAdapter implements AgentAdapter {
         if (ev.notification_type === 'permission_prompt' && s.approvals.size === 0) {
           this.#setState(s, 'waiting_input', 'a permission dialog waits in the terminal');
         }
-        {
-          reply();
-          return;
-        }
+        reply();
+        return;
       case 'Stop':
         if (ev.last_assistant_message) {
           this.#emit(s, { t: 'message.delta', text: ev.last_assistant_message });
@@ -498,16 +489,12 @@ export class PtyAdapter implements AgentAdapter {
           'idle',
           ev.background_tasks?.length ? 'background tasks still running' : undefined,
         );
-        {
-          reply();
-          return;
-        }
+        reply();
+        return;
       case 'StopFailure':
         this.#turnEnded(s, 'idle', 'the turn failed');
-        {
-          reply();
-          return;
-        }
+        reply();
+        return;
     }
   }
 

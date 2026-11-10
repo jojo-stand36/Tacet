@@ -7,6 +7,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -117,6 +118,28 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
     expect(next.events.find((e) => e.t === 'message.delta')).toMatchObject({
       text: expect.stringContaining('You said again'),
     });
+    await adapter.close(h);
+  });
+
+  it('asks Tacet before every tool call, read-only ones included', {
+    timeout: 120_000,
+  }, async () => {
+    const h = await adapter.start({ cwd: worktree });
+    const tap = new EventTap(adapter.events(h));
+    writeFileSync(join(worktree, 'note.txt'), 'hello');
+    await adapter.send(h, { text: `READ_TOOL ${join(worktree, 'note.txt')}` });
+    // Claude Code reads a file in its working directory without asking on its own; the adapter's
+    // PreToolUse answer makes it ask.
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000);
+    expect(req.event).toMatchObject({ toolName: 'Read' });
+    if (req.event.t !== 'approval.request') throw new Error('no approval request');
+    await adapter.respond(h, req.event.id, { kind: 'reject', persist: false });
+    const end = await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index);
+    expect(tap.events.slice(req.index, end.index).find((e) => e.t === 'tool.result')).toMatchObject(
+      {
+        ok: false,
+      },
+    );
     await adapter.close(h);
   });
 
