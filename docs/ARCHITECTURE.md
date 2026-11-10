@@ -188,6 +188,8 @@ events:
 - Secrets never appear in config. Literal credentials (API keys, tokens, private keys) are rejected without echoing them; use `{ env: NAME }` or `{ keychain: service/account }`. A keychain reference is read at startup from the OS keychain (#160): `security find-generic-password` on macOS, or `secret-tool lookup` (a Secret Service keyring such as gnome-keyring) on Linux. It is never unlocked by Tacet; the value must be printable ASCII (one trailing newline is dropped); and a missing, locked or unreadable item is a startup error naming its config path, never a value (details: [spike #160](adapters/spikes/160-keychain/README.md)). A higher layer replaces a secret reference whole (`secrets.*`, `agents.*.env.*`), so switching from `env` to `keychain` never keeps both, and the merged result is validated against the schema again.
 - `tacet config explain [--json]` prints every effective value with the layer and file that set it. The output is deterministic.
 
+**Setting up a repo** (#20). `tacet init [--worker ADAPTER] [--model MODEL]` writes the repo layer `.tacet/tacet.yaml` and `.tacet/.gitignore` (which ignores `local.yaml`), each only when it is absent, so a re-run changes nothing. It writes nothing outside `.tacet/`: not the root `.gitignore`, not `~/.tacet`, and not the repo's own agent files (`CLAUDE.md`, `AGENTS.md`, `.claude/`). The generated config sets `tiers.worker` (default `claude-sdk`; `codex-app-server`, `acp:gemini` and `acp:claude-acp` on request) and its `model` when given or typed at the prompt; it never guesses a model id. `tiers.mini`, `verify` (suggested from `package.json` scripts) and review stay commented out: a Worker checkout is a fresh worktree, so a verify command that needs installed dependencies would fail there. Init reports which adapters can run (the bundled ones, or the ACP agent's command on `PATH`) and which API-key variables are set, by name; it never reads values or vendor logins. Each file starts with a header carrying a hash of its contents, so `tacet uninstall` (a preview; `--apply` acts) removes only the files init wrote and nobody changed, then `.tacet/` if it is empty. `--purge` removes all of `.tacet/` after copying it to `~/.tacet/backups/<repo>-<hash>/uninstall-<time>/`. Neither touches the run state under `~/.tacet/state`.
+
 **Session profile** (#110). Each Worker session runs on a profile, `SessionProfile { model, effort?, contextWindow? }` in `@tacet/core`. The Mini-conductor chooses it with `chooseProfile` (`packages/mini/src/daemon/profile.ts`) from the tier and its bounds, the sub-task and its failed attempts:
 
 - **Model:** the tier's `model`, else the first of `models`.
@@ -212,7 +214,7 @@ When an adapter refuses a part, the Mini-conductor logs it and starts the sessio
 | `@tacet/adapter-*` | `claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty` |
 | `@tacet/web` | React UI: board, inbox, live terminals (xterm.js), cost |
 | `@tacet/tui` | Ink-based terminal mode |
-| `tacet` (cli) | `tacet up`, `tacet init`, `tacet status`, `tacet attach`; in standalone mode today (#21) `tacet run`, `tacet status`, `tacet logs`, `tacet attach` and `tacet config explain` |
+| `tacet` (cli) | `tacet up`, `tacet init`, `tacet status`, `tacet attach`; in standalone mode today (#21, #20) `tacet init`, `tacet uninstall`, `tacet run`, `tacet status`, `tacet logs`, `tacet attach` and `tacet config explain` |
 
 ### Interop
 
