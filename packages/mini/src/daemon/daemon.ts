@@ -842,10 +842,22 @@ export class MiniConductor {
           causationId: result.id,
         });
       }
+      // Owner decision on #210: a commit this task integrated and then replaced with a later
+      // integration of the same sub-task (an amend in a fix round) counts as covered once the task
+      // landed. Reflog reachability alone never does: the manager still keeps anything else.
+      const superseded: string[] = [];
+      for (const sub of subs) {
+        const integrated = this.#o.store
+          .query({ taskId: sub, typePrefix: 'worker.integrated' })
+          .map((e) => (e.envelope.data as { commit?: unknown }).commit)
+          .filter((c): c is string => typeof c === 'string');
+        superseded.push(...integrated.slice(0, -1));
+      }
+      const landedCommits = [...new Set([published.commit, ...superseded])];
       for (const id of left) {
         if (!this.#live(gen)) return;
-        // Kept (local files, or work the result does not contain) until the user forces it.
-        await this.#o.workspaces.remove(id, { landed: [published.commit] }).catch(() => {});
+        // Kept (local files, or work none of these contain) until the user forces it.
+        await this.#o.workspaces.remove(id, { landed: landedCommits }).catch(() => {});
       }
     }
   }

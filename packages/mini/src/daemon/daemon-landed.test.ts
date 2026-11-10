@@ -6,6 +6,7 @@ import type { SummaryPacket, TacetConfig, TaskLanded } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitIntegrator } from '../git/integrate.js';
+import { CommandVerifier } from '../verify/command-verifier.js';
 import { WorktreeManager } from '../worktree.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
@@ -65,11 +66,12 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
   });
 
   async function runTask(
-    script: (cwd: string) => void,
+    script: (cwd: string, input: string) => void,
     worktrees?: TacetConfig['worktrees'],
+    verify?: string[],
   ): Promise<{ id: string; published: { ref: string; commit: string } }> {
-    const fake = new ScriptedAdapter('fake', (_input, s): Script => {
-      script(s.opts.cwd);
+    const fake = new ScriptedAdapter('fake', (input, s): Script => {
+      script(s.opts.cwd, input);
       return { do: 'reply', text: 'done' };
     });
     daemon = new MiniConductor({
@@ -77,7 +79,18 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       config: {
         tiers: { worker: { adapter: 'fake', model: 'cheap' } },
         ...(worktrees ? { worktrees } : {}),
+        ...(verify ? { verify, workers: { verify_fix_attempts: 2 } } : {}),
       },
+      ...(verify
+        ? {
+            verifier: new CommandVerifier({
+              repoRoot: repo,
+              commands: verify,
+              env: { PATH: env.PATH ?? '', HOME: env.HOME ?? '' },
+              gitEnv: env,
+            }),
+          }
+        : {}),
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
       workspaces: manager,
       integrator: new GitIntegrator(repo, env),
@@ -169,5 +182,43 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     await vi.waitFor(() => expect(landedEvents(id)).toHaveLength(1), { timeout: 3_000 });
     await severalSweeps();
     expect(await manager.list()).toHaveLength(1);
+  });
+
+  describe('commits superseded within the task (owner decision on #210)', () => {
+    /** First turn commits without `fixed.txt`; told verification failed, the Worker amends. */
+    const amendInFixRound = (cwd: string, input: string) => {
+      if (input.startsWith('Verification failed')) {
+        writeFileSync(join(cwd, 'fixed.txt'), 'fixed\n');
+        workerGit(cwd, ['add', 'fixed.txt']);
+        workerGit(cwd, ['commit', '--amend', '-qm', 'work, fixed']);
+      } else commitWork(cwd);
+    };
+
+    it('removes the checkout when an integrated commit was replaced by a later integration', async () => {
+      const { id, published } = await runTask(amendInFixRound, undefined, ['test -f fixed.txt']);
+      const integrated = store
+        .query({ taskId: `${id}/1`, typePrefix: 'worker.integrated' })
+        .map((e) => (e.envelope.data as { commit: string }).commit);
+      expect(integrated).toHaveLength(2);
+      squashIntoMain(published.commit);
+
+      await vi.waitFor(async () => expect(await manager.list()).toEqual([]), { timeout: 3_000 });
+      expect(landedEvents(id)).toHaveLength(1);
+    });
+
+    it('keeps the checkout for a commit only the reflog reached, never integrated', async () => {
+      const { id, published } = await runTask((cwd) => {
+        commitWork(cwd);
+        // Thrown away before any integration: only the Worker's reflog and store hold it.
+        workerGit(cwd, ['reset', '-q', '--hard', 'HEAD~1']);
+        writeFileSync(join(cwd, 'kept.txt'), 'kept\n');
+        workerGit(cwd, ['add', 'kept.txt']);
+        workerGit(cwd, ['commit', '-qm', 'kept']);
+      });
+      squashIntoMain(published.commit);
+      await vi.waitFor(() => expect(landedEvents(id)).toHaveLength(1), { timeout: 3_000 });
+      await severalSweeps();
+      expect(await manager.list()).toHaveLength(1);
+    });
   });
 });
