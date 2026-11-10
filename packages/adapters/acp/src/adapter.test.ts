@@ -87,6 +87,38 @@ describe('AcpAdapter (fake ACP agent)', () => {
       : [];
   const methods = () => received().flatMap((l) => (l.received?.method ? [l.received] : []));
 
+  it("leaves none of the agent's processes running after close, even one ignoring SIGTERM", async () => {
+    const adapter = make(
+      GEMINI_AGENT,
+      { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+      {
+        killTimeoutMs: 300,
+      },
+    );
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const pid = received()
+      .map((l) => (l as { childPid?: number }).childPid)
+      .find((p) => p !== undefined);
+    expect(pid).toBeTypeOf('number');
+    await adapter.close(h);
+    // Running, not a zombie its parent (here: an init that may not reap) has yet to collect.
+    const alive = (() => {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+      } catch {
+        try {
+          process.kill(pid as number, 0);
+          return process.platform !== 'linux';
+        } catch {
+          return false;
+        }
+      }
+    })();
+    if (alive) process.kill(pid as number, 'SIGKILL');
+    expect(alive).toBe(false);
+  });
+
   it('exposes why an agent may not run Workers (#183)', () => {
     expect(make(CODEX_ACP_AGENT).workerRefused).toMatch(/#183/);
     expect(make(GEMINI_AGENT).workerRefused).toBeUndefined();

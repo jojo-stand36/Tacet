@@ -1,6 +1,14 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
@@ -757,11 +765,20 @@ export class AcpAdapter implements AgentAdapter {
         new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
       ]);
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (await within(Math.min(500, timeout))) return;
-    if (!hasExited()) signalGroup(proc, 'SIGTERM');
-    if (await within(timeout)) return;
-    if (!hasExited()) signalGroup(proc, 'SIGKILL');
-    await exited;
+    if (!(await within(Math.min(500, timeout)))) {
+      if (!hasExited()) signalGroup(proc, 'SIGTERM');
+      if (!(await within(timeout))) {
+        if (!hasExited()) signalGroup(proc, 'SIGKILL');
+        await exited;
+      }
+    }
+    // The agent's own children (claude-agent-acp's Claude Code, its MCP servers) got SIGTERM
+    // when it exited, but may still be shutting down and writing: wait for the whole group, so
+    // nothing of a closed session is left running (#181 CI).
+    if (!(await groupGone(proc, timeout))) {
+      signalGroup(proc, 'SIGKILL');
+      await groupGone(proc, 1000);
+    }
   }
 
   #live(h: SessionHandle): Session {
@@ -788,6 +805,52 @@ function drained(proc: ChildProcess): Promise<void> {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Whether the process group `proc` led has no member left, polled until `ms` passes. Only once
+ * `proc` itself has exited: until then its pid is the group's. On Windows, `proc` is all there is.
+ */
+async function groupGone(proc: ChildProcess, ms: number): Promise<boolean> {
+  if (proc.pid === undefined || process.platform === 'win32') return true;
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (!groupAlive(proc.pid)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 50).unref());
+  }
+}
+
+/**
+ * Whether process group `pgid` has a running member. On Linux, from `/proc`: a zombie is not
+ * running (its parent, often an init that does not reap orphans in a container, has yet to reap
+ * it), though `kill(-pgid, 0)` would still find it. Elsewhere, by signal 0.
+ */
+function groupAlive(pgid: number): boolean {
+  if (process.platform === 'linux') {
+    try {
+      return readdirSync('/proc').some((d) => {
+        if (!/^\d+$/.test(d)) return false;
+        try {
+          // Fields after the parenthesised command name: state, ppid, pgrp.
+          const stat = readFileSync(`/proc/${d}/stat`, 'utf8');
+          const [state, , pgrp] = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+          return Number(pgrp) === pgid && state !== 'Z';
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      // No /proc: fall through.
+    }
+  }
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    // ESRCH: the group is empty. (EPERM would be a member we may not signal: not ours.)
+    return false;
+  }
 }
 
 /** Signal the process group `proc` leads (POSIX), or just `proc`. Already-gone is fine. */
