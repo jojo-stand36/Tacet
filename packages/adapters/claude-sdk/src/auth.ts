@@ -1,5 +1,5 @@
-import { accessSync, constants } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { accessSync, constants, statSync } from 'node:fs';
+import { delimiter, isAbsolute, join } from 'node:path';
 import type { EnvAllow } from '@tacet/core';
 
 /**
@@ -138,10 +138,13 @@ export class SubprocessScrubError extends Error {
 }
 
 function onPath(name: string, path: string | undefined): boolean {
+  // Absolute entries only: a relative one would resolve against Tacet's own directory.
   for (const dir of (path ?? '').split(delimiter)) {
-    if (!dir) continue;
+    if (!isAbsolute(dir)) continue;
     try {
-      accessSync(join(dir, name), constants.X_OK);
+      const file = join(dir, name);
+      if (!statSync(file).isFile()) continue;
+      accessSync(file, constants.X_OK);
       return true;
     } catch {
       // Not here.

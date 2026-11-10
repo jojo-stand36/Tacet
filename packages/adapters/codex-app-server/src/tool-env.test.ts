@@ -44,23 +44,29 @@ describe('Codex Worker tool environment', () => {
       baseEnv: { PATH: process.env.PATH, HOME: home, OPENAI_API_KEY: KEY, MYAPP_SETTING: 'kept' },
       envPolicy: { pass: ['MYAPP_SETTING'] },
     });
-    const h = await a.start({ cwd });
-    try {
-      const tap = new EventTap(a.events(h));
-      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
-      await a.send(h, { text: 'RUN_CMD env' });
-      const end = await tap.waitFor(
-        (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'error'),
-        60_000,
-        2,
-      );
-      expect(end.event).toMatchObject({ state: 'idle' });
-      const out = api.requests.find((r) => r.toolOutput)?.toolOutput ?? '';
-      expect(out).toContain('MYAPP_SETTING=kept');
-      expect(out).not.toContain(KEY);
-      expect(out).not.toMatch(/^(OPENAI|CODEX)_API_KEY=/m);
-    } finally {
-      await a.close(h);
+    // A new thread, then the same thread resumed: both get the policy (#150).
+    let resume: string | undefined;
+    for (const round of ['start', 'resume']) {
+      const h = await a.start({ cwd, ...(resume ? { resume: { vendorSessionId: resume } } : {}) });
+      try {
+        const tap = new EventTap(a.events(h));
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
+        const from = api.requests.length;
+        await a.send(h, { text: 'RUN_CMD env' });
+        const end = await tap.waitFor(
+          (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'error'),
+          60_000,
+          2,
+        );
+        expect(end.event, round).toMatchObject({ state: 'idle' });
+        const out = api.requests.slice(from).find((r) => r.toolOutput)?.toolOutput ?? '';
+        expect(out, round).toContain('MYAPP_SETTING=kept');
+        expect(out, round).not.toContain(KEY);
+        expect(out, round).not.toMatch(/^(OPENAI|CODEX)_API_KEY=/m);
+        resume = h.vendorSessionId;
+      } finally {
+        await a.close(h);
+      }
     }
   });
 });

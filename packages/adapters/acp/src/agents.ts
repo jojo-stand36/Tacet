@@ -49,14 +49,18 @@ export interface AcpAgentSpec {
    * written there before every session. Used to give the agent settings without the user's.
    */
   home?: { env: string; files: Readonly<Record<string, string>> };
+  /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
+  envDeny?: readonly string[];
 }
 
 /**
  * Gemini CLI settings for Workers (#150), verified live on 0.67.0 over ACP: with them, a shell
  * command the Worker runs gets no `GEMINI_API_KEY` (redaction drops secret-looking names, and
- * never lets one back in through `allowed`), and no `.env` is loaded, neither the checkout's nor
- * `~/.env`. They only take effect as user settings: the system settings and system defaults
- * paths had no effect in ACP mode, and `--ignore-env` is refused by the argument parser.
+ * never lets one back in through `allowed`), and no `.env` of the checkout or its parents is
+ * loaded (`ignoreLocalEnv`). The user's `~/.env` stays out because Gemini looks for it in its
+ * home, which is `GEMINI_CLI_HOME`. They only take effect as user settings: the system settings
+ * and system defaults paths had no effect in ACP mode, and `--ignore-env` is refused by the
+ * argument parser.
  */
 export const GEMINI_WORKER_SETTINGS = {
   security: { environmentVariableRedaction: { enabled: true } },
@@ -108,6 +112,9 @@ export const GEMINI_AGENT: AcpAgentSpec = {
     env: 'GEMINI_CLI_HOME',
     files: { '.gemini/settings.json': `${JSON.stringify(GEMINI_WORKER_SETTINGS, null, 2)}\n` },
   },
+  // It would trust the checkout, and a trusted folder's `.gemini/.env` loads whatever
+  // `ignoreLocalEnv` says (bundle `findEnvFile`).
+  envDeny: ['GEMINI_CLI_TRUST_WORKSPACE'],
 };
 
 /**

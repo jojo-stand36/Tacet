@@ -120,7 +120,7 @@ export interface PtyAdapterOptions {
   rows?: number;
   /**
    * Whether the commands the Worker runs get its credentials stripped (#150). Default `true`;
-   * `false` only for tests that replace Claude Code (`spawn`).
+   * `false` is honoured only with `spawn` (a test that replaces Claude Code).
    */
   subprocessScrub?: boolean;
   /** Replaces node-pty; for tests. */
@@ -251,7 +251,8 @@ export class PtyAdapter implements AgentAdapter {
     this.#opts.onEnvDropped?.(filtered.dropped);
     const keyed = authEnv('api_key', { ...filtered.env, ...opts.env });
     // The commands the Worker runs never see its key (#150).
-    const env = this.#opts.subprocessScrub === false ? keyed : withSubprocessScrub(keyed);
+    const env =
+      this.#opts.subprocessScrub === false && this.#opts.spawn ? keyed : withSubprocessScrub(keyed);
 
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };

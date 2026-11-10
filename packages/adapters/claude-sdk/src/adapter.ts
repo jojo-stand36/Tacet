@@ -86,7 +86,7 @@ export interface ClaudeSdkAdapterOptions {
   >;
   /**
    * Whether the commands an API-key Worker runs get its credentials stripped (#150). Default
-   * `true`; `false` only for tests that replace the Claude Code binary (`query`).
+   * `true`; `false` is honoured only with `query` (a test that replaces the Claude Code binary).
    */
   subprocessScrub?: boolean;
   /** Replaces the SDK's `query()`; for tests. */
@@ -206,7 +206,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     });
     // An API-key Worker's commands never see the key (#150); a login session has none to hide.
     const env =
-      route === 'api_key' && this.#opts.subprocessScrub !== false
+      route === 'api_key' && !(this.#opts.subprocessScrub === false && this.#opts.query)
         ? withSubprocessScrub(routed)
         : routed;
     // Tacet owns the effort: this variable overrides the `effort` option and later

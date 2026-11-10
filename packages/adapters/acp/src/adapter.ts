@@ -402,6 +402,7 @@ export class AcpAdapter implements AgentAdapter {
     for (const [k, v] of Object.entries({ ...filtered.env, ...spec.env, ...opts.env })) {
       if (v !== undefined) env[k] = v;
     }
+    for (const k of spec.envDeny ?? []) delete env[k];
     if (spec.home) env[spec.home.env] = this.#prepareHome(spec, opts.cwd);
     if (spec.apiKeyEnv.length > 0 && !spec.apiKeyEnv.some((k) => env[k])) {
       throw new AuthRoutingError(
@@ -432,6 +433,10 @@ export class AcpAdapter implements AgentAdapter {
       if (!path.startsWith(`${dir}/`))
         throw new Error(`${spec.id}: home file ${rel} is outside it`);
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      // Never written through a symlink a session left in the home.
+      for (let d = dirname(path); d !== dir; d = dirname(d)) {
+        if (!lstatSync(d).isDirectory()) throw new Error(`${spec.id}: ${d} is not a directory`);
+      }
       const tmp = `${path}.tacet-${process.pid}-${randomUUID()}`;
       writeFileSync(tmp, content, { mode: 0o600, flag: 'wx' });
       renameSync(tmp, path);

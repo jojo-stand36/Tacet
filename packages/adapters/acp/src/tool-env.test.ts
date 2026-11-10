@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from './adapter.js';
-import { GEMINI_AGENT } from './agents.js';
+import { type AcpAgentSpec, GEMINI_AGENT } from './agents.js';
 import { type MockGeminiApi, startMockGeminiApi } from './testing/mock-gemini-api.js';
 
 const require = createRequire(import.meta.url);
@@ -25,11 +25,14 @@ const KEY = 'gm-tool-env-placeholder-0000000000';
 
 /**
  * #150: a shell command a Gemini Worker runs gets neither the API key nor what a `.env` file
- * holds (the checkout's, or `~/.env`). Real Gemini CLI over ACP against the mock Gemini API.
+ * holds. Real Gemini CLI over ACP against the mock Gemini API. Gemini's redaction also hides the
+ * `.env` variables it loads (they are on its never-allowed list), so each setting is checked on
+ * its own, with redaction off, against a control run that shows the load happening without it.
  */
 describe('Gemini Worker tool environment', () => {
   let api: MockGeminiApi;
   let root: string;
+  let n = 0;
 
   beforeAll(async () => {
     api = await startMockGeminiApi();
@@ -40,52 +43,102 @@ describe('Gemini Worker tool environment', () => {
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  it('keeps the API key and .env files away from tool commands', { timeout: 120_000 }, async () => {
-    const home = join(root, 'home');
-    const cwd = join(root, 'wt');
-    mkdirSync(home);
-    mkdirSync(cwd);
-    // Gemini loads a `.env` it finds, but only one: so each run below has one of them.
-    writeFileSync(join(home, '.env'), 'GOOGLE_CLOUD_LOCATION=from-home-dotenv\n');
+  /** Gemini's spec with other Worker settings, or none at all (`home: undefined`). */
+  const withSettings = (settings: object | undefined, over: Partial<AcpAgentSpec> = {}) => {
+    const spec: AcpAgentSpec = { ...GEMINI_AGENT, ...over };
+    if (settings === undefined) delete spec.home;
+    else
+      spec.home = {
+        env: 'GEMINI_CLI_HOME',
+        files: { '.gemini/settings.json': JSON.stringify(settings) },
+      };
+    return spec;
+  };
+
+  /** One session in a fresh checkout and home: the environment its shell tool saw. */
+  async function toolEnv(
+    agent: AcpAgentSpec,
+    files: { repoEnv?: string; repoGeminiEnv?: string; homeEnv?: string } = {},
+    extraEnv: Record<string, string> = {},
+  ): Promise<{ out: string; home: string }> {
+    const dir = join(root, `run-${++n}`);
+    const home = join(dir, 'home');
+    const cwd = join(dir, 'wt');
+    mkdirSync(home, { recursive: true });
+    mkdirSync(join(cwd, '.gemini'), { recursive: true });
+    if (files.repoEnv) writeFileSync(join(cwd, '.env'), files.repoEnv);
+    if (files.repoGeminiEnv) writeFileSync(join(cwd, '.gemini', '.env'), files.repoGeminiEnv);
+    if (files.homeEnv) writeFileSync(join(home, '.env'), files.homeEnv);
     const a = new AcpAdapter({
-      agent: GEMINI_AGENT,
+      agent,
       executable: [process.execPath, GEMINI],
       killTimeoutMs: 2000,
-      stateDir: join(root, 'state'),
+      stateDir: join(dir, 'state'),
       baseEnv: {
         PATH: process.env.PATH,
         HOME: home,
         GEMINI_API_KEY: KEY,
         GOOGLE_GEMINI_BASE_URL: api.url,
         MYAPP_SETTING: 'kept',
+        ...extraEnv,
       },
       envPolicy: { pass: ['MYAPP_SETTING'] },
     });
-    for (const repoDotenv of [false, true]) {
-      if (repoDotenv) writeFileSync(join(cwd, '.env'), 'GOOGLE_CLOUD_PROJECT=from-repo-dotenv\n');
-      rmSync(join(cwd, 'tool-env.txt'), { force: true });
-      const h = await a.start({ cwd });
-      try {
-        const tap = new EventTap(a.events(h));
-        await a.send(h, { text: 'ENV_TOOL' });
-        // The shell tool asks first: allow it, then wait for the turn to end.
-        const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000);
-        if (req.event.t !== 'approval.request') throw new Error('no approval request');
-        await a.respond(h, req.event.id, { kind: 'allow_once', persist: false });
-        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index + 1);
-      } finally {
-        await a.close(h);
-      }
-      const file = join(cwd, 'tool-env.txt');
-      expect(existsSync(file)).toBe(true);
-      const out = readFileSync(file, 'utf8');
-      expect(out).toContain('MYAPP_SETTING=kept');
-      expect(out).not.toContain(KEY);
-      expect(out).not.toMatch(/^GEMINI_API_KEY=/m);
-      expect(out).not.toContain('from-home-dotenv');
-      expect(out).not.toContain('from-repo-dotenv');
+    const h = await a.start({ cwd });
+    try {
+      const tap = new EventTap(a.events(h));
+      await a.send(h, { text: 'ENV_TOOL' });
+      // The shell tool asks first: allow it, then wait for the turn to end.
+      const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000);
+      if (req.event.t !== 'approval.request') throw new Error('no approval request');
+      await a.respond(h, req.event.id, { kind: 'allow_once', persist: false });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index + 1);
+    } finally {
+      await a.close(h);
     }
-    // The user's own Gemini settings are never written: only Tacet's home for the agent.
+    const file = join(cwd, 'tool-env.txt');
+    expect(existsSync(file)).toBe(true);
+    return { out: readFileSync(file, 'utf8'), home };
+  }
+
+  it('Worker settings: no API key in tool commands; the user’s ~/.gemini untouched', {
+    timeout: 120_000,
+  }, async () => {
+    const { out, home } = await toolEnv(GEMINI_AGENT);
+    expect(out).toContain('MYAPP_SETTING=kept');
+    expect(out).not.toContain(KEY);
+    expect(out).not.toMatch(/^GEMINI_API_KEY=/m);
     expect(existsSync(join(home, '.gemini', 'settings.json'))).toBe(false);
+  });
+
+  it('ignoreLocalEnv keeps the checkout’s .env out (control: it loads without)', {
+    timeout: 120_000,
+  }, async () => {
+    const repoEnv = 'GOOGLE_CLOUD_PROJECT=from-repo-dotenv\n';
+    expect((await toolEnv(withSettings({}), { repoEnv })).out).toContain('from-repo-dotenv');
+    const ignored = withSettings({ advanced: { ignoreLocalEnv: true } });
+    expect((await toolEnv(ignored, { repoEnv })).out).not.toContain('from-repo-dotenv');
+  });
+
+  it('a trusted checkout’s .gemini/.env stays out: the trust variable is never passed', {
+    timeout: 120_000,
+  }, async () => {
+    const files = { repoGeminiEnv: 'GOOGLE_CLOUD_PROJECT=from-gemini-dotenv\n' };
+    const trust = { GEMINI_CLI_TRUST_WORKSPACE: 'true' };
+    const ignored = { advanced: { ignoreLocalEnv: true } };
+    // Control: passed, it trusts the checkout, whose .gemini/.env loads despite ignoreLocalEnv.
+    const passed = withSettings(ignored, { envDeny: [] });
+    expect((await toolEnv(passed, files, trust)).out).toContain('from-gemini-dotenv');
+    expect((await toolEnv(withSettings(ignored), files, trust)).out).not.toContain(
+      'from-gemini-dotenv',
+    );
+  });
+
+  it('the user’s ~/.env stays out: Gemini’s home is its own (control: it loads without)', {
+    timeout: 120_000,
+  }, async () => {
+    const files = { homeEnv: 'GOOGLE_CLOUD_PROJECT=from-home-dotenv\n' };
+    expect((await toolEnv(withSettings(undefined), files)).out).toContain('from-home-dotenv');
+    expect((await toolEnv(withSettings({}), files)).out).not.toContain('from-home-dotenv');
   });
 });

@@ -67,6 +67,8 @@ describe('Claude Worker tool environment', () => {
       sdkOptions: { settingSources: [] },
     });
     if (process.platform === 'linux' && !hasBwrap) {
+      // CI installs bubblewrap: there, the scrub itself must be what this test checks.
+      expect(process.env.CI, 'CI must run this test with bubblewrap').toBeFalsy();
       await expect(adapter.start({ cwd })).rejects.toThrow(/bubblewrap/);
       return;
     }
