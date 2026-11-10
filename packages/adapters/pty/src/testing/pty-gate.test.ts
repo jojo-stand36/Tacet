@@ -14,9 +14,14 @@ describe('ptyGate (#189)', () => {
 
   it('skips them locally, with the reason, when node-pty is missing', async () => {
     const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const gate = await ptyGate({}, missing);
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^Skipping the PTY suites/));
-    warn.mockRestore();
+    let gate: Awaited<ReturnType<typeof ptyGate>>;
+    try {
+      gate = await ptyGate({}, missing);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^Skipping the PTY suites/));
+    } finally {
+      // Never leave stderr muted for the rest of this worker's output.
+      warn.mockRestore();
+    }
     expect(gate).toEqual({ ok: false, reason: expect.stringMatching(/node-pty is not available/) });
     expect(gatedTitle('PTY suite', gate)).toMatch(/^PTY suite \(skipped locally: node-pty/);
   });
