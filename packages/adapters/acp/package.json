@@ -29,7 +29,8 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "2.4.0",
-    "@tacet/core": "workspace:*"
+    "@tacet/core": "workspace:*",
+    "zod": "catalog:"
   },
   "devDependencies": {
     "@google/gemini-cli": "0.67.0"

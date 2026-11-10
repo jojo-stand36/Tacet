@@ -142,7 +142,8 @@ export class AcpAdapter implements AgentAdapter {
       throw new ProfileRefusedError('contextWindow', `${spec.id} over ACP has one context size`);
     }
     if (opts.resume && !caps.resume) throw new Error(`${spec.id} does not resume sessions`);
-    if (opts.resume?.fork) throw new Error(`${spec.id}: forking over ACP is not supported`);
+    if (opts.resume?.fork)
+      throw new Error(`${spec.id}: forking over ACP is not supported yet (#146)`);
 
     const env = this.#env(opts);
     const command = [
@@ -168,16 +169,40 @@ export class AcpAdapter implements AgentAdapter {
         if (s) s.exit = exitInfo.value;
         signalGroup(proc, 'SIGTERM');
         resolve();
-        if (s) this.#onExit(s);
+        // Messages still buffered on stdout (a last prompt response) are read first.
+        void drained(proc).then(() => {
+          flushStderr();
+          if (s) this.#onExit(s);
+        });
       });
-      proc.once('error', () => resolve());
+      proc.on('error', () => resolve());
     });
     let stderrTail = '';
-    proc.stderr?.on('data', (b: Buffer) => {
-      const text = scrubLiterals(redactSecrets(b.toString('utf8')), secrets);
+    // Scrubbed a line at a time for known key formats, and across chunks for this session's own
+    // secrets, so a token split between two reads is still caught.
+    const stderrSecrets = new DeltaScrubber(secrets);
+    let stderrLine = '';
+    const stderrOut = (raw: string, last = false) => {
+      const text = stderrSecrets.push(redactSecrets(raw)) + (last ? stderrSecrets.flush() : '');
+      if (!text) return;
       stderrTail = (stderrTail + text).slice(-4000);
       if (s) s.stderrTail = stderrTail;
       this.#opts.stderr?.(text, handle);
+    };
+    const flushStderr = () => {
+      stderrOut(stderrLine, true);
+      stderrLine = '';
+    };
+    proc.stderr?.setEncoding('utf8');
+    proc.stderr?.on('data', (chunk: string) => {
+      stderrLine += chunk;
+      // A line with no end is passed on once long; key formats are best effort there.
+      const cut =
+        stderrLine.length > 64 * 1024 ? stderrLine.length : stderrLine.lastIndexOf('\n') + 1;
+      if (cut > 0) {
+        stderrOut(stderrLine.slice(0, cut));
+        stderrLine = stderrLine.slice(cut);
+      }
     });
     const stream = ndJsonStream(
       Writable.toWeb(proc.stdin as NonNullable<typeof proc.stdin>) as WritableStream<Uint8Array>,
@@ -240,6 +265,8 @@ export class AcpAdapter implements AgentAdapter {
       conn.close();
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      flushStderr();
+      if (err instanceof ProfileRefusedError || err instanceof AuthRoutingError) throw err;
       if (err instanceof RequestError && err.code === AUTH_REQUIRED) {
         throw new AuthRoutingError(
           `${spec.id} needs authentication, and Workers only use an API key: set ${spec.apiKeyEnv.join(' or ') || 'its API key'}`,
@@ -279,10 +306,14 @@ export class AcpAdapter implements AgentAdapter {
     const s = this.#live(h);
     const pending = s.approvals.get(requestId);
     if (!pending) throw new Error(`no pending approval ${requestId}`);
-    s.approvals.delete(requestId);
     if (decision.kind === 'cancel') {
+      // Cancelling one request cancels the turn: the same flow as interrupt().
+      s.queue.length = 0;
       await s.conn.agent.notify('session/cancel', { sessionId: s.acpSessionId });
+      this.#cancelApprovals(s);
+      return;
     }
+    s.approvals.delete(requestId);
     pending.resolve(permissionOutcome(pending.options, decision));
   }
 
@@ -418,6 +449,11 @@ export class AcpAdapter implements AgentAdapter {
           if (usage) this.#emit(s, usage);
           ({ state, message } = stopState(r.stopReason));
         } catch (err) {
+          if (!(err instanceof RequestError)) {
+            // The connection broke: if the agent died, its exit is the one error to report.
+            await Promise.race([s.exited, new Promise((r) => setTimeout(r, 1000).unref())]);
+            if (s.exit) return;
+          }
           if (s.ended || s.closing) return;
           if (err instanceof RequestError && err.code === REQUEST_CANCELLED) {
             state = 'cancelled';
@@ -518,6 +554,20 @@ export class AcpAdapter implements AgentAdapter {
     if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
     return s;
   }
+}
+
+/** Resolves once the agent's stdout has ended (or after a second, if a grandchild holds it). */
+function drained(proc: ChildProcess): Promise<void> {
+  const out = proc.stdout;
+  if (!out || out.readableEnded || out.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, 1000);
+    t.unref();
+    out.once('close', () => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
 }
 
 function errorMessage(err: unknown): string {

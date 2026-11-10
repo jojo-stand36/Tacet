@@ -26,7 +26,11 @@ export interface AcpAgentSpec {
    * subscription or browser login method.
    */
   apiKeyAuthMethods: readonly string[];
-  /** What this agent supports; checked against its `initialize` answer at start. */
+  /**
+   * What this agent supports through this adapter. Declared, not negotiated: a declared resume
+   * still fails at start if the agent's `initialize` offers neither `session/resume` nor
+   * `session/load`.
+   */
   capabilities: AdapterCapabilities;
   /** Version the spec was verified against, for the capability matrix. */
   verifiedVersion?: string;
@@ -56,7 +60,8 @@ export const GEMINI_AGENT: AcpAgentSpec = {
   id: 'gemini',
   command: ['gemini', '--acp'],
   modelArgs: (model) => ['--model', model],
-  apiKeyEnv: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
+  // Only the Gemini API key: `GOOGLE_API_KEY` is the Vertex AI route, not verified here.
+  apiKeyEnv: ['GEMINI_API_KEY'],
   apiKeyAuthMethods: ['gemini-api-key'],
   capabilities: {
     ...ACP_BASE,
@@ -68,7 +73,8 @@ export const GEMINI_AGENT: AcpAgentSpec = {
 
 /**
  * Claude Code through `@agentclientprotocol/claude-agent-acp` (spike #62, 0.101.1; not run live
- * here). `--hide-claude-auth` hides the "Claude Subscription" login: Workers use
+ * here). Not in `BUILTIN_ACP_AGENTS`: that it uses `ANTHROPIC_API_KEY` over a subscription login
+ * already in `~/.claude` is not verified yet (#145). `--hide-claude-auth` hides the "Claude Subscription" login: Workers use
  * `ANTHROPIC_API_KEY` only (owner decision 2026-11-09). The native Agent SDK adapter stays first
  * choice.
  */
@@ -81,7 +87,9 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
 };
 
 /**
- * Codex through `@agentclientprotocol/codex-acp` (spike #62, 2.6.0; not run live here).
+ * Codex through `@agentclientprotocol/codex-acp` (spike #62, 2.6.0; not run live here). Not in
+ * `BUILTIN_ACP_AGENTS`: what its `api-key` method does to the user's `~/.codex` login is not
+ * verified yet (#145; Codex app-server needs its own `CODEX_HOME` for a key, capability matrix §2).
  * `NO_BROWSER=1` hides the ChatGPT login; the `api-key` method reads `CODEX_API_KEY` or
  * `OPENAI_API_KEY`. The native app-server adapter stays first choice.
  */
@@ -94,10 +102,12 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
 };
 
+/**
+ * The agents a Worker can be configured with by id: only those whose API-key-only auth was
+ * verified live. Claude and Codex have native adapters; their ACP specs join once verified.
+ */
 export const BUILTIN_ACP_AGENTS: Readonly<Record<string, AcpAgentSpec>> = {
   gemini: GEMINI_AGENT,
-  'claude-acp': CLAUDE_ACP_AGENT,
-  'codex-acp': CODEX_ACP_AGENT,
 };
 
 /** Config for an ACP agent that has no built-in spec. */
@@ -106,8 +116,11 @@ export interface CustomAcpAgentConfig {
   env?: Record<string, string>;
   apiKeyEnv?: string[];
   apiKeyAuthMethods?: string[];
-  /** Declared support beyond the ACP baseline; checked against `initialize` at start. */
-  capabilities?: Partial<AdapterCapabilities>;
+  /**
+   * Declared support beyond the ACP baseline. Only what this adapter can deliver for any agent:
+   * resume (by `session/resume` or `session/load`) and usage reporting.
+   */
+  capabilities?: Partial<Pick<AdapterCapabilities, 'resume' | 'usage'>>;
 }
 
 const SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -124,6 +137,10 @@ export function customAcpAgent(slug: string, cfg: CustomAcpAgentConfig): AcpAgen
     ...(cfg.env ? { env: { ...cfg.env } } : {}),
     apiKeyEnv: [...(cfg.apiKeyEnv ?? [])],
     apiKeyAuthMethods: [...(cfg.apiKeyAuthMethods ?? [])],
-    capabilities: { ...ACP_BASE, ...cfg.capabilities },
+    capabilities: {
+      ...ACP_BASE,
+      ...(cfg.capabilities?.resume !== undefined ? { resume: cfg.capabilities.resume } : {}),
+      ...(cfg.capabilities?.usage ? { usage: { ...cfg.capabilities.usage } } : {}),
+    },
   };
 }

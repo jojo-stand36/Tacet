@@ -193,6 +193,9 @@ importers:
       '@tacet/core':
         specifier: workspace:*
         version: link:../../core
+      zod:
+        specifier: 'catalog:'
+        version: 4.6.7
     devDependencies:
       '@google/gemini-cli':
         specifier: 0.67.0

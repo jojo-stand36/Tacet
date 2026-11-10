@@ -1,8 +1,18 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { SessionHandle } from '@tacet/core';
+import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from './adapter.js';
@@ -140,5 +150,50 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
       source: 'reported',
     });
     await adapter.close(h);
+  });
+
+  it('keeps the Worker MCP token off the command line and off disk', {
+    timeout: 120_000,
+  }, async () => {
+    const token = 'acp-conformance-token-5f1d0c7e9a2b4c6d';
+    const cwd = join(root, 'wt-mcp');
+    mkdirSync(cwd);
+    const stderr: string[] = [];
+    const withLog = new AcpAdapter({
+      agent: GEMINI_AGENT,
+      executable: [process.execPath, GEMINI],
+      killTimeoutMs: 2000,
+      stderr: (t) => stderr.push(t),
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: join(root, 'home'),
+        GEMINI_API_KEY: 'placeholder-not-a-real-key',
+        GOOGLE_GEMINI_BASE_URL: api.url,
+      },
+    });
+    const h = await withLog.start({
+      cwd,
+      // Nothing listens there: the token only has to reach the agent, not a server.
+      mcpServers: [
+        {
+          name: 'tacet',
+          url: 'http://127.0.0.1:9/mcp',
+          headers: mcpAuthHeaders(new Secret(token)),
+        },
+      ],
+    });
+    const tap = new EventTap(withLog.events(h));
+    await withLog.send(h, { text: 'SAY mcp' });
+    await tap.waitFor((e) => e.t === 'status' && e.state !== 'running', 60_000, 1);
+    await withLog.close(h);
+    const files = (dir: string): string[] =>
+      readdirSync(dir).flatMap((f) => {
+        const p = join(dir, f);
+        const st = statSync(p, { throwIfNoEntry: false });
+        return st?.isDirectory() ? files(p) : st?.isFile() ? [p] : [];
+      });
+    for (const f of files(root)) expect(readFileSync(f, 'utf8'), f).not.toContain(token);
+    expect(JSON.stringify(tap.events)).not.toContain(token);
+    expect(stderr.join('')).not.toContain(token);
   });
 });
