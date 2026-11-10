@@ -180,8 +180,11 @@ export class AcpAdapter implements AgentAdapter {
   constructor(opts: AcpAdapterOptions) {
     const { fork, resume } = opts.agent.capabilities;
     // The adapter forks by `session/fork` only (#146): no emulation, and never without resume.
-    if (fork === 'emulated' || (fork === 'native' && !resume)) {
-      throw new Error(`${opts.agent.id}: fork '${fork}' is not offered over ACP without resume`);
+    if (fork === 'emulated') {
+      throw new Error(`${opts.agent.id}: fork 'emulated' is not offered over ACP`);
+    }
+    if (fork === 'native' && !resume) {
+      throw new Error(`${opts.agent.id}: fork 'native' needs resume`);
     }
     this.#opts = opts;
     this.id = opts.agent.id;
@@ -523,7 +526,10 @@ export class AcpAdapter implements AgentAdapter {
     }));
   }
 
-  /** `session/new`, or for a resume `session/resume` or `session/load`, as the agent offers. */
+  /**
+   * `session/new`; for a fork `session/fork` (#146); for a resume `session/resume` or
+   * `session/load`, as the agent offers.
+   */
   async #openSession(
     s: Session,
     opts: SessionOptions,
@@ -541,7 +547,9 @@ export class AcpAdapter implements AgentAdapter {
       if (!(caps as UnstableAgentCapabilities | undefined)?.sessionCapabilities?.fork) {
         throw new Error(`${this.id} did not advertise session/fork in its initialize response`);
       }
-      // The stable entrypoint sends any method; only its types leave out the unstable ones.
+      // The stable entrypoint sends any method; only its types leave out the unstable ones. Relies on
+      // SDK 2.4.0 `dist/v1/stable/acp.js` `ClientContext.request` → `sendRequest(..., mapResponse)`
+      // with no param or response validation: recheck on an SDK bump.
       const request = s.conn.agent.request as unknown as (
         method: 'session/fork',
         params: ForkSessionRequest,

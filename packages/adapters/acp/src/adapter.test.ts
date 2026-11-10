@@ -523,6 +523,36 @@ describe('AcpAdapter (fake ACP agent)', () => {
         await adapter.close(h);
       });
 
+      it('gives a fork the same MCP servers, _meta and mode pin as a new session (#181, #145)', async () => {
+        const meta = { claudeCode: { options: { settingSources: [] } } };
+        const spec: AcpAgentSpec = { ...forking('native'), sessionMeta: meta, sessionMode: 'ask' };
+        const adapter = make(spec, {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_SESSION: JSON.stringify({
+            modes: {
+              currentModeId: 'auto',
+              availableModes: [
+                { id: 'ask', name: 'Ask' },
+                { id: 'auto', name: 'Auto' },
+              ],
+            },
+          }),
+        });
+        const mcp = { name: 'tacet', url: 'http://127.0.0.1:1/mcp', headers: { 'x-t': 'v' } };
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork, mcpServers: [mcp] });
+        await adapter.close(h);
+        expect(methods().find((m) => m.method === 'session/fork')?.params).toMatchObject({
+          mcpServers: [
+            { type: 'http', name: 'tacet', url: mcp.url, headers: [{ name: 'x-t', value: 'v' }] },
+          ],
+          _meta: meta,
+        });
+        expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+          sessionId: 'src-1-fork',
+          modeId: 'ask',
+        });
+      });
+
       it('refuses a fork the agent did not advertise, or the spec did not declare', async () => {
         const quiet = make(forking('native'), {
           FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }),
@@ -559,7 +589,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
           ...base,
           capabilities: { ...base.capabilities, resume, fork },
         });
-        expect(() => make(spec(false, 'native'))).toThrow(/not offered over ACP without resume/);
+        expect(() => make(spec(false, 'native'))).toThrow(/fork 'native' needs resume/);
         expect(() => make(spec(true, 'emulated'))).toThrow(/not offered over ACP/);
       });
     });

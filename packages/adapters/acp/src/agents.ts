@@ -62,7 +62,7 @@ export interface AcpAgentSpec {
    */
   sessionMode?: string;
   /**
-   * `_meta` sent with `session/new`, `session/load` and `session/resume`, for agent-specific
+   * `_meta` sent with `session/new`, `session/load`, `session/resume` and `session/fork`, for agent-specific
    * session options (e.g. claude-agent-acp's `claudeCode.options`, #181).
    */
   sessionMeta?: Readonly<Record<string, unknown>>;

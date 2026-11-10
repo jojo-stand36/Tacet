@@ -185,7 +185,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       process.env.FAKE_FORK_ID === 'same'
         ? m.params.sessionId
         : (process.env.FAKE_FORK_ID ?? `${m.params.sessionId}-fork`);
-    send({ id: m.id, result: { sessionId: id } });
+    send({ id: m.id, result: { sessionId: id, ...session } });
   } else if (m.method === 'session/prompt') {
     prompt(m);
   } else if (m.method === 'session/cancel') {
