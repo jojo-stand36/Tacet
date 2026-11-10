@@ -74,6 +74,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
 - [ ] **Pin a task's target branch so its sub-tasks never start from different branches** — `feature` `P2` `claude`
 - [ ] **Prune per-Worker progress state when a Worker token is revoked** — `chore` `P2` `either`
+- [ ] **PtyCliAdapter: @path expansion in Gemini, Codex and claude presets** — `feature` `P1` `claude`
 - [ ] **Rate-limit escalate and record_decision in the Mini-conductor MCP server** — `feature` `P2` `either`
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
 - [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
@@ -99,6 +100,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
+- [ ] **pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments** — `feature` `P1` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 
@@ -129,6 +131,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
+- [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
 
 ## M4 · Visual & terminal UI

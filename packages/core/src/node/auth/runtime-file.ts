@@ -55,6 +55,11 @@ export interface WriteRuntimeFileOptions {
   protocolVersions: number[];
   pid?: number;
   now?: () => Date;
+  /**
+   * The token, when the server already listens with it (it must exist before the port does).
+   * Default: a new 256-bit one. Either way it is new for every start.
+   */
+  token?: Secret;
 }
 
 /** Error about a runtime file. Its message never includes file contents. */
@@ -88,7 +93,7 @@ function ensurePrivateDir(dir: string): void {
  * be a real directory owned by the current user; it is tightened to mode 0700.
  */
 export function writeRuntimeFile(opts: WriteRuntimeFileOptions): RuntimeInfo {
-  const token = randomToken(32);
+  const token = opts.token ?? randomToken(32);
   const info: RuntimeInfo = {
     pid: opts.pid ?? process.pid,
     port: opts.port,
