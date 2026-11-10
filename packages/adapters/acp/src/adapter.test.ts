@@ -609,11 +609,21 @@ describe('AcpAdapter (fake ACP agent)', () => {
       });
 
       it('refuses a fork the agent did not advertise, or the spec did not declare', async () => {
-        const quiet = make(forking('native'), {
-          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }),
-        });
+        // An agent with a child that ignores SIGTERM: the refusal leaves none of it running.
+        const quiet = make(
+          forking('native'),
+          { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }), FAKE_CHILD: '1' },
+          { killTimeoutMs: 300 },
+        );
         // Typed, so a caller can fall back to a HandoffPacket (#228); not "failed to start".
         const refused = await quiet.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        const child = received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+        const alive = child !== undefined && running(child);
+        if (alive) process.kill(child, 'SIGKILL');
+        expect(child).toBeTypeOf('number');
+        expect(alive).toBe(false);
         expect(refused).toBeInstanceOf(ForkRefusedError);
         expect(refused).toMatchObject({ adapterId: 'acp:forker' });
         expect((refused as Error).message).toMatch(/did not advertise session\/fork/);
@@ -626,12 +636,11 @@ describe('AcpAdapter (fake ACP agent)', () => {
         );
         // Gemini declares no fork: refused before anything starts, as before.
         const before = methods().length;
-        await expect(gemini().start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
-          /does not fork sessions/,
-        );
-        await expect(gemini().start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
-          ForkRefusedError,
-        );
+        const declined = await gemini()
+          .start({ cwd: join(root, 'wt'), resume: fork })
+          .catch((e) => e);
+        expect(declined).toBeInstanceOf(ForkRefusedError);
+        expect((declined as Error).message).toMatch(/does not fork sessions/);
         expect(methods()).toHaveLength(before);
         expect(methods().map((m) => m.method)).not.toContain('session/fork');
       });
