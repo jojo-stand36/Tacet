@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
@@ -2188,6 +2196,27 @@ export async function cancelStopped(
     return { canceled, errors };
   } finally {
     releaseMiniLock(o.lockPath);
+  }
+}
+
+/**
+ * Run `fn` while holding the repo's Mini-conductor lock as `tacet run` takes it (a live holder is
+ * refused, a stale lock is taken over), after ending the Worker processes a crashed Mini-conductor
+ * left running (#127), as `cancelStopped` does. For maintenance that must not race a run, such as
+ * `tacet uninstall --purge` (#211). Throws when a run holds the lock; returns `fn`'s result and the
+ * problems met ending stale Workers.
+ */
+export async function withStoppedMini<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+  processFile = `${lockPath}.workers`,
+): Promise<{ result: T; errors: unknown[] }> {
+  takeMiniLock(lockPath);
+  try {
+    const errors = existsSync(processFile) ? await endStaleWorkerProcesses(processFile) : [];
+    return { result: await fn(), errors };
+  } finally {
+    releaseMiniLock(lockPath);
   }
 }
 

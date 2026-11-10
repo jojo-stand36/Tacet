@@ -21,6 +21,7 @@ import { TacetConfig } from '@tacet/core';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
 import { repoRootFrom } from '../state.js';
+import { applyState, planState, type StatePlan, type StateResult } from './purge-state.js';
 
 // The symlink-safe file checks, `wx` writes, PATH detection and the uninstall backup layout are
 // adapted from Copilot's draft for #20 (PR #113).
@@ -80,6 +81,8 @@ export interface UninstallOptions {
   'user-dir'?: string;
   apply?: boolean;
   purge?: boolean;
+  /** With `--purge`: also remove checkouts that hold unintegrated work (#211). */
+  force?: boolean;
   json?: boolean;
 }
 
@@ -209,13 +212,23 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
  * the files `tacet init` wrote that are still unchanged and not committed (owner decision on #209),
  * then `.tacet/` if that leaves it empty.
  * `--purge` removes the whole `.tacet/` after copying it to
- * `<user dir>/backups/<repo>-<hash>/uninstall-<time>/`. Run state outside the repo is not touched.
+ * `<user dir>/backups/<repo>-<hash>/uninstall-<time>/`, and the repo's run state (#211):
+ * `<state_dir>/<repo-hash>/`, its Worker and planner checkouts first, each through the worktree
+ * manager, which refuses one with unintegrated work unless `--force`. It refuses while a run holds
+ * the repo's lock, and keeps the `tacet/*` branches.
  */
-export function uninstall(io: Io, o: UninstallOptions): number {
+export async function uninstall(io: Io, o: UninstallOptions): Promise<number> {
   let backup: string | undefined;
   let backedUp = false;
   try {
     const root = repoFor(io, o);
+    if (o.force && !o.purge) {
+      io.err('--force only applies with --purge');
+      return 2;
+    }
+    // Before anything is removed: it reads the repo config, and refuses while a run is live.
+    const state = o.purge ? await planState(io, root, userDirOf(io, o)) : undefined;
+    let stateResult: StateResult | undefined;
     const tacetDir = join(root, '.tacet');
     const removals: string[] = [];
     const kept: string[] = [];
@@ -241,6 +254,16 @@ export function uninstall(io: Io, o: UninstallOptions): number {
         }
         kept.push(...committed);
         if (kept.length === 0) removals.push(tacetDir);
+      }
+    }
+
+    if (o.apply && state) {
+      // Checked again under the run lock: a run may have started, or made the dir, since.
+      stateResult = await applyState(io, root, userDirOf(io, o), o.force === true);
+      if (existsSync(state.dir) && !stateResult.dirRemoved) {
+        // Nothing of .tacet/ is touched until the run state is gone.
+        reportStateRefusal(io, o, root, state, stateResult, { removals, kept, committed });
+        return 1;
       }
     }
 
@@ -278,10 +301,14 @@ export function uninstall(io: Io, o: UninstallOptions): number {
           kept,
           committed,
           ...(backup ? { backup } : {}),
+          ...(state
+            ? { state: { ...state, ...(stateResult ? { result: stateResult } : {}) } }
+            : {}),
         }),
       );
       return 0;
     }
+    if (state) reportState(io, o, state, stateResult);
     if (removals.length === 0) io.out('nothing to remove');
     for (const path of removals)
       io.out(`${o.apply ? 'removed' : 'would remove'} ${terminalSafe(path)}`);
@@ -300,6 +327,82 @@ export function uninstall(io: Io, o: UninstallOptions): number {
     if (backedUp && backup !== undefined) io.err(`the backup is at ${terminalSafe(backup)}`);
     return code;
   }
+}
+
+function reportState(
+  io: Io,
+  o: UninstallOptions,
+  state: StatePlan,
+  result: StateResult | undefined,
+): void {
+  if (state.note) io.err(`note: ${state.note}`);
+  if (!state.exists && !result?.dirRemoved) {
+    io.out(`no run state at ${terminalSafe(state.dir)}`);
+    return;
+  }
+  if (result) {
+    // What was done, which may differ from the preview (a checkout made since).
+    for (const path of result.removed) io.out(`removed checkout ${terminalSafe(path)}`);
+    io.out(`removed run state ${terminalSafe(state.dir)}`);
+    for (const w of result.warnings) io.err(`warning: ${terminalSafe(w)}`);
+  } else {
+    for (const c of state.checkouts) {
+      const what = `${c.missing ? 'checkout (deleted by hand)' : 'checkout'} ${terminalSafe(c.path)}`;
+      if (c.kept && !o.force) io.out(`would keep ${what}: ${terminalSafe(c.kept)}`);
+      else {
+        const held = c.heldBy?.length
+          ? `; its work stays on ${c.heldBy.map((r) => terminalSafe(r.replace(/^refs\/heads\//, ''))).join(', ')}`
+          : '';
+        io.out(`would remove ${what}${c.kept ? ' (forced)' : ''}${held}`);
+      }
+    }
+    io.out(
+      `would remove run state ${terminalSafe(state.dir)}${state.events ? ' (with the event log)' : ''}: ${state.entries.map(terminalSafe).join(', ')}`,
+    );
+    if (state.checkouts.some((c) => c.kept) && !o.force) {
+      io.err('checkouts with unintegrated work are kept: --force removes them too');
+    }
+  }
+  io.err('the tacet/* branches are kept; list them with: git for-each-ref refs/heads/tacet/');
+}
+
+function reportStateRefusal(
+  io: Io,
+  o: UninstallOptions,
+  root: string,
+  state: StatePlan,
+  r: StateResult,
+  tacet: { removals: string[]; kept: string[]; committed: string[] },
+): void {
+  if (o.json) {
+    // The shape of a successful run, with nothing applied.
+    io.out(
+      safeJson({
+        repo: root,
+        applied: false,
+        refused: true,
+        removals: [],
+        kept: tacet.kept,
+        committed: tacet.committed,
+        state: { ...state, result: r },
+      }),
+    );
+    return;
+  }
+  for (const path of r.removed) io.out(`removed checkout ${terminalSafe(path)}`);
+  for (const c of r.refused)
+    io.err(`kept checkout ${terminalSafe(c.path)}: ${terminalSafe(c.kept ?? '')}`);
+  for (const path of r.leftovers) {
+    io.err(
+      `git still lists the worktree ${terminalSafe(path)}: remove it with git worktree remove`,
+    );
+  }
+  for (const w of r.warnings) io.err(`warning: ${terminalSafe(w)}`);
+  io.err(
+    r.refused.some((c) => c.forceable)
+      ? 'nothing else was removed: --force removes checkouts with unintegrated work'
+      : 'nothing else was removed',
+  );
 }
 
 /**

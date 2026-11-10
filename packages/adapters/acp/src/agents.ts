@@ -38,7 +38,8 @@ export interface AcpAgentSpec {
   /**
    * What this agent supports through this adapter. Declared, not negotiated: a declared resume
    * still fails at start if the agent's `initialize` offers neither `session/resume` nor
-   * `session/load`.
+   * `session/load`, and a declared `fork: 'native'` (which needs `resume`) is only attempted when
+   * the agent's `initialize` advertises `sessionCapabilities.fork` (unstable ACP, #146).
    */
   capabilities: AdapterCapabilities;
   /** Version the spec was verified against, for the capability matrix. */
@@ -61,7 +62,7 @@ export interface AcpAgentSpec {
    */
   sessionMode?: string;
   /**
-   * `_meta` sent with `session/new`, `session/load` and `session/resume`, for agent-specific
+   * `_meta` sent with `session/new`, `session/load`, `session/resume` and `session/fork`, for agent-specific
    * session options (e.g. claude-agent-acp's `claudeCode.options`, #181).
    */
   sessionMeta?: Readonly<Record<string, unknown>>;
@@ -280,7 +281,8 @@ export interface CustomAcpAgentConfig {
   apiKeyAuthMethods?: string[];
   /**
    * Declared support beyond the ACP baseline. Only what this adapter can deliver for any agent:
-   * resume (by `session/resume` or `session/load`) and usage reporting.
+   * resume (by `session/resume` or `session/load`) and usage reporting. Fork is declared only by
+   * a built-in spec whose agent's fork was verified (#146).
    */
   capabilities?: Partial<Pick<AdapterCapabilities, 'resume' | 'usage'>>;
 }
