@@ -173,7 +173,7 @@ describe('WorktreeManager', () => {
     const stale = await manager.create('stale');
     const dirty = await manager.create('dirty');
     const active = await manager.create('active');
-    // Staleness is by creation time (#126): all three are 10 s old by then.
+    // Without activity, staleness is by creation time: all three are 10 s old by then.
     const now = Date.now() + 10_000;
     await writeFile(path.join(dirty.path, 'untracked.txt'), 'keep me\n');
     await writeFile(path.join(active.path, '.env'), 'keep me too\n');
@@ -1128,6 +1128,79 @@ describe('WorktreeManager', () => {
       expect(events('workspace.removed')).toHaveLength(2);
     });
 
+    it('removes an idle checkout by its last activity, and keeps an old one in recent use (#238)', async () => {
+      const idle = await manager.create('idle');
+      const used = await manager.create('used');
+      const now = Date.now() + 10 * 86_400_000;
+      const result = await manager.gc({
+        olderThanMs: 86_400_000,
+        // `idle` was last used long ago; `used`, created as long ago, an hour before `now`.
+        lastActivity: new Map([
+          [idle.id, Date.now()],
+          [used.id, now - 3_600_000],
+        ]),
+        now,
+      });
+      expect(result.removed).toEqual([idle.id]);
+      expect(result.skipped).toEqual([{ id: used.id, reason: 'not stale' }]);
+      expect(events('workspace.removed')).toEqual([{ workspaceId: idle.id, reason: 'removed' }]);
+      // Idle, but holding work nothing else has: kept.
+      await workerCommit(used.path);
+      const later = await manager.gc({ olderThanMs: 0, now: now + 1_000 });
+      expect(later.removed).toEqual([]);
+      expect(await manager.get(used.id)).toBeDefined();
+    });
+
+    it('never removes an idle checkout with unintegrated or uncommitted work, however old (#238)', async () => {
+      const committed = await manager.create('committed');
+      await workerCommit(committed.path);
+      const edited = await manager.create('edited');
+      await writeFile(path.join(edited.path, 'README'), 'changed\n');
+      const longAgo = Date.now() - 365 * 86_400_000;
+      const result = await manager.gc({
+        olderThanMs: 86_400_000,
+        lastActivity: new Map([
+          [committed.id, longAgo],
+          [edited.id, longAgo],
+        ]),
+        now: Date.now() + 365 * 86_400_000,
+      });
+      expect(result.removed).toEqual([]);
+      expect(result.skipped.map(({ id }) => id).sort()).toEqual([committed.id, edited.id].sort());
+      expect(await manager.get(committed.id)).toBeDefined();
+      expect(await manager.get(edited.id)).toBeDefined();
+      expect(events('workspace.removed')).toEqual([]);
+    });
+
+    it('force-removes a planner checkout a crash left registered, at the next reconcile (#238)', async () => {
+      const planner = await manager.create('plan-task', undefined, { scratch: true });
+      // The planner wrote to it, then the process died before its own forced removal.
+      await writeFile(path.join(planner.path, 'scratch.txt'), 'x\n');
+      await workerCommit(planner.path);
+      const worker = await manager.create('worker');
+      // gc leaves a scratch checkout to its planner, however old.
+      expect(
+        (
+          await manager.gc({
+            olderThanMs: 0,
+            activeWorktreeIds: [worker.id],
+            now: Date.now() + 1_000,
+          })
+        ).skipped,
+      ).toContainEqual({ id: planner.id, reason: 'scratch' });
+
+      const restarted = new WorktreeManager(repository, root(), { log });
+      await restarted.reconcile();
+      expect(await restarted.get(planner.id)).toBeUndefined();
+      await expect(lstat(planner.path)).rejects.toThrow();
+      expect(events('workspace.removed')).toContainEqual({
+        workspaceId: planner.id,
+        reason: 'forced',
+      });
+      // A Worker's checkout is never touched by this.
+      expect(await restarted.get(worker.id)).toBeDefined();
+    });
+
     it('records the intent before git makes the checkout', async () => {
       const seen: boolean[] = [];
       const append = store.append.bind(store);
@@ -1239,6 +1312,37 @@ describe('WorktreeManager', () => {
     expect(await manager.head()).toEqual({ branch: 'main', commit });
     await git(repository, ['checkout', '--detach']);
     expect(await manager.head()).toEqual({ commit });
+  });
+
+  it('unpins only a ref that still holds the pinned commit (#247)', async () => {
+    const first = (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    await writeFile(path.join(repository, 'later.txt'), 'later\n');
+    await git(repository, ['add', 'later.txt']);
+    await git(repository, ['commit', '-qm', 'later']);
+    const second = (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    const refs = async () =>
+      (await git(repository, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/tacet/']))
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+
+    await manager.pin('done', first);
+    await manager.pin('moved', second);
+    await manager.pin('other', first);
+    await manager.unpin([
+      { taskId: 'done', commit: first },
+      // Pinned again at another commit since: kept.
+      { taskId: 'moved', commit: first },
+      // Never pinned: nothing to do.
+      { taskId: 'never', commit: first },
+    ]);
+    expect(await refs()).toEqual([
+      `refs/tacet/moved/target ${second}`,
+      `refs/tacet/other/target ${first}`,
+    ]);
+    await expect(manager.unpin([{ taskId: 'other', commit: 'HEAD' }])).rejects.toThrow(
+      'expected a full commit id',
+    );
   });
 
   it('holds a pinned target with a ref, so git gc never prunes it (#236)', async () => {

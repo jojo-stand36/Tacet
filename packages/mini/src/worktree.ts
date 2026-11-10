@@ -41,6 +41,11 @@ export interface WorktreeSetup {
 
 export interface CreateWorktreeOptions {
   setup?: WorktreeSetup;
+  /**
+   * A throwaway checkout (a planner's, #238): it holds nothing of value, so one a crash left
+   * registered is force-removed by the next `reconcile`, and `gc` leaves it to its owner.
+   */
+  scratch?: boolean;
 }
 
 export interface RemoveWorktreeOptions {
@@ -70,6 +75,8 @@ export interface WorktreeInfo {
   baseCommit: string;
   /** When it was registered (ms since the epoch). */
   createdAt: number;
+  /** A throwaway checkout (#238): see `CreateWorktreeOptions.scratch`. */
+  scratch?: true;
 }
 
 export type MergeStrategy = 'pr' | 'squash-to-branch' | 'manual';
@@ -88,6 +95,12 @@ export interface MergeResult {
 export interface WorktreeGcOptions {
   olderThanMs: number;
   activeWorktreeIds?: readonly string[];
+  /**
+   * When each worktree was last used (ms since the epoch, by id), e.g. its Worker sessions' newest
+   * `worker.*` event (#238). A worktree is stale once both this and its creation are older than
+   * `olderThanMs`.
+   */
+  lastActivity?: ReadonlyMap<string, number>;
   now?: number;
 }
 
@@ -364,6 +377,36 @@ export class WorktreeManager implements Workspaces {
     await this.git(['update-ref', '--no-deref', targetRef(taskId), commit]);
   }
 
+  /**
+   * Delete each `refs/tacet/<task>/target` that holds its task's `commit` (#247), reading the refs
+   * once. A ref gone or moved (a later pin of the same task) is left; git deletes each atomically
+   * against `commit`. Throws when the refs cannot be listed or a delete fails.
+   */
+  async unpin(pins: ReadonlyArray<{ taskId: string; commit: string }>): Promise<void> {
+    for (const { commit } of pins) {
+      if (!commitIdPattern.test(commit)) throw new Error('unpin: expected a full commit id');
+    }
+    if (pins.length === 0) return;
+    const out = await this.git([
+      'for-each-ref',
+      '--format=%(refname) %(objectname)',
+      'refs/tacet/',
+    ]);
+    const tips = new Map(
+      out
+        .split('\n')
+        .map((line) => line.trim().split(' '))
+        .filter((parts): parts is [string, string] => parts.length === 2),
+    );
+    const failed: string[] = [];
+    for (const { taskId, commit } of pins) {
+      const ref = targetRef(taskId);
+      if (tips.get(ref) !== commit) continue;
+      await this.git(['update-ref', '--no-deref', '-d', ref, commit]).catch(() => failed.push(ref));
+    }
+    if (failed.length > 0) throw new Error(`could not delete ${failed.join(', ')}`);
+  }
+
   /** The repo's checked-out branch (absent when HEAD is detached) and its commit (#219). */
   async head(): Promise<{ branch?: string; commit: string }> {
     const { baseBranch, baseCommit } = await this.resolveBase(undefined);
@@ -508,6 +551,15 @@ export class WorktreeManager implements Workspaces {
       if (left === false)
         await this.record('workspace.removed', { workspaceId: id, reason: 'gone' });
     }
+    // A throwaway checkout a crash left registered (#238): nothing in it is kept.
+    const failed: string[] = [];
+    for (const info of (await this.registry()).values()) {
+      if (!info.scratch || this.#pending.has(info.id)) continue;
+      await this.remove(info.id, { force: true }).catch(() => failed.push(info.id));
+    }
+    if (failed.length > 0) {
+      throw new Error(`could not remove leftover planner checkouts: ${failed.join(', ')}`);
+    }
   }
 
   /**
@@ -567,8 +619,17 @@ export class WorktreeManager implements Workspaces {
         result.skipped.push({ id: info.id, reason: 'active' });
         continue;
       }
-      // By age: activity is not recorded (#126; a follow-up can read it from worker.* events).
-      if (now - info.createdAt < options.olderThanMs) {
+      // Its planner removes it; a crash leaves it to the next `reconcile` (#238).
+      if (info.scratch) {
+        result.skipped.push({ id: info.id, reason: 'scratch' });
+        continue;
+      }
+      // The newest of its creation and its last use (#238): an old checkout in use is kept.
+      // An unreadable time reads as now: kept.
+      const at = (t: number | undefined) =>
+        t === undefined || Number.isFinite(t) ? (t ?? 0) : now;
+      const used = Math.max(at(info.createdAt), at(options.lastActivity?.get(info.id)));
+      if (now - used < options.olderThanMs) {
         result.skipped.push({ id: info.id, reason: 'not stale' });
         continue;
       }
@@ -774,6 +835,7 @@ export class WorktreeManager implements Workspaces {
       workerId,
       baseCommit,
       ...(baseBranch !== undefined ? { baseBranch } : {}),
+      ...(options.scratch ? { scratch: true } : {}),
     });
     try {
       await this.worktreeGit(['worktree', 'add', '--detach', worktreePath, baseCommit]);
@@ -1469,6 +1531,7 @@ export class WorktreeManager implements Workspaces {
             ...(w.baseBranch !== undefined ? { baseBranch: w.baseBranch } : {}),
             baseCommit: w.baseCommit,
             createdAt: Date.parse(w.createdAt),
+            ...(w.scratch ? { scratch: true as const } : {}),
           },
         ]),
     );
@@ -1501,6 +1564,7 @@ export class WorktreeManager implements Workspaces {
           ...(created.baseBranch !== undefined ? { baseBranch: created.baseBranch } : {}),
           baseCommit: created.baseCommit,
           createdAt: Date.now(),
+          ...(created.scratch ? { scratch: true as const } : {}),
         });
       } else {
         this.#memory.delete(id);

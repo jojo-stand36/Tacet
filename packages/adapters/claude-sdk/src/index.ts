@@ -13,6 +13,8 @@ export {
   type ClaudeAuthRoute,
   chooseAuthRoute,
   claudeEnvAllow,
+  SubprocessScrubError,
+  withSubprocessScrub,
 } from './auth.js';
 export {
   defaultMcpConfigDir,

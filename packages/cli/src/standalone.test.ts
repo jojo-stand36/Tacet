@@ -716,11 +716,12 @@ describe('tacet standalone (#21)', () => {
     await new Promise((r) => setTimeout(r, 300));
     stop.abort();
     const a = await attaching;
-    expect(a.code).toBe(0);
+    expect(a.code, a.err).toBe(0);
     expect(a.out).toMatch(/worker \S+ started/);
     expect(a.err).not.toContain('note:');
     expect(got).toEqual([]);
-    expect((await tacet(['cancel', ...user(), id])).code).toBe(0);
+    const c = await tacet(['cancel', ...user(), id]);
+    expect(c.code, c.err).toBe(0);
     await running;
   });
 });

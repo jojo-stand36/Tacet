@@ -212,20 +212,16 @@ describe('Mini-conductor with a real Claude Worker', () => {
     previous = JSON.parse(readFileSync(`${lockPath}.workers`, 'utf8')) as string[];
     leftovers.push(...previous);
     expect(previous).toHaveLength(1);
-    const workspaceId = (
-      store.query({ taskId: sub, typePrefix: 'worker.started' })[0]?.envelope.data as
-        | { workspaceId: string }
-        | undefined
-    )?.workspaceId;
-    const checkout = (await ws.get(workspaceId ?? ''))?.path ?? '';
-    const job = Number.parseInt(readFileSync(join(checkout, 'background.pid'), 'utf8'), 10);
     // A crash: nothing is closed. Claude Code and the job its Bash tool left behind live on, the
     // job outside Claude Code's process group.
     first.crashForTest();
     const before = [...markedProcesses(previous).values()].flat();
-    expect(before).toContain(job);
+    // The job is found among them by what it runs: the pid it wrote (`$$`) is its pid inside the
+    // sandbox's PID namespace on Linux (#150), not the one the system knows it by.
+    const job = before.find((pid) => / sleep 600$/.test(psLine(pid)));
+    expect(job, before.map(psLine).join('\n')).toBeDefined();
     expect(before.length).toBeGreaterThan(1);
-    expect(alive(job)).toBe(true);
+    expect(alive(job as number)).toBe(true);
 
     const escalationId = (
       store.query({ taskId: sub, typePrefix: 'escalation.raised' })[0]?.envelope.data as

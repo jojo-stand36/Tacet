@@ -75,6 +75,11 @@ export interface EventLogBackendOptions {
   allowRepoDecision?: (b: WorkerBinding, d: ToolInput<'record_decision'>) => boolean;
   /** Called when a handoff packet is accepted; the daemon closes the session and seeds a new one. */
   onHandoff?: (b: WorkerBinding, packet: HandoffPacket, reason: string) => void;
+  /**
+   * Why this Worker may not hand off now, if so (#129): asked before the packet is recorded, so a
+   * refused handoff leaves nothing behind.
+   */
+  canHandoff?: (b: WorkerBinding) => string | undefined;
   /** Minimum interval between stored progress reports per worker. Default 1000 ms. */
   progressIntervalMs?: number;
   /**
@@ -397,6 +402,8 @@ export class EventLogBackend implements MiniBackend {
       (e) => e.sessionId === b.workerSessionId,
     );
     if (already) throw new ToolError('a handoff was already accepted for this session');
+    const refused = this.#o.canHandoff?.(b);
+    if (refused !== undefined) throw new ToolError(`handoff refused: ${refused}`);
     const raw = (typeof i.packet === 'object' && i.packet !== null ? i.packet : {}) as Record<
       string,
       unknown

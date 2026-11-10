@@ -110,6 +110,8 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
   const make = (stub: ReturnType<typeof stubQuery>, extra: object = {}) =>
     new ClaudeSdkAdapter({
       query: stub.fn,
+      // The binary is replaced: nothing runs commands, so no bubblewrap is needed (#150).
+      subprocessScrub: false,
       baseEnv: { PATH: '/bin', ANTHROPIC_API_KEY: FAKE_KEY },
       mcpConfigDir: join(root, 'mcp'),
       stateDir: join(root, 'state'),
@@ -161,6 +163,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(stub.calls[1]?.env?.PATH).toBe('/bin');
     const noKey = new ClaudeSdkAdapter({
       query: stub.fn,
+      subprocessScrub: false,
       baseEnv: { PATH: '/bin' },
       mcpConfigDir: join(root, 'mcp'),
       stateDir: join(root, 'state'),
@@ -460,6 +463,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
         query: (() => {
           throw new Error('spawn failed');
         }) as unknown as typeof query,
+        subprocessScrub: false,
         baseEnv: { ANTHROPIC_API_KEY: FAKE_KEY },
         mcpConfigDir: join(root, 'mcp'),
         stateDir: join(root, 'state'),
@@ -489,11 +493,41 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(forked.vendorSessionId).not.toBe(v1);
   });
 
+  it("strips an API-key Worker's credentials from the commands it runs, or refuses (#150)", async () => {
+    const stub = stubQuery();
+    // A stand-in for bubblewrap, found on the Worker's PATH.
+    const bin = join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
+    const scrubbed = new ClaudeSdkAdapter({
+      query: stub.fn,
+      baseEnv: { PATH: bin, ANTHROPIC_API_KEY: FAKE_KEY },
+      mcpConfigDir: join(root, 'mcp'),
+    });
+    await scrubbed.start({ cwd: root });
+    expect(stub.calls[0]?.env?.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+    // Without bubblewrap on Linux it fails closed, before anything starts.
+    const none = new ClaudeSdkAdapter({
+      query: stub.fn,
+      baseEnv: { PATH: join(root, 'empty'), ANTHROPIC_API_KEY: FAKE_KEY },
+      mcpConfigDir: join(root, 'mcp'),
+    });
+    if (process.platform === 'linux') {
+      await expect(none.start({ cwd: root })).rejects.toThrow(/bubblewrap/);
+      expect(stub.calls).toHaveLength(1);
+    } else {
+      await none.start({ cwd: root });
+      expect(stub.calls[1]?.env?.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+    }
+  });
+
   it('removes the MCP file if the SDK fails to start', async () => {
     const adapter = new ClaudeSdkAdapter({
       query: (() => {
         throw new Error('spawn failed');
       }) as unknown as typeof query,
+      subprocessScrub: false,
       baseEnv: { ANTHROPIC_API_KEY: FAKE_KEY },
       mcpConfigDir: join(root, 'mcp'),
       stateDir: join(root, 'state'),
