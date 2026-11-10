@@ -248,6 +248,10 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
       '.yarnrc.yml',
       '.gemini/settings.json',
       '.codex/config.toml',
+      '.pre-commit-config.yaml',
+      'lefthook.yml',
+      'sub/.lefthook.yml',
+      '.vscode/mcp.json',
     ];
     for (const p of writes) {
       const r = ask('Write', { file_path: p, content: '' });
@@ -288,6 +292,46 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
         allow: true,
       });
     }
+  });
+
+  it('resolves a glob from its own path, not the checkout root (#213 review B1)', () => {
+    symlinkSync(join(root, 'outside'), join(wt, 'src', 'out'));
+    expect(ask('Glob', { path: 'src', pattern: 'out/**' }).allow).toBe(false);
+    expect(ask('Glob', { path: 'src', pattern: 'out/secret' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: 'src/out/**' }).allow).toBe(false);
+    expect(ask('Glob', { path: 'src/out', pattern: '**' }).allow).toBe(false);
+    // And the other way round: an outbound link at the root is no reason to refuse under src.
+    symlinkSync(join(root, 'outside'), join(wt, 'out'));
+    mkdirSync(join(wt, 'src', 'in'));
+    expect(ask('Glob', { path: 'src', pattern: 'in/**' }).allow).toBe(true);
+  });
+
+  it('refuses names NTFS or a URL-aware tool may read as another (#213 review S1, N1)', () => {
+    for (const p of [
+      '.git.',
+      '.git /config',
+      '.git::$INDEX_ALLOCATION/config',
+      '.mcp.json.',
+      '.mcp.json::$DATA',
+      '.claude./settings.json',
+      'CLAUDE~1/settings.json',
+      'MCP~1.JSO',
+      'GITHUB~1/WORKFL~1/ci.yml',
+      'file:///etc/passwd',
+      '$HOME/.bashrc',
+      '%USERPROFILE%/x',
+    ]) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
+    expect(ask('Glob', { pattern: 'GIT~1/*' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: '$HOME/*' }).allow).toBe(false);
+    expect(ask('Read', { file_path: 'src/a\u0085b' }).allow).toBe(false);
+    // Ordinary names with dots and tildes are fine.
+    expect(ask('Write', { file_path: 'src/a.b.c.ts', content: '' }).allow).toBe(true);
+    expect(ask('Write', { file_path: 'src/~notes.md', content: '' }).allow).toBe(true);
   });
 
   it('checks the literal directory of a glob like a path', () => {

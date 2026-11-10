@@ -1,4 +1,16 @@
 /** Per-repo Mini-conductor daemon (#17) and its MCP server for Workers (#18). */
+
+export type {
+  CreateWorktreeOptions,
+  MergeResult,
+  MergeStrategy,
+  WorktreeGcOptions,
+  WorktreeGcResult,
+  WorktreeInfo,
+  WorktreeSetup,
+} from './worktree.js';
+export { WorktreeManager } from './worktree.js';
+
 export const packageName = '@tacet/mini' as const;
 
 export {
@@ -44,7 +56,6 @@ export {
   integrateWorktree,
   taskBranch,
 } from './git/integrate.js';
-export { GitWorktrees, type GitWorktreesOptions } from './git/worktrees.js';
 export {
   type EscalationGate,
   EventLogBackend,
