@@ -7,6 +7,7 @@ import {
   type AgentTerminal,
   type ApprovalDecision,
   AsyncQueue,
+  ForkRefusedError,
   type InterruptResult,
   looksSecret,
   ProfileRefusedError,
@@ -219,7 +220,7 @@ export class PtyCliAdapter implements AgentAdapter {
     }
     const resumeArgs = this.#opts.preset.resumeArgs;
     if (opts.resume && !resumeArgs) throw new Error(`${this.id} does not resume sessions`);
-    if (opts.resume?.fork) throw new Error(`${this.id} cannot fork a session`);
+    if (opts.resume?.fork) throw new ForkRefusedError(this.id, `${this.id} cannot fork a session`);
     if (opts.mcpServers?.length) {
       throw new Error(
         `${this.id} cannot be given MCP servers: a generic CLI has no known way to take them`,

@@ -7,6 +7,7 @@ import { HandoffPacket } from './handoff.js';
 import { HelloParams, HelloResult } from './hello.js';
 import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
+import { StatusExt } from './status-ext.js';
 import { SummaryPacket } from './summary.js';
 import { Task, TaskExt, TaskLanded, TaskTarget } from './task.js';
 import {
@@ -22,6 +23,7 @@ import {
   WorkerVerification,
 } from './worker.js';
 
+export * from './a2a.js';
 export * from './agent-event.js';
 export * from './common.js';
 export * from './decision.js';
@@ -31,6 +33,7 @@ export * from './handoff.js';
 export * from './hello.js';
 export * from './plan.js';
 export * from './profile.js';
+export * from './status-ext.js';
 export * from './summary.js';
 export * from './task.js';
 export * from './worker.js';
@@ -58,6 +61,10 @@ export const jsonSchemas = {
   'decision-ext': {
     schema: DecisionExt,
     title: 'Tacet A2A decision extension (urn:tacet:a2a-ext:decision:v1)',
+  },
+  'status-ext': {
+    schema: StatusExt,
+    title: 'Tacet A2A status extension (urn:tacet:a2a-ext:status:v1)',
   },
   'handoff-packet': { schema: HandoffPacket, title: 'Tacet HandoffPacket' },
   'hello-params': { schema: HelloParams, title: 'Tacet tacet/hello request params' },

@@ -59,6 +59,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Codex in a PTY: a prompt ending in @token is not submitted; check pasted image paths** — `feature` `P2` `claude`
 - [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
 - [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
+- [ ] **Delete a task's pinned-target ref once its result lands** — `feature` `P2` `claude`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 - [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
 - [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude + human`
@@ -74,6 +75,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
 - [ ] **Pin a task's target branch so its sub-tasks never start from different branches** — `feature` `P2` `claude`
 - [ ] **Prune per-Worker progress state when a Worker token is revoked** — `chore` `P2` `either`
+- [ ] **PtyCliAdapter: @path expansion in Gemini, Codex and claude presets** — `feature` `P1` `claude`
 - [ ] **Rate-limit escalate and record_decision in the Mini-conductor MCP server** — `feature` `P2` `either`
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
 - [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
@@ -98,6 +100,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
+- [ ] **pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments** — `feature` `P1` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 

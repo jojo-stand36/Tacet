@@ -31,6 +31,7 @@ import {
   type ApprovalDecision,
   AsyncQueue,
   DeltaScrubber,
+  ForkRefusedError,
   type InterruptResult,
   type McpServerConfig,
   mcpHeaderSecrets,
@@ -222,7 +223,7 @@ export class AcpAdapter implements AgentAdapter {
     }
     if (opts.resume && !caps.resume) throw new Error(`${spec.id} does not resume sessions`);
     if (opts.resume?.fork && caps.fork !== 'native') {
-      throw new Error(`${spec.id} does not fork sessions over ACP`);
+      throw new ForkRefusedError(spec.id, `${spec.id} does not fork sessions over ACP`);
     }
 
     const claimed = opts.resume?.vendorSessionId;
@@ -385,7 +386,13 @@ export class AcpAdapter implements AgentAdapter {
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined, gone);
       flushStderr();
-      if (err instanceof ProfileRefusedError || err instanceof AuthRoutingError) throw err;
+      if (
+        err instanceof ProfileRefusedError ||
+        err instanceof AuthRoutingError ||
+        err instanceof ForkRefusedError
+      ) {
+        throw err;
+      }
       if (err instanceof RequestError && err.code === AUTH_REQUIRED) {
         throw new AuthRoutingError(
           `${spec.id} needs authentication, and Workers only use an API key: set ${spec.apiKeyEnv.join(' or ') || 'its API key'}`,
@@ -623,7 +630,10 @@ export class AcpAdapter implements AgentAdapter {
     if (opts.resume?.fork) {
       // Unstable ACP (#146): only when this agent advertised it in this session's `initialize`.
       if (!(caps as UnstableAgentCapabilities | undefined)?.sessionCapabilities?.fork) {
-        throw new Error(`${this.id} did not advertise session/fork in its initialize response`);
+        throw new ForkRefusedError(
+          this.id,
+          `${this.id} did not advertise session/fork in its initialize response`,
+        );
       }
       // The stable entrypoint sends any method; only its types leave out the unstable ones. Relies on
       // SDK 2.4.0 `dist/v1/stable/acp.js` `ClientContext.request` → `sendRequest(..., mapResponse)`

@@ -143,6 +143,9 @@ export class AdapterPlanner implements Planner {
     } finally {
       opts.signal?.removeEventListener('abort', onAbort);
       await adapter.close(h).catch(() => {});
+      // A planner session is never resumed: drop what the adapter keeps for that (#237).
+      if (h.vendorSessionId)
+        await adapter.discard?.(h.vendorSessionId, this.#o.cwd).catch(() => {});
     }
   }
 }

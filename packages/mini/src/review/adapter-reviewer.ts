@@ -273,6 +273,8 @@ export class AdapterReviewer implements Reviewer {
     } finally {
       ctx.signal.removeEventListener('abort', onAbort);
       await adapter.close(h).catch(() => {});
+      // A review session is never resumed: drop what the adapter keeps for that (#237).
+      if (h.vendorSessionId) await adapter.discard?.(h.vendorSessionId, cwd).catch(() => {});
     }
   }
 }

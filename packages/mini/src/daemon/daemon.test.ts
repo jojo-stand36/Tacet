@@ -1602,6 +1602,10 @@ describe('planning', () => {
     expect(planner.sessions[0]?.inputs).toHaveLength(2);
     expect(planner.sessions[0]?.opts.systemPrompt).toContain('never write or change code');
     expect(planner.open).toBe(0);
+    // Never resumed: its session is discarded once closed (#237).
+    expect(planner.discarded).toEqual([
+      { vendorSessionId: planner.sessions[0]?.handle.vendorSessionId, cwd: '/repo' },
+    ]);
   });
 });
 
