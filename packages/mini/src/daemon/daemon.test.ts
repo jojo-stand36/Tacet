@@ -54,7 +54,8 @@ const mcp: WorkerMcp = {
       config: {
         name: 'tacet',
         url: 'http://127.0.0.1:1/mcp',
-        headers: { authorization: 'Bearer x' },
+        // One token per Worker session, so a test can tell which minting a session got.
+        headers: { authorization: `Bearer token-for-${b.workerSessionId}` },
       },
       revoke: () => revoked.push(b.workerSessionId),
     };
@@ -392,6 +393,14 @@ describe('MiniConductor', () => {
     // It resumed the same vendor session in the same checkout, told that it restarted.
     const resumed = fake.sessions.find((s) => s.opts.resume);
     expect(resumed?.opts.resume?.vendorSessionId).toBe(vendor);
+    // With the restarted Mini-conductor's MCP config: a token minted for the new session (#128).
+    const resumedSession = (
+      ofType('worker.started', `${id}/2`).at(-1)?.data as { sessionId: string } | undefined
+    )?.sessionId;
+    expect(resumedSession).not.toBe(crashed);
+    expect(resumed?.opts.mcpServers?.[0]?.headers).toEqual({
+      authorization: `Bearer token-for-${resumedSession}`,
+    });
     const firstWs = ofType('worker.started', `${id}/2`)[0]?.data as
       | { workspaceId: string }
       | undefined;
