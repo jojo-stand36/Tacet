@@ -21,7 +21,7 @@ import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeSdkAdapter, toPermissionResult } from './adapter.js';
 import { AuthRoutingError } from './auth.js';
-import { ownerDirName } from './mcp-config.js';
+import { ownOwnerDirName } from './mcp-config.js';
 
 // Fake values only.
 const FAKE_KEY = 'fake-key-for-tests';
@@ -122,7 +122,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     const opts = stub.calls[0];
     expect(opts?.mcpServers).toBeUndefined();
     const path = opts?.extraArgs?.['mcp-config'];
-    expect(path).toBe(join(root, 'mcp', ownerDirName(), `${h.id}.json`));
+    expect(path).toBe(join(root, 'mcp', ownOwnerDirName(), `${h.id}.json`));
     expect(existsSync(path as string)).toBe(true);
     expect(opts?.includePartialMessages).toBe(true);
     expect(opts?.sessionId).toBe(h.vendorSessionId);
@@ -133,7 +133,8 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
   });
 
   it('sweeps the MCP files of a dead Mini-conductor once, at its first session (#108)', async () => {
-    const stale = join(root, 'mcp', '999999999-000000000000');
+    const ns = ownOwnerDirName().split('-')[0];
+    const stale = join(root, 'mcp', `${ns}-999999999-000000000000`);
     mkdirSync(stale, { recursive: true });
     writeFileSync(join(stale, 'old.json'), '{"token":"leftover"}');
     const swept: unknown[] = [];

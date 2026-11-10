@@ -204,8 +204,13 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     if (!this.#swept) {
       // Once per adapter, which lives as long as its Mini-conductor: files a crashed one left.
       this.#swept = true;
-      const removed = sweepStaleMcpConfigs(this.#opts.mcpConfigDir);
-      this.#opts.onSweep?.(removed);
+      // Cleanup never stands in the way of a session.
+      try {
+        const removed = sweepStaleMcpConfigs(this.#opts.mcpConfigDir);
+        this.#opts.onSweep?.(removed);
+      } catch {
+        // Tried again by the next Mini-conductor that starts.
+      }
     }
     const mcpConfigPath = opts.mcpServers?.length
       ? writeMcpConfig(opts.mcpServers, {

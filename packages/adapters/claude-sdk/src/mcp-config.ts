@@ -7,6 +7,7 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   rmdirSync,
   rmSync,
@@ -54,20 +55,47 @@ function isInside(child: string, parent: string): boolean {
   return rel === '' || !(rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel));
 }
 
-const OWNER_DIR = /^(\d+)-([0-9a-f]{12})$/;
+/** `<namespace>-<pid>-<hash>`, or `<namespace>-<pid>-unknown`; see `ownerDirName`. */
+const OWNER_DIR = /^(\d+)-(\d+)-([0-9a-f]{12}|unknown)$/;
 
 /**
- * `<pid>-<hash>`: the process that writes a set of MCP config files, and a hash of its start
- * time, so a later process that gets the same pid is not taken for it (#108).
+ * This machine's pid namespace (Linux: the inode of `/proc/self/ns/pid`; elsewhere `0`). A pid
+ * means a different process in another namespace, e.g. a container sharing the home directory, so
+ * the sweep leaves other namespaces' directories alone.
+ */
+function pidNamespace(): string {
+  if (process.platform !== 'linux') return '0';
+  try {
+    return /\[(\d+)\]/.exec(readlinkSync('/proc/self/ns/pid'))?.[1] ?? '0';
+  } catch {
+    return '0';
+  }
+}
+
+const startHash = (start: string): string =>
+  createHash('sha256').update(start).digest('hex').slice(0, 12);
+
+/**
+ * `<namespace>-<pid>-<hash>`: the process that writes a set of MCP config files, and a hash of its
+ * start time, so a later process that gets the same pid is not taken for it (#108). When the start
+ * time cannot be read, the hash is `unknown`, and only the pid being gone lets a sweep remove the
+ * directory.
  */
 export function ownerDirName(pid = process.pid): string {
-  const start = processStartTime(pid) ?? 'unknown';
-  return `${pid}-${createHash('sha256').update(start).digest('hex').slice(0, 12)}`;
+  const start = processStartTime(pid);
+  return `${pidNamespace()}-${pid}-${start === undefined ? 'unknown' : startHash(start)}`;
+}
+
+/** This process's owner directory name, worked out once, so all its files share one directory. */
+let ownName: string | undefined;
+export function ownOwnerDirName(): string {
+  ownName ??= ownerDirName();
+  return ownName;
 }
 
 /**
  * Whether the process an owner directory is named after is still running. A process that exists
- * but whose start time cannot be read counts as running: a sweep must never remove a live
+ * but whose start time cannot be read now counts as running: a sweep must never remove a live
  * Mini-conductor's files.
  */
 function ownerRunning(pid: number, hash: string): boolean {
@@ -76,9 +104,10 @@ function ownerRunning(pid: number, hash: string): boolean {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EPERM') return false;
   }
+  if (hash === 'unknown') return true;
   const start = processStartTime(pid);
   if (start === undefined) return true;
-  return createHash('sha256').update(start).digest('hex').slice(0, 12) === hash;
+  return startHash(start) === hash;
 }
 
 /**
@@ -95,21 +124,23 @@ export function sweepStaleMcpConfigs(dir = defaultMcpConfigDir()): number {
   } catch {
     return 0;
   }
-  const own = ownerDirName();
+  const own = ownOwnerDirName();
+  const ns = pidNamespace();
   let removed = 0;
   for (const name of entries) {
     const m = OWNER_DIR.exec(name);
-    if (!m || name === own) continue;
+    if (!m || name === own || m[1] !== ns) continue;
     const path = join(dir, name);
-    const st = lstatSync(path, { throwIfNoEntry: false });
-    if (!st?.isDirectory() || st.isSymbolicLink()) continue;
-    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) continue;
-    if (ownerRunning(Number(m[1]), m[2] ?? '')) continue;
     try {
-      removed += readdirSync(path).filter((f) => f.endsWith('.json')).length;
+      const st = lstatSync(path);
+      if (!st.isDirectory() || st.isSymbolicLink()) continue;
+      if (typeof process.getuid === 'function' && st.uid !== process.getuid()) continue;
+      if (ownerRunning(Number(m[2]), m[3] ?? '')) continue;
+      const files = readdirSync(path).filter((f) => f.endsWith('.json')).length;
       rmSync(path, { recursive: true, force: true });
+      removed += files;
     } catch {
-      // Gone already, or not removable: the next sweep tries again.
+      // Gone already, or not readable or removable: the next sweep tries again.
     }
   }
   return removed;
@@ -117,7 +148,7 @@ export function sweepStaleMcpConfigs(dir = defaultMcpConfigDir()): number {
 
 /**
  * Write the Worker's MCP config (which holds its per-worker token) to
- * `<dir>/<owner>/<sessionId>.json` with mode 0600 (`<owner>` is `ownerDirName()`, for
+ * `<dir>/<owner>/<sessionId>.json` with mode 0600 (`<owner>` is `ownOwnerDirName()`, for
  * `sweepStaleMcpConfigs`), and refuse a location inside the worktree, so it can
  * never be committed (owner decision 2026-11-09). Containment is checked on real paths (symlinks
  * followed before `..`), so a symlinked directory or worktree cannot route the file into the
@@ -150,7 +181,7 @@ export function writeMcpConfig(
     throw new Error('MCP config directory must be outside the worktree');
   }
   chmodSync(dir, 0o700);
-  const ownerDir = join(dir, ownerDirName());
+  const ownerDir = join(dir, ownOwnerDirName());
   mkdirSync(ownerDir, { mode: 0o700, recursive: true });
   const ost = lstatSync(ownerDir);
   if (!ost.isDirectory() || ost.isSymbolicLink()) {

@@ -11,6 +11,7 @@ export { AuthRoutingError, authEnv, type ClaudeAuthRoute, chooseAuthRoute } from
 export {
   defaultMcpConfigDir,
   ownerDirName,
+  ownOwnerDirName,
   removeMcpConfig,
   sweepStaleMcpConfigs,
   writeMcpConfig,
