@@ -76,6 +76,14 @@ export interface PtyPreset {
    * `vendorSessionId` is a marker, set at start.
    */
   resumeArgs?: string[];
+  /**
+   * Type every `@` as `\@` (#245): for Gemini CLI, which otherwise reads an `@path` in a prompt
+   * into it with `ReadManyFiles`, a file in the workspace without asking and one outside after a
+   * confirmation whose default is Yes (the next Enter Tacet types would accept it). Gemini takes
+   * `\@` as a literal at sign and sends it as typed. Verified live on Gemini CLI 0.67.0 against a
+   * local mock of its API (capability matrix, "Generic PTY presets: `@path` mentions").
+   */
+  escapeAt?: boolean;
 }
 
 /** `vendorSessionId` of a session whose CLI resumes by `resumeArgs`: there is no real id. */
@@ -313,7 +321,8 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.effort !== undefined) {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
-    const text = promptText(input.text);
+    const typed = promptText(input.text);
+    const text = this.#opts.preset.escapeAt ? typed.replaceAll('@', '\\@') : typed;
     // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
     if (s.stalled) {
       s.stalled = false;

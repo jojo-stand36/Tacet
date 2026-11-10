@@ -615,6 +615,17 @@
       "body": "Found in #110 slice 2 (spike `docs/adapters/spikes/110-codex-effort/`, Codex 0.167.0, mock Responses API): `thread/fork` sent without a `model` came back on the catalog's default model (`gpt-6.1-sol`) with `reasoningEffort: null`, not on the source thread's model. The Codex adapter adopts the reported model, so its own state is consistent, but a forked Worker silently changes model and loses its effort unless the adapter sends them.\n\n### Tasks\n- [ ] Verify on the pinned Codex whether `thread/fork` honours `model` (and the thread config's `model_reasoning_effort`) in its params (`verify-vendor-facts`).\n- [ ] When forking without `SessionOptions.model`, send the source thread's model (and its effort, checked against `model/list`) so the fork continues on what the source ran.\n- [ ] Record the behaviour in the capability matrix Codex Resume/fork row.\n\n### Acceptance criteria\n- Against the mock Responses API, a fork of a thread that ran on `gpt-5.5` at `low`, started without a model or effort, sends its first request with model `gpt-5.5` and effort `low`.\n- A fork with an explicit `model` or `effort` still uses those, and an effort the model does not list is refused (`ProfileRefusedError`).\n\n_See docs/adapters/capability-matrix.md (Codex) and #110._"
     },
     {
+      "title": "Codex in a PTY: a prompt ending in @token is not submitted; check pasted image paths",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Found while working on #245. In live tests against the local mock Responses API, interactive Codex 0.167.0 in a PTY does not read an `@path` into a prompt. But when a Worker prompt ends in an `@token` (`… see @note.txt`), Codex opens its \"Mentions\" popup, and the Enter that Tacet types then inserts the selected completion instead of submitting. The prompt text changes (`@note.txt` became `note.txt`), and the turn is not submitted until Esc and then Enter. The `PtyCliAdapter` turn stalls, and the next prompt Tacet types lands in that composer. An `@` that is not the last word submits normally.\n\nSeparately, Codex source (`codex-rs/tui/src/bottom_pane/chat_composer.rs`, main) attaches a pasted path as an image when it names an image file (`handle_paste_image_path`). That would send an image from outside the checkout to the model. When this triggers, for example whether a prompt with surrounding text counts, is unverified.\n\n### Tasks\n- [ ] Reproduce the trailing-`@` popup with the PTY live setup, and decide how to fix it: close the popup before submitting, end the prompt with a character that doesn't complete, or disable `mentions_v2`. Verify any switch first (`verify-vendor-facts`).\n- [ ] Probe live whether a Worker prompt holding an image path attaches the image, both inside and outside the checkout.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- A Codex `pty:<slug>` Worker prompt that ends in `@<path>` is submitted with its text unchanged, shown live.\n- A prompt holding an image path outside the checkout attaches nothing, shown live or documented with a source.\n\n_See #245, #244 and docs/adapters/capability-matrix.md (\"Generic PTY presets\")._"
+    },
+    {
       "title": "Core: modelSwitch 'none' for adapters that cannot choose a model",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [

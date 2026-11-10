@@ -27,7 +27,7 @@ import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
 import { TempWorkspaces } from '../daemon/testing.js';
-import { buildWorkerAdapters, WorkerConfigError } from './build.js';
+import { buildWorkerAdapters, runsGemini, WorkerConfigError } from './build.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
@@ -133,6 +133,49 @@ describe('buildWorkerAdapters', () => {
       if (h) await adapter?.close(h);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('recognises a PTY preset running Gemini CLI, whose prompts get every @ escaped (#245)', () => {
+    for (const w of [
+      'gemini',
+      '/usr/local/bin/gemini',
+      '@google/gemini-cli',
+      '@google/gemini-cli@0.67.0',
+      '/x/node_modules/@google/gemini-cli/bundle/gemini.js',
+    ]) {
+      expect(runsGemini(w), w).toBe(true);
+    }
+    for (const w of ['gemini-helper', 'my-gemini', 'codex', 'aider', '@google/genai']) {
+      expect(runsGemini(w), w).toBe(false);
+    }
+  });
+
+  it('refuses a custom PTY preset running Claude Code for Workers: pty:claude is hardened (#245)', () => {
+    for (const command of [
+      ['claude'],
+      ['/usr/local/bin/claude', '--model', 'x'],
+      ['npx', '-y', '@anthropic-ai/claude-code@2.1.319'],
+      ['sh', '-c', 'exec claude'],
+      ['sh', '-c', 'claude;'],
+      ['/x/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'],
+      ['node', '/x/node_modules/@anthropic-ai/claude-code/cli.js'],
+    ]) {
+      const config = {
+        tiers: { worker: { adapter: 'pty:mine' } },
+        agents: { mine: { kind: 'pty' as const, command } },
+      };
+      expect(() => buildWorkerAdapters(config, { baseEnv: {} }), command.join(' ')).toThrow(
+        /agents\.mine runs Claude Code; use pty:claude/,
+      );
+    }
+    // Other CLIs, and names that only contain the word, still build.
+    for (const command of [['aider'], ['codex'], ['claude-helper'], ['my-claude'], ['gemini']]) {
+      const built = buildWorkerAdapters(
+        { tiers: { worker: { adapter: 'pty:mine' } }, agents: { mine: { kind: 'pty', command } } },
+        { baseEnv: {} },
+      );
+      expect(Object.keys(built)).toEqual(['pty:mine']);
     }
   });
 

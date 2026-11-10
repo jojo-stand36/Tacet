@@ -182,6 +182,24 @@ describe.skipIf(!gate.ok)(
       await resumable.close(none);
     });
 
+    it('types every @ as \\@ for a preset that asks for it (#245)', {
+      timeout: 60_000,
+    }, async () => {
+      const escaping = make({
+        preset: { command: [process.execPath, FAKE], readyPrompt: 'fake>', escapeAt: true },
+      });
+      const h = await escaping.start({ cwd: root });
+      const tap = new EventTap(escaping.events(h));
+      const { events } = await turn(escaping, h, tap, 'see @/etc/hosts and a@b.c');
+      expect(reply(events)).toContain('echo: see \\@/etc/hosts and a\\@b.c');
+      await escaping.close(h);
+      // Without it, the text is typed as given.
+      const h2 = await adapter.start({ cwd: root });
+      const tap2 = new EventTap(adapter.events(h2));
+      expect(reply((await turn(adapter, h2, tap2, 'see @x')).events)).toContain('echo: see @x');
+      await adapter.close(h2);
+    });
+
     it('refuses what a generic CLI cannot do, and reports a crash once', {
       timeout: 60_000,
     }, async () => {

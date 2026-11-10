@@ -56,6 +56,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
 - [ ] **Codex adapter: report a self-exit only once the process group is gone** — `feature` `P2` `claude`
 - [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
+- [ ] **Codex in a PTY: a prompt ending in @token is not submitted; check pasted image paths** — `feature` `P2` `claude`
 - [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
 - [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`

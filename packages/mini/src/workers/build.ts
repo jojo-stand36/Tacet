@@ -189,6 +189,7 @@ export function buildWorkerAdapters(
           `${where}: agents.${ptySlug} is of kind ${preset.kind}; use ${preset.kind}:${ptySlug}`,
         );
       }
+      refusePtyForWorkers(ptySlug, where);
       const env = resolveEnv(ptySlug, preset.env);
       return new PtyCliAdapter({
         ...opts.ptyCli,
@@ -200,6 +201,11 @@ export function buildWorkerAdapters(
           secrets: Object.values(env),
           ...(preset.ready_prompt !== undefined ? { readyPrompt: preset.ready_prompt } : {}),
           ...(preset.resume_flag !== undefined ? { resumeArgs: [preset.resume_flag].flat() } : {}),
+          // Gemini CLI reads an `@path` in a prompt unasked, or after a Yes-by-default question
+          // (#245): its prompts are typed with every `@` escaped.
+          ...(preset.command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).some(runsGemini)
+            ? { escapeAt: true }
+            : {}),
         },
       });
     }
@@ -297,6 +303,23 @@ export function buildWorkerAdapters(
     }
   }
 
+  /**
+   * Throws for a custom PTY preset that runs interactive Claude Code: it would get none of
+   * `pty:claude`'s Worker hardening (hooks asking Tacet about every tool, isolated settings, and
+   * no `@path` read into a prompt unasked, #226), so Workers use the built-in (#245).
+   */
+  function refusePtyForWorkers(slug: string, where: string): void {
+    const preset = config.agents?.[slug];
+    if (
+      preset?.kind === 'pty' &&
+      preset.command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).some(runsClaudeCode)
+    ) {
+      throw new WorkerConfigError(
+        `${where}: agents.${slug} runs Claude Code; use pty:claude for Workers, which runs it with the Worker hardening (#245)`,
+      );
+    }
+  }
+
   /** Throws unless `id` names an adapter this function can build. */
   function buildable(id: string, where: string): void {
     if (id === 'claude-sdk' || id === 'codex-app-server') return;
@@ -311,6 +334,7 @@ export function buildWorkerAdapters(
     }
     const pty = PTY_ID.exec(id)?.[1];
     if (pty !== undefined && (BUILTIN_PTY.includes(pty) || config.agents?.[pty]?.kind === 'pty')) {
+      if (!BUILTIN_PTY.includes(pty)) refusePtyForWorkers(pty, where);
       return;
     }
     if (pty !== undefined) {
@@ -337,6 +361,39 @@ function runsClaudeAcp(word: string): boolean {
     ['claude-agent-acp', 'claude-code-acp'].includes(base) ||
     /(^|\/)(claude-agent-acp|claude-code-acp)(\/|@|$)/.test(word)
   );
+}
+
+/**
+ * Whether a command word runs Claude Code: the `claude` bin (by name or path), its npm package
+ * `@anthropic-ai/claude-code`, or the binary the Agent SDK bundles
+ * (`@anthropic-ai/claude-agent-sdk-<platform>-<arch>/claude`). A wrapper script that hides it is
+ * not caught.
+ */
+function runsClaudeCode(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return (
+    base === 'claude' ||
+    /(^|\/)@anthropic-ai\/claude-code(\/|@|$)/.test(word) ||
+    /(^|\/)@anthropic-ai\/claude-agent-sdk-[^/]+\/claude$/.test(word)
+  );
+}
+
+/**
+ * Whether a command word runs Gemini CLI: the `gemini` bin (by name or path) or its npm package
+ * `@google/gemini-cli` (`npx @google/gemini-cli`, `node .../@google/gemini-cli/bundle/gemini.js`).
+ * A wrapper script that hides it is not caught.
+ */
+export function runsGemini(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return base === 'gemini' || /(^|\/)@google\/gemini-cli(\/|@|$)/.test(word);
 }
 
 /** Whether one word of a command runs `bin` (by name, path or npm package). */

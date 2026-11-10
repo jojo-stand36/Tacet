@@ -167,7 +167,7 @@ budget:
 auth:
   unattended: api_key      # default: API key for parallel or unattended Workers
   interactive: subscription
-agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt, resume_flag = argument(s) that continue the CLI's last session in the Worker's checkout, e.g. [resume, --last], only for a CLI whose resume is scoped to its working directory, or a Worker could continue another's; the built-in Claude preset is pty:claude)
+agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt, resume_flag = argument(s) that continue the CLI's last session in the Worker's checkout, e.g. [resume, --last], only for a CLI whose resume is scoped to its working directory, or a Worker could continue another's; the built-in Claude preset is pty:claude; Workers may not use a preset whose command runs Claude Code, which would get none of pty:claude's hardening, and a preset running Gemini CLI has every `@` in its prompts typed as `\@`, so no `@path` is read in, #245)
   goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
   # a tier on such an agent: tiers.worker: { adapter: "acp:goose" } (no model: its command fixes it)
 policies:
