@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   mkdirSync,
   mkdtempSync,
@@ -651,6 +652,39 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     },
   );
 
+  it.runIf(process.platform !== 'win32')(
+    'reports a self-exit only once the whole process group is gone (#198)',
+    async () => {
+      const adapter = make('child-term-crash', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        const tap = new EventTap(adapter.events(h));
+        await adapter.send(h, { text: 'go' });
+        // Checked the moment the error is seen: a caller cleaning up on it races nothing.
+        let alive: boolean | undefined;
+        const seen = tap.waitFor((e) => {
+          if (e.t === 'status' && e.state === 'error') {
+            alive = running(childPid as number);
+            return true;
+          }
+          return false;
+        }, 10_000);
+        const { event } = await seen;
+        expect(event).toMatchObject({ message: expect.stringContaining('exited unexpectedly') });
+        expect(alive).toBe(false);
+        // Ended at once, though: nothing more can be sent to it while its group is reaped.
+        await expect(adapter.send(h, { text: 'again' })).rejects.toThrow('has ended');
+      } finally {
+        try {
+          if (childPid) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
+    },
+  );
+
   it('queues input sent during a turn and reports it in the interrupt receipt', async () => {
     const adapter = make('approval');
     const h = await adapter.start({ cwd: root });
@@ -766,3 +800,30 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     await adapter.close(h);
   });
 });
+
+/**
+ * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
+ * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
+ * where `kill(pid, 0)` also finds a zombie.
+ */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+  } catch {
+    if (process.platform === 'linux') return false;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    return state.trim() !== '' && !state.trim().startsWith('Z');
+  } catch (err) {
+    // `ps` exits 1 once the pid is gone; anything else is a broken check, not an answer.
+    if ((err as { status?: number }).status === 1) return false;
+    throw err;
+  }
+}

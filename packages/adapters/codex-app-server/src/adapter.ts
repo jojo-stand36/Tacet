@@ -552,7 +552,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
     const session = s;
     this.#sessions.set(handle.id, session);
-    void exited.then(() => this.#onExit(session));
+    // Ended at once, so nothing more is sent to it; reported only once its whole process group is
+    // gone, so nothing of it still runs (or writes into the worktree) after the error (#198).
+    void exited
+      .then(() => {
+        this.#exited(session);
+        return this.#reapGroup(proc);
+      })
+      .then(() => this.#onExit(session));
 
     // The own-login route needs the user to have logged in to Codex; say so instead of failing
     // on the first turn.
@@ -696,8 +703,17 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // servers: not verified) got SIGTERM when it exited, but may still be shutting down and
     // writing into the Worker's CODEX_HOME or checkout: wait for the whole group (#191). A child
     // that starts a group or session of its own is not covered.
-    // SIGKILL only right after seeing a running member, synchronously: a pid is not reused while
-    // it is the id of a group with members, so this cannot reach a reused group id.
+    await this.#reapGroup(proc);
+  }
+
+  /**
+   * Once the leader has exited (and its group had SIGTERM), wait for the rest of the group, then
+   * SIGKILL what is left. SIGKILL only right after seeing a running member, synchronously: a pid
+   * is not reused while it is the id of a group with members, so this cannot reach a reused group
+   * id.
+   */
+  async #reapGroup(proc: ChildProcess): Promise<void> {
+    const timeout = this.#opts.killTimeoutMs ?? 5000;
     if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
       if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
       await processGroupGone(proc.pid, 1000);
@@ -897,10 +913,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
     s.approvals.clear();
   }
 
-  #onExit(s: Session): void {
+  /** The process exited: the session takes no more input, and pending requests fail now. */
+  #exited(s: Session): void {
     s.ended = true;
     this.#denyPending(s);
     s.rpc.fail(new Error('app-server exited'));
+  }
+
+  /** Report the exit, once the process group is gone (#198). A close() reports its own end. */
+  #onExit(s: Session): void {
     if (s.closing) return;
     // Any exit we did not ask for is a crash (adapter rules), during a turn or not.
     const how = s.exit?.signal ? `signal ${s.exit.signal}` : `code ${s.exit?.code ?? '?'}`;
