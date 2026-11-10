@@ -98,10 +98,14 @@ rl.on('line', async (line) => {
       });
       return;
     }
-    send({
-      method: 'item/agentMessage/delta',
-      params: { threadId: 'thread-1', turnId, itemId: 'm', delta: 'hi' },
-    });
+    // split-delta: the message comes in the pieces FAKE_DELTAS lists (a JSON array).
+    const deltas = mode === 'split-delta' ? JSON.parse(process.env.FAKE_DELTAS ?? '[]') : ['hi'];
+    for (const delta of deltas) {
+      send({
+        method: 'item/agentMessage/delta',
+        params: { threadId: 'thread-1', turnId, itemId: 'm', delta },
+      });
+    }
     if (mode === 'normal') complete(turnId, 'failed', { error: { message: 'model overloaded' } });
     else complete(turnId, 'completed');
   }
