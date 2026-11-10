@@ -1,3 +1,5 @@
+import type { EnvAllow } from '@tacet/core';
+
 /**
  * Auth routing for Claude Workers (owner policy, 2026-11-09; docs/RESEARCH.md §7):
  * - `api_key`: parallel or unattended Workers use the user's own API key (or cloud provider
@@ -60,4 +62,50 @@ export function authEnv(
   }
   for (const k of API_KEY_VARS) delete out[k];
   return out;
+}
+
+/**
+ * The variables a Claude Code Worker needs beyond the common base set (#147), verified on Claude
+ * Code 2.1.319 (capability matrix §1, "Worker environment"). `ANTHROPIC_*` and `CLAUDE_*` pass
+ * only names that do not look secret (base URL, model overrides, config dir, cert paths); the
+ * credentials pass by name. A cloud provider route the user chose adds its own credentials:
+ * Bedrock the whole `AWS_*` chain; Vertex the Google project and credentials file; Foundry its
+ * keys and the Azure identity variables found in the binary (the exact Azure set is
+ * unverified: pass others with `workers.env.pass`). Never `GOOGLE_*` or `AZURE_*` as a whole,
+ * which hold other products' keys (`GOOGLE_API_KEY`, `AZURE_OPENAI_API_KEY`).
+ */
+export function claudeEnvAllow(env: Record<string, string | undefined>): EnvAllow {
+  // As `authEnv` reads them: set, and not `0`.
+  const on = (k: string) => Boolean(env[k]) && env[k] !== '0';
+  const names = [
+    ...API_KEY_VARS,
+    'CLAUDE_CODE_CLIENT_CERT',
+    'CLAUDE_CODE_CLIENT_KEY',
+    'CLAUDE_CODE_CLIENT_KEY_PASSPHRASE',
+    // The user's opt-outs and timeouts, from Claude Code's environment reference.
+    'DISABLE_TELEMETRY',
+    'DISABLE_ERROR_REPORTING',
+    'DISABLE_AUTOUPDATER',
+    'DISABLE_UPDATES',
+    'API_TIMEOUT_MS',
+  ];
+  const prefixes = ['ANTHROPIC_', 'CLAUDE_'];
+  const credentialPrefixes: string[] = [];
+  if (on('CLAUDE_CODE_USE_BEDROCK')) credentialPrefixes.push('AWS_');
+  if (on('CLAUDE_CODE_USE_VERTEX')) {
+    names.push('GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_CLOUD_PROJECT', 'GCLOUD_PROJECT');
+    prefixes.push('CLOUD_ML_', 'VERTEX_', 'CLOUDSDK_');
+  }
+  if (on('CLAUDE_CODE_USE_FOUNDRY')) {
+    names.push(
+      'ANTHROPIC_FOUNDRY_API_KEY',
+      'ANTHROPIC_FOUNDRY_AUTH_TOKEN',
+      'AZURE_CLIENT_ID',
+      'AZURE_TENANT_ID',
+      'AZURE_CLIENT_SECRET',
+      'AZURE_FEDERATED_TOKEN_FILE',
+      'AZURE_CONFIG_DIR',
+    );
+  }
+  return { names, prefixes, credentialPrefixes };
 }

@@ -192,6 +192,41 @@ describe('loadConfig', () => {
     });
   });
 
+  it('unions workers.env.pass across layers; the repo layer may not pass a secret by name', () => {
+    write(join(userDir, 'config.yaml'), 'workers: { env: { pass: [NPM_TOKEN, JDK_*] } }\n');
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [MYAPP_*, JDK_*] } }\n');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [ROLLUP_CACHE] } }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.workers?.env?.pass).toEqual([
+      'NPM_TOKEN',
+      'JDK_*',
+      'MYAPP_*',
+      'ROLLUP_CACHE',
+    ]);
+    // Each value shows every layer that added to it.
+    expect(formatExplain(loadConfig({ userDir, repoRoot }))).toMatch(
+      /^workers\.env\.pass = .*# user \(.*\) \+ repo \(.*\) \+ local \(.*\)$/m,
+    );
+    // The local layer, which is the user's own, may name a secret.
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [GITHUB_TOKEN] } }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.workers?.env?.pass).toContain('GITHUB_TOKEN');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [ROLLUP_CACHE] } }\n');
+    // A prefix is fine in the repo layer: it never lets a secret-looking name through.
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [AWS_*] } }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).not.toThrow();
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [GITHUB_TOKEN] } }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/GITHUB_TOKEN looks like a secret/);
+    for (const bad of ['"*"', '"A-B"', '"*_X"']) {
+      write(join(repoRoot, '.tacet', 'tacet.yaml'), `workers: { env: { pass: [${bad}] } }\n`);
+      expect(() => loadConfig({ userDir, repoRoot })).toThrow(/workers.env.pass/);
+    }
+  });
+
+  it('never lets a task change the Worker environment', () => {
+    expect(() =>
+      loadConfig({ userDir, repoRoot, task: { workers: { env: { pass: ['MYAPP_*'] } } } }),
+    ).toThrow(/task layer .* may not change a Worker's environment/);
+  });
+
   it('reports every problem with file, line and column', () => {
     write(
       join(repoRoot, '.tacet', 'tacet.yaml'),

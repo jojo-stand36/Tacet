@@ -64,6 +64,8 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **ACP: verify API-key-only auth for claude-agent-acp and codex-acp, then register them** — `feature` `P2` `claude`
 - [ ] **ACP: offer fork when the agent advertises sessionCapabilities.fork** — `feature` `P2` `claude`
 - [ ] **Adapters: launch Workers with an environment allowlist** — `feature` `P2` `either`
+- [ ] **Mini-conductor: build Worker adapters from the effective config at startup** — `feature` `P1` `either`
+- [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation
 

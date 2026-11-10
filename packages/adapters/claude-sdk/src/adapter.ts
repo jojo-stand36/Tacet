@@ -27,8 +27,10 @@ import {
   type SessionState,
   scrubbedEvents,
   type UserInput,
+  type WorkerEnvPolicy,
+  workerEnv,
 } from '@tacet/core';
-import { authEnv, type ClaudeAuthRoute } from './auth.js';
+import { authEnv, type ClaudeAuthRoute, claudeEnvAllow } from './auth.js';
 import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
 
 const CONTEXT_1M = 1_000_000;
@@ -61,8 +63,15 @@ export interface ClaudeSdkAdapterOptions {
    * policy for parallel or unattended Workers.
    */
   authRoute?: ClaudeAuthRoute;
-  /** The user's environment the Worker inherits. Default `process.env`. */
+  /** The user's environment, which the Worker gets an allowlist of. Default `process.env`. */
   baseEnv?: Record<string, string | undefined>;
+  /**
+   * Which of `baseEnv` the Worker gets (#147). Default: the allowlist (`workerEnv`), with no
+   * passthrough. Interactive sessions may pass `{ inherit: 'all' }`.
+   */
+  envPolicy?: WorkerEnvPolicy;
+  /** Told the names (never values) of the variables left out of each session's environment. */
+  onEnvDropped?: (names: string[]) => void;
   /** Directory for per-session MCP config files. Default `~/.tacet/run/mcp`. */
   mcpConfigDir?: string;
   /**
@@ -176,8 +185,16 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       check1m(opts.model);
     }
     const id = randomUUID();
+    const base = this.#opts.baseEnv ?? process.env;
+    const filtered = workerEnv(
+      base,
+      claudeEnvAllow({ ...base, ...opts.env }),
+      this.#opts.envPolicy,
+    );
+    this.#opts.onEnvDropped?.(filtered.dropped);
+    // The SDK's `env` replaces the child's environment (verified, 0.3.319): only this reaches it.
     const env = authEnv(this.#opts.authRoute ?? 'api_key', {
-      ...(this.#opts.baseEnv ?? process.env),
+      ...filtered.env,
       ...opts.env,
       CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     });

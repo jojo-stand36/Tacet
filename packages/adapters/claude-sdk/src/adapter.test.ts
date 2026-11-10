@@ -167,6 +167,81 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(h1.id).not.toBe(h2.id);
   });
 
+  it('gives the Worker an allowlist of the environment, not all of it (#147)', async () => {
+    const user = {
+      PATH: '/bin',
+      HOME: '/home/u',
+      JAVA_HOME: '/opt/jdk',
+      ANTHROPIC_API_KEY: FAKE_KEY,
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
+      OPENAI_API_KEY: 'sk-other-vendor',
+      GEMINI_API_KEY: 'other-vendor',
+      GITHUB_TOKEN: 'ghp_x',
+      GITHUB_ACTIONS: 'true',
+      AWS_SECRET_ACCESS_KEY: 'aws-x',
+      MYAPP_HOME: '/opt/myapp',
+    };
+    const dropped: string[][] = [];
+    const stub = stubQuery();
+    const adapter = make(stub, {
+      baseEnv: user,
+      envPolicy: { pass: ['MYAPP_*'] },
+      onEnvDropped: (n: string[]) => dropped.push(n),
+    });
+    await adapter.start({ cwd: root, env: { TACET_WORKER_MARKER: 'm-1' } });
+    const env = stub.calls[0]?.env ?? {};
+    expect(Object.keys(env).sort()).toEqual([
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_BASE_URL',
+      'CLAUDE_AGENT_SDK_CLIENT_APP',
+      'HOME',
+      'JAVA_HOME',
+      'MYAPP_HOME',
+      'PATH',
+      'TACET_WORKER_MARKER',
+    ]);
+    expect(dropped).toEqual([
+      [
+        'AWS_SECRET_ACCESS_KEY',
+        'GEMINI_API_KEY',
+        'GITHUB_ACTIONS',
+        'GITHUB_TOKEN',
+        'OPENAI_API_KEY',
+      ],
+    ]);
+    // A cloud route the user chose brings its credential chain; interactive may inherit all.
+    await make(stub, {
+      baseEnv: { ...user, ANTHROPIC_API_KEY: undefined, CLAUDE_CODE_USE_BEDROCK: '1' },
+    }).start({ cwd: root });
+    expect(stub.calls[1]?.env?.AWS_SECRET_ACCESS_KEY).toBe('aws-x');
+    expect(stub.calls[1]?.env?.OPENAI_API_KEY).toBeUndefined();
+    await make(stub, { baseEnv: user, envPolicy: { inherit: 'all' } }).start({ cwd: root });
+    expect(stub.calls[2]?.env?.OPENAI_API_KEY).toBe('sk-other-vendor');
+    // Vertex brings the Google project and credentials file, not other Google keys.
+    await make(stub, {
+      baseEnv: {
+        ...user,
+        ANTHROPIC_API_KEY: undefined,
+        CLAUDE_CODE_USE_VERTEX: '1',
+        CLOUD_ML_REGION: 'us-east5',
+        GOOGLE_APPLICATION_CREDENTIALS: '/home/u/adc.json',
+        GOOGLE_API_KEY: 'google-other-product',
+        GEMINI_API_KEY: 'gemini-other-vendor',
+        CLAUDE_CODE_SOME_LOGIN_TOKEN: 'login',
+      },
+    }).start({ cwd: root });
+    const vertex = stub.calls[3]?.env ?? {};
+    expect(vertex).toMatchObject({
+      CLOUD_ML_REGION: 'us-east5',
+      GOOGLE_APPLICATION_CREDENTIALS: '/home/u/adc.json',
+    });
+    for (const k of ['GOOGLE_API_KEY', 'GEMINI_API_KEY', 'AWS_SECRET_ACCESS_KEY']) {
+      expect(vertex[k]).toBeUndefined();
+    }
+    // A vendor prefix never carries a secret-looking name along: only the named key variables.
+    expect(vertex.CLAUDE_CODE_SOME_LOGIN_TOKEN).toBeUndefined();
+  });
+
   it('maps resume and fork to the SDK options', async () => {
     const stub = stubQuery();
     const adapter = make(stub);

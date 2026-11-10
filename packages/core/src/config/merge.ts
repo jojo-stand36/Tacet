@@ -1,3 +1,4 @@
+import { passesSecret } from '../adapter/env.js';
 import { DEFAULT_CONFIG, TacetConfig, validateEffective } from './schema.js';
 
 /** Config layers, lowest precedence first (ARCHITECTURE.md §4). */
@@ -15,7 +16,12 @@ export interface ConfigLayer {
  * Arrays that are combined across layers instead of replaced, so a higher layer cannot drop a
  * safety rule set lower down. Every other array is replaced by the higher layer.
  */
-export const UNION_PATHS: ReadonlySet<string> = new Set(['policies', 'escalation.always_ask']);
+export const UNION_PATHS: ReadonlySet<string> = new Set([
+  'policies',
+  'escalation.always_ask',
+  // A local file adds to the repo's Worker passthrough instead of dropping it (#147).
+  'workers.env.pass',
+]);
 
 /**
  * Objects that a higher layer replaces whole instead of merging key by key: secret references
@@ -103,6 +109,7 @@ export function mergeConfig(
   const layerErrors: string[] = [];
   for (const layer of all) {
     if (layer.name === 'task') layerErrors.push(...taskRaisesWorkers(merged, layer));
+    layerErrors.push(...workerEnvErrors(layer));
     apply(merged, layer.data as Plain, layer, '', []);
   }
 
@@ -159,6 +166,26 @@ function taskRaisesWorkers(merged: Plain, layer: ConfigLayer): string[] {
     check(`per_adapter.${id}`, cap, below.per_adapter?.[id] ?? below.max);
   }
   return errors;
+}
+
+/**
+ * Who may widen a Worker's environment (#147): not the task layer at all, and not the committed
+ * repo layer with a secret-looking name, which other people write. Prefixes are fine anywhere a
+ * pass is allowed: they never let a secret-looking name through.
+ */
+function workerEnvErrors(layer: ConfigLayer): string[] {
+  const pass = layer.data.workers?.env?.pass;
+  if (!layer.data.workers?.env) return [];
+  if (layer.name === 'task') {
+    return [`workers.env: the task layer (${layer.origin}) may not change a Worker's environment`];
+  }
+  if (layer.name !== 'repo') return [];
+  return (pass ?? [])
+    .filter(passesSecret)
+    .map(
+      (p) =>
+        `workers.env.pass: ${p} looks like a secret; the repo layer (${layer.origin}) may not pass it to Workers. Name it in your user or local config instead.`,
+    );
 }
 
 /** Human-readable `tacet config explain` output: one line per value with its source. */

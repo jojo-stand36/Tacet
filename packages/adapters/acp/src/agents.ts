@@ -1,4 +1,4 @@
-import type { AdapterCapabilities } from '@tacet/core';
+import type { AdapterCapabilities, EnvAllow } from '@tacet/core';
 
 /**
  * How to launch one ACP agent and what it honestly supports. Built-in specs below; any other
@@ -12,6 +12,11 @@ export interface AcpAgentSpec {
   command: string[];
   /** Fixed environment additions, e.g. to hide a subscription login. Never credentials. */
   env?: Record<string, string>;
+  /**
+   * The user's variables this agent needs beyond the common base set (#147). `apiKeyEnv` is
+   * always passed too; everything else of the user's environment is left out.
+   */
+  envAllow?: EnvAllow;
   /** Arguments that select a model at launch, when the agent has no `model` config option. */
   modelArgs?: (model: string) => string[];
   /**
@@ -60,6 +65,13 @@ export const GEMINI_AGENT: AcpAgentSpec = {
   id: 'gemini',
   command: ['gemini', '--acp'],
   modelArgs: (model) => ['--model', model],
+  // Verified on 0.67.0 (capability matrix §5, "Worker environment"): the CLI's own `GEMINI_*`
+  // settings, and the API-key route's base URL and API version. Not the rest of `GOOGLE_*`,
+  // which selects the Vertex and Code Assist routes.
+  envAllow: {
+    prefixes: ['GEMINI_'],
+    names: ['GOOGLE_GEMINI_BASE_URL', 'GOOGLE_GENAI_API_VERSION', 'NO_BROWSER'],
+  },
   // Only the Gemini API key: `GOOGLE_API_KEY` is the Vertex AI route, not verified here.
   apiKeyEnv: ['GEMINI_API_KEY'],
   apiKeyAuthMethods: ['gemini-api-key'],
@@ -81,6 +93,7 @@ export const GEMINI_AGENT: AcpAgentSpec = {
 export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   id: 'claude-acp',
   command: ['claude-agent-acp', '--hide-claude-auth'],
+  envAllow: { prefixes: ['ANTHROPIC_', 'CLAUDE_'] },
   apiKeyEnv: ['ANTHROPIC_API_KEY'],
   apiKeyAuthMethods: [],
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
@@ -97,6 +110,7 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   id: 'codex-acp',
   command: ['codex-acp'],
   env: { NO_BROWSER: '1' },
+  envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
   apiKeyEnv: ['CODEX_API_KEY', 'OPENAI_API_KEY'],
   apiKeyAuthMethods: ['api-key'],
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },

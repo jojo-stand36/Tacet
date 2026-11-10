@@ -1,6 +1,6 @@
 // A fake ACP v1 agent for adapter tests: newline-delimited JSON-RPC on stdio, behaviour from env.
 // FAKE_LOG: file to append every received message and this process's argv to (JSON lines).
-// FAKE_AUTH_METHODS: JSON array of `authMethods` to offer. FAKE_REQUIRE_AUTH=1: `session/new`
+// FAKE_LOGIN_METHODS: JSON array of `authMethods` to offer. FAKE_NEEDS_LOGIN=1: `session/new`
 // fails with -32000 until `authenticate` succeeded. FAKE_STDERR: text to write to stderr at
 // start, in two chunks.
 // FAKE_CAPS: JSON merged into `agentCapabilities` (e.g. `loadSession`, `sessionCapabilities`).
@@ -25,7 +25,8 @@ const say = (sessionId, text) =>
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
     },
   });
-log({ argv: process.argv.slice(2) });
+// Names only, never values.
+log({ argv: process.argv.slice(2), envNames: Object.keys(process.env).sort() });
 if (process.env.FAKE_STDERR) {
   // In two writes, split mid-text, so a secret in it arrives in two chunks.
   const t = process.env.FAKE_STDERR;
@@ -92,7 +93,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       id: m.id,
       result: {
         protocolVersion: 1,
-        authMethods: JSON.parse(process.env.FAKE_AUTH_METHODS ?? '[]'),
+        authMethods: JSON.parse(process.env.FAKE_LOGIN_METHODS ?? '[]'),
         agentCapabilities: {
           mcpCapabilities: { http: true, sse: false },
           ...JSON.parse(process.env.FAKE_CAPS ?? '{}'),
@@ -103,7 +104,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
     authed = true;
     send({ id: m.id, result: {} });
   } else if (m.method === 'session/new') {
-    if (process.env.FAKE_REQUIRE_AUTH === '1' && !authed) {
+    if (process.env.FAKE_NEEDS_LOGIN === '1' && !authed) {
       send({ id: m.id, error: { code: -32000, message: 'Authentication required' } });
     } else send({ id: m.id, result: { sessionId: 'fake-session-1' } });
   } else if (m.method === 'session/load') {

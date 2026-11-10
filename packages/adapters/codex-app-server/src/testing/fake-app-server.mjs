@@ -1,6 +1,7 @@
 // A scripted stand-in for `codex app-server` for failure-path unit tests. Speaks the same
 // newline-delimited JSON-RPC. FAKE_MODE selects the behaviour; FAKE_LOG records the client's
-// messages (method and params or result only) for assertions.
+// messages (method and params or result only) for assertions. FAKE_ENV_LOG receives the names
+// (never values) of the variables this process got.
 import { spawn } from 'node:child_process';
 import { appendFileSync, closeSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -9,6 +10,9 @@ const mode = process.env.FAKE_MODE ?? 'normal';
 const send = (m) => process.stdout.write(`${JSON.stringify(m)}\n`);
 const log = (m) =>
   process.env.FAKE_LOG && appendFileSync(process.env.FAKE_LOG, `${JSON.stringify(m)}\n`);
+if (process.env.FAKE_ENV_LOG) {
+  appendFileSync(process.env.FAKE_ENV_LOG, JSON.stringify(Object.keys(process.env).sort()));
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let turns = 0;
 let active;
