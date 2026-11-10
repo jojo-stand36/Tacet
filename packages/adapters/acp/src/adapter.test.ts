@@ -15,7 +15,7 @@ import type { AgentEvent } from '@tacet/core';
 import { ProfileRefusedError } from '@tacet/core';
 import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AcpAdapter, AuthRoutingError } from './adapter.js';
 import {
   type AcpAgentSpec,
@@ -423,7 +423,60 @@ describe('AcpAdapter (fake ACP agent)', () => {
         const pid = childPid();
         expect(pid).toBeTypeOf('number');
         expect(running(pid as number)).toBe(false);
+        // close() waits on that one reap (#218): it neither polls nor signals the group again,
+        // and returns at once, well within the kill timeout.
+        const kill = vi.spyOn(process, 'kill');
+        const before = Date.now();
+        let calls: unknown[][];
+        try {
+          await adapter.close(h);
+        } finally {
+          // Copied first: restoring the spy clears what it recorded.
+          calls = [...kill.mock.calls];
+          kill.mockRestore();
+        }
+        const groupCalls = calls.filter(([p]) => typeof p === 'number' && p < 0);
+        expect(groupCalls).toEqual([]);
+        expect(Date.now() - before).toBeLessThan(250);
+      } finally {
+        const p = childPid();
+        if (p !== undefined && running(p)) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
+    });
+
+    it('close() during the reap of a crashed agent returns only once its group is gone (#218)', async () => {
+      const adapter = make(
+        GEMINI_AGENT,
+        { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        await adapter.send(h, { text: 'CRASH' });
+        // Exited (it takes no more input), its SIGTERM-ignoring child still being reaped.
+        await expect
+          .poll(
+            () =>
+              adapter.send(h, { text: 'more' }).then(
+                () => 'open',
+                (e: Error) => e.message,
+              ),
+            { timeout: 5000 },
+          )
+          .toMatch(/has ended \(exited\)/);
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(true);
         await adapter.close(h);
+        expect(running(pid as number)).toBe(false);
       } finally {
         const p = childPid();
         if (p !== undefined && running(p)) {
