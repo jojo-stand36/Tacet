@@ -52,6 +52,12 @@ export interface ConformanceScenario {
    * unlisted window is checked.
    */
   contextWindow?: { session?: Partial<SessionOptions>; applied: (prompt: string) => boolean };
+  /**
+   * Whether the vendor has begun the slow turn, e.g. from a mock API's request log. A
+   * non-streaming adapter shows no text mid-turn, so the interrupt probe waits for this before it
+   * interrupts. Without it, it waits a fixed moment after `running`.
+   */
+  slowTurnStarted?: () => boolean;
   minDeltas?: number;
   timeoutMs?: number;
 }
@@ -284,6 +290,12 @@ const PROBES: Probe[] = [
         // its text only when the turn ends, so it is interrupted a moment after it starts.
         if (ctx.caps.streaming) {
           await tap.waitFor((e) => e.t === 'message.delta', ctx.timeout, running.index);
+        } else if (ctx.sc.slowTurnStarted) {
+          const until = Date.now() + ctx.timeout;
+          while (!ctx.sc.slowTurnStarted()) {
+            if (Date.now() > until) return fail('the slow turn never reached the vendor');
+            await new Promise((r) => setTimeout(r, 50));
+          }
         } else {
           await new Promise((r) => setTimeout(r, NON_STREAMING_SETTLE_MS));
         }

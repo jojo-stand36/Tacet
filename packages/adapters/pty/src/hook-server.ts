@@ -40,21 +40,28 @@ export class HookServer {
 
   /** Register a session; returns its token and the URL its hooks POST to. */
   async register(handler: HookHandler): Promise<{ token: Secret; url: string; key: string }> {
-    const listener = await this.#listen();
+    // Registered before waiting for the server, so a session that closes meanwhile cannot shut
+    // the server down under this one.
     const token = randomToken();
     const key = tokenKey(token.reveal());
     this.#handlers.set(key, handler);
-    return { token, url: `http://127.0.0.1:${listener.port}/hooks`, key };
+    try {
+      const listener = await this.#listen();
+      return { token, url: `http://127.0.0.1:${listener.port}/hooks`, key };
+    } catch (err) {
+      this.#handlers.delete(key);
+      throw err;
+    }
   }
 
   /** Forget a session; closes the server after the last one. */
   async unregister(key: string): Promise<void> {
-    this.#handlers.delete(key);
-    if (this.#handlers.size === 0 && this.#listener) {
-      const l = this.#listener;
+    if (!this.#handlers.delete(key)) return;
+    if (this.#handlers.size === 0 && this.#starting) {
+      const starting = this.#starting;
       this.#listener = undefined;
       this.#starting = undefined;
-      await l.close();
+      await (await starting.catch(() => undefined))?.close();
     }
   }
 
@@ -73,8 +80,8 @@ export class HookServer {
 
   #handle(req: IncomingMessage, res: ServerResponse): void {
     const deny = (code: number) => {
-      res.writeHead(code).end();
-      req.resume();
+      // Nothing more is read from a refused request.
+      res.writeHead(code, { connection: 'close' }).end(() => req.destroy());
     };
     const port = this.#listener?.port ?? 0;
     if (req.method !== 'POST' || !req.url?.startsWith('/hooks')) {
@@ -99,15 +106,15 @@ export class HookServer {
     const chunks: Buffer[] = [];
     let tooBig = false;
     req.on('data', (c: Buffer) => {
+      if (tooBig) return;
       size += c.length;
-      if (size > MAX_BODY) tooBig = true;
-      else chunks.push(c);
+      if (size > MAX_BODY) {
+        tooBig = true;
+        deny(413);
+      } else chunks.push(c);
     });
     req.on('end', () => {
-      if (tooBig) {
-        deny(413);
-        return;
-      }
+      if (tooBig) return;
       let body: unknown;
       try {
         body = JSON.parse(Buffer.concat(chunks).toString('utf8'));

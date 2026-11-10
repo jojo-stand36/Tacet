@@ -85,6 +85,8 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
       replyPrompt: 'SAY hello',
       approvalPrompt: 'RUN_TOOL',
       slowPrompt: 'SLOW',
+      // The adapter shows no text mid-turn: the mock's log says when the slow turn began.
+      slowTurnStarted: () => api.requests.some((r) => r.text.endsWith('SLOW')),
       timeoutMs: 60_000,
     });
     console.log(formatResults(results));
@@ -189,26 +191,150 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
       ],
     });
     const runDir = join(root, 'run', 'mcp');
-    const files = readdirSync(runDir, { recursive: true, withFileTypes: true }).filter((d) =>
-      d.isFile(),
-    );
-    expect(files.map((f) => f.name).sort()).toEqual(
-      [`${h.id}.hook.json`, `${h.id}.json`, `${h.id}.settings.json`].sort(),
-    );
-    for (const f of files) expect(statSync(join(f.parentPath, f.name)).mode & 0o777).toBe(0o600);
+    const mine = () =>
+      readdirSync(runDir, { recursive: true, withFileTypes: true }).filter(
+        (d) => d.isFile() && d.name.startsWith(h.id),
+      );
+    expect(
+      mine()
+        .map((f) => f.name)
+        .sort(),
+    ).toEqual([`${h.id}.hook.json`, `${h.id}.json`, `${h.id}.settings.json`].sort());
+    for (const f of mine()) expect(statSync(join(f.parentPath, f.name)).mode & 0o777).toBe(0o600);
+    const settings = mine().find((f) => f.name.endsWith('.settings.json'));
+    const hookToken = String(
+      JSON.parse(readFileSync(join(settings?.parentPath ?? '', settings?.name ?? ''), 'utf8')).hooks
+        .Stop[0].hooks[0].headers.Authorization,
+    ).replace('Bearer ', '');
+    expect(hookToken.length).toBeGreaterThan(20);
     const tap = new EventTap(adapter.events(h));
     await turn(h, tap, 'SAY files');
     await adapter.close(h);
-    expect(
-      readdirSync(runDir, { recursive: true }).filter((f) => String(f).endsWith('.json')),
-    ).toEqual([]);
-    // Nothing in the worktree, and the token is in no event.
+    expect(mine()).toEqual([]);
+    // Nothing in the worktree; neither token in any event or in any file Claude Code or Tacet
+    // left behind (config, transcripts, logs).
     expect(readdirSync(cwd)).toEqual([]);
-    expect(JSON.stringify(tap.events)).not.toContain(token);
-    for (const f of readdirSync(join(root, 'state'), { recursive: true, withFileTypes: true })) {
-      if (f.isFile() && f.name === '.claude.json') {
-        expect(readFileSync(join(f.parentPath, f.name), 'utf8')).not.toContain(token);
+    for (const secret of [token, hookToken]) {
+      expect(JSON.stringify(tap.events)).not.toContain(secret);
+      for (const dir of [join(root, 'state'), join(root, 'home'), runDir]) {
+        for (const f of readdirSync(dir, { recursive: true, withFileTypes: true })) {
+          if (!f.isFile()) continue;
+          expect(readFileSync(join(f.parentPath, f.name), 'utf8'), f.name).not.toContain(secret);
+        }
       }
     }
+  });
+
+  it("keeps the repo's own settings, hooks and MCP servers out of a Worker", {
+    timeout: 120_000,
+  }, async () => {
+    const cwd = join(root, 'wt-hostile');
+    mkdirSync(join(cwd, '.claude'), { recursive: true });
+    // A repo that would allow every command, run a hook of its own and start an MCP server.
+    writeFileSync(
+      join(cwd, '.claude', 'settings.json'),
+      JSON.stringify({
+        permissions: { allow: ['Bash(*)', 'Bash', 'Read'] },
+        hooks: {
+          SessionStart: [{ hooks: [{ type: 'command', command: 'touch project-hook-ran.txt' }] }],
+          UserPromptSubmit: [
+            { hooks: [{ type: 'command', command: 'touch project-hook-ran.txt' }] },
+          ],
+        },
+      }),
+    );
+    writeFileSync(
+      join(cwd, '.claude', 'settings.local.json'),
+      JSON.stringify({ permissions: { allow: ['Bash(*)'] } }),
+    );
+    writeFileSync(
+      join(cwd, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { repo: { command: 'sh', args: ['-c', 'touch mcp-server-ran.txt; sleep 5'] } },
+      }),
+    );
+    const h = await adapter.start({ cwd });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'RUN_TOOL' });
+    // The repo's allow rule does not apply: Tacet is still asked.
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000);
+    if (req.event.t !== 'approval.request') throw new Error('no approval request');
+    await adapter.respond(h, req.event.id, { kind: 'reject', persist: false });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index);
+    await adapter.close(h);
+    expect(existsSync(join(cwd, 'project-hook-ran.txt'))).toBe(false);
+    expect(existsSync(join(cwd, 'mcp-server-ran.txt'))).toBe(false);
+    expect(existsSync(join(cwd, 'tool-ran.txt'))).toBe(false);
+  });
+
+  it('ends a turn cleanly on interrupt and on cancel, and takes the next one', {
+    timeout: 180_000,
+  }, async () => {
+    const cwd = join(root, 'wt-cancel');
+    mkdirSync(cwd);
+    const h = await adapter.start({ cwd });
+    const tap = new EventTap(adapter.events(h));
+    // Interrupt a running turn (Esc).
+    const before = api.requests.length;
+    await adapter.send(h, { text: 'SLOW' });
+    await expect
+      .poll(() => api.requests.slice(before).some((r) => r.text.endsWith('SLOW')), {
+        timeout: 30_000,
+      })
+      .toBe(true);
+    await adapter.interrupt(h);
+    expect(adapter.status(h)).toBe('cancelled');
+    let next = await turn(h, tap, 'SAY after');
+    expect(next.end).toMatchObject({ state: 'idle' });
+    expect(next.events.filter((e) => e.t === 'message.delta')).toEqual([
+      { t: 'message.delta', text: 'You said after.' },
+    ]);
+    // Cancel while a permission waits (a denial that interrupts), and interrupt in that state.
+    for (const how of ['cancel', 'interrupt'] as const) {
+      const from = tap.events.length;
+      await adapter.send(h, { text: 'RUN_TOOL' });
+      const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000, from);
+      if (req.event.t !== 'approval.request') throw new Error('no approval request');
+      if (how === 'cancel')
+        await adapter.respond(h, req.event.id, { kind: 'cancel', persist: false });
+      else await adapter.interrupt(h);
+      expect(adapter.status(h)).toBe('cancelled');
+      const sentBefore = api.requests.length;
+      next = await turn(h, tap, `SAY after ${how}`);
+      expect(next.end).toMatchObject({ state: 'idle' });
+      // Its own reply (the mock answers the cancelled tool's result, sent along with the
+      // prompt, with "Tool finished."), and the prompt reached the API.
+      expect(next.events.filter((e) => e.t === 'message.delta')).toHaveLength(1);
+      expect(api.requests.slice(sentBefore).some((r) => r.text.includes(`SAY after ${how}`))).toBe(
+        true,
+      );
+    }
+    expect(existsSync(join(cwd, 'tool-ran.txt'))).toBe(false);
+    await adapter.close(h);
+  });
+
+  it('reaches its hook endpoint past a proxy the user set', { timeout: 120_000 }, async () => {
+    const proxied = new PtyAdapter({
+      command: [claudeBinary()],
+      killTimeoutMs: 2000,
+      stateDir: join(root, 'state'),
+      sessionFileDir: join(root, 'run', 'mcp'),
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: join(root, 'home'),
+        ANTHROPIC_BASE_URL: api.url,
+        ANTHROPIC_API_KEY: 'sk-ant-placeholder-not-a-real-key-0123456789',
+        DISABLE_AUTOUPDATER: '1',
+        // Nothing listens there: anything sent through it fails.
+        HTTPS_PROXY: 'http://127.0.0.1:9',
+        HTTP_PROXY: 'http://127.0.0.1:9',
+      },
+    });
+    const h = await proxied.start({ cwd: worktree });
+    const tap = new EventTap(proxied.events(h));
+    await proxied.send(h, { text: 'SAY proxied' });
+    const end = await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+    expect(end.event).toMatchObject({ state: 'idle' });
+    await proxied.close(h);
   });
 });

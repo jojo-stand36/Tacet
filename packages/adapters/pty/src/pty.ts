@@ -1,3 +1,7 @@
+import { accessSync, chmodSync, constants, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, join } from 'node:path';
+
 /**
  * node-pty, loaded only when a PTY session starts: it is an optional native dependency
  * (ADR-002 decision 4), so Tacet works without it as long as no PTY Worker is used.
@@ -28,10 +32,42 @@ export class PtyUnavailableError extends Error {
 
 let loaded: Promise<SpawnPty> | undefined;
 
+/**
+ * node-pty 1.1.0 ships its macOS prebuilds with a `spawn-helper` that is not executable
+ * (`-rw-r--r--` in the published tarball), and spawns every PTY through it. Make it executable
+ * once, as the owner of the install; fail clearly if that is not possible.
+ */
+function fixSpawnHelper(): void {
+  if (process.platform !== 'darwin') return;
+  const require = createRequire(import.meta.url);
+  let root: string;
+  try {
+    root = dirname(require.resolve('node-pty/package.json'));
+  } catch {
+    return;
+  }
+  for (const dir of [`prebuilds/${process.platform}-${process.arch}`, 'build/Release']) {
+    const helper = join(root, dir, 'spawn-helper');
+    if (!existsSync(helper)) continue;
+    try {
+      accessSync(helper, constants.X_OK);
+    } catch {
+      try {
+        chmodSync(helper, 0o755);
+      } catch (err) {
+        throw new PtyUnavailableError(
+          `node-pty's ${helper} is not executable and cannot be made so: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+}
+
 /** node-pty's `spawn`, or `PtyUnavailableError` if node-pty is not installed or failed to build. */
 export function loadPty(): Promise<SpawnPty> {
   loaded ??= import('node-pty').then(
     (m) => {
+      fixSpawnHelper();
       // CommonJS module: the namespace or its default export carries `spawn`.
       const mod = (m as { spawn?: unknown; default?: { spawn?: unknown } }).spawn
         ? m

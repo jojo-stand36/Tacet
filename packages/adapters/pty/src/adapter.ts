@@ -3,22 +3,22 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { authEnv, claudeEnvAllow, writeMcpConfig } from '@tacet/adapter-claude-sdk';
+import { authEnv, claudeEnvAllow, writeMcpConfig } from '@tacet/adapter-claude-sdk/launch';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
   type AgentEvent,
   type ApprovalDecision,
   AsyncQueue,
-  DeltaScrubber,
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
+  redactSecrets,
   type SendOptions,
   type SessionHandle,
   type SessionOptions,
   type SessionState,
-  scrubbedEvents,
+  scrubLiterals,
   type UserInput,
   type WorkerEnvPolicy,
   workerEnv,
@@ -81,6 +81,13 @@ export interface PtyAdapterOptions {
   sessionFileDir?: string;
   /** Milliseconds `start()` waits for the session to report it is ready. Default 30000. */
   startTimeoutMs?: number;
+  /**
+   * Milliseconds a typed prompt may go unacknowledged (no `UserPromptSubmit`) before the session
+   * is reported as `waiting_input`: something in the terminal holds it up. Default 15000.
+   */
+  ackTimeoutMs?: number;
+  /** Name of Tacet's own MCP server in the Worker's config: its tools never ask. Default `tacet`. */
+  tacetMcpServer?: string;
   /** Milliseconds to wait after SIGTERM before SIGKILL. Default 5000. */
   killTimeoutMs?: number;
   /** Terminal size. Default 200 × 50. */
@@ -95,18 +102,31 @@ interface PendingApproval {
   toolUseId: string | undefined;
 }
 
+/** A tool call that started (`PreToolUse`) and has no result yet. */
+interface OpenTool {
+  id: string;
+  name: string;
+  /** Its input, as stable JSON: a `PermissionRequest` carries no tool id, only name and input. */
+  input: string;
+}
+
 interface Session {
   handle: SessionHandle;
   pty: Pty;
   events: AsyncQueue<AgentEvent>;
   state: SessionState;
   secrets: string[];
-  deltas: DeltaScrubber;
   hookKey: string;
   files: string[];
   approvals: Map<string, PendingApproval>;
-  /** The last tool call that started, for the result of a denied permission (no id in it). */
-  lastToolUseId: string | undefined;
+  /** Tool calls that started and have no result yet, oldest first. */
+  openTools: OpenTool[];
+  /** The `prompt_id` of the turn in progress, from its `UserPromptSubmit`. */
+  promptId: string | undefined;
+  /** A prompt is being typed: input sent meanwhile is queued. */
+  typing: boolean;
+  /** Fires when a typed prompt was not acknowledged in time. */
+  ackTimer: NodeJS.Timeout | undefined;
   /** Tool calls whose result was reported. */
   finished: Set<string>;
   queue: string[];
@@ -120,9 +140,12 @@ interface Session {
 }
 
 const ESC = '\x1b';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** A timer that never keeps the process alive, for deadlines raced against other promises. */
+const deadline = (ms: number) => new Promise((r) => setTimeout(r, ms).unref());
 
 /** The hook forwarder's entry point: the compiled `.js`, or the `.ts` source in a checkout. */
 function forwardScript(): string {
@@ -162,6 +185,10 @@ export class PtyAdapter implements AgentAdapter {
       throw new ProfileRefusedError('contextWindow', 'the PTY adapter does not set a context size');
     }
     if (opts.resume?.fork) throw new Error('the PTY adapter does not fork sessions');
+    // It names a directory and goes on the command line: only a session id Claude Code made.
+    if (opts.resume && !UUID.test(opts.resume.vendorSessionId)) {
+      throw new Error('a PTY session to resume is named by its UUID');
+    }
     const spawn = this.#opts.spawn ?? (await loadPty());
     if (!this.#swept) {
       this.#swept = true;
@@ -274,11 +301,13 @@ export class PtyAdapter implements AgentAdapter {
         events: new AsyncQueue(),
         state: 'idle',
         secrets,
-        deltas: new DeltaScrubber(secrets),
         hookKey: reg.key,
         files,
         approvals: new Map(),
-        lastToolUseId: undefined,
+        openTools: [],
+        promptId: undefined,
+        typing: false,
+        ackTimer: undefined,
         finished: new Set(),
         queue: [],
         escAt: 0,
@@ -306,7 +335,7 @@ export class PtyAdapter implements AgentAdapter {
       const timeout = this.#opts.startTimeoutMs ?? 30_000;
       const started = await Promise.race([
         readyP.then(() => true),
-        sleep(timeout).then(() => false),
+        deadline(timeout).then(() => false),
       ]);
       if (!started || session.exit) {
         throw new Error(
@@ -334,23 +363,19 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.effort !== undefined) {
       throw new ProfileRefusedError('effort', 'the PTY adapter does not set an effort');
     }
-    if (s.state === 'running' || s.state === 'waiting_input') {
-      s.queue.push(input.text);
+    const text = promptText(input.text);
+    if (s.typing || s.state === 'running' || s.state === 'waiting_input') {
+      s.queue.push(text);
       return;
     }
-    await this.#type(s, input.text);
+    await this.#type(s, text);
   }
 
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
     const s = this.#live(h);
     s.queue.length = 0;
     if (s.state !== 'running' && s.state !== 'waiting_input') return {};
-    // A permission held open is let go first, so the Esc reaches Claude Code's own dialog.
-    this.#releaseApprovals(s);
-    s.pty.write(ESC);
-    s.escAt = Date.now();
-    // Claude Code sends no Stop for an interrupted turn: the adapter reports the end itself.
-    this.#setState(s, 'cancelled');
+    this.#cancelTurn(s);
     return {};
   }
 
@@ -366,10 +391,9 @@ export class PtyAdapter implements AgentAdapter {
     }
     if (p.toolUseId) this.#toolResult(s, p.toolUseId, false);
     if (decision.kind === 'cancel') {
-      // Cancel the turn, not just the tool: let the request go (Claude Code shows its own
-      // dialog) and press Esc, as `interrupt()` does.
-      p.reply();
-      await this.interrupt(h);
+      // Cancel the turn, not just the tool: a denial that interrupts (verified live, #15).
+      p.reply(denyPermission('cancelled by Tacet', true));
+      this.#cancelTurn(s, true);
       return;
     }
     p.reply(denyPermission('denied by Tacet'));
@@ -381,6 +405,7 @@ export class PtyAdapter implements AgentAdapter {
     if (!s || s.closing) return;
     s.closing = true;
     s.queue.length = 0;
+    clearTimeout(s.ackTimer);
     this.#releaseApprovals(s);
     await this.#terminate(s);
     for (const f of s.files) removeSessionFile(f);
@@ -402,15 +427,54 @@ export class PtyAdapter implements AgentAdapter {
 
   // ---- internals -------------------------------------------------------------------------
 
-  /** Type a prompt and submit it. Several lines go as one bracketed paste. */
+  /**
+   * Type a prompt as one bracketed paste and submit it. `UserPromptSubmit` acknowledges it; if it
+   * does not come in time, something in the terminal holds the prompt up.
+   */
   async #type(s: Session, text: string): Promise<void> {
-    const since = Date.now() - s.escAt;
-    if (since < 500) await sleep(500 - since);
+    s.typing = true;
     this.#setState(s, 'running');
-    const multiline = /[\r\n]/.test(text);
-    s.pty.write(multiline ? `${PASTE_START}${text}${PASTE_END}` : text);
-    await sleep(100);
-    s.pty.write('\r');
+    try {
+      // A key right after Esc reads as Alt+key.
+      const since = Date.now() - s.escAt;
+      if (since < 500) await sleep(500 - since);
+      if (s.ended || s.closing) return;
+      const before = s.promptId;
+      s.pty.write(`${PASTE_START}${text}${PASTE_END}`);
+      await sleep(100);
+      if (s.ended || s.closing) return;
+      s.pty.write('\r');
+      clearTimeout(s.ackTimer);
+      s.ackTimer = setTimeout(() => {
+        if (s.promptId === before && s.state === 'running' && !s.ended && !s.closing) {
+          this.#setState(s, 'waiting_input', 'the prompt was not taken; check the terminal');
+        }
+      }, this.#opts.ackTimeoutMs ?? 15_000);
+      s.ackTimer.unref();
+    } finally {
+      s.typing = false;
+    }
+  }
+
+  /**
+   * End the turn in progress. An open permission is denied with `interrupt` (verified live: the
+   * turn stops, no `Stop` follows); otherwise Esc, which Claude Code also ends with no `Stop`. So
+   * the adapter reports `cancelled` itself, and hooks of that turn arriving later are dropped.
+   */
+  #cancelTurn(s: Session, interruptedByDenial = false): void {
+    s.queue.length = 0;
+    if (interruptedByDenial || s.approvals.size > 0) {
+      for (const p of s.approvals.values()) {
+        if (p.toolUseId) this.#toolResult(s, p.toolUseId, false);
+        p.reply(denyPermission('cancelled by Tacet', true));
+      }
+      s.approvals.clear();
+    } else {
+      s.pty.write(ESC);
+      s.escAt = Date.now();
+    }
+    clearTimeout(s.ackTimer);
+    this.#setState(s, 'cancelled');
   }
 
   #onHook(
@@ -429,24 +493,46 @@ export class PtyAdapter implements AgentAdapter {
       reply();
       return;
     }
+    const promptId = typeof body.prompt_id === 'string' ? body.prompt_id : undefined;
+    // A turn-scoped hook from another turn than the one in progress (e.g. an interrupted one
+    // whose events arrive late) changes nothing.
+    const stale =
+      ev.hook_event_name !== 'SessionStart' &&
+      ev.hook_event_name !== 'UserPromptSubmit' &&
+      (s.state === 'cancelled' ||
+        (promptId !== undefined && s.promptId !== undefined && promptId !== s.promptId));
+    if (stale) {
+      if (ev.hook_event_name === 'PreToolUse')
+        reply(preToolUseDecision(ev.tool_name, this.#tacetPrefix));
+      else if (ev.hook_event_name === 'PermissionRequest') {
+        reply(denyPermission('the turn was cancelled', true));
+      } else reply();
+      return;
+    }
     switch (ev.hook_event_name) {
       case 'SessionStart':
         s.ready();
         reply();
         return;
       case 'UserPromptSubmit':
+        s.promptId = promptId;
+        clearTimeout(s.ackTimer);
         if (s.state !== 'running') this.#setState(s, 'running');
         reply();
         return;
       case 'PreToolUse':
-        s.lastToolUseId = ev.tool_use_id;
+        s.openTools.push({
+          id: ev.tool_use_id,
+          name: ev.tool_name,
+          input: stableJson(ev.tool_input),
+        });
         this.#emit(s, {
           t: 'tool.call',
           id: ev.tool_use_id,
           name: ev.tool_name,
           input: ev.tool_input ?? {},
         });
-        reply(preToolUseDecision(ev.tool_name));
+        reply(preToolUseDecision(ev.tool_name, this.#tacetPrefix));
         return;
       case 'PostToolUse':
       case 'PostToolUseFailure':
@@ -455,7 +541,10 @@ export class PtyAdapter implements AgentAdapter {
         return;
       case 'PermissionRequest': {
         const id = `perm-${randomUUID()}`;
-        s.approvals.set(id, { reply, toolUseId: s.lastToolUseId });
+        // The oldest open call with this tool and input; none if nothing matches.
+        const input = stableJson(ev.tool_input);
+        const tool = s.openTools.find((t) => t.name === ev.tool_name && t.input === input);
+        s.approvals.set(id, { reply, toolUseId: tool?.id });
         onAbort(() => {
           // Claude Code stopped waiting (timeout): its own dialog is up in the terminal.
           if (s.approvals.delete(id) && !s.ended && !s.closing) {
@@ -498,28 +587,34 @@ export class PtyAdapter implements AgentAdapter {
     }
   }
 
+  get #tacetPrefix(): string {
+    return `mcp__${this.#opts.tacetMcpServer ?? 'tacet'}__`;
+  }
+
   /** One result per tool call, whichever reports it first (a denial, or the vendor's hook). */
   #toolResult(s: Session, id: string, ok: boolean): void {
+    s.openTools = s.openTools.filter((t) => t.id !== id);
     if (s.finished.has(id)) return;
     s.finished.add(id);
     this.#emit(s, { t: 'tool.result', id, ok });
   }
 
   #turnEnded(s: Session, state: SessionState, message?: string): void {
-    // An interrupted turn was already reported as cancelled.
-    if (s.state === 'cancelled') return;
+    clearTimeout(s.ackTimer);
+    s.openTools = [];
     this.#setState(s, state, message);
     const next = s.queue.shift();
     if (next !== undefined) void this.#type(s, next);
   }
 
-  /** Let open permission requests go unanswered: Claude Code then shows its own dialog. */
+  /** Let open permission requests go (the session is closing): answered with no decision. */
   #releaseApprovals(s: Session): void {
     for (const p of s.approvals.values()) p.reply();
     s.approvals.clear();
   }
 
   #onExit(s: Session): void {
+    clearTimeout(s.ackTimer);
     if (s.closing || s.ended || !this.#sessions.has(s.handle.id)) return;
     s.ended = true;
     s.approvals.clear();
@@ -545,15 +640,24 @@ export class PtyAdapter implements AgentAdapter {
     };
     signal('SIGTERM');
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    const gone = await Promise.race([s.exited.then(() => true), sleep(timeout).then(() => false)]);
+    const gone = await Promise.race([
+      s.exited.then(() => true),
+      deadline(timeout).then(() => false),
+    ]);
     if (!gone) {
       signal('SIGKILL');
-      await Promise.race([s.exited, sleep(1000)]);
+      await Promise.race([s.exited, deadline(1000)]);
     }
   }
 
+  /**
+   * Every event leaves through here, scrubbed of known key formats and this session's secrets.
+   * A reply arrives whole (from `Stop`), never in pieces, so it is scrubbed as one text: the
+   * streaming scrubber would hold back a tail that looks like the start of a secret and so split
+   * one reply into two deltas.
+   */
   #emit(s: Session, e: AgentEvent): void {
-    for (const out of scrubbedEvents(s.deltas, s.secrets, e)) s.events.push(out);
+    s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {
@@ -567,6 +671,44 @@ export class PtyAdapter implements AgentAdapter {
     if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
     return s;
   }
+}
+
+/**
+ * The text to type for a prompt. Control characters would act as keys (Esc, Ctrl-C, Ctrl-D, the
+ * end of the paste), so only newlines and tabs are kept. A prompt starting with `/` or `!` would
+ * run a slash command or, without asking anyone, a shell command (verified live on 2.1.319: a
+ * leading `!` runs it with no `UserPromptSubmit`, `PreToolUse` or `PermissionRequest`; a leading
+ * space or zero-width character does not stop `/`), so it is refused.
+ */
+export function promptText(text: string): string {
+  const clean = [...text.replace(/\r\n?/g, '\n')]
+    .filter((c) => {
+      const code = c.codePointAt(0) ?? 0;
+      // C0 and C1 controls and DEL, except tab and newline.
+      return c === '\t' || c === '\n' || !(code < 0x20 || (code >= 0x7f && code <= 0x9f));
+    })
+    .join('');
+  const first = clean.replace(/^[\s\p{Cf}\p{Z}]+/u, '').charAt(0);
+  if (first === '/' || first === '!') {
+    throw new Error(
+      `a PTY prompt must not start with "${first}": Claude Code would run it as a command`,
+    );
+  }
+  if (clean.trim() === '') throw new Error('a PTY prompt must not be empty');
+  return clean;
+}
+
+/** JSON with sorted keys, so equal tool inputs compare equal. */
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(v ?? null);
 }
 
 /** A short, single-line description of a tool input for an approval summary. */

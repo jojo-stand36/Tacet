@@ -118,7 +118,14 @@ export function prepareClaudeConfigDir(dir: string, opts: { cwd: string; apiKey?
     rejected?: string[];
   };
   const approved = new Set(responses.approved ?? []);
-  if (opts.apiKey) approved.add(opts.apiKey.trim().slice(-20));
+  if (opts.apiKey) {
+    const key = opts.apiKey.trim();
+    // Claude Code keeps the last 20 characters; for a shorter key that would be all of it.
+    if (key.length <= 20) {
+      throw new Error('the API key is too short to approve without storing it whole');
+    }
+    approved.add(key.slice(-20));
+  }
   config = {
     ...config,
     hasCompletedOnboarding: true,
@@ -189,8 +196,11 @@ export function parseClaudeHook(body: unknown): ClaudeHook | undefined {
  * asking (Read, Glob, ...). Matches the Mini-conductor's policy until the escalation gate (#25)
  * decides per tool. Tacet's tools follow Claude Code's own flow.
  */
-export function preToolUseDecision(toolName: string): object | undefined {
-  if (toolName.startsWith('mcp__tacet__')) return undefined;
+export function preToolUseDecision(
+  toolName: string,
+  tacetPrefix = 'mcp__tacet__',
+): object | undefined {
+  if (toolName.startsWith(tacetPrefix)) return undefined;
   return {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -204,9 +214,10 @@ export function preToolUseDecision(toolName: string): object | undefined {
 export const allowPermission = () => ({
   hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } },
 });
-export const denyPermission = (message: string) => ({
+/** `interrupt: true` also stops the turn (verified live, #15: no `Stop` follows). */
+export const denyPermission = (message: string, interrupt = false) => ({
   hookSpecificOutput: {
     hookEventName: 'PermissionRequest',
-    decision: { behavior: 'deny', message },
+    decision: { behavior: 'deny', message, ...(interrupt ? { interrupt: true } : {}) },
   },
 });
