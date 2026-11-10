@@ -201,7 +201,7 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   // root trusted after any config Tacet can pass, so a Worker-written checkout's
   // `.codex/config.toml` (an MCP server command ran) and AGENTS.md apply.
   workerRefused:
-    'it trusts every session directory itself, so a checkout another Worker wrote can run commands through its .codex/config.toml; Tacet cannot turn that off (interim default until #183 is decided; use codex-app-server, which Tacet keeps untrusted)',
+    'it trusts every session directory itself, so a checkout a Worker or anyone else wrote can run commands through its .codex/config.toml; Tacet cannot turn that off (interim default until #183 is decided; use codex-app-server)',
   env: { NO_BROWSER: '1' },
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
   apiKeyEnv: ['OPENAI_API_KEY'],

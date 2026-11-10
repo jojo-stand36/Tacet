@@ -89,6 +89,25 @@ describe('buildWorkerAdapters', () => {
         }),
       );
     }
+    // Nor as a cap, nor as a custom agent whose command runs it (by name, path or npm package).
+    const refusedFor = (cfg: TacetConfig) =>
+      expect(() => buildWorkerAdapters(cfg, { baseEnv: {} })).toThrow(
+        /is refused for Workers: .*#183/,
+      );
+    refusedFor({
+      tiers: { worker: { adapter: 'claude-sdk', model: 'm' } },
+      workers: { per_adapter: { 'acp:codex-acp': 1 } },
+    });
+    for (const command of [
+      ['codex-acp'],
+      ['/usr/local/bin/codex-acp', '--flag'],
+      ['npx', '-y', '@agentclientprotocol/codex-acp@2.6.0'],
+    ]) {
+      refusedFor({
+        tiers: { worker: { adapter: 'acp:cx' } },
+        agents: { cx: { kind: 'acp', command } },
+      });
+    }
     // The other built-in ACP agents still build.
     const ok = buildWorkerAdapters(
       { tiers: { worker: { adapter: 'acp:gemini' } } },

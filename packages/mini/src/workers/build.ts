@@ -204,11 +204,7 @@ export function buildWorkerAdapters(
     const preset = config.agents?.[slug];
     const builtin = BUILTIN_ACP_AGENTS[slug];
     noShadow(slug, builtin !== undefined, 'acp', 'ACP agent');
-    if (builtin?.workerRefused) {
-      throw new WorkerConfigError(
-        `${where}: acp:${slug} is refused for Workers: ${builtin.workerRefused}`,
-      );
-    }
+    refuseForWorkers(slug, where);
     if (builtin) return { agent: builtin, secrets: [] };
     if (!preset) {
       throw new WorkerConfigError(
@@ -227,11 +223,34 @@ export function buildWorkerAdapters(
     };
   }
 
+  /**
+   * Throws for an ACP agent unattended Workers may not use (`AcpAgentSpec.workerRefused`): a
+   * built-in one, or a custom `agents.<slug>` whose command runs it (e.g. codex-acp through `npx`,
+   * #183). A wrapper script can still hide the command; the reason is documented.
+   */
+  function refuseForWorkers(slug: string, where: string): void {
+    const builtin = BUILTIN_ACP_AGENTS[slug];
+    const preset = builtin ? undefined : config.agents?.[slug];
+    const runs =
+      preset?.kind === 'acp'
+        ? Object.values(BUILTIN_ACP_AGENTS).find(
+            (a) =>
+              a.workerRefused && preset.command.some((w) => runsAgent(w, a.command[0] ?? '', a.id)),
+          )
+        : undefined;
+    const refused = builtin?.workerRefused ?? runs?.workerRefused;
+    if (refused) {
+      throw new WorkerConfigError(`${where}: acp:${slug} is refused for Workers: ${refused}`);
+    }
+  }
+
   /** Throws unless `id` names an adapter this function can build. */
   function buildable(id: string, where: string): void {
     if (id === 'claude-sdk' || id === 'codex-app-server') return;
     const acp = ACP_ID.exec(id)?.[1];
     if (acp !== undefined && (BUILTIN_ACP_AGENTS[acp] || config.agents?.[acp]?.kind === 'acp')) {
+      // A cap on an agent Workers may not use would silently cap nothing, too.
+      refuseForWorkers(acp, where);
       return;
     }
     if (acp !== undefined) {
@@ -248,4 +267,14 @@ export function buildWorkerAdapters(
       `${where}: no Worker adapter "${id}" yet (available: claude-sdk, codex-app-server, acp:<agent>, pty:<preset>)`,
     );
   }
+}
+
+/** Whether one word of a command runs `bin` (by name, path or npm package). */
+function runsAgent(word: string, bin: string, id: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return base === bin || word.includes(`/${id}`) || base === id;
 }
