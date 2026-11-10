@@ -115,6 +115,8 @@ interface SessionRecord {
   baseCommit?: string;
   /** The local branch its checkout started from, when it did: its task's target (#210). */
   baseBranch?: string;
+  /** Its newest `worker.*` event (ms since the epoch): when its checkout was last used (#238). */
+  activeAt?: number;
 }
 
 interface EscalationRecord {
@@ -893,9 +895,11 @@ export class MiniConductor {
     const gen = this.#gen;
     this.#sweepingGen = gen;
     this.#track(
-      this.#sweepLanded(gen).finally(() => {
-        if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
-      }),
+      this.#sweepLanded(gen)
+        .then(() => this.#sweepIdle(gen))
+        .finally(() => {
+          if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
+        }),
     );
   }
 
@@ -982,6 +986,43 @@ export class MiniConductor {
           .catch(() => {});
       }
     }
+  }
+
+  /**
+   * Remove Worker checkouts not used for `worktrees.idle_days` (#238; 0 turns it off), after the
+   * landed sweep. A checkout's last use is its sessions' newest `worker.*` event; one in use (a
+   * running or closing session) or whose task is unfinished is skipped. The worktree manager keeps any with local files or
+   * unintegrated work.
+   */
+  async #sweepIdle(gen: number): Promise<void> {
+    const days = this.#o.config.worktrees?.idle_days ?? 7;
+    const gc = this.#o.workspaces.gc?.bind(this.#o.workspaces);
+    if (!gc || days <= 0 || !this.#live(gen)) return;
+    const v = this.#state();
+    const lastActivity = new Map<string, number>();
+    const active = new Set([
+      ...[...this.#runs.values()].map((r) => r.workspace.id),
+      ...this.#closing,
+    ]);
+    for (const s of v.sessions.values()) {
+      if (!s.workspaceId) continue;
+      // An unfinished task may still resume in it, however long it waits (an open escalation).
+      const root = v.tasks[this.#rootOf(s.taskId)];
+      if (!root || !TERMINAL.has(root.state)) active.add(s.workspaceId);
+      if (s.activeAt === undefined) continue;
+      lastActivity.set(s.workspaceId, Math.max(lastActivity.get(s.workspaceId) ?? 0, s.activeAt));
+    }
+    await gc({
+      olderThanMs: days * 86_400_000,
+      activeWorktreeIds: [...active],
+      lastActivity,
+    }).catch((err: unknown) => {
+      const key = `gc ${(err as Error).message}`;
+      if (!this.#sweepErrors.has(key)) {
+        this.#sweepErrors.add(key);
+        this.#errors.push(err);
+      }
+    });
   }
 
   /**
@@ -2297,7 +2338,11 @@ function readView(store: EventStore, prev?: View): View {
       // Written by the MCP backend: the session is on the envelope, the report is the data.
       const summary = str('summary');
       if (summary && e.taskId) progress.set(e.taskId, summary);
-      if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
+      if (e.sessionId) {
+        progressAt.set(e.sessionId, Date.parse(e.ts));
+        const s = sessions.get(e.sessionId);
+        if (s) s.activeAt = Math.max(s.activeAt ?? 0, Date.parse(e.ts) || 0);
+      }
     } else if (e.type.startsWith('worker.')) {
       const id = str('sessionId');
       if (!id || !e.taskId) continue;
@@ -2313,10 +2358,12 @@ function readView(store: EventStore, prev?: View): View {
           ...(workspaceId ? { workspaceId } : {}),
           ...(baseCommit ? { baseCommit } : {}),
           ...(baseBranch ? { baseBranch } : {}),
+          activeAt: Date.parse(e.ts) || 0,
         });
       } else {
         const s = sessions.get(id);
         if (!s) continue;
+        s.activeAt = Math.max(s.activeAt ?? 0, Date.parse(e.ts) || 0);
         const vendor = str('vendorSessionId');
         if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
         else if (e.type === 'worker.ended') {

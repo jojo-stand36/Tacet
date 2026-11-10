@@ -6,6 +6,7 @@ import { newUlid, type SummaryPacket, type TacetConfig, type TaskLanded } from '
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitIntegrator } from '../git/integrate.js';
+import { CheckoutPlanner } from '../standalone.js';
 import { CommandVerifier } from '../verify/command-verifier.js';
 import { WorktreeManager } from '../worktree.js';
 import { MiniConductor } from './daemon.js';
@@ -564,6 +565,82 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(store.query({ taskId: id, typePrefix: 'task.target' })).toHaveLength(1);
       expect(bases).toEqual([pinned]);
       expect(startedAt).toBe(pinned);
+    });
+  });
+  describe('idle checkouts and leftover planner checkouts (#238)', () => {
+    type GcOptions = Parameters<NonNullable<Workspaces['gc']>>[0];
+    const recording = (calls: GcOptions[]): Workspaces => ({
+      create: (workerId, base, o) => manager.create(workerId, base, o),
+      get: (id) => manager.get(id),
+      remove: (id, o) => manager.remove(id, o),
+      head: () => manager.head(),
+      reconcile: () => manager.reconcile(),
+      gc: (o) => {
+        calls.push(o);
+        return manager.gc(o);
+      },
+    });
+
+    it("passes each checkout its sessions' newest worker event as its last activity", async () => {
+      const calls: GcOptions[] = [];
+      await runTask(commitWork, { remove_merged: false }, undefined, {
+        workspaces: recording(calls),
+      });
+      // A sweep after the task settled, so after its last worker event.
+      const before = calls.length;
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(before), { timeout: 3_000 });
+      const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as {
+        sessionId: string;
+        workspaceId: string;
+      };
+      const newest = Math.max(
+        ...store
+          .query({ typePrefix: 'worker' })
+          .filter(
+            (e) =>
+              (e.envelope.data as { sessionId?: string }).sessionId === started.sessionId ||
+              e.envelope.sessionId === started.sessionId,
+          )
+          .map((e) => Date.parse(e.envelope.ts)),
+      );
+      const last = calls.at(-1);
+      expect(last?.olderThanMs).toBe(7 * 86_400_000);
+      expect(last?.lastActivity?.get(started.workspaceId)).toBe(newest);
+      // Its task is done and no session runs in it: not held as active.
+      expect(last?.activeWorktreeIds).not.toContain(started.workspaceId);
+      // Used recently: kept.
+      expect(await manager.get(started.workspaceId)).toBeDefined();
+    });
+
+    it('runs no gc with idle_days 0', async () => {
+      const calls: GcOptions[] = [];
+      await runTask(commitWork, { remove_merged: false, idle_days: 0 }, undefined, {
+        workspaces: recording(calls),
+      });
+      await severalSweeps();
+      expect(calls).toEqual([]);
+    });
+
+    it('removes at start the planner checkout a crash left, and marks new ones scratch', async () => {
+      // What a crash mid-plan leaves: a registered planner checkout the planner never removed.
+      const left = await manager.create('plan-crashed-1234abcd', undefined, { scratch: true });
+      writeFileSync(join(left.path, 'notes.txt'), 'planner scribbles\n');
+      const planner = new CheckoutPlanner(manager, () => new SingleStepPlanner());
+      await runTask(commitWork, { remove_merged: false }, undefined, { planner });
+      expect(await manager.get(left.id)).toBeUndefined();
+      expect(
+        store
+          .query({ typePrefix: 'workspace.removed' })
+          .map((e) => e.envelope.data as { workspaceId: string; reason: string }),
+      ).toContainEqual({ workspaceId: left.id, reason: 'forced' });
+      const plannerCheckouts = store
+        .query({ typePrefix: 'workspace.created' })
+        .map((e) => e.envelope.data as { workerId: string; scratch?: boolean })
+        .filter((d) => d.workerId.startsWith('plan-'));
+      expect(plannerCheckouts).toHaveLength(2);
+      expect(plannerCheckouts.every((d) => d.scratch === true)).toBe(true);
+      // The Worker's checkout is untouched.
+      expect(await manager.list()).toHaveLength(1);
     });
   });
 });

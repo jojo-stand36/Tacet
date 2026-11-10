@@ -41,6 +41,11 @@ export interface WorktreeSetup {
 
 export interface CreateWorktreeOptions {
   setup?: WorktreeSetup;
+  /**
+   * A throwaway checkout (a planner's, #238): it holds nothing of value, so one a crash left
+   * registered is force-removed by the next `reconcile`, and `gc` leaves it to its owner.
+   */
+  scratch?: boolean;
 }
 
 export interface RemoveWorktreeOptions {
@@ -70,6 +75,8 @@ export interface WorktreeInfo {
   baseCommit: string;
   /** When it was registered (ms since the epoch). */
   createdAt: number;
+  /** A throwaway checkout (#238): see `CreateWorktreeOptions.scratch`. */
+  scratch?: true;
 }
 
 export type MergeStrategy = 'pr' | 'squash-to-branch' | 'manual';
@@ -88,6 +95,12 @@ export interface MergeResult {
 export interface WorktreeGcOptions {
   olderThanMs: number;
   activeWorktreeIds?: readonly string[];
+  /**
+   * When each worktree was last used (ms since the epoch, by id), e.g. its Worker sessions' newest
+   * `worker.*` event (#238). A worktree is stale once both this and its creation are older than
+   * `olderThanMs`.
+   */
+  lastActivity?: ReadonlyMap<string, number>;
   now?: number;
 }
 
@@ -493,6 +506,15 @@ export class WorktreeManager implements Workspaces {
       if (left === false)
         await this.record('workspace.removed', { workspaceId: id, reason: 'gone' });
     }
+    // A throwaway checkout a crash left registered (#238): nothing in it is kept.
+    const failed: string[] = [];
+    for (const info of (await this.registry()).values()) {
+      if (!info.scratch || this.#pending.has(info.id)) continue;
+      await this.remove(info.id, { force: true }).catch(() => failed.push(info.id));
+    }
+    if (failed.length > 0) {
+      throw new Error(`could not remove leftover planner checkouts: ${failed.join(', ')}`);
+    }
   }
 
   /**
@@ -552,8 +574,14 @@ export class WorktreeManager implements Workspaces {
         result.skipped.push({ id: info.id, reason: 'active' });
         continue;
       }
-      // By age: activity is not recorded (#126; a follow-up can read it from worker.* events).
-      if (now - info.createdAt < options.olderThanMs) {
+      // Its planner removes it; a crash leaves it to the next `reconcile` (#238).
+      if (info.scratch) {
+        result.skipped.push({ id: info.id, reason: 'scratch' });
+        continue;
+      }
+      // The newest of its creation and its last use (#238): an old checkout in use is kept.
+      const used = Math.max(info.createdAt, options.lastActivity?.get(info.id) ?? 0);
+      if (now - used < options.olderThanMs) {
         result.skipped.push({ id: info.id, reason: 'not stale' });
         continue;
       }
@@ -759,6 +787,7 @@ export class WorktreeManager implements Workspaces {
       workerId,
       baseCommit,
       ...(baseBranch !== undefined ? { baseBranch } : {}),
+      ...(options.scratch ? { scratch: true } : {}),
     });
     try {
       await this.worktreeGit(['worktree', 'add', '--detach', worktreePath, baseCommit]);
@@ -1454,6 +1483,7 @@ export class WorktreeManager implements Workspaces {
             ...(w.baseBranch !== undefined ? { baseBranch: w.baseBranch } : {}),
             baseCommit: w.baseCommit,
             createdAt: Date.parse(w.createdAt),
+            ...(w.scratch ? { scratch: true as const } : {}),
           },
         ]),
     );
@@ -1486,6 +1516,7 @@ export class WorktreeManager implements Workspaces {
           ...(created.baseBranch !== undefined ? { baseBranch: created.baseBranch } : {}),
           baseCommit: created.baseCommit,
           createdAt: Date.now(),
+          ...(created.scratch ? { scratch: true as const } : {}),
         });
       } else {
         this.#memory.delete(id);

@@ -190,6 +190,8 @@ export class CheckoutPlanner implements Planner {
     const ws = await this.workspaces.create(
       `plan-${task.id.replace(/\//g, '_')}-${randomUUID().slice(0, 8)}`,
       opts.base,
+      // A crash mid-plan leaves it registered: the next start removes it (#238).
+      { scratch: true },
     );
     try {
       return await this.make(ws.path).plan(task, opts);
