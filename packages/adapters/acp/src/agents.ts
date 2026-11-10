@@ -168,7 +168,14 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   envAllow: { prefixes: ['ANTHROPIC_', 'CLAUDE_'] },
   apiKeyEnv: ['ANTHROPIC_API_KEY'],
   apiKeyAuthMethods: [],
-  capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  // Resume (`session/resume`, its transcripts in the repo's CLAUDE_CONFIG_DIR) and fork (unstable
+  // `session/fork`) keep the Worker restrictions: verified live on 0.101.0 (#224).
+  capabilities: {
+    ...ACP_BASE,
+    resume: true,
+    fork: 'native',
+    usage: { live: true, context: true, cost: 'none' },
+  },
   verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
   home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
   // A session's own files in its config dir (#232), read from the Agent SDK 0.3.318 binary that
