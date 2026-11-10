@@ -175,9 +175,11 @@ export class CheckoutPlanner implements Planner {
     private readonly make: (cwd: string) => Planner,
   ) {}
 
-  async plan(task: Task, opts: { signal?: AbortSignal } = {}): Promise<PlanResult> {
+  async plan(task: Task, opts: { signal?: AbortSignal; base?: string } = {}): Promise<PlanResult> {
+    // At the task's pinned target, where its Workers start (#219), not where the user is now.
     const ws = await this.workspaces.create(
       `plan-${task.id.replace(/\//g, '_')}-${randomUUID().slice(0, 8)}`,
+      opts.base,
     );
     try {
       return await this.make(ws.path).plan(task, opts);

@@ -75,3 +75,22 @@ export const TaskLanded = z.object({
     .describe('The target commit that makes the same change, for a squash merge'),
 });
 export type TaskLanded = z.infer<typeof TaskLanded>;
+
+/**
+ * Payload of `task.target` (#219): where a task's work starts and lands, recorded once when its
+ * planning starts. Every sub-task without dependencies starts from `commit`, so switching the
+ * main checkout's branch mid-task changes nothing; `branch` (absent when the repo's HEAD was
+ * detached) is the target the landed sweep checks (#210).
+ */
+export const TaskTarget = z.object({
+  branch: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('The local branch checked out when the task started'),
+  commit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .describe('Its commit then: where sub-tasks without dependencies start'),
+});
+export type TaskTarget = z.infer<typeof TaskTarget>;

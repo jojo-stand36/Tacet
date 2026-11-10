@@ -1531,6 +1531,17 @@
         "agent:claude"
       ],
       "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "Hold a task's pinned target commit with a ref so git gc cannot prune it",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #219 (PR #233). A task's `task.target` pins the commit its sub-tasks start from, but no ref holds that commit. Live checkouts keep it alive. But if the user resets or rewrites the branch during a long task and `git gc` prunes the commit, a later fresh checkout for the task (a retry, a new sub-task) fails to start (\"base commit does not name a commit\").\n\n### Tasks\n- [ ] When the Mini-conductor pins a target, also point `refs/tacet/<task>/target` at the commit. The repo's git side is behind a port (for example `Workspaces.pin?(taskId, commit)`), so the daemon stays git-free. The task id must be made ref-safe, as `taskBranch` does.\n- [ ] Delete the ref where the task's other Tacet refs are cleaned up. Today nothing deletes them: `tacet/*` branches are kept on purpose. At minimum, `tacet uninstall --purge --apply` removes every `refs/tacet/*` ref, which is internal and never a user branch, and its preview lists them.\n- [ ] Docs: ARCHITECTURE §2.4 and §3 (the `task.target` paragraph says no ref holds the commit today).\n\n### Acceptance criteria\n- After the pinned branch is reset and `git gc --prune=now` runs, a new checkout for the task still starts at the pinned commit (test).\n- `tacet uninstall --purge --apply` leaves no `refs/tacet/*` ref (test).\n\n_See #219, PR #233, packages/mini/src/daemon/daemon.ts (`#pinTarget`) and packages/cli/src/commands/purge-state.ts._"
     }
   ]
 }

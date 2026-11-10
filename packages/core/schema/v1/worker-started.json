@@ -37,12 +37,12 @@
       "maxLength": 256
     },
     "baseCommit": {
-      "description": "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
+      "description": "Commit a new checkout started at: its dependencies' combined work (#134), else its task's pinned target (#219); absent for older tasks, which started at the main branch",
       "type": "string",
       "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
     },
     "baseBranch": {
-      "description": "Local branch a new checkout started from, when it started from one: the target its task lands in (#210)",
+      "description": "Local branch a new checkout started from, when it started from one (older tasks; #219 checkouts start from a commit and the target is in task.target)",
       "type": "string",
       "minLength": 1
     }
