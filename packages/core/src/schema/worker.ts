@@ -86,3 +86,15 @@ export const WorkerIntegrated = z.object({
   ref: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
 });
 export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;
+
+/**
+ * Payload of `worker.throttled`: a Worker went over the Mini-conductor's limit for an MCP tool
+ * (#121). Written once per window; the calls over the limit get a tool error and change nothing.
+ */
+export const WorkerThrottled = z.object({
+  sessionId: Id,
+  tool: z.string().min(1),
+  limit: z.number().int().positive().describe('Calls allowed per window'),
+  windowMs: z.number().int().positive(),
+});
+export type WorkerThrottled = z.infer<typeof WorkerThrottled>;

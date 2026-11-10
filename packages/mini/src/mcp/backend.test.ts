@@ -155,6 +155,68 @@ describe('EventLogBackend', () => {
     ).not.toContain('held');
   });
 
+  it('rate-limits escalate per Worker, with a readable error and one event (#121)', async () => {
+    const b = make();
+    const W2: WorkerBinding = { workerSessionId: 'w-2', taskId: 'task-1' };
+    const ask = (w: WorkerBinding, n: number) =>
+      b.escalate(w, { question: `Question ${n}?`, urgency: 'normal' });
+    for (let n = 0; n < 6; n++) await ask(W1, n);
+    const err = await ask(W1, 6).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ToolError);
+    expect((err as ToolError).message).toMatch(/rate-limited.*at most 6 calls per 10 minutes/);
+    expect((err as ToolError).detail).toMatchObject({ tool: 'escalate', limit: 6 });
+    await expect(ask(W1, 7)).rejects.toBeInstanceOf(ToolError);
+    const raised = () => store.query({ typePrefix: 'escalation.raised' });
+    expect(raised()).toHaveLength(6);
+    // One event for the window, however many calls were refused.
+    const throttled = store.query({ typePrefix: 'worker.throttled' }).map((e) => e.envelope);
+    expect(throttled).toHaveLength(1);
+    expect(throttled[0]).toMatchObject({
+      sessionId: 'w-1',
+      source: { kind: 'mini' },
+      data: { sessionId: 'w-1', tool: 'escalate', limit: 6, windowMs: 600_000 },
+    });
+    // Another Worker has its own limit.
+    await ask(W2, 0);
+    expect(raised()).toHaveLength(7);
+    // Once the window has passed, the Worker may ask again.
+    clock += 600_000;
+    await ask(W1, 8);
+    expect(raised()).toHaveLength(8);
+  });
+
+  it('rate-limits record_decision, configurably, and forgets the counts on revoke', async () => {
+    const b = make({ limits: { record_decision: { max: 2, windowMs: 60_000 } } });
+    const decide = (n: number) =>
+      b.recordDecision(W1, { topic: `t${n}`, decision: 'd', scope: 'task' });
+    await decide(1);
+    await decide(2);
+    await expect(decide(3)).rejects.toThrow(/record_decision is rate-limited/);
+    expect(store.query({ typePrefix: 'decision.recorded' })).toHaveLength(2);
+    expect(b.workersWithState).toBe(1);
+    b.forget(W1.workerSessionId);
+    expect(b.workersWithState).toBe(0);
+    // Escalate keeps its default limit.
+    await b.escalate(W1, { question: 'q?', urgency: 'normal' });
+  });
+
+  it('drops call counts once their window has passed, for every Worker', async () => {
+    const b = make();
+    for (let i = 0; i < 20; i++) {
+      await b.escalate(
+        { workerSessionId: `w-${i}`, taskId: 'task-1' },
+        {
+          question: 'q?',
+          urgency: 'normal',
+        },
+      );
+    }
+    expect(b.workersWithState).toBe(20);
+    clock += 600_000;
+    await b.escalate(W1, { question: 'q?', urgency: 'normal' });
+    expect(b.workersWithState).toBe(1);
+  });
+
   it('refuses unknown tasks and other tasks’ escalations', async () => {
     const b = make();
     await expect(b.readTask({ workerSessionId: 'w', taskId: 'nope' })).rejects.toBeInstanceOf(

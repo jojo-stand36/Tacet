@@ -77,6 +77,11 @@ export interface EventLogBackendOptions {
   onHandoff?: (b: WorkerBinding, packet: HandoffPacket, reason: string) => void;
   /** Minimum interval between stored progress reports per worker. Default 1000 ms. */
   progressIntervalMs?: number;
+  /**
+   * Per-Worker limits on the tools that ask a person for something (#121): at most `max` calls
+   * per `windowMs`. Defaults: `escalate` 6 and `record_decision` 30 per 10 minutes.
+   */
+  limits?: Partial<Record<LimitedTool, ToolLimit>>;
   /** Extra task constraints for `read_task`, e.g. from repo policy. */
   constraints?: (taskId: string) => string[];
   now?: () => Date;
@@ -84,11 +89,34 @@ export interface EventLogBackendOptions {
 
 const ANSWER_SOURCES = new Set(['policy', 'precedent', 'mini', 'user']);
 
+export type LimitedTool = 'escalate' | 'record_decision';
+export interface ToolLimit {
+  max: number;
+  windowMs: number;
+}
+
+/**
+ * A Worker that escalates more than this in ten minutes is looping, not asking: each escalation
+ * lands in the user's queue. Decisions are cheaper, so the bar is higher.
+ */
+export const DEFAULT_TOOL_LIMITS: Readonly<Record<LimitedTool, ToolLimit>> = {
+  escalate: { max: 6, windowMs: 600_000 },
+  record_decision: { max: 30, windowMs: 600_000 },
+};
+
+/** What the rate limits keep per Worker: recent call times, and when it was last throttled. */
+interface WorkerCalls {
+  calls: Map<LimitedTool, number[]>;
+  throttled: Map<LimitedTool, number>;
+}
+
 /** The MCP tools over the append-only event log (ADR-003 §1); all state changes are events. */
 export class EventLogBackend implements MiniBackend {
   readonly #o: EventLogBackendOptions;
   /** When each Worker's last progress report was stored: only for the rate limit. */
   readonly #lastProgress = new Map<string, number>();
+  /** Recent calls to the limited tools, per Worker (#121). */
+  readonly #calls = new Map<string, WorkerCalls>();
 
   constructor(opts: EventLogBackendOptions) {
     this.#o = opts;
@@ -160,11 +188,58 @@ export class EventLogBackend implements MiniBackend {
 
   forget(workerSessionId: string): void {
     this.#lastProgress.delete(workerSessionId);
+    this.#calls.delete(workerSessionId);
   }
 
   /** @internal Tests only: how many Workers the backend keeps state for. */
   get workersWithState(): number {
-    return this.#lastProgress.size;
+    return new Set([...this.#lastProgress.keys(), ...this.#calls.keys()]).size;
+  }
+
+  /**
+   * Count a call to a limited tool, or refuse it (#121): over the limit, the Worker gets a tool
+   * error it can read, nothing is created, and one `worker.throttled` is recorded per window.
+   * Other Workers have limits of their own.
+   */
+  #limit(b: WorkerBinding, tool: LimitedTool): void {
+    const lim = this.#o.limits?.[tool] ?? DEFAULT_TOOL_LIMITS[tool];
+    const now = this.#now().getTime();
+    // Calls older than their window limit nothing: drop them, for every Worker, so state for a
+    // Worker whose token was never revoked does not stay forever.
+    for (const [id, w] of this.#calls) {
+      for (const [t, times] of w.calls) {
+        const window = (this.#o.limits?.[t] ?? DEFAULT_TOOL_LIMITS[t]).windowMs;
+        const recent = times.filter((x) => now - x < window);
+        if (recent.length > 0) w.calls.set(t, recent);
+        else w.calls.delete(t);
+      }
+      for (const [t, at] of w.throttled) {
+        if (now - at >= (this.#o.limits?.[t] ?? DEFAULT_TOOL_LIMITS[t]).windowMs)
+          w.throttled.delete(t);
+      }
+      if (w.calls.size === 0 && w.throttled.size === 0) this.#calls.delete(id);
+    }
+    const w = this.#calls.get(b.workerSessionId) ?? { calls: new Map(), throttled: new Map() };
+    this.#calls.set(b.workerSessionId, w);
+    const times = w.calls.get(tool) ?? [];
+    if (times.length >= lim.max) {
+      if (!w.throttled.has(tool)) {
+        w.throttled.set(tool, now);
+        this.#append(
+          b,
+          'worker.throttled',
+          { sessionId: b.workerSessionId, tool, limit: lim.max, windowMs: lim.windowMs },
+          'mini',
+        );
+      }
+      const retryAfterMs = Math.max(0, lim.windowMs - (now - (times[0] ?? now)));
+      throw new ToolError(
+        `${tool} is rate-limited for this Worker: at most ${lim.max} calls per ${Math.round(lim.windowMs / 60_000)} minutes, and the limit is reached. Do not call it again now; work on with what you have, or end your turn with a summary of what blocks you.`,
+        { tool, limit: lim.max, windowMs: lim.windowMs, retryAfterMs },
+      );
+    }
+    times.push(now);
+    w.calls.set(tool, times);
   }
 
   async reportProgress(b: WorkerBinding, i: ToolInput<'report_progress'>) {
@@ -211,6 +286,7 @@ export class EventLogBackend implements MiniBackend {
   }
 
   async escalate(b: WorkerBinding, i: ToolInput<'escalate'>): Promise<ToolOutput<'escalate'>> {
+    this.#limit(b, 'escalate');
     const escalation = this.#raise(b, i);
     const gate = this.#o.gate;
     if (!gate) return { escalationId: escalation.id, status: 'pending' };
@@ -342,6 +418,7 @@ export class EventLogBackend implements MiniBackend {
     b: WorkerBinding,
     i: ToolInput<'record_decision'>,
   ): Promise<ToolOutput<'record_decision'>> {
+    this.#limit(b, 'record_decision');
     const decisionId = newUlid(this.#now().getTime());
     if (i.scope === 'repo' && !(this.#o.allowRepoDecision?.(b, i) ?? false)) {
       // Repo-wide precedent needs approval: it becomes an escalation instead (ADR-003 §6). It
