@@ -23,6 +23,7 @@ import {
   workerWorktree,
 } from '@tacet/core/node';
 import { type Integrator, type Workspace, WorktreeRefusedError } from '../daemon/ports.js';
+import { detectLanded, type Landed } from './landed.js';
 import { combineCommits, setTaskBranch } from './merge.js';
 
 export { WorktreeRefusedError };
@@ -568,6 +569,10 @@ export class GitIntegrator implements Integrator {
 
   combine(commits: readonly string[]): Promise<string | undefined> {
     return combineCommits(commits, { repoRoot: this.#repoRoot, env: this.#env });
+  }
+
+  landed(commit: string, target: string): Promise<Landed | undefined> {
+    return detectLanded({ repoRoot: this.#repoRoot, commit, target, env: this.#env });
   }
 
   async publish(taskId: string, commit: string): Promise<string> {

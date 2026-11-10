@@ -83,6 +83,12 @@ export interface MiniConductorOptions {
   now?: () => Date;
   /** How often to look for answered escalations, in ms. Default 1000. */
   pollMs?: number;
+  /**
+   * How often to look for finished tasks whose result landed in its target, and free their
+   * Worker checkouts when `worktrees.remove_merged` is on (#210), in ms. Default 10 minutes; it
+   * also runs once at start.
+   */
+  landedSweepMs?: number;
 }
 
 /** What the pool knows about each Worker session, rebuilt from `worker.*` events. */
@@ -97,6 +103,8 @@ interface SessionRecord {
   refused?: boolean;
   /** The commit its checkout started at (#134). */
   baseCommit?: string;
+  /** The local branch its checkout started from, when it did: its task's target (#210). */
+  baseBranch?: string;
 }
 
 interface EscalationRecord {
@@ -231,6 +239,9 @@ export class MiniConductor {
   /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
+  #sweepTimer: NodeJS.Timeout | undefined;
+  /** The landed sweep in flight, so a slow one is never started twice. */
+  #sweeping: Promise<void> | undefined;
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -319,6 +330,9 @@ export class MiniConductor {
     this.#timer = setInterval(() => this.#kick(), this.#o.pollMs ?? 1000);
     this.#timer.unref();
     this.#kick();
+    this.#sweepTimer = setInterval(() => this.#sweep(), this.#o.landedSweepMs ?? 10 * 60_000);
+    this.#sweepTimer.unref();
+    this.#sweep();
   }
 
   /** Accept a task. Returns its id; planning and scheduling continue in the background. */
@@ -387,6 +401,7 @@ export class MiniConductor {
     this.#gen += 1;
     this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
     await this.#ticking;
     await Promise.all([...this.#runs.values()].map((r) => this.#end(r, 'restart')));
     await Promise.allSettled([...this.#inflight]);
@@ -402,6 +417,7 @@ export class MiniConductor {
     this.#gen += 1;
     this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
     this.#runs.clear();
     this.#unlock();
   }
@@ -739,6 +755,9 @@ export class MiniConductor {
           ...results.flatMap((r) => r.openQuestions ?? []),
           ...(published?.question ? [published.question] : []),
         ],
+        ...(published?.commit && published.ref
+          ? { published: { ref: published.ref, commit: published.commit } }
+          : {}),
       };
       this.#o.store.append([
         this.#env(parent.task.id, 'task.result', summary),
@@ -747,6 +766,87 @@ export class MiniConductor {
           ...(done ? {} : { message: `${failed} sub-task(s) failed` }),
         }),
       ]);
+    }
+  }
+
+  // ---- landed results (#210) ------------------------------------------------------------
+
+  #sweep(): void {
+    if (this.#sweeping || !this.#started) return;
+    const gen = this.#gen;
+    const run = this.#sweepLanded(gen).finally(() => {
+      this.#sweeping = undefined;
+    });
+    this.#sweeping = run;
+    this.#track(run);
+  }
+
+  /**
+   * Free the Worker checkouts of finished tasks whose result landed in its target (#210), when
+   * `worktrees.remove_merged` is on. The user merges outside Tacet, so this looks again on a slow
+   * timer: for each completed task with a published result and a checkout left, it records
+   * `task.landed` once the result is merged or squash-merged into the branch its checkouts started
+   * from (only when they all agree on one), then removes each checkout with the result as landed.
+   * The worktree manager still keeps any with local files or work the result does not contain.
+   */
+  async #sweepLanded(gen: number): Promise<void> {
+    if (this.#o.config.worktrees?.remove_merged === false) return;
+    const integrator = this.#o.integrator;
+    if (!integrator?.landed) return;
+    const v = this.#state();
+    const inUse = new Set([...this.#runs.values()].map((r) => r.workspace.id));
+    for (const root of Object.values(v.tasks)) {
+      if (!this.#live(gen)) return;
+      if (root.task.parentId || root.state !== 'completed') continue;
+      const result = this.#o.store
+        .query({ taskId: root.task.id, typePrefix: 'task.result' })
+        .at(-1)?.envelope;
+      const published = (result?.data as SummaryPacket | undefined)?.published;
+      if (!result || !published) continue;
+      const subs = new Set(
+        Object.values(v.tasks)
+          .filter((t) => t.task.parentId === root.task.id)
+          .map((t) => t.task.id),
+      );
+      const sessions = [...v.sessions.values()].filter((s) => subs.has(s.taskId));
+      const workspaceIds = [
+        ...new Set(sessions.flatMap((s) => (s.workspaceId ? [s.workspaceId] : []))),
+      ].filter((id) => !inUse.has(id));
+      const left: string[] = [];
+      for (const id of workspaceIds) if (await this.#o.workspaces.get(id)) left.push(id);
+      if (left.length === 0 || !this.#live(gen)) continue;
+
+      const recorded = this.#o.store
+        .query({ taskId: root.task.id, typePrefix: 'task.landed' })
+        .some((e) => (e.envelope.data as { commit?: unknown }).commit === published.commit);
+      if (!recorded) {
+        const branches = new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
+        // No target, or sub-tasks that started from different branches: nothing to compare.
+        if (branches.size !== 1) continue;
+        const target = `refs/heads/${[...branches][0]}`;
+        let landed: Awaited<ReturnType<NonNullable<Integrator['landed']>>>;
+        try {
+          landed = await integrator.landed(published.commit, target);
+        } catch (err) {
+          this.#errors.push(err);
+          continue;
+        }
+        if (!landed || !this.#live(gen)) continue;
+        this.#o.store.append({
+          ...this.#env(root.task.id, 'task.landed', {
+            commit: published.commit,
+            target,
+            how: landed.how,
+            ...(landed.landedAs ? { landedAs: landed.landedAs } : {}),
+          }),
+          causationId: result.id,
+        });
+      }
+      for (const id of left) {
+        if (!this.#live(gen)) return;
+        // Kept (local files, or work the result does not contain) until the user forces it.
+        await this.#o.workspaces.remove(id, { landed: [published.commit] }).catch(() => {});
+      }
     }
   }
 
@@ -984,6 +1084,7 @@ export class MiniConductor {
           attempt: failed + 1,
           ...(last ? { previousSessionId: last.sessionId } : {}),
           ...(baseCommit !== undefined ? { baseCommit } : {}),
+          ...(workspace.baseBranch !== undefined ? { baseBranch: workspace.baseBranch } : {}),
         },
         sessionId,
       ),
@@ -1830,12 +1931,14 @@ export class MiniConductor {
           const adapter = str('adapter');
           const workspaceId = str('workspaceId');
           const baseCommit = str('baseCommit');
+          const baseBranch = str('baseBranch');
           sessions.set(id, {
             sessionId: id,
             taskId: e.taskId,
             ...(adapter ? { adapter } : {}),
             ...(workspaceId ? { workspaceId } : {}),
             ...(baseCommit ? { baseCommit } : {}),
+            ...(baseBranch ? { baseBranch } : {}),
           });
         } else {
           const s = sessions.get(id);

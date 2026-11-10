@@ -59,6 +59,14 @@ export interface Integrator {
   combine(commits: readonly string[]): Promise<string | undefined>;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
+  /**
+   * Whether `commit` landed in `target` (`refs/heads/<branch>`), merged or squash-merged, from
+   * the repo's own refs only (#210). Undefined when it has not (or cannot tell).
+   */
+  landed?(
+    commit: string,
+    target: string,
+  ): Promise<{ how: 'merge' | 'squash'; landedAs?: string } | undefined>;
 }
 
 /** Commits that cannot be combined without a person: `files` conflict. */
