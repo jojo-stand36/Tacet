@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import { fstatSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
+import { cappedLog } from './capped-log.js';
+import { isDetachedChild } from './commands/detach.js';
 import { main } from './main.js';
 
 const abort = new AbortController();
@@ -27,9 +30,15 @@ const prompt = interactive
     }
   : undefined;
 
+// The background run of `tacet run --detach` (#201): its output is its log, kept under a cap
+// (#273). Standard output and error are the same file there.
+// Only a file: a terminal or a pipe cannot be cut.
+const log =
+  isDetachedChild(process.argv.slice(2)) && fstatSync(2).isFile() ? cappedLog(2) : undefined;
+
 process.exitCode = await main(process.argv.slice(2), {
-  out: (t) => process.stdout.write(`${t}\n`),
-  err: (t) => process.stderr.write(`${t}\n`),
+  out: log ?? ((t) => process.stdout.write(`${t}\n`)),
+  err: log ?? ((t) => process.stderr.write(`${t}\n`)),
   cwd: process.cwd(),
   signal: abort.signal,
   ...(prompt ? { prompt } : {}),

@@ -74,7 +74,9 @@ describe('WorktreeManager', () => {
   }
 
   afterEach(async () => {
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    // Retried: after a test times out, its git processes may still be writing here for a moment
+    // (ENOTEMPTY, #265), and that must not hide the timeout behind a cleanup error.
+    await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   it('creates ten parallel detached workers with unique integration refs and paths', async () => {
@@ -1048,22 +1050,33 @@ describe('WorktreeManager', () => {
       await workerGit(worktreePath, ['commit', '-m', file]);
     }
 
-    it('keeps no state files, with or without a log', async () => {
-      for (const m of [manager, new WorktreeManager(repository, root())]) {
-        const a = await m.create('a');
-        const b = await m.create('b');
-        await workerCommit(a.path);
-        const squash = await m.merge(a.id, 'squash-to-branch', 'main');
-        expect(squash.status).toBe('applied');
-        await m.remove(b.id);
-        for (const name of await readdir(root())) {
-          expect(name === '.tacet-locks' || /^[a-z0-9-]+$/.test(name), name).toBe(true);
-        }
+    /** Create, commit, squash-merge and remove: nothing but checkouts (and locks) is left. */
+    async function noStateFiles(m: WorktreeManager): Promise<void> {
+      const a = await m.create('a');
+      const b = await m.create('b');
+      await workerCommit(a.path);
+      const squash = await m.merge(a.id, 'squash-to-branch', 'main');
+      expect(squash.status).toBe('applied');
+      await m.remove(b.id);
+      for (const name of await readdir(root())) {
+        expect(name === '.tacet-locks' || /^[a-z0-9-]+$/.test(name), name).toBe(true);
       }
+    }
+
+    // Real git work: well under a second here, but a cold git on a CI runner (macOS) can take
+    // several times the default 5 s (#265, #251).
+    it('keeps no state files with a log, and no path in its events', {
+      timeout: 30_000,
+    }, async () => {
+      await noStateFiles(manager);
       // Never a path in an event: a checkout is <root>/<id>.
       for (const e of store.query({ typePrefix: 'workspace' })) {
         expect(JSON.stringify(e.envelope)).not.toContain(temporaryDirectory);
       }
+    });
+
+    it('keeps no state files without a log', { timeout: 30_000 }, async () => {
+      await noStateFiles(new WorktreeManager(repository, root()));
     });
 
     it('finds every live worktree from the log after a restart, and none removed', async () => {
