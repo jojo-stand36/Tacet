@@ -30,14 +30,14 @@ export const WorkerStarted = z.object({
     .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/)
     .optional()
     .describe(
-      "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
+      "Commit a new checkout started at: its dependencies' combined work (#134), else its task's pinned target (#219); absent for older tasks, which started at the main branch",
     ),
   baseBranch: z
     .string()
     .min(1)
     .optional()
     .describe(
-      'Local branch a new checkout started from, when it started from one: the target its task lands in (#210)',
+      'Local branch a new checkout started from, when it started from one (older tasks; #219 checkouts start from a commit and the target is in task.target)',
     ),
 });
 export type WorkerStarted = z.infer<typeof WorkerStarted>;
