@@ -14,7 +14,8 @@
     "test": "vitest run",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "check:matrix": "node scripts/check-matrix-freshness.mjs && node --test scripts/*.test.mjs",
+    "check:matrix": "node scripts/check-matrix-freshness.mjs",
+    "check:scripts": "node --test scripts/*.test.mjs",
     "check:generated": "node scripts/gen-roadmap.mjs --check && node scripts/sync-agents.mjs --check && pnpm --filter @tacet/core check:schemas"
   },
   "devDependencies": {

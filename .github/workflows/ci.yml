@@ -36,11 +36,24 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Generated files are current
         run: pnpm check:generated
+      - name: Repo scripts pass their tests
+        run: pnpm check:scripts
 
-      # Fails once an active vendor surface was last checked more than 30 days ago (#66):
-      # refresh it as "Keeping it fresh" in docs/adapters/capability-matrix.md says.
+  # Fails once an active vendor surface was last checked more than 30 days ago (#66), and warns a
+  # week before. It goes red with time, not with the change, so it is a job of its own: do not
+  # make it a required check. Refresh as "Keeping it fresh" in docs/adapters/capability-matrix.md
+  # says.
+  matrix-freshness:
+    name: matrix-freshness
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Capability matrix is fresh
-        run: pnpm check:matrix
+        run: node scripts/check-matrix-freshness.mjs
 
   test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
