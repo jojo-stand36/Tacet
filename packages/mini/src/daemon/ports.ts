@@ -14,6 +14,8 @@ import type { WorkerBinding } from '@tacet/core/node';
 export interface Workspace {
   id: string;
   path: string;
+  /** The local branch it started from, when it started from one: its task's target (#210). */
+  baseBranch?: string;
 }
 
 export interface Workspaces {
@@ -27,8 +29,9 @@ export interface Workspaces {
   /**
    * Delete a checkout; a no-op for an id that is gone. Refuses (throws) rather than lose work
    * nothing else has, such as local files or commits no other branch contains, unless `force`.
+   * `landed` names commits that landed in their target (#210); work they contain counts as kept.
    */
-  remove(id: string, options?: { force?: boolean }): Promise<void>;
+  remove(id: string, options?: { force?: boolean; landed?: readonly string[] }): Promise<void>;
 }
 
 /** The Worker's checkout failed its integrity checks: nothing was run in it. */

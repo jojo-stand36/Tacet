@@ -34,6 +34,12 @@ export interface RemoveWorktreeOptions {
    * delete its `tacet/<id>` branch. Without it, `remove` refuses rather than lose work.
    */
   force?: boolean;
+  /**
+   * Commits that landed in their target (#210): the event log records the task's published result
+   * as merged or squash-merged. Work they contain counts as kept, as if a branch held them. Each
+   * must be a full commit id in the repository, or the worktree is kept.
+   */
+  landed?: readonly string[];
 }
 
 export interface WorktreeInfo {
@@ -360,7 +366,7 @@ export class WorktreeManager implements Workspaces {
       if (errorCode(error) !== 'ENOENT') throw error;
       missing = true;
     }
-    await this.removeWorktree(info, options.force === true, missing);
+    await this.removeWorktree(info, options.force === true, missing, options.landed ?? []);
   }
 
   async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
@@ -650,7 +656,12 @@ export class WorktreeManager implements Workspaces {
     return { baseBranch, baseCommit };
   }
 
-  private async removeWorktree(info: WorktreeInfo, force: boolean, missing = false): Promise<void> {
+  private async removeWorktree(
+    info: WorktreeInfo,
+    force: boolean,
+    missing = false,
+    landed: readonly string[] = [],
+  ): Promise<void> {
     const { root } = await this.paths();
     const release = await this.lockRemoval(info.id);
     try {
@@ -687,7 +698,7 @@ export class WorktreeManager implements Workspaces {
           );
         }
       }
-      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip);
+      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip, landed);
       if (missing) {
         // Only this worktree's registration: `git worktree prune` would also prune the user's own.
         if (gitDirectory) await rm(gitDirectory, { recursive: true, force: true });
@@ -736,6 +747,7 @@ export class WorktreeManager implements Workspaces {
     info: WorktreeInfo,
     gitDirectory: string | undefined,
     branchTip: string | undefined,
+    landed: readonly string[] = [],
   ): Promise<void> {
     const unverifiable = (reason: string) =>
       new WorktreeKeptError(
@@ -786,7 +798,15 @@ export class WorktreeManager implements Workspaces {
       }
     }
 
-    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits]);
+    // Landed commits go to `rev-list --stdin`: anything but a full commit id could be read there as
+    // a revision expression or an option.
+    if (landed.some((commit) => !commitIdPattern.test(commit))) {
+      throw unverifiable('a landed commit is not a full commit id');
+    }
+    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits, ...landed]);
+    if (landed.some((commit) => !shared.has(commit))) {
+      throw unverifiable('a landed commit is not in the repository');
+    }
     if (privateCommits.some((commit) => !shared.has(commit))) {
       // Integration copies only what HEAD reaches: commits left behind by an amend or a reset
       // can never be integrated, so say how to let them go.
@@ -821,7 +841,7 @@ export class WorktreeManager implements Workspaces {
     const unique = (
       await this.git(
         ['rev-list', '--max-count=1', '--stdin'],
-        `${[...candidates, ...others.map((tip) => `^${tip}`)].join('\n')}\n`,
+        `${[...candidates, ...[...others, ...landed].map((tip) => `^${tip}`)].join('\n')}\n`,
       )
     ).trim();
     if (unique) {
