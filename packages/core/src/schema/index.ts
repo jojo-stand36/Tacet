@@ -8,7 +8,7 @@ import { HelloParams, HelloResult } from './hello.js';
 import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
 import { SummaryPacket } from './summary.js';
-import { Task, TaskExt } from './task.js';
+import { Task, TaskExt, TaskLanded } from './task.js';
 import {
   WorkerEnded,
   WorkerIntegrated,
@@ -63,6 +63,7 @@ export const jsonSchemas = {
   'hello-result': { schema: HelloResult, title: 'Tacet tacet/hello result' },
   'task-plan': { schema: TaskPlan, title: 'Tacet task.planned payload' },
   'summary-packet': { schema: SummaryPacket, title: 'Tacet SummaryPacket (task.result)' },
+  'task-landed': { schema: TaskLanded, title: 'Tacet task.landed payload' },
   'worker-started': { schema: WorkerStarted, title: 'Tacet worker.started payload' },
   'worker-vendor-session': {
     schema: WorkerVendorSession,

@@ -1,5 +1,8 @@
 import { z } from 'zod';
 import { Id, openEnum, Timestamp } from './common.js';
+
+const CommitId = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id');
+
 import { Verification } from './handoff.js';
 
 /**
@@ -38,6 +41,15 @@ export const SummaryPacket = z.object({
     .describe('Full lowercase commit ids; the Mini-conductor resolves them before writing'),
   verification: Verification,
   openQuestions: z.array(z.string().min(1)).default([]),
+  published: z
+    .object({
+      ref: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
+      commit: CommitId,
+    })
+    .optional()
+    .describe(
+      "The branch the Mini-conductor pointed at the task's combined result, and that commit (#210)",
+    ),
 });
 export type SummaryPacket = z.infer<typeof SummaryPacket>;
 

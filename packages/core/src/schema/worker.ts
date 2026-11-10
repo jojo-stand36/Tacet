@@ -32,6 +32,13 @@ export const WorkerStarted = z.object({
     .describe(
       "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
     ),
+  baseBranch: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Local branch a new checkout started from, when it started from one: the target its task lands in (#210)',
+    ),
 });
 export type WorkerStarted = z.infer<typeof WorkerStarted>;
 
