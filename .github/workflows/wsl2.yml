@@ -1,7 +1,7 @@
 name: wsl2
 
 # Experimental (#193): the suite inside a WSL2 distro on a GitHub-hosted Windows runner. Not a
-# required check. GitHub documents no support for WSL2 (nested virtualisation) on hosted
+# required check. GitHub's docs do not say WSL2 (nested virtualisation) is supported on hosted
 # runners; the windows-2025 image ships WSL 2 and users report it starting there
 # (actions/runner-images README and issue #11869, read 2026-11-10), so this may break with the
 # platform. It runs weekly, on demand, and on pull requests that change it or the WSL checks.
@@ -13,6 +13,9 @@ on:
     paths:
       - .github/workflows/wsl2.yml
       - packages/core/src/node/wsl.ts
+      - packages/core/src/node/wsl.test.ts
+      - packages/cli/src/commands/run.ts
+      - docs/WSL2.md
 
 permissions:
   contents: read
@@ -34,34 +37,39 @@ jobs:
           distribution: Ubuntu-24.04
           wsl-version: 2
 
+      # From Windows, as the research recommends: `wsl -l -v` lists each distro's WSL version.
+      # Its output is UTF-16, so NULs are dropped before matching.
       - name: Assert WSL 2, not WSL 1
-        shell: wsl-bash {0}
+        shell: pwsh
         run: |
-          set -eu
-          uname -r
-          grep -qi 'wsl2' /proc/sys/kernel/osrelease || { echo 'not WSL 2'; exit 1; }
+          $out = (wsl -l -v | Out-String) -replace "`0", ''
+          Write-Output $out
+          if ($out -notmatch 'Ubuntu-24\.04\s+\S+\s+2') { throw 'Ubuntu-24.04 is not running on WSL 2' }
 
       # Inside the distro's own file system, as docs/WSL2.md tells users to work: a fresh clone
       # of this commit in ~, not the Windows checkout under /mnt.
       - name: Install, lint, typecheck and test inside WSL2
         shell: wsl-bash {0}
-        env:
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        # The wsl-bash wrapper passes no environment into WSL (it sets no WSLENV), so the values
+        # are written into the script. Both are safe there: a commit SHA is hex, and a repository
+        # name is letters, digits, `.`, `_` and `-`. github.sha is the merge commit ci.yml tests.
         run: |
           set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
           SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
           $SUDO apt-get update -qq
           $SUDO apt-get install -y -qq curl git ca-certificates build-essential python3
-          rm -rf ~/tacet
-          git clone -q "https://github.com/$REPO.git" ~/tacet
-          cd ~/tacet
-          git fetch -q origin "$SHA"
-          git checkout -q "$SHA"
+          rm -rf ~/tacet && mkdir ~/tacet && cd ~/tacet
+          git init -q
+          git fetch -q --depth 1 'https://github.com/${{ github.repository }}.git' '${{ github.sha }}'
+          git checkout -q FETCH_HEAD
           curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
           export NVM_DIR="$HOME/.nvm"
+          # nvm is not written for `set -u`, which the wsl-bash wrapper turns on.
+          set +u
           . "$NVM_DIR/nvm.sh"
           nvm install 24
+          set -u
           corepack enable
           pnpm install --frozen-lockfile
           pnpm lint
@@ -75,7 +83,9 @@ jobs:
         run: |
           set -euo pipefail
           export NVM_DIR="$HOME/.nvm"
+          set +u
           . "$NVM_DIR/nvm.sh"
+          set -u
           cd ~/tacet
           grep -E ' /mnt/[a-z] ' /proc/self/mountinfo || true
           node --input-type=module -e "

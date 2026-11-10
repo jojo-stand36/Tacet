@@ -1,5 +1,5 @@
 import { readFileSync, realpathSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 /**
  * What the WSL checks read; replaced in tests with fake tables. Every field is optional: a file
@@ -108,12 +108,7 @@ function automountRoot(wslConf: string | undefined): string {
  */
 export function windowsDrive(path: string, probe: WslProbe): string | undefined {
   if (!isWsl(probe)) return undefined;
-  let real: string;
-  try {
-    real = (probe.realpath ?? ((p: string) => realpathSync.native(p)))(resolve(path));
-  } catch {
-    real = resolve(path);
-  }
+  const real = canonical(resolve(path), probe.realpath ?? ((p: string) => realpathSync.native(p)));
   const root = automountRoot(probe.wslConf);
   const letterUnder = (p: string) => {
     if (!p.startsWith(root)) return undefined;
@@ -121,12 +116,15 @@ export function windowsDrive(path: string, probe: WslProbe): string | undefined 
     return m ? `${(m[1] as string).toUpperCase()}:` : undefined;
   };
   const mounts = probe.mountinfo ? parseMountinfo(probe.mountinfo) : [];
+  // The longest mount point holding the path; of two at the same point, the later one is the
+  // one in effect.
   const within = mounts
-    .filter((m) => real === m.point || real.startsWith(m.point === '/' ? '/' : `${m.point}/`))
-    .sort((a, b) => b.point.length - a.point.length)[0];
+    .map((m, i) => ({ m, i }))
+    .filter(({ m }) => real === m.point || real.startsWith(m.point === '/' ? '/' : `${m.point}/`))
+    .sort((a, b) => b.m.point.length - a.m.point.length || b.i - a.i)[0]?.m;
   if (within) {
     const drive = /^([A-Za-z]):[\\/]?/.exec(within.source);
-    const drvfs = within.fstype === 'drvfs' || /(^|[,;])aname=drvfs|drvfs/i.test(within.options);
+    const drvfs = within.fstype === 'drvfs' || /drvfs/i.test(within.options);
     if (drive) return `${(drive[1] as string).toUpperCase()}:`;
     if (drvfs) return letterUnder(within.point) ?? 'a Windows drive';
     if (within.fstype === '9p' || within.fstype === 'virtiofs') {
@@ -135,6 +133,25 @@ export function windowsDrive(path: string, probe: WslProbe): string | undefined 
     return undefined;
   }
   return letterUnder(real);
+}
+
+/**
+ * `path` with its longest existing ancestor made canonical: a state directory not created yet,
+ * behind a symlink to a Windows drive, still resolves to the drive.
+ */
+function canonical(path: string, real: (p: string) => string): string {
+  let head = path;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      return join(real(head), ...tail.reverse());
+    } catch {
+      const up = dirname(head);
+      if (up === head) return path;
+      tail.push(basename(head));
+      head = up;
+    }
+  }
 }
 
 /**

@@ -43,6 +43,21 @@ describe('WSL checks (#193)', () => {
     expect(windowsDrive('/home/me/repo', p)).toBe('C:');
   });
 
+  it('resolves the nearest existing parent of a path not created yet', () => {
+    const p = probe({
+      realpath: (x) => {
+        if (x === '/home/me/state-link') return '/mnt/c/state';
+        throw new Error('ENOENT');
+      },
+    });
+    expect(windowsDrive('/home/me/state-link/abc123/events.db', p)).toBe('C:');
+  });
+
+  it('takes the later of two mounts at the same point', () => {
+    const over = `${MOUNTS}\n99 29 0:60 / /mnt/c rw - ext4 /dev/sdd rw`;
+    expect(windowsDrive('/mnt/c/repo', probe({ mountinfo: over }))).toBeUndefined();
+  });
+
   it('honours [automount] root, and falls back to it without a mount table', () => {
     const conf = '# custom\n[automount]\nenabled = true\nroot = /windir/\n';
     expect(windowsDrive('/windir/c/repo', probe({ mountinfo: undefined, wslConf: conf }))).toBe(

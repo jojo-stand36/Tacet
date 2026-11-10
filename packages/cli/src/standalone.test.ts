@@ -263,11 +263,12 @@ describe('tacet standalone (#21)', () => {
     expect(r.err).toMatch(/warning: the repo is on C: \(a Windows drive\) inside WSL/);
     // The state directory is in the distro's own file system: no warning for it.
     expect(r.err).not.toMatch(/state directory is on/);
-    // Not WSL, or not a Windows drive: nothing to say.
-    const plain = await tacet(['run', ...user(), 'again'], {
-      wslProbe: { ...wsl, osrelease: '6.8.0' },
+    // Inside WSL, but in the distro's own file system: nothing to say.
+    const inDistro = await tacet(['run', ...user(), 'again'], {
+      wslProbe: { ...wsl, realpath: (p: string) => p },
     });
-    expect(plain.err).not.toMatch(/warning: the repo/);
+    expect(inDistro.code).toBe(0);
+    expect(inDistro.err).not.toMatch(/warning: the/);
   });
 
   it('refuses to run beside another live Mini-conductor for the repo', async () => {
