@@ -365,6 +365,32 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(
       ask('Edit', { file_path: '.tacet/tacet.yaml', old_string: 'a', new_string: 'b' }).allow,
     ).toBe(false);
+    expect(ask('NotebookEdit', { notebook_path: '.tacet/n.ipynb', new_source: '' }).allow).toBe(
+      false,
+    );
+    // Folded names, and the file that keeps local.yaml out of git.
+    for (const p of ['.ta\u200dcet/tacet.yaml', '\uff0etacet/tacet.yaml', '.tacet/.gitignore']) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
+    // A committed `.tacet` symlink to elsewhere in the checkout is still Tacet's config.
+    mkdirSync(join(wt, 'config', 'tacet'), { recursive: true });
+    symlinkSync(join(wt, 'config', 'tacet'), join(wt, '.tacet'));
+    expect(ask('Write', { file_path: '.tacet/tacet.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: join(wt, '.tacet', 'tacet.yaml'), content: '' }).allow).toBe(
+      false,
+    );
+    // So is the file it points at, written by its real path: Tacet reads it through the link.
+    expect(ask('Write', { file_path: 'config/tacet/tacet.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'config/other.yaml', content: '' }).allow).toBe(true);
+    // Likewise a root `.mcp.json` that links to another file.
+    writeFileSync(join(wt, 'servers.json'), '{}');
+    symlinkSync(join(wt, 'servers.json'), join(wt, '.mcp.json'));
+    expect(ask('Edit', { file_path: 'servers.json', old_string: '{', new_string: '[' }).allow).toBe(
+      false,
+    );
     // Reading it is fine, and similar names are not it.
     expect(ask('Read', { file_path: '.tacet/tacet.yaml' }).allow).toBe(true);
     expect(ask('Write', { file_path: 'docs/tacet.md', content: '' }).allow).toBe(true);

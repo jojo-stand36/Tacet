@@ -91,8 +91,10 @@ const FILE_TOOLS: Record<string, FileTool> = {
  * Agent, editor, hook and package-manager config a Worker may not write (owner decision on #200,
  * 2026-11-10). Tacet's own sessions never load them (no setting sources, a strict MCP config,
  * git hooks off), but the user's tools would, once the user opens or merges the branch: a hook,
- * an MCP server command or a task there runs code. Matched at any depth and in any letter case,
- * on the path after symlinks are resolved. A task that needs one of these escalates. The list
+ * an MCP server command or a task there runs code. Tacet's own `.tacet/` config is loaded by the
+ * next `tacet run` on the merged branch (#227). Matched at any depth and in any letter case, on
+ * the path as written and on the path after symlinks are resolved (a committed `.tacet` symlink
+ * to `config/tacet` is still Tacet's config). A task that needs one of these escalates. The list
  * cannot be complete (`package.json` scripts and a `Makefile` run code too, but are the work
  * itself); it covers the files that run without the user choosing to build or test.
  * Directories: anything inside them. Files: that name anywhere.
@@ -211,7 +213,12 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     if (typeof v !== 'string' || v === '') return refuse(`${name}: ${f} is not a path`);
     const at = inside(root, worktree, v, spec.writes);
     if (typeof at !== 'string') return refuse(`${name}: ${at.why}`);
-    if (spec.writes && protectedConfig(at)) {
+    if (
+      spec.writes &&
+      (protectedConfig(at) ||
+        protectedConfig(lexical(root, worktree, v)) ||
+        linkedConfig(root).some((l) => at === l || at.startsWith(`${l}${sep}`)))
+    ) {
       return refuse(
         `${name}: agent, hook and tool config is not open to Workers; escalate if the task needs it`,
       );
@@ -289,6 +296,46 @@ function segmentMatches(rawSeg: string, name: string): boolean {
   } catch {
     return true;
   }
+}
+
+/**
+ * Where protected config at the checkout's root really is when it is a symlink to elsewhere in
+ * the checkout (`.tacet -> config/tacet`): what is written there is still read as that config.
+ * Root-level names only, where Tacet and most tools load them; relative to the real root.
+ */
+function linkedConfig(root: string): string[] {
+  const out: string[] = [];
+  const names = [
+    ...PROTECTED_DIRS.map((d) => d.join(sep)),
+    ...PROTECTED_FILES,
+    ...PROTECTED_IN.map(([d, f]) => join(d, f)),
+  ];
+  for (const name of names) {
+    const p = join(root, name);
+    try {
+      if (!lstatSync(p).isSymbolicLink()) continue;
+      const r = relative(root, realpathSync.native(p));
+      if (r !== '' && r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) out.push(r);
+    } catch {
+      // Not there, or a dangling link: nothing to protect beyond the name itself.
+    }
+  }
+  return out;
+}
+
+/**
+ * `p` relative to the checkout as written, before symlinks: `inside` has already refused `..`,
+ * paths elsewhere and odd names, so this only joins its plain segments.
+ */
+function lexical(root: string, given: string, p: string): string {
+  const segs = p.split('/').filter((s) => s !== '' && s !== '.');
+  if (!isAbsolute(p)) return segs.join(sep);
+  const abs = `${sep}${segs.join(sep)}`;
+  for (const r of [root, given]) {
+    const rel = relative(r, abs);
+    if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return rel;
+  }
+  return '';
 }
 
 /** Whether `s` has a C0 or C1 control character (NEL included) or DEL. */
