@@ -1,5 +1,15 @@
 import { execFile } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -849,6 +859,83 @@ describe('WorktreeManager', () => {
     expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
     await manager.remove(worktree.id);
     expect(await manager.get(worktree.id)).toBeUndefined();
+  });
+
+  it('never counts another tacet branch as keeping a commit, so concurrent removals keep it', async () => {
+    const first = await manager.create('race-a');
+    const second = await manager.create('race-b');
+    await writeFile(path.join(first.path, 'race.txt'), 'race\n');
+    await workerGit(first.path, ['add', 'race.txt']);
+    await workerGit(first.path, ['commit', '-m', 'race']);
+    expect(await manager.checkConflicts(first.id, 'main')).toEqual([]);
+    const commit = (await git(repository, ['rev-parse', `refs/heads/${first.branchName}`])).trim();
+    await git(repository, ['update-ref', `refs/heads/${second.branchName}`, commit]);
+    await workerGit(first.path, ['checkout', '--detach', 'refs/heads/main']);
+    const other = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'));
+
+    const results = await Promise.allSettled([manager.remove(first.id), other.remove(second.id)]);
+
+    expect(results.map(({ status }) => status)).toEqual(['rejected', 'rejected']);
+    const containing = await git(repository, [
+      'for-each-ref',
+      `--contains=${commit}`,
+      '--format=%(refname)',
+    ]);
+    expect(containing.trim()).not.toBe('');
+  });
+
+  it('does not let a private commit hide behind a replace ref', async () => {
+    const worktree = await manager.create('replace-worker');
+    await writeFile(path.join(worktree.path, 'replaced.txt'), 'replaced\n');
+    await workerGit(worktree.path, ['add', 'replaced.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'replaced']);
+    const privateCommit = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    const mainHead = (await git(repository, ['rev-parse', 'refs/heads/main'])).trim();
+    await git(repository, ['update-ref', `refs/replace/${privateCommit}`, mainHead]);
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow(
+      'Worker has unintegrated private commits',
+    );
+  });
+
+  it('treats a lock held past the maximum age as stale, and waits out a short removal', async () => {
+    const worktree = await manager.create('old-lock-worker');
+    const locks = path.join(temporaryDirectory, 'worktrees', '.tacet-locks');
+    await mkdir(locks, { recursive: true });
+    const lock = path.join(locks, `${worktree.id}.removing`);
+
+    // Held by a live PID (ours), as a reused PID would be: briefly, then released.
+    await writeFile(lock, `${process.pid} 0123abcd-0002\n`);
+    const released = new Promise((resolve) => setTimeout(resolve, 300)).then(() =>
+      rm(lock, { force: true }),
+    );
+    expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+    await released;
+
+    // Held by a live PID for longer than any removal runs.
+    await writeFile(lock, `${process.pid} 0123abcd-0003\n`);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(lock, old, old);
+    await manager.remove(worktree.id);
+    expect(await manager.get(worktree.id)).toBeUndefined();
+  });
+
+  it('sweeps lock drafts and stale locks left by a crash', async () => {
+    const locks = path.join(temporaryDirectory, 'worktrees', '.tacet-locks');
+    await mkdir(locks, { recursive: true });
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    const draft = path.join(locks, 'w-1.draft.0123abcd-0004');
+    const stale = path.join(locks, 'w-1.stale.0123abcd-0005');
+    const fresh = path.join(locks, 'w-2.draft.0123abcd-0006');
+    for (const file of [draft, stale, fresh]) await writeFile(file, '');
+    await utimes(draft, old, old);
+    await utimes(stale, old, old);
+
+    await manager.gc({ olderThanMs: 0 });
+
+    await expect(readFile(draft)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(readFile(stale)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(fresh, 'utf8')).toBe('');
   });
 
   it('ignores busy markers left by a manager that died', async () => {

@@ -1,6 +1,16 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { link, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import {
+  link,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import path from 'node:path';
 import { readWorkerFile, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
 import { MergeConflictError, type Workspaces } from './daemon/ports.js';
@@ -100,12 +110,21 @@ const maxReflogBytes = 4 * 1024 * 1024;
 const worktreeIdPattern = /^[a-z0-9-]+$/;
 const commitIdPattern = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const locksDirectoryName = '.tacet-locks';
+/** Longer than any merge or removal runs; a holder older than this is taken to be dead. */
+const maxHoldMs = 60 * 60 * 1000;
+/** How long a merge waits for a removal that may only be checking its worktree. */
+const lockWaitMs = 5_000;
+/** Drafts and stale locks are only ever left by a crash once they are this old. */
+const lockLitterMs = 10 * 60 * 1000;
 const managerGitArgs = [
   ...SAFE_GIT_ARGS,
   '-c',
   'gc.auto=0',
   '-c',
   'maintenance.auto=false',
+  // A Worker's `git replace` must not make its private commit look present in the shared store.
+  '-c',
+  'core.useReplaceRefs=false',
 ] as const;
 
 function runCommand(
@@ -163,6 +182,7 @@ async function runGit(
       PATH: baseEnv.PATH ?? '',
       HOME: baseEnv.HOME ?? '',
       GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_NO_REPLACE_OBJECTS: '1',
       GIT_CONFIG_NOSYSTEM: '1',
     };
     const repository = (
@@ -231,6 +251,16 @@ function processAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+/**
+ * A marker or lock holder is live while its process is, for at most `maxHoldMs`: after a crash
+ * its PID can be reused by an unrelated process, which must not block removal forever.
+ */
+function holderIsLive(pid: number, modifiedMs: number): boolean {
+  return (
+    Number.isSafeInteger(pid) && pid > 0 && Date.now() - modifiedMs < maxHoldMs && processAlive(pid)
+  );
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -341,6 +371,7 @@ export class WorktreeManager implements Workspaces {
       throw new Error('now must be a non-negative safe integer');
     const active = new Set(options.activeWorktreeIds ?? []);
     const result: WorktreeGcResult = { removed: [], skipped: [] };
+    await this.sweepLockLitter();
 
     for (const info of await this.list()) {
       if (active.has(info.id)) {
@@ -780,7 +811,11 @@ export class WorktreeManager implements Workspaces {
     )
       .split('\n')
       .map((line) => line.split(' '))
-      .filter(([tip, ref]) => tip && commitIdPattern.test(tip) && ref !== taskBranch(info.id))
+      // Never another `tacet/*` branch: those are removable too, and two removals that each
+      // counted the other's branch would leave a commit in no ref.
+      .filter(
+        ([tip, ref]) => tip && commitIdPattern.test(tip) && !ref?.startsWith('refs/heads/tacet/'),
+      )
       .map(([tip]) => tip as string);
     const unique = (
       await this.git(
@@ -849,9 +884,13 @@ export class WorktreeManager implements Workspaces {
         await writeFile(marker, '', { flag: 'wx', mode: 0o600 });
         markers.push(marker);
       }
+      // A removal may only be checking the worktree and then keep it: wait a little for it.
       for (const id of ids) {
-        if (await this.removalLocked(directory, id)) {
-          throw new Error('worktree is being removed');
+        let delay = 50;
+        for (let waited = 0; await this.removalLocked(directory, id); waited += delay) {
+          if (waited >= lockWaitMs) throw new Error('worktree is being removed');
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.min(delay * 2, 1_000);
         }
       }
     } catch (error) {
@@ -861,15 +900,31 @@ export class WorktreeManager implements Workspaces {
     return release;
   }
 
+  /** Lock drafts and stale locks moved aside, left behind by a manager that crashed. */
+  private async sweepLockLitter(): Promise<void> {
+    const directory = await this.locksDirectory();
+    for (const name of await readdir(directory)) {
+      if (!/\.(draft|stale)\.[0-9a-f-]+$/.test(name)) continue;
+      const file = path.join(directory, name);
+      const modified = (await stat(file).catch(() => undefined))?.mtimeMs;
+      if (modified !== undefined && Date.now() - modified > lockLitterMs) {
+        await rm(file, { force: true });
+      }
+    }
+  }
+
   private async isBusy(id: string): Promise<boolean> {
     const directory = await this.locksDirectory();
     const prefix = `${id}.busy.`;
     for (const name of await readdir(directory)) {
       if (!name.startsWith(prefix)) continue;
+      const marker = path.join(directory, name);
       const pid = Number(name.slice(prefix.length).split('.')[0]);
-      if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) return true;
+      const modified = (await stat(marker).catch(() => undefined))?.mtimeMs;
+      if (modified === undefined) continue;
+      if (holderIsLive(pid, modified)) return true;
       // Left by a manager that died mid-merge.
-      await rm(path.join(directory, name), { force: true });
+      await rm(marker, { force: true });
     }
     return false;
   }
@@ -888,14 +943,16 @@ export class WorktreeManager implements Workspaces {
     }
   }
 
-  private lockIsLive(contents: string): boolean {
+  private async lockIsLive(lock: string, contents: string): Promise<boolean> {
     const pid = Number(/^(\d+) [0-9a-f-]+\n$/.exec(contents)?.[1]);
-    return Number.isSafeInteger(pid) && pid > 0 && processAlive(pid);
+    const modified = (await stat(lock).catch(() => undefined))?.mtimeMs;
+    return modified !== undefined && holderIsLive(pid, modified);
   }
 
   private async removalLocked(directory: string, id: string): Promise<boolean> {
-    const contents = await this.readRemovalLock(path.join(directory, `${id}.removing`));
-    return contents !== undefined && this.lockIsLive(contents);
+    const lock = path.join(directory, `${id}.removing`);
+    const contents = await this.readRemovalLock(lock);
+    return contents !== undefined && (await this.lockIsLive(lock, contents));
   }
 
   private async lockRemoval(id: string): Promise<() => Promise<void>> {
@@ -917,7 +974,7 @@ export class WorktreeManager implements Workspaces {
         }
         const seen = await this.readRemovalLock(lock);
         if (seen === undefined) continue;
-        if (this.lockIsLive(seen)) break;
+        if (await this.lockIsLive(lock, seen)) break;
         // Left by a process that died: move it aside, and put it back if another manager
         // replaced it with a live lock in the meantime.
         const aside = path.join(directory, `${id}.stale.${randomUUID()}`);
@@ -935,7 +992,10 @@ export class WorktreeManager implements Workspaces {
     } finally {
       await rm(draft, { force: true });
     }
-    throw new WorktreeKeptError('being removed', 'worktree is already being removed');
+    throw new WorktreeKeptError(
+      'being removed',
+      `worktree is already being removed (lock ${lock}; delete it if no Tacet process holds it)`,
+    );
   }
 
   private async paths(): Promise<ManagerPaths> {
@@ -999,6 +1059,7 @@ export class WorktreeManager implements Workspaces {
           ...env,
           GIT_CONFIG_NOSYSTEM: '1',
           GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_NO_REPLACE_OBJECTS: '1',
         },
         input,
       );
@@ -1060,13 +1121,10 @@ export class WorktreeManager implements Workspaces {
       throw new Error('worktree common directory is not the manager-owned directory');
     }
     try {
-      return await runCommand(
-        'git',
-        [...managerGitArgs, ...args],
-        repository,
-        commandTimeoutMs,
-        trustedGitEnv(info.path, worktree, this.env),
-      );
+      return await runCommand('git', [...managerGitArgs, ...args], repository, commandTimeoutMs, {
+        ...trustedGitEnv(info.path, worktree, this.env),
+        GIT_NO_REPLACE_OBJECTS: '1',
+      });
     } catch (error) {
       throw gitFailure(error);
     }
