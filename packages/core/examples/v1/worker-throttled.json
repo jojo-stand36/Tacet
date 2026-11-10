@@ -1,0 +1,6 @@
+{
+  "sessionId": "sess-2",
+  "tool": "escalate",
+  "limit": 6,
+  "windowMs": 600000
+}

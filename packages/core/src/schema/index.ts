@@ -14,6 +14,7 @@ import {
   WorkerIntegrated,
   WorkerNudged,
   WorkerStarted,
+  WorkerThrottled,
   WorkerVendorSession,
 } from './worker.js';
 
@@ -67,6 +68,7 @@ export const jsonSchemas = {
   'worker-ended': { schema: WorkerEnded, title: 'Tacet worker.ended payload' },
   'worker-nudged': { schema: WorkerNudged, title: 'Tacet worker.nudged payload' },
   'worker-integrated': { schema: WorkerIntegrated, title: 'Tacet worker.integrated payload' },
+  'worker-throttled': { schema: WorkerThrottled, title: 'Tacet worker.throttled payload' },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;
