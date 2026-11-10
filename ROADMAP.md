@@ -67,6 +67,8 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Mini-conductor: build Worker adapters from the effective config at startup** — `feature` `P1` `either`
 - [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
 - [ ] **PTY adapter: clean up per-session Claude config directories** — `feature` `P2` `either`
+- [ ] **PTY presets: use resume_flag and process_name, or drop them** — `feature` `P2` `either`
+- [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
 
 ## M2 · Conductor & escalation
 
