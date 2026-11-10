@@ -1,6 +1,4 @@
 import {
-  accessSync,
-  constants,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -10,22 +8,14 @@ import {
   rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { join } from 'node:path';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ClaudeSdkAdapter } from './adapter.js';
+import { SubprocessScrubError } from './auth.js';
 import { type MockMessagesApi, startMockMessagesApi } from './testing/mock-messages-api.js';
 
 const KEY = 'sk-ant-tool-env-placeholder-000000000000';
-const hasBwrap = (process.env.PATH ?? '').split(delimiter).some((d) => {
-  try {
-    accessSync(join(d, 'bwrap'), constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-});
-
 /**
  * #150: the commands a Claude Worker runs (its Bash tool) never see its API key. Real Claude Code
  * against the mock Messages API. Where the scrub can work (macOS; Linux with bubblewrap, as on CI)
@@ -68,13 +58,18 @@ describe('Claude Worker tool environment', () => {
       mcpConfigDir: join(root, 'run'),
       sdkOptions: { settingSources: [] },
     });
-    if (process.platform === 'linux' && !hasBwrap) {
-      // CI installs bubblewrap: there, the scrub itself must be what this test checks.
-      expect(process.env.CI, 'CI must run this test with bubblewrap').toBeFalsy();
-      await expect(adapter.start({ cwd })).rejects.toThrow(/bubblewrap/);
+    // The adapter's own checks decide (bubblewrap, socat, user namespaces): where they refuse,
+    // the refusal is what is tested, never on CI, which installs both, so there the scrub itself
+    // is what this test checks.
+    let h: Awaited<ReturnType<typeof adapter.start>>;
+    try {
+      h = await adapter.start({ cwd });
+    } catch (err) {
+      expect(err, String(err)).toBeInstanceOf(SubprocessScrubError);
+      expect(process.platform).toBe('linux');
+      expect(process.env.CI, `CI must run the scrub: ${String(err)}`).toBeFalsy();
       return;
     }
-    const h = await adapter.start({ cwd });
     try {
       const tap = new EventTap(adapter.events(h));
       await adapter.send(h, { text: 'ENV_TOOL' });
