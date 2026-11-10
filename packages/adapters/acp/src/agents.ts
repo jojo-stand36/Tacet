@@ -54,7 +54,10 @@ export interface AcpAgentSpec {
   /**
    * The ACP session mode every session is put in right after it opens (#145), for agents whose
    * default runs tools without asking. Set by the `mode` config option, or `session/set_mode` when
-   * the agent has none; a session the agent can't put in this mode fails to start.
+   * the agent has none; a session the agent can't put in this mode fails to start. The mode
+   * holds for the session: "always" approvals are answered once, and if the agent reports another
+   * mode the turn is cancelled and the mode set back. Only the config option's answer shows the
+   * switch; `session/set_mode` answers nothing, so there the agent is trusted.
    */
   sessionMode?: string;
 }

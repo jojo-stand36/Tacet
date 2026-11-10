@@ -503,20 +503,77 @@ describe('AcpAdapter (fake ACP agent)', () => {
       ['config option', select('auto')],
       ['session/set_mode', { modes }],
     ] as const) {
-      it(`sets the mode back when the agent leaves it (${via})`, async () => {
+      it(`cancels the turn, then sets the mode back, when the agent leaves it (${via})`, async () => {
         const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(session) });
         const h = await adapter.start({ cwd: join(root, 'wt') });
         const tap = new EventTap(adapter.events(h));
-        const setters = () =>
-          methods().filter((m) => /^session\/set_(config_option|mode)$/.test(m.method ?? ''));
-        const before = setters().length;
+        const isSetter = (m?: string) => /^session\/set_(config_option|mode)$/.test(m ?? '');
+        const before = methods().filter((m) => isSetter(m.method)).length;
         await adapter.send(h, { text: 'DRIFT' });
-        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
-        await until(() => setters().length === before + 1);
-        expect(JSON.stringify(setters().at(-1)?.params)).toContain('"ask"');
+        const end = await tap.waitFor(
+          (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'cancelled'),
+          5000,
+          1,
+        );
+        expect(end.event).toMatchObject({ state: 'cancelled' });
+        await until(() => methods().filter((m) => isSetter(m.method)).length === before + 1);
+        const sent = methods();
+        const cancelAt = sent.findIndex((m) => m.method === 'session/cancel');
+        const setAt = sent.findLastIndex((m) => isSetter(m.method));
+        expect(cancelAt).toBeGreaterThan(-1);
+        expect(cancelAt).toBeLessThan(setAt);
+        expect(JSON.stringify(sent[setAt]?.params)).toContain('"ask"');
+        await tap.waitFor(
+          (e) =>
+            e.t === 'status' &&
+            /left session mode "ask" for "auto".*set back/.test(e.message ?? ''),
+          5000,
+        );
         await adapter.close(h);
       });
     }
+
+    it('ends the session when the mode is not set back', async () => {
+      const adapter = make(spec('ask'), {
+        FAKE_SESSION: JSON.stringify(select('ask')),
+        FAKE_SET: 'ignore',
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'DRIFT' });
+      const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+      expect(err.event).toMatchObject({ message: expect.stringMatching(/did not switch back/) });
+      await expect(adapter.send(h, { text: 'more' })).rejects.toThrow();
+    });
+
+    it('ends the session when the agent keeps leaving the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(select('ask')) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      for (let i = 1; i <= 2; i++) {
+        await adapter.send(h, { text: 'DRIFT' });
+        await until(
+          () =>
+            tap.events.filter((e) => e.t === 'status' && /set back/.test(e.message ?? ''))
+              .length === i,
+        );
+      }
+      await adapter.send(h, { text: 'DRIFT' });
+      const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+      expect(err.event).toMatchObject({ message: expect.stringMatching(/3 times/) });
+    });
+
+    it('answers an open permission cancelled when the agent leaves the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'ASK_DRIFT' });
+      await tap.waitFor((e) => e.t === 'approval.request', 5000);
+      await until(() =>
+        received().some((l) => JSON.stringify(l.received ?? {}).includes('"outcome":"cancelled"')),
+      );
+      await adapter.close(h);
+    });
 
     it('answers "always" once when the mode is pinned', async () => {
       const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
@@ -525,6 +582,8 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await adapter.send(h, { text: 'ASK_ALWAYS' });
       const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
       if (req.event.t !== 'approval.request') throw new Error('no approval request');
+      // Not offered: it would be answered once.
+      expect(req.event.options).not.toContain('allow_always');
       await adapter.respond(h, req.event.id, { kind: 'allow_always', persist: true });
       await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, req.index);
       await adapter.close(h);

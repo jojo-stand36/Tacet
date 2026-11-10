@@ -13,7 +13,9 @@
 // - `ABORT`: waits for `session/cancel`, then fails the request with -32800.
 // - `CRASH`: exits with code 3 mid-turn.
 // - `ASK_ALWAYS`: asks one permission offering allow_once, allow_always and reject_once.
-// - `DRIFT`: reports a switch to mode `auto` on its own (`current_mode_update`), then replies.
+// - `DRIFT`: reports a switch to mode `auto` on its own (`current_mode_update`), then replies
+//   after 300 ms, or ends `cancelled` on `session/cancel`. `ASK_DRIFT`: asks a permission, then
+//   reports the switch; ends once the permission is answered.
 // - `SLOW <text>`: replies `<text>` after 300 ms. Anything else: replies with the prompt text.
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -80,18 +82,36 @@ function prompt(m) {
     ];
     const toolCall = { toolCallId: 't1', title: 'tool t1', kind: 'edit' };
     ask('session/request_permission', { sessionId, toolCall, options }).then(() => end('end_turn'));
-  } else if (text === 'DRIFT') {
-    send({
-      method: 'session/update',
-      params: {
-        sessionId,
-        update: { sessionUpdate: 'current_mode_update', currentModeId: 'auto' },
-      },
-    });
-    setTimeout(() => {
+  } else if (text === 'DRIFT' || text === 'ASK_DRIFT') {
+    const drift = () => {
+      // The switch is real: a `mode` option now holds it too.
+      for (const o of session.configOptions ?? []) if (o.id === 'mode') o.currentValue = 'auto';
+      send({
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: { sessionUpdate: 'current_mode_update', currentModeId: 'auto' },
+        },
+      });
+    };
+    if (text === 'ASK_DRIFT') {
+      const options = [{ optionId: 'once', name: 'Yes', kind: 'allow_once' }];
+      const toolCall = { toolCallId: 't1', title: 'tool t1', kind: 'edit' };
+      ask('session/request_permission', { sessionId, toolCall, options }).then(() =>
+        end('end_turn'),
+      );
+      setTimeout(drift, 50);
+      return;
+    }
+    drift();
+    const timer = setTimeout(() => {
       say(sessionId, 'drifted');
       end('end_turn');
-    }, 100);
+    }, 300);
+    onCancel = () => {
+      clearTimeout(timer);
+      end('cancelled');
+    };
   } else if (text === 'ABORT') {
     onCancel = () => send({ id: m.id, error: { code: -32800, message: 'Request cancelled' } });
   } else if (text === 'CRASH') {
