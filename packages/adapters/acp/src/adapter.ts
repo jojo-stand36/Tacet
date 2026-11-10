@@ -52,6 +52,8 @@ import {
 } from './turn-v1.js';
 
 /** The ACP protocol version this adapter speaks (v2 is tracked in #85). */
+/** Mode drifts set back before a session is ended instead (#145). */
+const MAX_MODE_DRIFTS = 2;
 export const ACP_PROTOCOL_VERSION = 1;
 
 /** Version of `@agentclientprotocol/sdk` the adapter is built and tested against. */
@@ -123,6 +125,14 @@ interface Session {
   loading: boolean;
   /** The config option that selects the model, when the agent has one. */
   modelOption?: string;
+  /** The spec's `sessionMode`, once set, and the config option that sets it, if any (#145). */
+  pinnedMode?: { mode: string; configId?: string };
+  /** Started: mode drift is acted on only from here on. */
+  ready: boolean;
+  /** Setting a drifted mode back; further reports wait for it. */
+  restoring: boolean;
+  /** How often the agent left the pinned mode. */
+  drifts: number;
   exited: Promise<void>;
   exit?: { code: number | null; signal: NodeJS.Signals | null };
   stderrTail: string;
@@ -286,6 +296,9 @@ export class AcpAdapter implements AgentAdapter {
         stderrTail,
         closing: false,
         ended: false,
+        ready: false,
+        restoring: false,
+        drifts: 0,
       };
       const created = await this.#openSession(s, opts, mcpServers);
       s.acpSessionId = created.sessionId;
@@ -293,6 +306,8 @@ export class AcpAdapter implements AgentAdapter {
       const modelOption = (created.configOptions ?? []).find((o) => o.category === 'model');
       if (modelOption) s.modelOption = modelOption.id;
       if (opts.model !== undefined && !spec.modelArgs) await this.#setModel(s, opts.model);
+      // Last: an agent may revisit its mode when the model changes.
+      if (spec.sessionMode !== undefined) await this.#setMode(s, created, spec.sessionMode);
     } catch (err) {
       s = undefined;
       conn.close();
@@ -310,6 +325,7 @@ export class AcpAdapter implements AgentAdapter {
       );
     }
     this.#sessions.set(handle.id, s);
+    s.ready = true;
     if (s.exit) this.#onExit(s);
     else this.#emit(s, { t: 'status', state: 'idle' });
     return handle;
@@ -347,7 +363,13 @@ export class AcpAdapter implements AgentAdapter {
       return;
     }
     s.approvals.delete(requestId);
-    pending.resolve(permissionOutcome(pending.options, decision));
+    // With a pinned mode, "always" is answered once: agents offer mode changes as their
+    // `allow_always` options (claude-agent-acp: "Yes, and use auto mode"; #145).
+    const answer: ApprovalDecision =
+      s.pinnedMode && decision.kind === 'allow_always'
+        ? { ...decision, kind: 'allow_once', persist: false }
+        : decision;
+    pending.resolve(permissionOutcome(pending.options, answer));
   }
 
   async close(h: SessionHandle): Promise<void> {
@@ -493,6 +515,101 @@ export class AcpAdapter implements AgentAdapter {
     throw new Error(`${this.id} offers neither session/resume nor session/load`);
   }
 
+  /** Put the session in `mode`, or fail: an agent left in its own mode may not ask (#145). */
+  async #setMode(s: Session, created: NewSessionResponse, mode: string): Promise<void> {
+    const option = (created.configOptions ?? []).find((o) => o.category === 'mode');
+    if (option && option.type === 'select') {
+      const values = option.options.flatMap((o) =>
+        'value' in o ? [o.value] : o.options.map((x) => x.value),
+      );
+      if (!values.includes(mode)) {
+        throw new Error(
+          `${this.id} offers no session mode ${JSON.stringify(mode)} (it has ${values.join(', ')})`,
+        );
+      }
+      s.pinnedMode = { mode, configId: option.id };
+      if (option.currentValue !== mode) {
+        const r = await s.conn.agent.request('session/set_config_option', {
+          sessionId: s.acpSessionId,
+          configId: option.id,
+          value: mode,
+        });
+        const now = (r.configOptions ?? []).find((o) => o.id === option.id)?.currentValue;
+        if (now !== mode) {
+          throw new Error(`${this.id} did not switch to session mode ${JSON.stringify(mode)}`);
+        }
+      }
+      return;
+    }
+    const modes = created.modes;
+    if (!modes?.availableModes.some((m) => m.id === mode)) {
+      throw new Error(`${this.id} offers no session mode ${JSON.stringify(mode)}`);
+    }
+    s.pinnedMode = { mode };
+    if (modes.currentModeId !== mode) {
+      await s.conn.agent.request('session/set_mode', { sessionId: s.acpSessionId, modeId: mode });
+    }
+  }
+
+  /**
+   * The agent reported a mode other than the pinned one (#145). Fail closed: the turn is cancelled
+   * first, as by `interrupt()`, so nothing more runs in that mode; then the mode is set back. A
+   * switch that fails or is not reported, or a third drift, ends the session.
+   */
+  #onDrift(s: Session, now: string): void {
+    if (!s.ready || s.restoring || s.closing || s.ended || !s.pinnedMode) return;
+    s.restoring = true;
+    s.drifts += 1;
+    this.#restoreMode(s, now)
+      .catch(() => {})
+      .finally(() => {
+        s.restoring = false;
+      });
+  }
+
+  async #restoreMode(s: Session, now: string): Promise<void> {
+    const pin = s.pinnedMode;
+    if (!pin) return;
+    const left = `${this.id} left session mode ${JSON.stringify(pin.mode)} for ${JSON.stringify(now)}`;
+    s.queue.length = 0;
+    if (s.turning) await s.conn.agent.notify('session/cancel', { sessionId: s.acpSessionId });
+    this.#cancelApprovals(s);
+    let failure: string | undefined;
+    if (s.drifts > MAX_MODE_DRIFTS) failure = `it did so ${s.drifts} times`;
+    else {
+      try {
+        if (pin.configId !== undefined) {
+          const r = await s.conn.agent.request('session/set_config_option', {
+            sessionId: s.acpSessionId,
+            configId: pin.configId,
+            value: pin.mode,
+          });
+          const value = (r.configOptions ?? []).find((o) => o.id === pin.configId)?.currentValue;
+          if (value !== pin.mode) failure = 'it did not switch back';
+        } else {
+          // `session/set_mode` answers nothing to check: the agent is trusted here.
+          await s.conn.agent.request('session/set_mode', {
+            sessionId: s.acpSessionId,
+            modeId: pin.mode,
+          });
+        }
+      } catch (err) {
+        failure = `it could not be set back: ${this.#scrub(errorMessage(err), s.secrets)}`;
+      }
+    }
+    if (s.closing || s.ended) return;
+    if (failure === undefined) {
+      this.#emit(s, {
+        t: 'status',
+        state: s.state,
+        message: `${left}: turn cancelled, mode set back`,
+      });
+      return;
+    }
+    this.#setState(s, 'error', `${left}; ${failure}: session ended`);
+    await this.close(s.handle);
+  }
+
   async #setModel(s: Session, model: string): Promise<void> {
     if (!s.modelOption) {
       throw new ProfileRefusedError(
@@ -549,7 +666,18 @@ export class AcpAdapter implements AgentAdapter {
 
   #onUpdate(s: Session, n: SessionNotification): void {
     if (s.loading || s.ended || n.sessionId !== s.acpSessionId) return;
-    for (const e of updateToEvents(n.update, s.turn)) this.#emit(s, e);
+    const u = n.update;
+    const pin = s.pinnedMode;
+    if (pin) {
+      const now =
+        u.sessionUpdate === 'current_mode_update'
+          ? u.currentModeId
+          : u.sessionUpdate === 'config_option_update' && pin.configId !== undefined
+            ? u.configOptions.find((o) => o.id === pin.configId)?.currentValue
+            : undefined;
+      if (now !== undefined && now !== pin.mode) this.#onDrift(s, String(now));
+    }
+    for (const e of updateToEvents(u, s.turn)) this.#emit(s, e);
   }
 
   #onPermission(
@@ -571,7 +699,10 @@ export class AcpAdapter implements AgentAdapter {
         id,
         summary: tc.title || tc.name || tc.kind || 'tool call',
         toolName: tc.name || tc.kind || 'tool',
-        options: approvalChoices(req.options),
+        // With a pinned mode "always" is answered once, so it is not offered (#145).
+        options: approvalChoices(req.options).filter(
+          (o) => !(s.pinnedMode && o === 'allow_always'),
+        ),
         ...(tc.rawInput !== undefined ? { requestedGrant: { input: tc.rawInput } } : {}),
       });
     });

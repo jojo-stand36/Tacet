@@ -39,6 +39,19 @@ const ends = (e: AgentEvent) => e.t === 'status' && e.state !== 'running';
 const text = (events: AgentEvent[]) =>
   events.map((e) => (e.t === 'message.delta' ? e.text : '')).join('');
 
+/** The session modes the built-in specs put their sessions in (#145), as an agent offers them. */
+const BUILTIN_MODES = {
+  FAKE_SESSION: JSON.stringify({
+    modes: {
+      currentModeId: 'default',
+      availableModes: [
+        { id: 'default', name: 'Manual' },
+        { id: 'workspace-write', name: 'Workspace access' },
+      ],
+    },
+  }),
+};
+
 describe('AcpAdapter (fake ACP agent)', () => {
   let root: string;
   let logFile: string;
@@ -54,7 +67,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
       agent,
       executable: [process.execPath, FAKE],
       killTimeoutMs: 1000,
-      baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...env },
+      baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...BUILTIN_MODES, ...env },
       // The fake agent is steered by FAKE_* variables (#147: passed through on purpose).
       envPolicy: { pass: ['FAKE_*'] },
       ...extra,
@@ -376,6 +389,211 @@ describe('AcpAdapter (fake ACP agent)', () => {
     expect(lines.join('')).toContain('debug: [redacted] and [redacted]');
   });
 
+  describe('session mode (#145)', () => {
+    const spec = (sessionMode: string): AcpAgentSpec => ({
+      ...customAcpAgent('modes', { command: ['modes'] }),
+      sessionMode,
+    });
+    const select = (currentValue: string) => ({
+      configOptions: [
+        {
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue,
+          options: [
+            { value: 'ask', name: 'Ask' },
+            { value: 'auto', name: 'Auto' },
+          ],
+        },
+      ],
+    });
+    const modes = {
+      currentModeId: 'auto',
+      availableModes: [
+        { id: 'ask', name: 'Ask' },
+        { id: 'auto', name: 'Auto' },
+      ],
+    };
+
+    it('sets it by the mode config option right after the session opens', async () => {
+      const adapter = make(spec('ask'), {
+        FAKE_SESSION: JSON.stringify({ ...select('auto'), modes }),
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      const sent = methods().map((m) => m.method);
+      expect(sent.indexOf('session/set_config_option')).toBe(sent.indexOf('session/new') + 1);
+      expect(methods().find((m) => m.method === 'session/set_config_option')?.params).toEqual({
+        sessionId: 'fake-session-1',
+        configId: 'mode',
+        value: 'ask',
+      });
+      expect(sent).not.toContain('session/set_mode');
+    });
+
+    it('uses session/set_mode when the agent has no mode config option', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+        sessionId: 'fake-session-1',
+        modeId: 'ask',
+      });
+    });
+
+    it('sends nothing when the session is already in the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(select('ask')) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().map((m) => m.method)).not.toContain('session/set_config_option');
+    });
+
+    it('fails to start when the agent does not offer the mode', async () => {
+      for (const session of [{}, { modes }, select('auto')]) {
+        const adapter = make(spec('manual'), { FAKE_SESSION: JSON.stringify(session) });
+        await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+          /offers no session mode "manual"/,
+        );
+      }
+    });
+
+    it('finds the mode among grouped select options', async () => {
+      const grouped = select('auto');
+      const [option] = grouped.configOptions;
+      const opts = option?.options ?? [];
+      Object.assign(option ?? {}, { options: [{ group: 'g', name: 'All', options: opts }] });
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(grouped) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().map((m) => m.method)).toContain('session/set_config_option');
+    });
+
+    it('fails to start when the agent refuses or ignores the switch', async () => {
+      for (const [how, session] of [
+        ['fail', select('auto')],
+        ['fail', { modes }],
+        ['ignore', select('auto')],
+      ] as const) {
+        const adapter = make(spec('ask'), {
+          FAKE_SESSION: JSON.stringify(session),
+          FAKE_SET: how,
+        });
+        await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+          how === 'fail' ? /cannot change that now/ : /did not switch to session mode "ask"/,
+        );
+      }
+    });
+
+    it('fails a resume whose answer does not offer the mode', async () => {
+      // The fake's `session/load` answers `null`: no modes to set.
+      const resumable = spec('ask');
+      resumable.capabilities = { ...resumable.capabilities, resume: true };
+      const adapter = make(resumable, {
+        FAKE_SESSION: JSON.stringify({ modes }),
+        FAKE_CAPS: JSON.stringify({ loadSession: true }),
+      });
+      await expect(
+        adapter.start({ cwd: join(root, 'wt'), resume: { vendorSessionId: 'old' } }),
+      ).rejects.toThrow(/offers no session mode "ask"/);
+    });
+
+    for (const [via, session] of [
+      ['config option', select('auto')],
+      ['session/set_mode', { modes }],
+    ] as const) {
+      it(`cancels the turn, then sets the mode back, when the agent leaves it (${via})`, async () => {
+        const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(session) });
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const tap = new EventTap(adapter.events(h));
+        const isSetter = (m?: string) => /^session\/set_(config_option|mode)$/.test(m ?? '');
+        const before = methods().filter((m) => isSetter(m.method)).length;
+        await adapter.send(h, { text: 'DRIFT' });
+        const end = await tap.waitFor(
+          (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'cancelled'),
+          5000,
+          1,
+        );
+        expect(end.event).toMatchObject({ state: 'cancelled' });
+        await until(() => methods().filter((m) => isSetter(m.method)).length === before + 1);
+        const sent = methods();
+        const cancelAt = sent.findIndex((m) => m.method === 'session/cancel');
+        const setAt = sent.findLastIndex((m) => isSetter(m.method));
+        expect(cancelAt).toBeGreaterThan(-1);
+        expect(cancelAt).toBeLessThan(setAt);
+        expect(JSON.stringify(sent[setAt]?.params)).toContain('"ask"');
+        await tap.waitFor(
+          (e) =>
+            e.t === 'status' &&
+            /left session mode "ask" for "auto".*set back/.test(e.message ?? ''),
+          5000,
+        );
+        await adapter.close(h);
+      });
+    }
+
+    it('ends the session when the mode is not set back', async () => {
+      const adapter = make(spec('ask'), {
+        FAKE_SESSION: JSON.stringify(select('ask')),
+        FAKE_SET: 'ignore',
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'DRIFT' });
+      const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+      expect(err.event).toMatchObject({ message: expect.stringMatching(/did not switch back/) });
+      await expect(adapter.send(h, { text: 'more' })).rejects.toThrow();
+    });
+
+    it('ends the session when the agent keeps leaving the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(select('ask')) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      for (let i = 1; i <= 2; i++) {
+        await adapter.send(h, { text: 'DRIFT' });
+        await until(
+          () =>
+            tap.events.filter((e) => e.t === 'status' && /set back/.test(e.message ?? ''))
+              .length === i,
+        );
+      }
+      await adapter.send(h, { text: 'DRIFT' });
+      const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+      expect(err.event).toMatchObject({ message: expect.stringMatching(/3 times/) });
+    });
+
+    it('answers an open permission cancelled when the agent leaves the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'ASK_DRIFT' });
+      await tap.waitFor((e) => e.t === 'approval.request', 5000);
+      await until(() =>
+        received().some((l) => JSON.stringify(l.received ?? {}).includes('"outcome":"cancelled"')),
+      );
+      await adapter.close(h);
+    });
+
+    it('answers "always" once when the mode is pinned', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'ASK_ALWAYS' });
+      const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+      if (req.event.t !== 'approval.request') throw new Error('no approval request');
+      // Not offered: it would be answered once.
+      expect(req.event.options).not.toContain('allow_always');
+      await adapter.respond(h, req.event.id, { kind: 'allow_always', persist: true });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, req.index);
+      await adapter.close(h);
+      const answer = received().find(
+        (l) => l.received !== undefined && JSON.stringify(l.received).includes('"optionId"'),
+      );
+      expect(JSON.stringify(answer?.received)).toContain('"optionId":"once"');
+    });
+  });
+
   it('keeps the error type when a profile is refused at start', async () => {
     const adapter = make(customAcpAgent('plain', { command: ['plain'] }));
     await expect(adapter.start({ cwd: join(root, 'wt'), model: 'm' })).rejects.toThrow(
@@ -428,7 +646,17 @@ describe('ACP agent registry', () => {
   });
 
   it('registers only agents whose API-key-only auth was verified live', () => {
-    expect(Object.keys(BUILTIN_ACP_AGENTS)).toEqual(['gemini']);
+    expect(Object.keys(BUILTIN_ACP_AGENTS)).toEqual(['gemini', 'claude-acp', 'codex-acp']);
     expect(GEMINI_AGENT.apiKeyEnv).toEqual(['GEMINI_API_KEY']);
+    // Each has a home of its own, so the user's login is never used or changed (#145).
+    for (const spec of Object.values(BUILTIN_ACP_AGENTS)) expect(spec.home).toBeDefined();
+    // codex-acp never logs in: its api-key login overwrites the user's Codex login.
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.apiKeyAuthMethods).toEqual([]);
+    // Both start in a mode that runs tools unasked; Workers use one that asks (#145).
+    expect(BUILTIN_ACP_AGENTS['claude-acp']?.sessionMode).toBe('default');
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.sessionMode).toBe('workspace-write');
+    // No subscription or second key route, whatever the user passes through.
+    expect(BUILTIN_ACP_AGENTS['claude-acp']?.envDeny).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.envDeny).toEqual(['CODEX_API_KEY']);
   });
 });
