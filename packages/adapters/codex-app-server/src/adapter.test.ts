@@ -513,6 +513,51 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     },
   );
 
+  it.runIf(process.platform !== 'win32')(
+    'close() returns only once the whole process group is gone, SIGTERM or not (#191)',
+    async () => {
+      const adapter = make('child-term', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        await adapter.close(h);
+        // Gone when close() returns: no polling on Linux, where /proc shows a zombie init has yet
+        // to reap. Elsewhere `kill(pid, 0)` also finds a zombie, so allow launchd a moment.
+        if (process.platform !== 'linux') {
+          for (let i = 0; i < 20; i++) {
+            try {
+              process.kill(childPid, 0);
+            } catch {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        }
+        const running = (() => {
+          try {
+            const stat = readFileSync(`/proc/${childPid}/stat`, 'utf8');
+            return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+          } catch {
+            try {
+              process.kill(childPid as number, 0);
+              return process.platform !== 'linux';
+            } catch {
+              return false;
+            }
+          }
+        })();
+        expect(running).toBe(false);
+      } finally {
+        // Never leave the SIGTERM-ignoring child running on the test machine.
+        try {
+          if (childPid) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
+    },
+  );
+
   it('queues input sent during a turn and reports it in the interrupt receipt', async () => {
     const adapter = make('approval');
     const h = await adapter.start({ cwd: root });
