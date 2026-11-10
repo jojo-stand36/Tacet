@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
  * - `ENV_TOOL`: asks for a Bash tool call that writes its environment to `tool-env.txt` (#150).
+ * - `RUN_CMD <shell command>`: asks for a Bash tool call running the rest of the line.
  * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
  *   without asking for a file in its working directory.
  * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
@@ -126,6 +127,17 @@ function plan(body: Body): Block[] {
           description: 'start a background job',
           run_in_background: true,
         },
+      },
+    ];
+  }
+  const cmd = /RUN_CMD (.+)$/m.exec(text);
+  if (cmd) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Bash',
+        input: { command: cmd[1], description: 'run a command' },
       },
     ];
   }
