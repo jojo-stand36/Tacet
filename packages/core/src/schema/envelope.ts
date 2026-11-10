@@ -14,6 +14,8 @@ export const EVENT_NAMESPACES = [
   'handoff',
   'worker',
   'budget',
+  // Local to the Mini-conductor (#126): its worktree registry, never forwarded upward.
+  'workspace',
 ] as const;
 
 /**
