@@ -30,7 +30,7 @@ import {
   type WorkerEnvPolicy,
   workerEnv,
 } from '@tacet/core';
-import { authEnv, type ClaudeAuthRoute, claudeEnvAllow } from './auth.js';
+import { authEnv, type ClaudeAuthRoute, claudeEnvAllow, withSubprocessScrub } from './auth.js';
 import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
 
 const CONTEXT_1M = 1_000_000;
@@ -84,6 +84,11 @@ export interface ClaudeSdkAdapterOptions {
     Options,
     'settingSources' | 'pathToClaudeCodeExecutable' | 'permissionMode' | 'allowedTools'
   >;
+  /**
+   * Whether the commands an API-key Worker runs get its credentials stripped (#150). Default
+   * `true`; `false` only for tests that replace the Claude Code binary (`query`).
+   */
+  subprocessScrub?: boolean;
   /** Replaces the SDK's `query()`; for tests. */
   query?: typeof sdkQuery;
 }
@@ -193,11 +198,17 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     );
     this.#opts.onEnvDropped?.(filtered.dropped);
     // The SDK's `env` replaces the child's environment (verified, 0.3.319): only this reaches it.
-    const env = authEnv(this.#opts.authRoute ?? 'api_key', {
+    const route = this.#opts.authRoute ?? 'api_key';
+    const routed = authEnv(route, {
       ...filtered.env,
       ...opts.env,
       CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     });
+    // An API-key Worker's commands never see the key (#150); a login session has none to hide.
+    const env =
+      route === 'api_key' && this.#opts.subprocessScrub !== false
+        ? withSubprocessScrub(routed)
+        : routed;
     // Tacet owns the effort: this variable overrides the `effort` option and later
     // `applyFlagSettings` calls without any sign that it did.
     delete env.CLAUDE_CODE_EFFORT_LEVEL;

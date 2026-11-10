@@ -173,6 +173,8 @@ describe('PtyAdapter (fake claude)', () => {
   const make = (env: Record<string, string> = {}, extra: object = {}) =>
     new PtyAdapter({
       command: ['claude'],
+      // Claude Code is replaced: nothing runs commands, so no bubblewrap is needed (#150).
+      subprocessScrub: false,
       stateDir: join(root, 'state'),
       sessionFileDir: join(root, 'run'),
       startTimeoutMs: 1000,
@@ -224,6 +226,23 @@ describe('PtyAdapter (fake claude)', () => {
     // Never the whole key.
     expect(JSON.stringify(config)).not.toContain(KEY);
     await adapter.close(h);
+  });
+
+  it("strips the Worker's credentials from the commands it runs, or refuses (#150)", async () => {
+    const bin = join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
+    const adapter = make({ PATH: bin }, { subprocessScrub: true });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    expect(fake().opts.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+    await adapter.close(h);
+    if (process.platform === 'linux') {
+      await expect(
+        make({ PATH: join(root, 'empty') }, { subprocessScrub: true }).start({
+          cwd: join(root, 'wt'),
+        }),
+      ).rejects.toThrow(/bubblewrap/);
+    }
   });
 
   it('refuses what it cannot do safely', async () => {

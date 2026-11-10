@@ -26,6 +26,10 @@ jobs:
       - name: Enable pnpm via corepack
         run: corepack enable
 
+      # Claude Workers on Linux need bubblewrap (#150), and so do the tests that run Claude Code.
+      - name: Install bubblewrap
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

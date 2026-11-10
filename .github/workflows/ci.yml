@@ -58,6 +58,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
+      # Claude Workers on Linux need bubblewrap (#150): without it they refuse to start, so the
+      # tests that run the real Claude Code binary need it too.
+      - name: Install bubblewrap
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck

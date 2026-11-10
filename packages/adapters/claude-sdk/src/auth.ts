@@ -1,3 +1,5 @@
+import { accessSync, constants } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import type { EnvAllow } from '@tacet/core';
 
 /**
@@ -108,4 +110,42 @@ export function claudeEnvAllow(env: Record<string, string | undefined>): EnvAllo
     );
   }
   return { names, prefixes, credentialPrefixes };
+}
+
+/**
+ * The commands a Claude Code Worker runs (its Bash tool, hooks, stdio MCP servers) must not see
+ * its API key (#150). Claude Code strips credentials from them with
+ * `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`, which on Linux needs bubblewrap: verified live on
+ * 2.1.319, without `bwrap` Claude Code refuses to start ("bubblewrap is required for subprocess
+ * env scrubbing and isolation"). Owner decision (#150): fail closed, so a Linux user without
+ * bubblewrap is told to install it rather than running Workers whose commands see the key.
+ * Returns `env` with the scrub on; throws `SubprocessScrubError` when it cannot work.
+ */
+export function withSubprocessScrub(
+  env: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  if (platform === 'linux' && !onPath('bwrap', env.PATH)) {
+    throw new SubprocessScrubError(
+      'Claude Workers on Linux need bubblewrap (bwrap) on PATH, so the commands they run never see the API key; install it, e.g. `sudo apt-get install bubblewrap`',
+    );
+  }
+  return { ...env, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1' };
+}
+
+export class SubprocessScrubError extends Error {
+  override name = 'SubprocessScrubError';
+}
+
+function onPath(name: string, path: string | undefined): boolean {
+  for (const dir of (path ?? '').split(delimiter)) {
+    if (!dir) continue;
+    try {
+      accessSync(join(dir, name), constants.X_OK);
+      return true;
+    } catch {
+      // Not here.
+    }
+  }
+  return false;
 }

@@ -3,7 +3,12 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { authEnv, claudeEnvAllow, writeMcpConfig } from '@tacet/adapter-claude-sdk/launch';
+import {
+  authEnv,
+  claudeEnvAllow,
+  withSubprocessScrub,
+  writeMcpConfig,
+} from '@tacet/adapter-claude-sdk/launch';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -113,6 +118,11 @@ export interface PtyAdapterOptions {
   /** Terminal size. Default 200 × 50. */
   cols?: number;
   rows?: number;
+  /**
+   * Whether the commands the Worker runs get its credentials stripped (#150). Default `true`;
+   * `false` only for tests that replace Claude Code (`spawn`).
+   */
+  subprocessScrub?: boolean;
   /** Replaces node-pty; for tests. */
   spawn?: SpawnPty;
 }
@@ -239,7 +249,9 @@ export class PtyAdapter implements AgentAdapter {
       this.#opts.envPolicy,
     );
     this.#opts.onEnvDropped?.(filtered.dropped);
-    const env = authEnv('api_key', { ...filtered.env, ...opts.env });
+    const keyed = authEnv('api_key', { ...filtered.env, ...opts.env });
+    // The commands the Worker runs never see its key (#150).
+    const env = this.#opts.subprocessScrub === false ? keyed : withSubprocessScrub(keyed);
 
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
