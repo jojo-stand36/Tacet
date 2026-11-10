@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -12,9 +12,9 @@ import {
 import { type EventStore, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
-import { MiniConductor, type MiniConductorOptions } from './daemon.js';
+import { MiniConductor, type MiniConductorOptions, VERIFY_CODEX_WORKERS } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
-import type { Planner, ProposedSubtask, WorkerMcp } from './ports.js';
+import type { Planner, ProposedSubtask, Verifier, VerifyContext, WorkerMcp } from './ports.js';
 import { type Script, ScriptedAdapter, TempWorkspaces } from './testing.js';
 
 const CONFIG: TacetConfig = {
@@ -115,6 +115,190 @@ afterEach(async () => {
 });
 
 describe('MiniConductor', () => {
+  describe('verification (#19)', () => {
+    const VERIFY: TacetConfig = {
+      ...CONFIG,
+      verify: ['pnpm test'],
+      workers: { ...CONFIG.workers, verify_fix_attempts: 1 },
+    };
+    /** A verifier that answers from `results`, in turn, recording what it was given. */
+    function scripted(results: ('passed' | 'failed')[]) {
+      const calls: VerifyContext[] = [];
+      const verifier: Verifier = {
+        async verify(_task, _ws, ctx) {
+          calls.push(ctx);
+          const status = results[Math.min(calls.length - 1, results.length - 1)] ?? 'passed';
+          ctx.onCommand?.({
+            command: 'pnpm test',
+            status,
+            exitCode: status === 'passed' ? 0 : 1,
+            durationMs: 5,
+          });
+          return status === 'failed'
+            ? {
+                status,
+                commands: ['pnpm test'],
+                notes: 'tests failed',
+                feedback: `Verification failed (call ${calls.length}).`,
+              }
+            : { status, commands: ['pnpm test'] };
+        },
+      };
+      return { verifier, calls };
+    }
+    const verifications = () =>
+      ofType('worker.verification').map(
+        (e) => e.data as { round: number; status: string; sessionId: string },
+      );
+
+    it('sends a failure back to the same session to fix, then completes', async () => {
+      const { verifier, calls } = scripted(['failed', 'passed']);
+      const d = make({ config: VERIFY, verifier });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(fake.sessions).toHaveLength(1);
+      expect(fake.sessions[0]?.inputs.at(-1)).toBe('Verification failed (call 1).');
+      expect(calls).toHaveLength(2);
+      expect(verifications().map((v) => [v.round, v.status])).toEqual([
+        [0, 'failed'],
+        [1, 'passed'],
+      ]);
+      // Rounds go to the log; a failed round is not a failed attempt.
+      expect(
+        ofType('task.result', `${id}/1`).map((e) => (e.data as { outcome: string }).outcome),
+      ).toEqual(['completed']);
+    });
+
+    it('fails the attempt once its fix rounds are used, and retries afresh', async () => {
+      const { verifier } = scripted(['failed']);
+      const d = make({
+        config: { ...VERIFY, workers: { ...VERIFY.workers, max_attempts: 2 } },
+        verifier,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      // Two attempts (sessions), each with one fix round: two checks each.
+      expect(fake.sessions).toHaveLength(2);
+      for (const s of fake.sessions) {
+        expect(s.inputs.filter((x) => x.startsWith('Verification failed'))).toHaveLength(1);
+      }
+      const bySession = Map.groupBy(verifications(), (v) => v.sessionId);
+      expect([...bySession.values()].map((vs) => vs.map((v) => v.round))).toEqual([
+        [0, 1],
+        [0, 1],
+      ]);
+      const results = ofType('task.result', `${id}/1`).map(
+        (e) => e.data as { outcome: string; verification: { notes?: string } },
+      );
+      expect(results.map((r) => r.outcome)).toEqual(['failed', 'failed']);
+      expect(results[0]?.verification.notes).toBe('tests failed');
+      // The feedback meant for the Worker never goes up (review B2).
+      for (const e of ofType('task.result', `${id}/1`)) {
+        expect(Object.keys((e.data as { verification: object }).verification)).not.toContain(
+          'feedback',
+        );
+      }
+      // The fresh attempt is told why the last one failed (review S3).
+      expect(fake.sessions[1]?.inputs[0]).toContain('Verification of that attempt: tests failed');
+    });
+
+    it('keeps the fix-round budget across a restart in the middle of a fix (review S2)', async () => {
+      const { verifier } = scripted(['failed']);
+      // The fix turn holds, so the Mini-conductor restarts while the Worker is fixing.
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Verification failed') ? { do: 'hold' } : script(input),
+      );
+      const RETRY = { ...VERIFY, workers: { ...VERIFY.workers, max_attempts: 2 } };
+      const d1 = make({ config: RETRY, verifier });
+      await d1.start();
+      const id = d1.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await expect
+        .poll(() => fake.sessions[0]?.inputs.some((x) => x.startsWith('Verification failed')))
+        .toBe(true);
+      await d1.stop();
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('The Mini-conductor restarted')
+          ? { do: 'reply', text: 'fixed' }
+          : script(input),
+      );
+      const d2 = make({ config: RETRY, verifier });
+      await d2.start();
+      await d2.settled();
+      // One fix round in all (verify_fix_attempts: 1): the resumed session's failure fails the
+      // attempt instead of buying another round.
+      const resumed = fake.sessions.find((s) => s.opts.resume);
+      expect(resumed).toBeDefined();
+      expect(resumed?.inputs.filter((x) => x.startsWith('Verification failed'))).toEqual([]);
+      expect(
+        ofType('task.result', `${id}/1`).map((e) => (e.data as { outcome: string }).outcome)[0],
+      ).toBe('failed');
+      // The next attempt reuses the checkout but not the spent budget (re-review S2).
+      const retry = fake.sessions.find((s) => s !== resumed && !s.opts.resume);
+      expect(retry?.inputs.filter((x) => x.startsWith('Verification failed'))).toHaveLength(1);
+    });
+
+    it('records the process marker while it runs, and stops a run when the Mini-conductor stops', async () => {
+      let markerSeen: string | undefined;
+      let fileHadIt = false;
+      let aborted = false;
+      const verifier: Verifier = {
+        verify: (_task, _ws, ctx) =>
+          new Promise((resolve) => {
+            markerSeen = ctx.marker;
+            fileHadIt = readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8').includes(
+              ctx.marker,
+            );
+            ctx.signal.addEventListener('abort', () => {
+              aborted = true;
+              resolve({ status: 'not_run', commands: ['pnpm test'] });
+            });
+          }),
+      };
+      const d = make({ config: VERIFY, verifier });
+      await d.start();
+      d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await expect.poll(() => markerSeen).toBeDefined();
+      expect(fileHadIt).toBe(true);
+      await d.stop();
+      expect(aborted).toBe(true);
+      // Stopped, not failed: nothing counts against the sub-task, and the marker is dropped.
+      expect(ofType('task.result')).toEqual([]);
+      expect(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8')).not.toContain(markerSeen);
+    });
+
+    it('does not verify Codex Workers until the sandbox decision, and says so', async () => {
+      expect(VERIFY_CODEX_WORKERS).toBe(false);
+      const { verifier, calls } = scripted(['passed']);
+      const codex = new ScriptedAdapter('codex-app-server', script);
+      const d = make({
+        config: {
+          ...VERIFY,
+          tiers: { ...CONFIG.tiers, worker: { adapter: 'codex-app-server', model: 'm' } },
+        },
+        adapters: {
+          'codex-app-server': { adapter: codex, authRoute: 'api_key' },
+          other: { adapter: other, authRoute: 'api_key' },
+        },
+        verifier,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await d.settled();
+      expect(calls).toHaveLength(0);
+      const result = ofType('task.result', `${id}/1`)[0]?.data as {
+        verification: { status: string; notes?: string };
+      };
+      expect(result.verification).toMatchObject({
+        status: 'not_run',
+        notes: 'codex verify pending sandbox decision',
+      });
+    });
+  });
+
   it('plans, runs sub-tasks in dependency order, and rolls the result up', async () => {
     const d = make({
       planner: new FixedPlanner([

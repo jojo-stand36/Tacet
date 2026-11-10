@@ -132,6 +132,8 @@ describe('loadConfig', () => {
       stuck_after_s: 300,
       nudge_grace_s: 900,
       max_attempts: 3,
+      verify_timeout_s: 600,
+      verify_fix_attempts: 2,
     });
     write(
       join(repoRoot, '.tacet', 'tacet.yaml'),
@@ -225,6 +227,23 @@ describe('loadConfig', () => {
     expect(() =>
       loadConfig({ userDir, repoRoot, task: { workers: { env: { pass: ['MYAPP_*'] } } } }),
     ).toThrow(/task layer .* may not change a Worker's environment/);
+  });
+
+  it('never lets a task change the verify commands, and lets it only lower their limits (#19)', () => {
+    for (const verify of [[], ['true']]) {
+      expect(() => loadConfig({ userDir, repoRoot, task: { verify } })).toThrow(
+        /verify: the task layer .* may not change the verify commands/,
+      );
+    }
+    const defaults = loadConfig({ userDir, repoRoot }).config.workers;
+    expect(defaults).toMatchObject({ verify_timeout_s: 600, verify_fix_attempts: 2 });
+    expect(
+      loadConfig({ userDir, repoRoot, task: { workers: { verify_fix_attempts: 0 } } }).config
+        .workers?.verify_fix_attempts,
+    ).toBe(0);
+    expect(() =>
+      loadConfig({ userDir, repoRoot, task: { workers: { verify_timeout_s: 3600 } } }),
+    ).toThrow(/workers\.verify_timeout_s: the task layer .* may only lower it/);
   });
 
   it('reports every problem with file, line and column', () => {

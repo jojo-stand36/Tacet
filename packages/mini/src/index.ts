@@ -1,7 +1,12 @@
 /** Per-repo Mini-conductor daemon (#17) and its MCP server for Workers (#18). */
 export const packageName = '@tacet/mini' as const;
 
-export { isOwnMcpTool, MiniConductor, type MiniConductorOptions } from './daemon/daemon.js';
+export {
+  isOwnMcpTool,
+  MiniConductor,
+  type MiniConductorOptions,
+  VERIFY_CODEX_WORKERS,
+} from './daemon/daemon.js';
 export {
   AdapterPlanner,
   type AdapterPlannerOptions,
@@ -13,6 +18,8 @@ export type {
   Planner,
   ProposedSubtask,
   Verifier,
+  VerifyContext,
+  VerifyResult,
   WorkerAdapter,
   WorkerMcp,
   Workspace,
@@ -52,3 +59,8 @@ export {
   type ToolOutput,
   ToolSchemas,
 } from './mcp/tools.js';
+export {
+  CommandVerifier,
+  type CommandVerifierOptions,
+  commandVerifierFromConfig,
+} from './verify/command-verifier.js';
