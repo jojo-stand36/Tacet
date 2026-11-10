@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, realpathSync, rmdirSync, rmSync } from 'node:fs';
-import { basename, join, sep } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import {
   type RepoStatePaths,
   repoStatePaths,
@@ -205,15 +205,15 @@ function registeredUnder(io: Io, root: string, dir: string): string[] {
   } catch {
     return [dir];
   }
-  const base = real(dir);
+  // Both sides as given and resolved: a missing worktree path cannot be resolved, and git may
+  // report either form (macOS: /var is a symlink to /private/var).
+  const bases = [...new Set([resolve(dir), real(dir)])];
+  const under = (p: string) => bases.some((b) => p === b || p.startsWith(`${b}${sep}`));
   return out
     .split('\n')
     .filter((line) => line.startsWith('worktree '))
     .map((line) => line.slice('worktree '.length))
-    .filter((path) => {
-      const p = real(path);
-      return p === base || p.startsWith(`${base}${sep}`);
-    });
+    .filter((path) => under(resolve(path)) || under(real(path)));
 }
 
 function real(path: string): string {

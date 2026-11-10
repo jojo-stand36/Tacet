@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -64,7 +65,9 @@ describe('tacet uninstall --purge: run state (#211)', () => {
       .filter((l) => l.startsWith('worktree ') && l.includes(paths().dir));
 
   beforeEach(async () => {
-    dir = mkdtempSync(join(tmpdir(), 'tacet-purge-'));
+    // Real path: on macOS tmpdir() is under /var, a symlink to /private/var, and git reports the
+    // resolved path.
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-purge-')));
     repo = join(dir, 'repo');
     home = join(dir, 'home');
     mkdirSync(repo);
