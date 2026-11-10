@@ -379,6 +379,18 @@
       "body": "Found in the review of #198. The ACP adapter reaps an agent's process group in its exit handler (`packages/adapters/acp/src/adapter.ts`, the `exited` promise: `drained` then `#reapGroup`). A later `close()` runs `#terminate`, which calls `#reapGroup(proc)` again and polls `processGroupAlive(pid)` on a group already seen empty. By then that id may belong to a new process group: `close()` would wait out the kill timeout and SIGKILL it. The invariant \"a pid is not reused while it is the id of a group with members\" holds only while the group has had members all along. The Mini-conductor calls `close()` on every ended run, so this path is the usual one, not a corner. A `close()` during the reap also starts a second reaper alongside the first.\n\nThe Codex adapter fixed the same thing in #198: the session keeps one reap promise (`gone`), and `close()` waits on it instead of polling the group again.\n\n### Tasks\n- [ ] Keep the exit handler's reap on the ACP session, and make `close()` (`#terminate`) await it rather than call `#reapGroup` again once the agent has exited.\n- [ ] Note on `#reapGroup` that it runs once per process.\n\n### Acceptance criteria\n- After an agent exits by itself and its group is reaped, `close()` returns without polling or signalling the group again. A test shows `close()` returns well within the kill timeout.\n- `close()` called while the group is still being reaped returns only once the group is gone.\n\n_See #198, packages/adapters/codex-app-server/src/adapter.ts (`gone`), packages/adapters/acp/src/adapter.ts and packages/core/src/node/process-group.ts._"
     },
     {
+      "title": "ACP adapter: discard a Worker session's transcript once it will never be resumed",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Found in the review of #224.\n\n`AcpAdapter` has no `discard()`. When the Mini-conductor ends a session for good (finished, failed, canceled, or after a failed resume), it calls `adapter.discard(vendorSessionId, cwd)` (#153). For ACP that is a no-op.\n\nSo the transcripts of claude-acp Workers stay under `<state>/<repo>/acp-claude-acp/projects/` for good. They can hold contents of files the Worker read. Since #224 made those transcripts resumable, they are kept on purpose for restarts, which makes cleaning up the ones that are no longer needed more important. The claude-sdk adapter has the same gap.\n\n### Tasks\n- [ ] `AcpAdapter.discard(vendorSessionId, cwd)`: for agents whose transcripts live in the agent's own home (claude-acp: `CLAUDE_CONFIG_DIR/projects/<encoded cwd>/<id>.jsonl` and `<id>/`), delete them. Verify the layout against the pinned claude-agent-acp first (`verify-vendor-facts`).\n- [ ] The same for the claude-sdk adapter, or a separate issue.\n- [ ] Respect `events.retention.transcript_days` for sessions kept for a restart.\n\n### Acceptance criteria\n- After a claude-acp Worker session ends as finished, failed or canceled, its transcript files are gone from the agent's home. A test against the real agent shows it.\n- A session ended for a restart is kept, and still resumes.\n\n_See #153, #224, packages/adapters/acp/src/adapter.ts and packages/mini/src/daemon/daemon.ts (`#discard`)._"
+    },
+    {
       "title": "ACP: offer fork when the agent advertises sessionCapabilities.fork",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -509,6 +521,18 @@
         "agent:claude"
       ],
       "body": "Gap 11 in the capability matrix. Matrix rows carry a checked date, and vendor surfaces under active development go stale quickly. A CI check should fail when a checked date for those surfaces is older than a configured number of days.\n\n### Tasks\n- [ ] Add a machine-readable checked date per surface in the matrix\n- [ ] Add a script in scripts/ that parses those dates and enforces the threshold\n- [ ] Mark which surfaces are under active development (Claude, Codex, OpenCode, Gemini, ACP)\n- [ ] Wire the check into CI next to the other `--check` scripts, and document how to refresh a row\n\n### Acceptance criteria\n- CI fails with a clear message when an active surface is older than the threshold\n- CI passes after the row is refreshed\n\n_See docs/adapters/capability-matrix.md and .github/instructions/adapters.instructions.md for context._"
+    },
+    {
+      "title": "Claude SDK adapter: keep Worker transcripts out of the user's ~/.claude and discard them",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Split from #232.\n\nThe `claude-sdk` adapter runs its Workers with the user's own Claude config dir. Their transcripts go to the user's `~/.claude/projects/<encoded worktree>/<id>.jsonl`, with the per-session `file-history/`, `session-env/` and `todos/` entries next to them. They can hold the contents of files a Worker read.\n\nThe adapter has no `discard()`. `AgentAdapter.discard` must never touch the vendor's own stores, so the fix is not to delete from `~/.claude`. Instead, give SDK Workers a config dir of their own, as the ACP adapter does (`acp-claude-acp`, #150) and the PTY adapter does per session (#153). Then remove a session's files the way #232 does for claude-acp.\n\n### Tasks\n- [ ] Verify how the pinned Agent SDK treats `CLAUDE_CONFIG_DIR` for a `query()` session (`verify-vendor-facts`). Confirm that resume still works and that no auth state is read from the user's dir. Record the result in the capability matrix.\n- [ ] Run Workers (and the planner and reviewer, if they resume) with a per-repo config dir under the state dir.\n- [ ] `discard(vendorSessionId, cwd)` removes the session's files (reuse the ACP `sessionFiles` layout and helpers from #232, or share them through core).\n- [ ] Sweep sessions untouched for `events.retention.transcript_days`.\n\n### Acceptance criteria\n- After an SDK Worker session ends as finished, failed or canceled, nothing in the user's `~/.claude` or the state dir names it. A test against the real SDK binary and the mock Messages API shows this.\n- A session ended for a restart is kept, and still resumes."
     },
     {
       "title": "Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []",

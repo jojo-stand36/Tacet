@@ -35,6 +35,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 
 - [ ] **Epic: Mini-conductor MVP (standalone, single repo)** — `epic` `P0` `human`
 - [ ] **ACP adapter: close() after a self-exit must not poll the reaped process group again** — `chore` `P2` `claude`
+- [ ] **ACP adapter: discard a Worker session's transcript once it will never be resumed** — `feature` `P2` `claude`
 - [ ] **ACP: offer fork when the agent advertises sessionCapabilities.fork** — `feature` `P2` `claude`
 - [ ] **ACP: verify API-key-only auth for claude-agent-acp and codex-acp, then register them** — `feature` `P2` `claude`
 - [ ] **Adapter: Claude Code (Agent SDK / stream-json)** — `feature` `P0` `claude`
@@ -47,6 +48,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Browser session via hello frame instead of cookie (ADR-003 §3.4 addendum)** — `feature` `P0` `claude`
 - [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `claude`
 - [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
+- [ ] **Claude SDK adapter: keep Worker transcripts out of the user's ~/.claude and discard them** — `feature` `P2` `claude`
 - [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
