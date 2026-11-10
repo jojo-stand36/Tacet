@@ -52,6 +52,8 @@ import { TerminalBuffer } from './terminal.js';
  * - no streaming: the reply's text arrives once, from the `Stop` hook (`last_assistant_message`);
  * - approvals round-trip through the `PermissionRequest` hook (allow or deny answered over HTTP);
  * - Esc ends a turn (the binary sends no `Stop` for it, so the adapter reports `cancelled`);
+ * - a prompt submitted while a turn still runs joins it under that turn's `prompt_id`, then runs
+ *   under a new, unannounced one (#190): turns are matched to what was typed by the prompt text;
  * - resume by session id (`--resume`) in the session's own config directory; no fork yet;
  * - no usage: the hooks carry no token counts;
  * - the model is chosen at launch (`--model`).
@@ -147,6 +149,20 @@ interface Session {
   typing: boolean;
   /** The `prompt_id` of the last cancelled turn: its hooks are stale whenever they arrive. */
   cancelledPromptId: string | undefined;
+  /** The text of the prompt typed last, until its `UserPromptSubmit` arrives. */
+  typedPrompt: string | undefined;
+  /** The text of the turn in progress. */
+  currentPrompt: string | undefined;
+  /**
+   * The text of the last cancelled turn, so its `UserPromptSubmit` is known even when it arrives
+   * after the cancel (and so before its `prompt_id` could be recorded).
+   */
+  cancelledPrompt: string | undefined;
+  /**
+   * The typed prompt joined a turn that was still running (#190): its own turn comes under the
+   * next `prompt_id` Claude Code uses, which no `UserPromptSubmit` announces.
+   */
+  adoptNextPromptId: boolean;
   /** Bumped by a cancel or close, so a prompt being typed stops typing. */
   epoch: number;
   /** Fires when a typed prompt was not acknowledged in time. */
@@ -372,6 +388,10 @@ export class PtyAdapter implements AgentAdapter {
         queue: [],
         cancelledAt: 0,
         lastOutputAt: 0,
+        typedPrompt: undefined,
+        currentPrompt: undefined,
+        cancelledPrompt: undefined,
+        adoptNextPromptId: false,
         screen: new TerminalBuffer(this.#opts.cols ?? 200, this.#opts.rows ?? 50),
         ready,
         exited,
@@ -579,6 +599,7 @@ export class PtyAdapter implements AgentAdapter {
       }
       if (gone()) return;
       const before = s.promptId;
+      s.typedPrompt = text;
       // Paste and Enter in one write (verified live): no moment where a cancel could leave a
       // prompt typed but not submitted.
       s.pty.write(`${PASTE_START}${text}${PASTE_END}\r`);
@@ -603,6 +624,11 @@ export class PtyAdapter implements AgentAdapter {
     s.queue.length = 0;
     s.epoch++;
     s.cancelledPromptId = s.promptId;
+    // Typed but not acknowledged yet: the turn is this prompt, whatever prompt_id it gets.
+    s.cancelledPrompt = s.typedPrompt ?? s.currentPrompt;
+    s.typedPrompt = undefined;
+    s.currentPrompt = undefined;
+    s.adoptNextPromptId = false;
     if (interruptedByDenial || s.approvals.size > 0) {
       for (const p of s.approvals.values()) {
         if (p.toolUseId) this.#toolResult(s, p.toolUseId, false);
@@ -637,6 +663,16 @@ export class PtyAdapter implements AgentAdapter {
       return;
     }
     const promptId = typeof body.prompt_id === 'string' ? body.prompt_id : undefined;
+    // The first prompt_id after a prompt joined a running turn is that prompt's own turn (#190).
+    if (
+      s.adoptNextPromptId &&
+      promptId !== undefined &&
+      promptId !== s.cancelledPromptId &&
+      ev.hook_event_name !== 'UserPromptSubmit'
+    ) {
+      s.promptId = promptId;
+      s.adoptNextPromptId = false;
+    }
     // A turn-scoped hook from another turn than the one in progress (e.g. an interrupted one
     // whose events arrive late) changes nothing.
     const stale =
@@ -658,18 +694,49 @@ export class PtyAdapter implements AgentAdapter {
         s.ready();
         reply();
         return;
-      case 'UserPromptSubmit':
-        // A cancelled prompt's own submit (its Enter beat the cancel) is not a new turn.
-        if (promptId !== undefined && promptId === s.cancelledPromptId) {
+      case 'UserPromptSubmit': {
+        const text = typeof body.prompt === 'string' ? body.prompt : undefined;
+        const typed = s.typedPrompt !== undefined && samePrompt(text, s.typedPrompt);
+        if (typed) {
+          s.typedPrompt = undefined;
+          s.currentPrompt = text;
+          clearTimeout(s.ackTimer);
+          if (promptId !== undefined && promptId === s.cancelledPromptId) {
+            // Claude Code 2.1.319 (observed live, #190): a prompt submitted while a turn still
+            // runs (its Esc did not take) joins it. This hook carries the running turn's
+            // prompt_id, that turn's Stop follows with its own reply, and the prompt then runs
+            // under a new prompt_id that no UserPromptSubmit announces. So the old id stays
+            // stale and the next new one is this prompt's turn.
+            s.promptId = undefined;
+            s.adoptNextPromptId = true;
+          } else {
+            s.promptId = promptId;
+            s.cancelledPromptId = undefined;
+            s.adoptNextPromptId = false;
+          }
+          if (s.state !== 'running') this.#setState(s, 'running');
+          reply();
+          return;
+        }
+        // A cancelled prompt's own submit (its Enter beat the cancel, or its hook arrived after
+        // it) is not a new turn, and its later hooks are stale.
+        if (
+          (promptId !== undefined && promptId === s.cancelledPromptId) ||
+          (s.cancelledPrompt !== undefined && samePrompt(text, s.cancelledPrompt))
+        ) {
+          if (promptId !== undefined) s.cancelledPromptId = promptId;
           reply();
           return;
         }
         s.promptId = promptId;
+        s.currentPrompt = text;
         s.cancelledPromptId = undefined;
+        s.adoptNextPromptId = false;
         clearTimeout(s.ackTimer);
         if (s.state !== 'running') this.#setState(s, 'running');
         reply();
         return;
+      }
       case 'PreToolUse':
         s.openTools.push({
           id: ev.tool_use_id,
@@ -838,6 +905,13 @@ export class PtyAdapter implements AgentAdapter {
     if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
     return s;
   }
+}
+
+/** Whether a `UserPromptSubmit` prompt is the text Tacet typed (line endings and edges aside). */
+function samePrompt(hook: string | undefined, typed: string): boolean {
+  if (hook === undefined) return false;
+  const norm = (t: string) => t.replace(/\r\n?/g, '\n').trim();
+  return norm(hook) === norm(typed);
 }
 
 /**
