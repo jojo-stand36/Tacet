@@ -234,7 +234,6 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
       // The turn's usage comes after its text, and flushes the held-back tail first.
       await usages(tap, 1);
       const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
-      for (const d of deltas) expect(d).not.toContain(token.slice(0, Math.max(cut, 8)));
       expect(JSON.stringify(tap.events)).not.toContain(token);
       expect(deltas.join('')).toBe('my token is [redacted] ok');
       await adapter.close(h);

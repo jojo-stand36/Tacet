@@ -21,12 +21,11 @@ import {
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
-  redactSecrets,
   type SendOptions,
   type SessionHandle,
   type SessionOptions,
   type SessionState,
-  scrubLiterals,
+  scrubbedEvents,
   type UserInput,
 } from '@tacet/core';
 import { authEnv, type ClaudeAuthRoute } from './auth.js';
@@ -401,14 +400,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
    */
   #emit(s: Session, e: AgentEvent): void {
     s.deltas ??= new DeltaScrubber(s.secrets);
-    if (e.t === 'message.delta') {
-      const text = s.deltas.push(e.text);
-      if (text) s.events.push(redactSecrets({ ...e, text }));
-      return;
-    }
-    const held = s.deltas.flush();
-    if (held) s.events.push(redactSecrets({ t: 'message.delta', text: held }));
-    s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
+    for (const out of scrubbedEvents(s.deltas, s.secrets, e)) s.events.push(out);
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {

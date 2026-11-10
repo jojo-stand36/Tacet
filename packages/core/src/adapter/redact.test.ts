@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DeltaScrubber, mcpHeaderSecrets, scrubLiterals } from './redact.js';
+import { DeltaScrubber, mcpHeaderSecrets, scrubbedEvents, scrubLiterals } from './redact.js';
 
 describe('mcpHeaderSecrets / scrubLiterals', () => {
   it('collects header values and bare tokens, longest first, and scrubs them everywhere', () => {
@@ -61,6 +61,45 @@ describe('mcpHeaderSecrets / scrubLiterals', () => {
       const e = new DeltaScrubber(secrets);
       expect(e.push(`x ${TOKEN.slice(0, -1)}`)).toBe('x ');
       expect(e.flush()).toBe(TOKEN.slice(0, -1));
+    });
+
+    it('does not let a shorter secret cut a longer one it begins, or sits inside', () => {
+      for (const pair of [
+        ['abcdefgh', 'abcdefghXYZW1234'],
+        ['efghXYZW', 'abcdefghXYZW1234'],
+      ]) {
+        const text = 'pre abcdefghXYZW1234 post';
+        const whole = scrubLiterals(
+          text,
+          [...pair].sort((a, b) => b.length - a.length),
+        );
+        expect(whole).toBe('pre [redacted] post');
+        for (let i = 0; i <= text.length; i++) {
+          for (let j = i; j <= text.length; j++) {
+            const d = new DeltaScrubber(pair);
+            const out = [d.push(text.slice(0, i)), d.push(text.slice(i, j)), d.push(text.slice(j))];
+            out.push(d.flush());
+            for (const piece of out) expect(piece).not.toMatch(/XYZW|abcd/);
+            expect(out.join('')).toBe(whole);
+          }
+        }
+      }
+    });
+
+    it('lets held text out before any other event, scrubbed', () => {
+      const d = new DeltaScrubber(secrets);
+      expect(
+        scrubbedEvents(d, secrets, { t: 'message.delta', text: `x ${TOKEN.slice(0, 5)}` }),
+      ).toEqual([{ t: 'message.delta', text: 'x ' }]);
+      expect(
+        scrubbedEvents(d, secrets, { t: 'tool.call', id: '1', name: 'Bash', input: { c: TOKEN } }),
+      ).toEqual([
+        { t: 'message.delta', text: TOKEN.slice(0, 5) },
+        { t: 'tool.call', id: '1', name: 'Bash', input: { c: '[redacted]' } },
+      ]);
+      expect(scrubbedEvents(d, secrets, { t: 'status', state: 'idle' })).toEqual([
+        { t: 'status', state: 'idle' },
+      ]);
     });
 
     it('passes text through when there are no secrets', () => {
