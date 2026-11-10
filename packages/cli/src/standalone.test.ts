@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { newUlid } from '@tacet/core';
 import {
   miniRuntimePath,
@@ -269,9 +269,17 @@ describe('tacet standalone (#21)', () => {
     expect(r.code).toBe(130);
   });
 
-  it('refuses a directory outside git before starting anything', async () => {
+  it('refuses a directory outside git before starting anything', async (ctx) => {
     const plain = join(root, 'plain');
     mkdirSync(plain);
+    // `tacet run` finds the repo by walking up to a `.git`: a stray one above the temp dir (a
+    // `/tmp/.git` in some containers) makes every directory under it a repo, so there is no
+    // "outside git" to test there.
+    for (let d = dirname(plain); d !== dirname(d); d = dirname(d)) {
+      if (d !== repo && existsSync(join(d, '.git'))) {
+        ctx.skip(`a parent directory of the temp dir is a git repo (${d}/.git)`);
+      }
+    }
     const r = await tacet(['run', ...user(), 'x'], { cwd: plain });
     expect(r.code).toBe(1);
     expect(r.err).toContain('not in a git repository');
