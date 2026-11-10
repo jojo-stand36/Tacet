@@ -944,6 +944,75 @@ describe('WorktreeManager', () => {
     expect(await readFile(fresh, 'utf8')).toBe('');
   });
 
+  describe('landed commits (#210)', () => {
+    async function workerCommit(worktreePath: string, file: string): Promise<string> {
+      await writeFile(path.join(worktreePath, file), `${file}\n`);
+      await workerGit(worktreePath, ['add', file]);
+      await workerGit(worktreePath, ['commit', '-m', file]);
+      return (await workerGit(worktreePath, ['rev-parse', 'HEAD'])).trim();
+    }
+    async function squashIntoMain(commit: string): Promise<void> {
+      await git(repository, ['merge', '--squash', commit]);
+      await git(repository, ['commit', '-m', 'squash-merged']);
+    }
+
+    it('frees a squash-merged worktree only when told its commit landed', async () => {
+      const worktree = await manager.create('squashed-worker');
+      const commit = await workerCommit(worktree.path, 'squashed.txt');
+      expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+      await squashIntoMain(commit);
+
+      await expect(manager.remove(worktree.id)).rejects.toThrow(
+        'Worker has commits no other ref contains',
+      );
+      await manager.remove(worktree.id, { landed: [commit] });
+      expect(await manager.get(worktree.id)).toBeUndefined();
+    });
+
+    it('keeps work done after the landed commit', async () => {
+      const worktree = await manager.create('after-landing-worker');
+      const landed = await workerCommit(worktree.path, 'landed.txt');
+      await workerCommit(worktree.path, 'later.txt');
+      expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+      await squashIntoMain(landed);
+
+      await expect(manager.remove(worktree.id, { landed: [landed] })).rejects.toThrow(
+        'Worker has commits no other ref contains',
+      );
+    });
+
+    it('keeps an amended-away commit that was never integrated', async () => {
+      const worktree = await manager.create('amended-worker');
+      await workerCommit(worktree.path, 'first.txt');
+      await workerGit(worktree.path, ['commit', '--amend', '-m', 'amended']);
+      const amended = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
+      expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+      await squashIntoMain(amended);
+
+      await expect(manager.remove(worktree.id, { landed: [amended] })).rejects.toThrow(
+        'Worker has unintegrated private commits',
+      );
+    });
+
+    it('refuses landed values that are not commits of the repository', async () => {
+      const worktree = await manager.create('bad-landed-worker');
+      const commit = await workerCommit(worktree.path, 'bad.txt');
+      expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+
+      for (const landed of [['--all'], ['HEAD'], [`^${commit}`]]) {
+        await expect(manager.remove(worktree.id, { landed })).rejects.toThrow(
+          'unable to verify Worker commits',
+        );
+      }
+      // A commit the repository does not have covers nothing.
+      await expect(manager.remove(worktree.id, { landed: ['f'.repeat(40)] })).rejects.toThrow(
+        'Worker has commits no other ref contains',
+      );
+      expect(await manager.get(worktree.id)).toBeDefined();
+      expect(commit).toMatch(/^[0-9a-f]{40}$/);
+    });
+  });
+
   it('ignores busy markers left by a manager that died', async () => {
     const worktree = await manager.create('orphaned-marker-worker');
     const child = execFile(process.execPath, ['-e', '']);

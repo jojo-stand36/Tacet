@@ -86,10 +86,12 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
+- [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **ACP adapter: close() after a self-exit must not poll the reaped process group again** — `chore` `P2` `claude`
+- [ ] **Pin a task's target branch so its sub-tasks never start from different branches** — `feature` `P2` `claude`
 - [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation

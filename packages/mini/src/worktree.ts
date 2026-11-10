@@ -34,6 +34,14 @@ export interface RemoveWorktreeOptions {
    * delete its `tacet/<id>` branch. Without it, `remove` refuses rather than lose work.
    */
   force?: boolean;
+  /** Keep the checkout's `tacet/<id>` branch, whatever it holds (#211: a purge keeps branches). */
+  keepBranch?: boolean;
+  /**
+   * Commits that landed in their target (#210): the event log records the task's published result
+   * as merged or squash-merged. Work they contain counts as kept, as if a branch held them. Each
+   * must be a full commit id (else the worktree is kept); one not in the repository covers nothing.
+   */
+  landed?: readonly string[];
 }
 
 export interface WorktreeInfo {
@@ -346,10 +354,94 @@ export class WorktreeManager implements Workspaces {
    * is left (its Git admin directory and branch), then only that admin directory is deleted.
    */
   async remove(worktreeId: string, options: RemoveWorktreeOptions = {}): Promise<void> {
+    const found = await this.registeredEntry(worktreeId);
+    if (!found) return;
+    await this.removeWorktree(found.info, options.force === true, found.missing, false, {
+      keepBranch: options.keepBranch === true,
+      landed: options.landed ?? [],
+    });
+  }
+
+  /**
+   * Why `remove(worktreeId)` without `force` would keep the checkout, or undefined when it would
+   * remove it (or there is nothing to remove). Runs the same checks and changes nothing (#211).
+   */
+  async check(
+    worktreeId: string,
+    options: Pick<RemoveWorktreeOptions, 'landed'> = {},
+  ): Promise<WorktreeKeptError | undefined> {
+    const found = await this.registeredEntry(worktreeId);
+    if (!found) return undefined;
+    try {
+      await this.removeWorktree(found.info, false, found.missing, true, {
+        landed: options.landed ?? [],
+      });
+      return undefined;
+    } catch (error) {
+      if (error instanceof WorktreeKeptError) return error;
+      throw error;
+    }
+  }
+
+  /**
+   * The branches, tags and remote-tracking refs other than the checkout's own `tacet/<id>` that
+   * contain its HEAD commit: where its work lives once it is gone (#211). Empty when its HEAD
+   * cannot be read or nothing else holds it.
+   */
+  async holders(worktreeId: string): Promise<string[]> {
+    const found = await this.registeredEntry(worktreeId);
+    if (!found) return [];
+    let head: string;
+    try {
+      const gitDirectory = await this.managerWorktreeGitDirectory(found.info);
+      head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
+    } catch {
+      return [];
+    }
+    let commit: string | undefined = commitIdPattern.test(head) ? head : undefined;
+    if (!commit) {
+      const ref = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
+      if (ref) commit = await this.refTip(ref);
+    }
+    if (!commit) return [];
+    const own = taskBranch(found.info.id);
+    const out = await this.git([
+      'for-each-ref',
+      `--contains=${commit}`,
+      '--format=%(refname)',
+      'refs/heads',
+      'refs/tags',
+      'refs/remotes',
+    ]).catch(() => '');
+    return out
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((ref) => ref && ref !== own);
+  }
+
+  /**
+   * Every checkout this manager registered, including ones deleted by hand (`missing`), which
+   * `list()` leaves out. For a full cleanup (#211).
+   */
+  async registered(): Promise<Array<WorktreeInfo & { missing: boolean }>> {
+    const { root } = await this.paths();
+    const result: Array<WorktreeInfo & { missing: boolean }> = [];
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      const id = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name)?.[1];
+      if (!entry.isFile() || !id) continue;
+      const found = await this.registeredEntry(id).catch(() => undefined);
+      if (found) result.push({ ...found.info, missing: found.missing });
+    }
+    return result;
+  }
+
+  private async registeredEntry(
+    worktreeId: string,
+  ): Promise<{ info: WorktreeInfo; missing: boolean } | undefined> {
     if (!worktreeIdPattern.test(worktreeId)) throw new Error('invalid worktree id');
     const { root } = await this.paths();
     const info = await this.readInfo(root, worktreeId);
-    if (!info || info.path !== path.join(root, worktreeId)) return;
+    if (!info || info.path !== path.join(root, worktreeId)) return undefined;
     let missing = false;
     try {
       if ((await realpath(info.path)) !== info.path) {
@@ -360,7 +452,7 @@ export class WorktreeManager implements Workspaces {
       if (errorCode(error) !== 'ENOENT') throw error;
       missing = true;
     }
-    await this.removeWorktree(info, options.force === true, missing);
+    return { info, missing };
   }
 
   async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
@@ -650,11 +742,18 @@ export class WorktreeManager implements Workspaces {
     return { baseBranch, baseCommit };
   }
 
-  private async removeWorktree(info: WorktreeInfo, force: boolean, missing = false): Promise<void> {
+  private async removeWorktree(
+    info: WorktreeInfo,
+    force: boolean,
+    missing = false,
+    dryRun = false,
+    options: { keepBranch?: boolean; landed?: readonly string[] } = {},
+  ): Promise<void> {
     const { root } = await this.paths();
-    const release = await this.lockRemoval(info.id);
+    // A dry run writes nothing: no lock, and stale markers are left where they are.
+    const release = dryRun ? async () => {} : await this.lockRemoval(info.id);
     try {
-      if (await this.isBusy(info.id)) {
+      if (await this.isBusy(info.id, !dryRun)) {
         throw new WorktreeKeptError('in use by a merge', 'worktree is in use by a merge');
       }
       const branchRef = taskBranch(info.id);
@@ -687,7 +786,8 @@ export class WorktreeManager implements Workspaces {
           );
         }
       }
-      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip);
+      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip, options.landed ?? []);
+      if (dryRun) return;
       if (missing) {
         // Only this worktree's registration: `git worktree prune` would also prune the user's own.
         if (gitDirectory) await rm(gitDirectory, { recursive: true, force: true });
@@ -696,7 +796,9 @@ export class WorktreeManager implements Workspaces {
         await this.removeCheckout(info, gitDirectory);
       }
       // Only the tip that was checked: a branch moved since then is left alone.
-      if (branchTip) await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
+      if (branchTip && !options.keepBranch) {
+        await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
+      }
       await rm(this.infoPath(root, info.id), { force: true });
     } finally {
       await release();
@@ -736,6 +838,7 @@ export class WorktreeManager implements Workspaces {
     info: WorktreeInfo,
     gitDirectory: string | undefined,
     branchTip: string | undefined,
+    landed: readonly string[] = [],
   ): Promise<void> {
     const unverifiable = (reason: string) =>
       new WorktreeKeptError(
@@ -786,7 +889,14 @@ export class WorktreeManager implements Workspaces {
       }
     }
 
-    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits]);
+    // Landed commits go to `rev-list --stdin`: anything but a full commit id could be read there as
+    // a revision expression or an option.
+    if (landed.some((commit) => !commitIdPattern.test(commit))) {
+      throw unverifiable('a landed commit is not a full commit id');
+    }
+    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits, ...landed]);
+    // One that is gone (pruned by git gc) covers nothing, and keeps nothing either.
+    const covering = landed.filter((commit) => shared.has(commit));
     if (privateCommits.some((commit) => !shared.has(commit))) {
       // Integration copies only what HEAD reaches: commits left behind by an amend or a reset
       // can never be integrated, so say how to let them go.
@@ -821,7 +931,7 @@ export class WorktreeManager implements Workspaces {
     const unique = (
       await this.git(
         ['rev-list', '--max-count=1', '--stdin'],
-        `${[...candidates, ...others.map((tip) => `^${tip}`)].join('\n')}\n`,
+        `${[...candidates, ...[...others, ...covering].map((tip) => `^${tip}`)].join('\n')}\n`,
       )
     ).trim();
     if (unique) {
@@ -915,8 +1025,11 @@ export class WorktreeManager implements Workspaces {
     }
   }
 
-  private async isBusy(id: string): Promise<boolean> {
-    const directory = await this.locksDirectory();
+  private async isBusy(id: string, sweep = true): Promise<boolean> {
+    const { root } = await this.paths();
+    const directory = path.join(root, locksDirectoryName);
+    if (!sweep && !(await stat(directory).catch(() => undefined))) return false;
+    if (sweep) await this.locksDirectory();
     const prefix = `${id}.busy.`;
     for (const name of await readdir(directory)) {
       if (!name.startsWith(prefix)) continue;
@@ -926,7 +1039,7 @@ export class WorktreeManager implements Workspaces {
       if (modified === undefined) continue;
       if (holderIsLive(pid, modified)) return true;
       // Left by a manager that died mid-merge.
-      await rm(marker, { force: true });
+      if (sweep) await rm(marker, { force: true });
     }
     return false;
   }

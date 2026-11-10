@@ -10,11 +10,14 @@ import type { Io } from './io.js';
 export type { Io };
 
 const USAGE = `usage:
-  tacet init [--worker ADAPTER] [--model MODEL] [--json]
-                                 set up .tacet/ in this repo (never overwrites a file)
-  tacet uninstall [--apply] [--purge] [--json]
+  tacet init [--worker ADAPTER] [--model MODEL] [--keep-merged-worktrees] [--json]
+                                 set up .tacet/ in this repo (never overwrites a file); Worker
+                                 checkouts are removed once their work is merged, unless kept
+  tacet uninstall [--apply] [--purge [--force]] [--json]
                                  preview, then remove what init wrote (--purge: all of .tacet/,
-                                 after a backup to ~/.tacet/backups)
+                                 after a backup to ~/.tacet/backups, and the repo's run state:
+                                 event log and Worker checkouts; --force: even checkouts holding
+                                 unintegrated work; tacet/* branches are kept)
   tacet run [--accept TEXT]... [--single] [--json] "<task>"
                                  run a task in this repo until it is done (standalone)
   tacet run --resume [--answer ID=TEXT]...
@@ -37,8 +40,18 @@ const COMMON = {
 } as const;
 
 const OPTIONS = {
-  init: { ...COMMON, worker: { type: 'string' }, model: { type: 'string' } },
-  uninstall: { ...COMMON, apply: { type: 'boolean' }, purge: { type: 'boolean' } },
+  init: {
+    ...COMMON,
+    worker: { type: 'string' },
+    model: { type: 'string' },
+    'keep-merged-worktrees': { type: 'boolean' },
+  },
+  uninstall: {
+    ...COMMON,
+    apply: { type: 'boolean' },
+    purge: { type: 'boolean' },
+    force: { type: 'boolean' },
+  },
   run: {
     ...COMMON,
     accept: { type: 'string', multiple: true },
@@ -87,7 +100,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
         return await init(io, v);
       case 'uninstall':
         if (positionals.length > 0) return usage(io);
-        return uninstall(io, v);
+        return await uninstall(io, v);
       case 'run':
         if (positionals.length > 0 && values.resume) {
           io.err('give a task or --resume, not both');

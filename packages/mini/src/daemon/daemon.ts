@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
@@ -84,6 +92,12 @@ export interface MiniConductorOptions {
   now?: () => Date;
   /** How often to look for answered escalations, in ms. Default 1000. */
   pollMs?: number;
+  /**
+   * How often to look for finished tasks whose result landed in its target, and free their
+   * Worker checkouts when `worktrees.remove_merged` is on (#210), in ms. Default 10 minutes; it
+   * also runs once at start.
+   */
+  landedSweepMs?: number;
 }
 
 /** What the pool knows about each Worker session, rebuilt from `worker.*` events. */
@@ -98,6 +112,8 @@ interface SessionRecord {
   refused?: boolean;
   /** The commit its checkout started at (#134). */
   baseCommit?: string;
+  /** The local branch its checkout started from, when it did: its task's target (#210). */
+  baseBranch?: string;
 }
 
 interface EscalationRecord {
@@ -234,6 +250,13 @@ export class MiniConductor {
   /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
+  #sweepTimer: NodeJS.Timeout | undefined;
+  /** The generation whose landed sweep is in flight, so a slow one is never started twice. */
+  #sweepingGen: number | undefined;
+  /** Landed-sweep problems already reported, so a slow timer does not grow `errors` forever. */
+  readonly #sweepErrors = new Set<string>();
+  /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
+  readonly #closing = new Set<string>();
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -322,6 +345,9 @@ export class MiniConductor {
     this.#timer = setInterval(() => this.#kick(), this.#o.pollMs ?? 1000);
     this.#timer.unref();
     this.#kick();
+    this.#sweepTimer = setInterval(() => this.#sweep(), this.#o.landedSweepMs ?? 10 * 60_000);
+    this.#sweepTimer.unref();
+    this.#sweep();
   }
 
   /** Accept a task. Returns its id; planning and scheduling continue in the background. */
@@ -417,6 +443,7 @@ export class MiniConductor {
     this.#gen += 1;
     this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
     await this.#ticking;
     await Promise.all([...this.#runs.values()].map((r) => this.#end(r, 'restart')));
     await Promise.allSettled([...this.#inflight]);
@@ -432,6 +459,7 @@ export class MiniConductor {
     this.#gen += 1;
     this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
     this.#runs.clear();
     this.#unlock();
   }
@@ -795,6 +823,9 @@ export class MiniConductor {
           ...results.flatMap((r) => r.openQuestions ?? []),
           ...(published?.question ? [published.question] : []),
         ],
+        ...(published?.commit && published.ref
+          ? { published: { ref: published.ref, commit: published.commit } }
+          : {}),
       };
       this.#o.store.append([
         this.#env(parent.task.id, 'task.result', summary),
@@ -804,6 +835,129 @@ export class MiniConductor {
         }),
       ]);
     }
+  }
+
+  // ---- landed results (#210) ------------------------------------------------------------
+
+  #sweep(): void {
+    // One per generation: a sweep left over from before a stop exits at its next liveness check.
+    if (!this.#started || this.#sweepingGen === this.#gen) return;
+    const gen = this.#gen;
+    this.#sweepingGen = gen;
+    this.#track(
+      this.#sweepLanded(gen).finally(() => {
+        if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
+      }),
+    );
+  }
+
+  /**
+   * Free the Worker checkouts of finished tasks whose result landed in its target (#210), when
+   * `worktrees.remove_merged` is on. The user merges outside Tacet, so this looks again on a slow
+   * timer: for each completed task with a published result and a checkout left, it records
+   * `task.landed` once the result is merged or squash-merged into the branch its checkouts started
+   * from (only when they all agree on one), then removes each checkout with the result as landed.
+   * The worktree manager still keeps any with local files or work the result does not contain.
+   */
+  async #sweepLanded(gen: number): Promise<void> {
+    if (this.#o.config.worktrees?.remove_merged === false) return;
+    const integrator = this.#o.integrator;
+    if (!integrator?.landed) return;
+    const v = this.#state();
+    const inUse = () =>
+      new Set([...[...this.#runs.values()].map((r) => r.workspace.id), ...this.#closing]);
+    for (const root of Object.values(v.tasks)) {
+      if (!this.#live(gen)) return;
+      if (root.task.parentId || root.state !== 'completed') continue;
+      const result = this.#o.store
+        .query({ taskId: root.task.id, typePrefix: 'task.result' })
+        .at(-1)?.envelope;
+      const published = (result?.data as SummaryPacket | undefined)?.published;
+      if (!result || !published) continue;
+      const subs = new Set(
+        Object.values(v.tasks)
+          .filter((t) => t.task.parentId === root.task.id)
+          .map((t) => t.task.id),
+      );
+      const sessions = [...v.sessions.values()].filter((s) => subs.has(s.taskId));
+      const busy = inUse();
+      const workspaceIds = [
+        ...new Set(sessions.flatMap((s) => (s.workspaceId ? [s.workspaceId] : []))),
+      ].filter((id) => !busy.has(id));
+      const left: string[] = [];
+      for (const id of workspaceIds) if (await this.#o.workspaces.get(id)) left.push(id);
+      if (left.length === 0 || !this.#live(gen)) continue;
+
+      const recorded = this.#o.store
+        .query({ taskId: root.task.id, typePrefix: 'task.landed' })
+        .some((e) => (e.envelope.data as { commit?: unknown }).commit === published.commit);
+      if (!recorded) {
+        const branches = new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
+        // No target, or sub-tasks that started from different branches: nothing to compare.
+        if (branches.size !== 1) continue;
+        const target = `refs/heads/${[...branches][0]}`;
+        let landed: Awaited<ReturnType<NonNullable<Integrator['landed']>>>;
+        try {
+          landed = await integrator.landed(published.commit, target);
+        } catch (err) {
+          const key = `${root.task.id} ${(err as Error).message}`;
+          if (!this.#sweepErrors.has(key)) {
+            this.#sweepErrors.add(key);
+            this.#errors.push(err);
+          }
+          continue;
+        }
+        if (!landed || !this.#live(gen)) continue;
+        this.#o.store.append({
+          ...this.#env(root.task.id, 'task.landed', {
+            commit: published.commit,
+            target,
+            how: landed.how,
+            ...(landed.landedAs ? { landedAs: landed.landedAs } : {}),
+          }),
+          causationId: result.id,
+        });
+      }
+      for (const id of left) {
+        if (!this.#live(gen) || inUse().has(id)) continue;
+        const superseded = await this.#supersededIn(id, sessions);
+        if (!this.#live(gen) || inUse().has(id)) continue;
+        // Kept (local files, or work none of these contain) until the user forces it.
+        await this.#o.workspaces
+          .remove(id, { landed: [published.commit, ...superseded] })
+          .catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Owner decision on #210: a commit integrated and then replaced by a later integration counts as
+   * covered once its task landed. Narrowed so it never frees work that did not land: only commits
+   * of a session that ran in this checkout, replaced by that same session's next integration, and
+   * only as an amend does (the same first parent), never unrelated work after a reset. Reflog
+   * reachability alone never counts.
+   */
+  async #supersededIn(workspaceId: string, sessions: readonly SessionRecord[]): Promise<string[]> {
+    const replaces = this.#o.integrator?.replaces?.bind(this.#o.integrator);
+    if (!replaces) return [];
+    const superseded: string[] = [];
+    const workspace = await this.#o.workspaces.get(workspaceId);
+    if (!workspace) return [];
+    for (const s of sessions) {
+      if (s.workspaceId !== workspaceId) continue;
+      const integrated = this.#o.store
+        .query({ sessionId: s.sessionId, typePrefix: 'worker.integrated' })
+        .map((e) => e.envelope.data as { sessionId?: unknown; commit?: unknown })
+        .filter((d) => d.sessionId === s.sessionId && typeof d.commit === 'string')
+        .map((d) => d.commit as string);
+      for (let i = 0; i + 1 < integrated.length; i += 1) {
+        const [earlier, later] = [integrated[i], integrated[i + 1]] as [string, string];
+        if (await replaces(earlier, later, workspace).catch(() => false)) {
+          superseded.push(earlier);
+        }
+      }
+    }
+    return superseded;
   }
 
   /**
@@ -1043,6 +1197,7 @@ export class MiniConductor {
           attempt: failed + 1,
           ...(last ? { previousSessionId: last.sessionId } : {}),
           ...(baseCommit !== undefined ? { baseCommit } : {}),
+          ...(workspace.baseBranch !== undefined ? { baseBranch: workspace.baseBranch } : {}),
         },
         sessionId,
       ),
@@ -1768,6 +1923,21 @@ export class MiniConductor {
     if (this.#runs.get(run.subtaskId) !== run) return;
     // A verification still running for it stops (its result is not used).
     run.verifyAbort?.abort();
+    // Until it is closed and discarded below, the landed sweep must not take its checkout.
+    this.#closing.add(run.workspace.id);
+    try {
+      await this.#endRun(run, reason, message, extra);
+    } finally {
+      this.#closing.delete(run.workspace.id);
+    }
+  }
+
+  async #endRun(
+    run: Run,
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled',
+    message: string | undefined,
+    extra: { workspaceRefused?: boolean },
+  ): Promise<void> {
     this.#runs.delete(run.subtaskId);
     run.revoke();
     this.#o.store.append(
@@ -2029,6 +2199,27 @@ export async function cancelStopped(
   }
 }
 
+/**
+ * Run `fn` while holding the repo's Mini-conductor lock as `tacet run` takes it (a live holder is
+ * refused, a stale lock is taken over), after ending the Worker processes a crashed Mini-conductor
+ * left running (#127), as `cancelStopped` does. For maintenance that must not race a run, such as
+ * `tacet uninstall --purge` (#211). Throws when a run holds the lock; returns `fn`'s result and the
+ * problems met ending stale Workers.
+ */
+export async function withStoppedMini<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+  processFile = `${lockPath}.workers`,
+): Promise<{ result: T; errors: unknown[] }> {
+  takeMiniLock(lockPath);
+  try {
+    const errors = existsSync(processFile) ? await endStaleWorkerProcesses(processFile) : [];
+    return { result: await fn(), errors };
+  } finally {
+    releaseMiniLock(lockPath);
+  }
+}
+
 /** One reading of the log, rebuilt only when it has grown since `prev`. */
 function readView(store: EventStore, prev?: View): View {
   const count = store.count();
@@ -2056,12 +2247,14 @@ function readView(store: EventStore, prev?: View): View {
         const adapter = str('adapter');
         const workspaceId = str('workspaceId');
         const baseCommit = str('baseCommit');
+        const baseBranch = str('baseBranch');
         sessions.set(id, {
           sessionId: id,
           taskId: e.taskId,
           ...(adapter ? { adapter } : {}),
           ...(workspaceId ? { workspaceId } : {}),
           ...(baseCommit ? { baseCommit } : {}),
+          ...(baseBranch ? { baseBranch } : {}),
         });
       } else {
         const s = sessions.get(id);
