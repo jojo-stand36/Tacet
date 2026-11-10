@@ -8,12 +8,14 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { AgentEvent } from '@tacet/core';
 import { ProfileRefusedError } from '@tacet/core';
-import { mcpAuthHeaders, Secret } from '@tacet/core/node';
+import { mcpAuthHeaders, repoStateDir, Secret } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AcpAdapter, AuthRoutingError } from './adapter.js';
@@ -645,6 +647,90 @@ describe('AcpAdapter (fake ACP agent)', () => {
         expect(() => make(spec(false, 'native'))).toThrow(/fork 'native' needs resume/);
         expect(() => make(spec(true, 'emulated'))).toThrow(/not offered over ACP/);
       });
+    });
+  });
+
+  describe('discard (#232)', () => {
+    // A spec with a home and the claude-acp layout, on the fake agent (sessions `fake-session-1`).
+    const homed = (): AcpAgentSpec => {
+      const base = customAcpAgent('homed', { command: ['homed'] });
+      return {
+        ...base,
+        capabilities: { ...base.capabilities, resume: true },
+        home: { env: 'HOMED_HOME', files: {} },
+        sessionFiles: CLAUDE_ACP_AGENT.sessionFiles as readonly string[],
+      };
+    };
+    const homeOf = (state: string) => join(repoStateDir(join(root, 'repo'), state), 'acp-homed');
+    const put = (dir: string, rel: string) => {
+      mkdirSync(dirname(join(dir, rel)), { recursive: true });
+      writeFileSync(join(dir, rel), 'transcript');
+    };
+
+    it("removes a closed session's files from the agent's home, refusing an open one", async () => {
+      const state = join(root, 'state');
+      const adapter = make(homed(), {}, { stateDir: state, repoRoot: join(root, 'repo') });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      expect(h.vendorSessionId).toBe('fake-session-1');
+      const home = homeOf(state);
+      put(home, 'projects/-wt/fake-session-1.jsonl');
+      put(home, 'file-history/fake-session-1/f@v1');
+      put(home, 'projects/-wt/other-session.jsonl');
+      await expect(adapter.discard('fake-session-1', join(root, 'wt'))).rejects.toThrow(
+        /still open/,
+      );
+      expect(existsSync(join(home, 'projects/-wt/fake-session-1.jsonl'))).toBe(true);
+      await adapter.close(h);
+      await adapter.discard('fake-session-1', join(root, 'wt'));
+      expect(existsSync(join(home, 'projects/-wt/fake-session-1.jsonl'))).toBe(false);
+      expect(existsSync(join(home, 'file-history/fake-session-1'))).toBe(false);
+      expect(existsSync(join(home, 'projects/-wt/other-session.jsonl'))).toBe(true);
+      // The cwd may be gone; the home is found by the repo, and a bad id is refused.
+      await adapter.discard('other-session', join(root, 'gone'));
+      expect(existsSync(join(home, 'projects/-wt/other-session.jsonl'))).toBe(false);
+      await expect(adapter.discard('../x', join(root, 'wt'))).rejects.toThrow(/not a session id/);
+    });
+
+    it('never makes a home just to discard, and keeps sessions of agents without a layout', async () => {
+      const state = join(root, 'state');
+      await make(homed(), {}, { stateDir: state, repoRoot: join(root, 'repo') }).discard(
+        'fake-session-1',
+        join(root, 'wt'),
+      );
+      expect(existsSync(homeOf(state))).toBe(false);
+      const { sessionFiles, ...bare } = homed();
+      expect(sessionFiles).toBeDefined();
+      mkdirSync(homeOf(state), { recursive: true, mode: 0o700 });
+      put(homeOf(state), 'projects/-wt/s1.jsonl');
+      await make(bare, {}, { stateDir: state, repoRoot: join(root, 'repo') }).discard(
+        's1',
+        join(root, 'wt'),
+      );
+      expect(existsSync(join(homeOf(state), 'projects/-wt/s1.jsonl'))).toBe(true);
+    });
+
+    it('sweeps sessions older than the retention when it first prepares the home, never the one resumed', async () => {
+      const state = join(root, 'state');
+      const home = homeOf(state);
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const old = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+      for (const id of ['old-1', 'resumed-1', 'new-1']) {
+        put(home, `projects/-wt/${id}.jsonl`);
+        if (id !== 'new-1') utimesSync(join(home, `projects/-wt/${id}.jsonl`), old, old);
+      }
+      const adapter = make(
+        homed(),
+        { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }) },
+        { stateDir: state, repoRoot: join(root, 'repo'), retentionDays: 7 },
+      );
+      const h = await adapter.start({
+        cwd: join(root, 'wt'),
+        resume: { vendorSessionId: 'resumed-1' },
+      });
+      expect(existsSync(join(home, 'projects/-wt/old-1.jsonl'))).toBe(false);
+      expect(existsSync(join(home, 'projects/-wt/resumed-1.jsonl'))).toBe(true);
+      expect(existsSync(join(home, 'projects/-wt/new-1.jsonl'))).toBe(true);
+      await adapter.close(h);
     });
   });
 

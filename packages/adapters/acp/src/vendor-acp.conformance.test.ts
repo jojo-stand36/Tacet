@@ -317,6 +317,57 @@ for (const c of CASES) {
       },
     );
 
+    it.runIf(c.name === 'claude-agent-acp')(
+      "discards a finished Worker session's transcript, and keeps one for a restart (#232)",
+      { timeout: 180_000 },
+      async () => {
+        const spec = claudeAcpWorkerSpec(c.agent(api.url));
+        // Resume as #224 declares it; the files are the same either way.
+        const worker = new AcpAdapter({
+          agent: { ...spec, capabilities: { ...spec.capabilities, resume: true } },
+          executable: [process.execPath, c.bin],
+          killTimeoutMs: 2000,
+          stateDir: state,
+          repoRoot: join(root, 'repo-232'),
+          baseEnv: { PATH: process.env.PATH, HOME: home, ...c.env(api.url) },
+        });
+        const cwd = join(root, 'wt-232');
+        mkdirSync(cwd, { recursive: true });
+        const turn = async (resume: string | undefined, word: string) => {
+          const h = await worker.start({
+            cwd,
+            ...(resume ? { resume: { vendorSessionId: resume } } : {}),
+          });
+          const tap = new EventTap(worker.events(h));
+          await worker.send(h, { text: `SAY ${word}` });
+          await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+          await worker.close(h);
+          return h.vendorSessionId as string;
+        };
+        /** Files in the state dir named by the session, or holding the word. */
+        const traces = (id: string, word: string) => {
+          const all = snapshot(state);
+          return Object.keys(all).filter(
+            (p) => p.includes(id) || readFileSync(join(state, p), 'utf8').includes(word),
+          );
+        };
+
+        const done = await turn(undefined, 'done232');
+        expect(traces(done, 'done232').some((p) => p.endsWith(`${done}.jsonl`))).toBe(true);
+        await worker.discard(done, cwd);
+        expect(traces(done, 'done232')).toEqual([]);
+
+        // Ended for a restart: not discarded, so still there and still resumable.
+        const kept = await turn(undefined, 'kept232');
+        expect(traces(kept, 'kept232').some((p) => p.endsWith(`${kept}.jsonl`))).toBe(true);
+        expect(await turn(kept, 'again232')).toBe(kept);
+        const resumed = api.requests.findLast((r) => r.raw.includes('again232'));
+        expect(resumed?.raw).toContain('SAY kept232');
+        await worker.discard(kept, cwd);
+        expect(traces(kept, 'kept232')).toEqual([]);
+      },
+    );
+
     it.runIf(c.name === 'codex-acp')(
       'keeps the key from the commands it runs (#150)',
       { timeout: 120_000 },
