@@ -324,14 +324,10 @@ for (const c of CASES) {
         // The production Worker spec, which declares resume and fork.
         const spec = claudeAcpWorkerSpec(c.agent(api.url));
         expect(spec.capabilities).toMatchObject({ resume: true, fork: 'native' });
-        const make = (agent: AcpAgentSpec = spec) =>
-          new AcpAdapter({
-            agent,
-            executable: [process.execPath, c.bin],
-            killTimeoutMs: 2000,
-            stateDir: state,
-            baseEnv: { PATH: process.env.PATH, HOME: home, ...c.env(api.url) },
-          });
+        expect(spec.sessionMode).toBe('default');
+        // The same Worker options without the mode pin, and without any session options.
+        const { sessionMode: _mode, ...unpinned } = spec;
+        const { sessionMeta: _meta, ...bare } = spec;
         // A checkout a Worker could have written: a hook, CLAUDE.md and .mcp.json (#181).
         const cwd = join(root, 'wt-224');
         const ran = join(root, 'hook-ran-224');
@@ -353,25 +349,44 @@ for (const c of CASES) {
         );
         const outside = join(root, 'outside-224.txt');
         writeFileSync(outside, 'outside\n');
-        type Req = { text?: string; tools?: string[]; raw: string; messages?: number };
+        // A Worker MCP token, as the Mini-conductor mints one per session: never written to disk.
+        const token = 'tacet-worker-token-224-0123456789abcdef';
+        type Req = { text?: string; tools?: string[]; raw: string };
         const reqs = () => api.requests as unknown as Req[];
-        /** One session: a word to say, then a read outside the checkout that must be asked. */
+        /** One session: a word to say, then a read outside the checkout, which must be asked. */
         const session = async (
+          agent: AcpAgentSpec,
           resume: { vendorSessionId: string; fork?: boolean } | undefined,
           word: string,
-          agent: AcpAgentSpec = spec,
         ) => {
-          const a = make(agent);
-          const h = await a.start({ cwd, ...(resume ? { resume } : {}) });
+          const a = new AcpAdapter({
+            agent,
+            executable: [process.execPath, c.bin],
+            killTimeoutMs: 2000,
+            stateDir: state,
+            baseEnv: { PATH: process.env.PATH, HOME: home, ...c.env(api.url) },
+          });
+          const from = reqs().length;
+          const h = await a.start({
+            cwd,
+            ...(resume ? { resume } : {}),
+            mcpServers: [
+              {
+                name: 'tacet',
+                url: 'http://127.0.0.1:1/mcp',
+                headers: { authorization: `Bearer ${token}` },
+              },
+            ],
+          });
           const tap = new EventTap(a.events(h));
           await a.send(h, { text: `SAY ${word}` });
           await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
-          const from = tap.events.length;
+          const at = tap.events.length;
           await a.send(h, { text: `READ_TOOL ${outside}` });
           const asked = await tap.waitFor(
             (e) => e.t === 'approval.request' || (e.t === 'status' && e.state === 'idle'),
             60_000,
-            from + 1,
+            at + 1,
           );
           if (asked.event.t === 'approval.request') {
             await a.respond(h, asked.event.id, { kind: 'reject', persist: false });
@@ -383,28 +398,40 @@ for (const c of CASES) {
           }
           await new Promise((r) => setTimeout(r, 500));
           await a.close(h);
+          const mine = reqs().slice(from);
           // In this container a parent `.git` can prefix the prompt with a git status.
-          const said = reqs().filter((r) => (r.text ?? '').endsWith(`SAY ${word}`));
-          const tools = (said.at(-1)?.tools ?? []).filter(
+          const said = mine.filter((r) => (r.text ?? '').endsWith(`SAY ${word}`)).at(-1);
+          const tools = (said?.tools ?? []).filter(
             (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
           );
           return {
             id: h.vendorSessionId as string,
             asked: asked.event.t === 'approval.request',
             tools: tools.sort(),
-            history: said.at(-1)?.messages ?? 0,
-            claudeMd: said.some((r) => r.raw.includes('CLAUDEMD-MARKER-224')),
+            raw: said?.raw ?? '',
+            // Every request of the session, the title and suggestion calls included.
+            claudeMd: mine.some((r) => r.raw.includes('CLAUDEMD-MARKER-224')),
           };
         };
         const allow = [...CLAUDE_ACP_WORKER_OPTIONS.tools].sort();
-        const first = await session(undefined, 'first224');
-        expect(first).toMatchObject({ asked: true, tools: allow, claudeMd: false });
 
-        const resumed = await session({ vendorSessionId: first.id }, 'resumed224');
+        // The source runs unpinned, so its transcript records the vendor's own mode (`auto`), in
+        // which the outside read runs unasked: a resume or fork that asked would then show that
+        // Tacet pinned the mode again, not that the vendor restored a pinned one.
+        const first = await session(unpinned, undefined, 'first224');
+        expect(first).toMatchObject({ asked: false, tools: allow, claudeMd: false });
+
+        // Resumed without the pin, it stays in the recorded mode and reads unasked: the vendor does
+        // not restore a safe mode by itself (claude-agent-acp 0.101.0 resumes in the mode its
+        // transcript's last prompt records).
+        const stale = await session(unpinned, { vendorSessionId: first.id }, 'stale224');
+        expect(stale.asked).toBe(false);
+
+        const resumed = await session(spec, { vendorSessionId: first.id }, 'resumed224');
         expect(resumed.id).toBe(first.id);
         expect(resumed).toMatchObject({ asked: true, tools: allow, claudeMd: false });
-        // It continued the conversation: the earlier turns were sent again.
-        expect(resumed.history).toBeGreaterThan(first.history);
+        // It continued the conversation: the earlier turn was sent again.
+        expect(resumed.raw).toContain('SAY first224');
 
         // The source's transcript, which a fork must leave as it is.
         const transcripts = () =>
@@ -413,23 +440,36 @@ for (const c of CASES) {
           );
         const sourceBefore = transcripts();
         expect(Object.keys(sourceBefore)).toHaveLength(1);
-        const forked = await session({ vendorSessionId: first.id, fork: true }, 'forked224');
+        const forked = await session(spec, { vendorSessionId: first.id, fork: true }, 'forked224');
         expect(forked.id).not.toBe(first.id);
         expect(forked).toMatchObject({ asked: true, tools: allow, claudeMd: false });
-        expect(forked.history).toBeGreaterThan(first.history);
-
+        expect(forked.raw).toContain('SAY first224');
+        expect(forked.raw).toContain('SAY resumed224');
         expect(transcripts()).toEqual(sourceBefore);
 
-        // Nothing from the checkout ran in any of them.
+        // Nothing from the checkout ran in any of them, and the token is nowhere on disk.
         expect(existsSync(ran)).toBe(false);
         expect(existsSync(mcpRan)).toBe(false);
+        const leaked = Object.keys(snapshot(state)).filter((p) =>
+          readFileSync(join(state, p), 'utf8').includes(token),
+        );
+        expect(leaked).toEqual([]);
 
-        // Control: the same resume without the Worker options offers a shell and reads the
-        // checkout's CLAUDE.md, so the checks above would have caught a session losing them.
-        const { sessionMeta: _, ...bare } = spec;
-        const control = await session({ vendorSessionId: first.id }, 'control224', bare);
+        // Controls: the same resume and fork without the session options offer a shell, read the
+        // checkout's CLAUDE.md, and run its hook and MCP server, so each check above would have
+        // caught a session that lost them.
+        const control = await session(bare, { vendorSessionId: first.id }, 'control224');
         expect(control.tools).toContain('Bash');
         expect(control.claudeMd).toBe(true);
+        const controlFork = await session(
+          bare,
+          { vendorSessionId: first.id, fork: true },
+          'controlfork224',
+        );
+        expect(controlFork.tools).toContain('Bash');
+        expect(controlFork.claudeMd).toBe(true);
+        expect(existsSync(ran)).toBe(true);
+        expect(existsSync(mcpRan)).toBe(true);
       },
     );
 
