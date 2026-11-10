@@ -1003,9 +1003,11 @@ describe('MiniConductor', () => {
       'reject',
     ]);
     expect(claude.approvalsAnswered[1]?.message).toMatch(/leaves the worktree.*escalate/);
+    // Owner decision: allows are transcript-grade, refusals summary-grade.
+    const allowed = ofType('agent.approval.decision').map((e) => e.data as Record<string, unknown>);
+    expect(allowed.map((x) => [x.toolName, x.decision])).toEqual([['Edit', 'allowed']]);
     const recorded = ofType('worker.approval').map((e) => e.data as Record<string, unknown>);
     expect(recorded.map((x) => [x.toolName, x.decision])).toEqual([
-      ['Edit', 'allowed'],
       ['Write', 'refused'],
       ['Write', 'refused'],
       ['Bash', 'refused'],

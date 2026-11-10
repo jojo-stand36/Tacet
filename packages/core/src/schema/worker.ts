@@ -183,8 +183,10 @@ export const WorkerThrottled = z.object({
 export type WorkerThrottled = z.infer<typeof WorkerThrottled>;
 
 /**
- * Payload of `worker.approval`: how the Mini-conductor answered an unattended Worker's approval
- * request (#200; the interim policy until #25). `reason` never holds a path outside the Worker's
+ * Payload of `worker.approval`: an unattended Worker's approval request the Mini-conductor
+ * refused (#200; the interim policy until #25). Summary-grade, kept and forwarded. An allowed
+ * request is recorded with the same payload as transcript-grade `agent.approval.decision`, which
+ * retention drops (owner decision, 2026-11-10). `reason` never holds a path outside the Worker's
  * checkout; the request itself, with the tool's input, is the transcript event before it.
  */
 export const WorkerApproval = z.object({

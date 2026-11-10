@@ -168,6 +168,51 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Read', { file_path: 'src/linked' }).allow).toBe(true);
   });
 
+  it('refuses writes to agent, hook and tool config, at any depth and in any case (owner, #200)', () => {
+    const writes = [
+      '.claude/settings.json',
+      'pkg/.claude/hooks.json',
+      '.Claude',
+      '.mcp.json',
+      'sub/.MCP.json',
+      '.husky/pre-commit',
+      '.vscode/tasks.json',
+      '.vscode/launch.json',
+      '.envrc',
+      '.cursor/rules/x.mdc',
+      '.github/workflows/ci.yml',
+      '.npmrc',
+      '.yarnrc.yml',
+      '.gemini/settings.json',
+      '.codex/config.toml',
+    ];
+    for (const p of writes) {
+      const r = ask('Write', { file_path: p, content: '' });
+      expect({ p, allow: r.allow }).toEqual({ p, allow: false });
+      expect(r.reason).toMatch(/escalate/);
+    }
+    expect(ask('Edit', { file_path: '.mcp.json', old_string: 'a', new_string: 'b' }).allow).toBe(
+      false,
+    );
+    // Through a symlink that resolves to one.
+    mkdirSync(join(wt, '.husky'));
+    symlinkSync(join(wt, '.husky'), join(wt, 'hooks'));
+    expect(ask('Write', { file_path: 'hooks/pre-commit', content: '' }).allow).toBe(false);
+    // Reading them is fine, and similar names are not config.
+    expect(ask('Read', { file_path: '.claude/settings.json' }).allow).toBe(true);
+    for (const p of [
+      '.github/CODEOWNERS',
+      'docs/claude.md',
+      '.vscode/extensions.json',
+      'src/envrc.ts',
+    ]) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: true,
+      });
+    }
+  });
+
   it('checks the literal directory of a glob like a path', () => {
     symlinkSync(outside, join(wt, 'out'));
     expect(ask('Glob', { pattern: 'out/**' }).allow).toBe(false);

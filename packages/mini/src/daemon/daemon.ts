@@ -1149,10 +1149,12 @@ export class MiniConductor {
                 run.workspace.path,
               );
           if (d) {
+            // Owner decision on #200: refusals are summary-grade (kept and forwarded), allows are
+            // transcript-grade (`agent.approval.decision`, dropped by retention).
             this.#o.store.append(
               this.#env(
                 run.subtaskId,
-                'worker.approval',
+                d.allow ? 'agent.approval.decision' : 'worker.approval',
                 {
                   sessionId: run.sessionId,
                   requestId: e.id.slice(0, 200),

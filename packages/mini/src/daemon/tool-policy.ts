@@ -85,6 +85,52 @@ const FILE_TOOLS: Record<string, FileTool> = {
   },
 };
 
+/**
+ * Agent, editor, hook and package-manager config a Worker may not write (owner decision on #200,
+ * 2026-11-10). Tacet's own sessions never load them (no setting sources, a strict MCP config,
+ * git hooks off), but the user's tools would, once the user opens or merges the branch: a hook,
+ * an MCP server command or a task there runs code. Matched at any depth and in any letter case,
+ * on the path after symlinks are resolved. A task that needs one of these escalates.
+ * Directories: anything inside them. Files: that name anywhere.
+ */
+const PROTECTED_DIRS: readonly string[][] = [
+  ['.claude'],
+  ['.cursor'],
+  ['.gemini'],
+  ['.codex'],
+  ['.husky'],
+  ['.github', 'workflows'],
+];
+const PROTECTED_FILES: readonly string[] = [
+  '.mcp.json',
+  '.envrc',
+  '.npmrc',
+  '.yarnrc',
+  '.yarnrc.yml',
+];
+/** Editor files that can run commands: `.vscode/tasks.json` and its siblings. */
+const PROTECTED_IN: readonly [string, string][] = [
+  ['.vscode', 'tasks.json'],
+  ['.vscode', 'launch.json'],
+  ['.vscode', 'settings.json'],
+];
+
+/** Whether writing `rel` (relative to the checkout, `/`-separated) would change protected config. */
+function protectedConfig(rel: string): boolean {
+  const segs = rel.split(sep).map((s) => s.toLowerCase());
+  const name = segs.at(-1) ?? '';
+  if (PROTECTED_FILES.includes(name)) return true;
+  for (let i = 0; i < segs.length; i++) {
+    for (const dir of PROTECTED_DIRS) {
+      if (dir.every((d, j) => segs[i + j] === d) && segs.length > i + dir.length - 1) {
+        // The directory itself, or anything inside it.
+        return true;
+      }
+    }
+  }
+  return PROTECTED_IN.some(([d, f]) => segs.length >= 2 && segs.at(-2) === d && name === f);
+}
+
 /** What adapters put where they scrubbed a secret: a path seen through it is not the real one. */
 const REDACTED = '[redacted]';
 
@@ -144,6 +190,11 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     if (typeof v !== 'string' || v === '') return refuse(`${name}: ${f} is not a path`);
     const at = inside(root, worktree, v, spec.writes);
     if (typeof at !== 'string') return refuse(`${name}: ${at.why}`);
+    if (spec.writes && protectedConfig(at)) {
+      return refuse(
+        `${name}: agent, hook and tool config is not open to Workers; escalate if the task needs it`,
+      );
+    }
     targets.push(at);
   }
   if (spec.needsPath && targets.length === 0) return refuse(`${name}: no path given`);
