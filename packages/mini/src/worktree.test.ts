@@ -1151,6 +1151,27 @@ describe('WorktreeManager', () => {
       expect(await manager.get(used.id)).toBeDefined();
     });
 
+    it('never removes an idle checkout with unintegrated or uncommitted work, however old (#238)', async () => {
+      const committed = await manager.create('committed');
+      await workerCommit(committed.path);
+      const edited = await manager.create('edited');
+      await writeFile(path.join(edited.path, 'README'), 'changed\n');
+      const longAgo = Date.now() - 365 * 86_400_000;
+      const result = await manager.gc({
+        olderThanMs: 86_400_000,
+        lastActivity: new Map([
+          [committed.id, longAgo],
+          [edited.id, longAgo],
+        ]),
+        now: Date.now() + 365 * 86_400_000,
+      });
+      expect(result.removed).toEqual([]);
+      expect(result.skipped.map(({ id }) => id).sort()).toEqual([committed.id, edited.id].sort());
+      expect(await manager.get(committed.id)).toBeDefined();
+      expect(await manager.get(edited.id)).toBeDefined();
+      expect(events('workspace.removed')).toEqual([]);
+    });
+
     it('force-removes a planner checkout a crash left registered, at the next reconcile (#238)', async () => {
       const planner = await manager.create('plan-task', undefined, { scratch: true });
       // The planner wrote to it, then the process died before its own forced removal.
