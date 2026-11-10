@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CLAUDE_ACP_AGENT, claudeAcpWorkerSpec } from '@tacet/adapter-acp';
 import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
 import { gatedTitle, ptyGate } from '@tacet/adapter-pty/testing';
 import type { TacetConfig } from '@tacet/core';
@@ -133,6 +134,57 @@ describe('buildWorkerAdapters', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('refuses a custom preset running claude-agent-acp for Workers: the built-in is hardened (#214)', () => {
+    for (const command of [
+      ['claude-agent-acp'],
+      ['/opt/bin/claude-agent-acp', '--x'],
+      ['npx', '-y', '@agentclientprotocol/claude-agent-acp@0.101.0'],
+      ['sh', '-c', 'exec claude-agent-acp'],
+      ['node', '/x/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js'],
+      ['npx', '@zed-industries/claude-code-acp'],
+      ['claude-code-acp'],
+      ['sh', '-c', 'claude-agent-acp;'],
+      ['sh', '-c', '"claude-agent-acp"'],
+    ]) {
+      expect(() =>
+        buildWorkerAdapters(
+          {
+            tiers: { worker: { adapter: 'acp:mine' } },
+            agents: { mine: { kind: 'acp', command } },
+          },
+          { baseEnv: {} },
+        ),
+      ).toThrow(/agents\.mine runs claude-agent-acp; use acp:claude-acp/);
+    }
+    // The built-in builds, with the Worker options: file tools, no shell, reads asked about.
+    const ok = buildWorkerAdapters(
+      { tiers: { worker: { adapter: 'acp:claude-acp' } } },
+      { baseEnv: {} },
+    );
+    expect(Object.keys(ok)).toEqual(['acp:claude-acp']);
+    const options = (
+      claudeAcpWorkerSpec(CLAUDE_ACP_AGENT).sessionMeta as {
+        claudeCode: { options: Record<string, unknown> };
+      }
+    ).claudeCode.options;
+    expect(options).toMatchObject({
+      settingSources: [],
+      settings: { permissions: { ask: ['Read', 'Glob', 'Grep'] } },
+      verbatimPrompts: true,
+      disallowedTools: ['Bash', 'PowerShell', 'Monitor'],
+    });
+    // A command that only mentions the name in passing is not refused.
+    expect(() =>
+      buildWorkerAdapters(
+        {
+          tiers: { worker: { adapter: 'acp:other' } },
+          agents: { other: { kind: 'acp', command: ['my-agent', '--note=claude-agent-acp-like'] } },
+        },
+        { baseEnv: {} },
+      ),
+    ).not.toThrow(/claude-agent-acp/);
   });
 
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
