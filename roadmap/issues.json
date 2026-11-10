@@ -1464,6 +1464,28 @@
         "agent:claude"
       ],
       "body": "Over `acp:claude-acp`, an unattended Claude Worker (#206) gets only `Read`, `Write`, `Edit` and `NotebookEdit`, with no shell. They are passed through `_meta.claudeCode.options`. But reads inside its checkout still run without asking. The SDK self-approves them, and over ACP Tacet has no `PreToolUse` hook to ask with, so the #200 policy never sees them.\n\nWhat leaks today is small:\n- Symlinks out of the checkout are asked about (verified live in the #206 review).\n- In a linked worktree `.git` is a file, so `.git/...` paths fail.\n- Workers cannot write `.git`.\n- A `Read` of `<checkout>/.git` itself sends the main repo's absolute path to the vendor.\n- Nested repositories under the checkout can be read.\n\nA second gap is related: `claudeAcpWorkerSpec` only covers the built-in `claude-acp` id. A custom `agents.<slug>` ACP preset that runs claude-agent-acp keeps Bash, and its read-only Bash calls run unasked. The policy refuses everything such a preset asks about, so this is not new, but it is the same class of gap.\n\n### Tasks\n- [ ] Find a way to route in-cwd reads through Tacet over ACP. Options: an inline `settings` command hook passed in `_meta.claudeCode.options`, or a claude-agent-acp option. Verify it against the pinned claude-agent-acp source and live against the mock Messages API (`verify-vendor-facts`).\n- [ ] Apply the Worker options to a custom ACP preset that runs claude-agent-acp, or refuse such a preset for Workers.\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- An in-cwd `Read` by an `acp:claude-acp` Worker raises an approval request that the #200 policy decides, shown live.\n- No Worker over claude-agent-acp, built in or custom, has a shell.\n\n_See #200, #206, docs/ARCHITECTURE.md §2 and docs/adapters/capability-matrix.md §1._"
+    },
+    {
+      "title": "pty:claude Workers: an @path in a prompt may read files unasked",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Over the Claude Agent SDK and claude-agent-acp, an `@path` mention in a prompt is read into the prompt with no permission request, outside the checkout too. #214 closes that with `verbatimPrompts`, verified live. A Worker's next prompt can carry text the Worker wrote, such as a `verify` command's output or review findings.\n\n`pty:claude` (interactive Claude Code in a PTY) gets the same text. Its `promptText` (`packages/adapters/pty/src/adapter.ts`) refuses only a leading `/` or `!`. Interactive Claude Code probably expands `@path` too, and its `PreToolUse` hook does not see attachments. This is not verified: `node-pty` cannot build in the sessions that found it.\n\n### Tasks\n- [ ] Verify live, with the PTY conformance setup and the mock Messages API: does an `@<outside path>` pasted in a prompt reach the model? Check inside a ``` fence too.\n- [ ] If it does, refuse or neutralise `@` followed by a path character in Worker prompts. Alternatively, use an interactive-mode equivalent of verbatim prompts, if Claude Code has one: check the CLI reference (`verify-vendor-facts`).\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- A `pty:claude` Worker's prompt containing `@<path outside the checkout>` reads nothing into the prompt, shown live.\n\n_See #214, #200, #206 and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
     }
   ]
 }
