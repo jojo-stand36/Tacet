@@ -443,7 +443,10 @@ for (const c of CASES) {
         const kept = await turn(undefined, 'kept232');
         expect(traces(kept, 'kept232').some((p) => p.endsWith(`${kept}.jsonl`))).toBe(true);
         expect(await turn(kept, 'again232')).toBe(kept);
-        const resumed = api.requests.findLast((r) => r.raw.includes('again232'));
+        // The turn's request, not Claude Code's title request (no tools), which can come last.
+        const resumed = (api.requests as unknown as { tools?: string[]; raw: string }[]).findLast(
+          (r) => (r.tools?.length ?? 0) > 0 && r.raw.includes('again232'),
+        );
         expect(resumed?.raw).toContain('SAY kept232');
         await worker.discard(kept, cwd);
         expect(traces(kept, 'kept232')).toEqual([]);
