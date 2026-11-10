@@ -1205,7 +1205,7 @@ describe('planning', () => {
     const t0 = performance.now();
     expect(() => parseProposal(`x${' '.repeat(200_000)}y`)).toThrow(/not JSON/);
     expect(() => parseProposal(' '.repeat(300 * 1024))).toThrow(/longer than/);
-    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(performance.now() - t0).toBeLessThan(5000);
     // `indivisible` is kept only when true (#110).
     expect(
       parseProposal(

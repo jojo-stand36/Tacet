@@ -1,6 +1,7 @@
 /**
- * The longest model reply the Mini-conductor parses (#203): characters, not tokens. A planner or
- * reviewer reply is a short JSON document; anything longer is treated as an invalid reply.
+ * The longest model reply the Mini-conductor parses (#203), in UTF-16 code units (JavaScript
+ * string length): 256 Ki, up to about 768 KiB as UTF-8. A planner or reviewer reply is a short
+ * JSON document; anything longer is treated as an invalid reply.
  */
 export const MAX_REPLY_CHARS = 256 * 1024;
 
@@ -9,7 +10,7 @@ export const MAX_REPLY_CHARS = 256 * 1024;
  * ```` ```json ````), in linear time (#203). The input is model text that can be steered by what
  * a Worker wrote, so no backtracking regex runs on it: the old `/\s*```$/` took seconds on a long
  * run of whitespace and blocked the Mini-conductor's event loop. Throws if the reply is longer
- * than `MAX_REPLY_CHARS`.
+ * than `MAX_REPLY_CHARS` code units.
  */
 export function unfence(text: string): string {
   if (text.length > MAX_REPLY_CHARS) {
