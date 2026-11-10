@@ -261,6 +261,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           ...this.#opts.sdkOptions,
           // SDK isolation mode unless the caller opted in (#181); see `sdkOptions`.
           settingSources: this.#opts.sdkOptions?.settingSources ?? [],
+          // Only Tacet's MCP config (the `--mcp-config` file below): never a checkout's `.mcp.json`
+          // or a plugin's servers, whatever the setting sources (#181).
+          strictMcpConfig: true,
           ...sessionOpts,
           cwd: opts.cwd,
           env,

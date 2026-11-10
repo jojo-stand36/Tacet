@@ -249,6 +249,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     // Other SDK options do not drop the default, and a resume keeps it too.
     await make(stub).start({ cwd: root, resume: { vendorSessionId: 'v-1' } });
     expect(stub.calls.map((c) => c.settingSources)).toEqual([[], [], []]);
+    expect(stub.calls.every((c) => c.strictMcpConfig === true)).toBe(true);
     await make(stub, { sdkOptions: { settingSources: ['project'] } }).start({ cwd: root });
     expect(stub.calls[3]?.settingSources).toEqual(['project']);
   });
