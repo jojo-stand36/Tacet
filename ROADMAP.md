@@ -76,7 +76,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
 - [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
-- [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude`
+- [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude + human`
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 
