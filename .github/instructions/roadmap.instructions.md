@@ -6,6 +6,7 @@ applyTo: "roadmap/**,ROADMAP.md"
 
 - `roadmap/issues.json` is the source of truth. `ROADMAP.md` is generated: run `node scripts/gen-roadmap.mjs` after any change to `issues.json` and commit both.
 - Never hand-edit `ROADMAP.md`.
+- `gen-roadmap.mjs` also rewrites `issues.json` in canonical order: by milestone (the order of `milestones`), epics first, then title by code unit. Add entries anywhere; titles must be unique. `--check` fails on an unsorted `issues.json` as well as a stale `ROADMAP.md`. The order keeps new entries from different branches apart, so they merge without conflicts (#231).
 - Every issue needs exactly one `type:*`, one `priority:*`, at least one `area:*` label, and a milestone that exists in `milestones`. New labels must be added to the `labels` array with a hex color.
 - Issue bodies follow: summary paragraph, `### Tasks` checklist, `### Acceptance criteria`, closing line pointing to the docs.
 - Adding issues is fine when you discover new work. Removing issues, renaming milestones or changing priorities needs a human request.
