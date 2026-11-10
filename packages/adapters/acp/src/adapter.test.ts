@@ -423,7 +423,40 @@ describe('AcpAdapter (fake ACP agent)', () => {
         const pid = childPid();
         expect(pid).toBeTypeOf('number');
         expect(running(pid as number)).toBe(false);
+        // close() waits on that one reap (#218): it returns at once, well within the kill timeout.
+        const before = Date.now();
         await adapter.close(h);
+        expect(Date.now() - before).toBeLessThan(250);
+      } finally {
+        const p = childPid();
+        if (p !== undefined && running(p)) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
+    });
+
+    it('close() during the reap of a crashed agent returns only once its group is gone (#218)', async () => {
+      const adapter = make(
+        GEMINI_AGENT,
+        { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        await adapter.send(h, { text: 'CRASH' });
+        // Exited, its SIGTERM-ignoring child still being reaped.
+        await new Promise((r) => setTimeout(r, 150));
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(true);
+        await adapter.close(h);
+        expect(running(pid as number)).toBe(false);
       } finally {
         const p = childPid();
         if (p !== undefined && running(p)) {
