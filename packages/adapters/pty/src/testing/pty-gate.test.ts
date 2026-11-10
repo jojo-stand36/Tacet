@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PtyUnavailableError } from '../pty.js';
 import { gatedTitle, ptyGate } from './pty-gate.js';
 
@@ -13,7 +13,10 @@ describe('ptyGate (#189)', () => {
   });
 
   it('skips them locally, with the reason, when node-pty is missing', async () => {
+    const warn = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const gate = await ptyGate({}, missing);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/^Skipping the PTY suites/));
+    warn.mockRestore();
     expect(gate).toEqual({ ok: false, reason: expect.stringMatching(/node-pty is not available/) });
     expect(gatedTitle('PTY suite', gate)).toMatch(/^PTY suite \(skipped locally: node-pty/);
   });

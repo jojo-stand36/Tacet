@@ -44,7 +44,7 @@ scripts/                      repo tooling (node, no dependencies)
 | Create roadmap issues on GitHub | `scripts/create-issues.sh OWNER/REPO [--dry-run]` |
 | Install / lint / typecheck / test | `pnpm install`, `pnpm lint` (Biome), `pnpm typecheck` (`tsc -b`), `pnpm test` (Vitest) |
 
-`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. On pull requests CI runs them on Ubuntu with Node 24 and 26 and on macOS with Node 24, plus one `check` job (generated files, no tracked ignored files); pushes to `main` run the full Ubuntu and macOS × Node 24 and 26 matrix.
+`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. On pull requests CI runs them on Ubuntu with Node 24 and 26 and on macOS with Node 24, plus one `check` job (generated files, no tracked ignored files); pushes to `main` run the full Ubuntu and macOS × Node 24 and 26 matrix. `node-pty` (the PTY adapter's native dependency) needs a C++ toolchain to build where no prebuild fits: without it, `pnpm test` skips the live PTY suites locally and says why on stderr, while CI (`CI` set) fails if `node-pty` does not load (#189).
 
 ## How to work an issue
 

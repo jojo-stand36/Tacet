@@ -17,7 +17,11 @@ export async function ptyGate(
     return { ok: true };
   } catch (err) {
     if (!(err instanceof PtyUnavailableError) || env.CI) throw err;
-    return { ok: false, reason: `node-pty is not available here: ${err.message}` };
+    const reason = `node-pty is not available here: ${err.message}`;
+    // The default reporter prints neither skipped suites' titles nor console output of passing
+    // files: write straight to stderr, where a developer sees it.
+    process.stderr.write(`Skipping the PTY suites (CI would fail): ${reason}\n`);
+    return { ok: false, reason };
   }
 }
 
