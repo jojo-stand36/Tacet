@@ -9,7 +9,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  * Only a UUID-named, real (not symlinked) directory of the current user is removed.
  */
 export function removeClaudeConfigDir(root: string, vendorSessionId: string): boolean {
-  if (!UUID.test(vendorSessionId)) throw new Error('a PTY session is named by its UUID');
+  if (!UUID.test(vendorSessionId)) throw new Error('a Claude session is named by its UUID');
   const dir = join(root, vendorSessionId);
   if (!ownDir(dir)) return false;
   rmSync(dir, { recursive: true, force: true });

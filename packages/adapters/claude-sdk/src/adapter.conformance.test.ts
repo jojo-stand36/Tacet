@@ -152,6 +152,82 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     await adapter.close(h3);
   });
 
+  it("keeps Worker transcripts out of the user's ~/.claude, and discards them (#237)", {
+    timeout: 180_000,
+  }, async () => {
+    // A user with a login and a session of their own, which a Worker must never use, copy or touch.
+    const home = join(root, 'home-237');
+    const userClaude = join(home, '.claude');
+    mkdirSync(join(userClaude, 'projects', '-users-own'), { recursive: true });
+    writeFileSync(
+      join(userClaude, '.credentials.json'),
+      JSON.stringify({ claudeAiOauth: { accessToken: 'sk-ant-oat01-user-login-237' } }),
+    );
+    writeFileSync(join(userClaude, 'projects', '-users-own', 'own.jsonl'), "the user's own\n");
+    writeFileSync(join(home, '.claude.json'), '{"hasCompletedOnboarding":true}');
+    const listAll = (dir: string): string[] =>
+      readdirSync(dir, { recursive: true, withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => join(e.parentPath, e.name));
+    const userBefore = Object.fromEntries(listAll(home).map((p) => [p, readFileSync(p, 'utf8')]));
+    const state = join(root, 'state-237');
+    const worker = new ClaudeSdkAdapter({
+      authRoute: 'api_key',
+      repoRoot: join(root, 'repo-237'),
+      stateDir: state,
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: home,
+        // Even a config dir the user set is not the Worker's (#237).
+        CLAUDE_CONFIG_DIR: userClaude,
+        ANTHROPIC_BASE_URL: api.url,
+        ANTHROPIC_API_KEY: 'placeholder-not-a-real-key',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        DISABLE_AUTOUPDATER: '1',
+      },
+      mcpConfigDir: join(root, 'run', 'mcp'),
+    });
+    const say = async (resume: string | undefined, word: string) => {
+      const h = await worker.start({
+        cwd: worktree,
+        ...(resume ? { resume: { vendorSessionId: resume } } : {}),
+      });
+      const tap = new EventTap(worker.events(h));
+      await worker.send(h, { text: `SAY ${word}` });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+      await worker.close(h);
+      return h.vendorSessionId as string;
+    };
+    /** Files in the state dir named by the session, or holding the word. */
+    const traces = (id: string, word: string) =>
+      listAll(state).filter((p) => p.includes(id) || readFileSync(p, 'utf8').includes(word));
+
+    const done = await say(undefined, 'done237');
+    expect(traces(done, 'done237').some((p) => p.endsWith(`${done}.jsonl`))).toBe(true);
+    await worker.discard(done, worktree);
+    expect(traces(done, 'done237')).toEqual([]);
+
+    // Ended for a restart: kept, and it resumes with its history.
+    const kept = await say(undefined, 'kept237');
+    expect(await say(kept, 'again237')).toBe(kept);
+    // The turn's request: the title request (no tools) quotes the prompt too, and in a container
+    // with a parent `.git` the prompt is prefixed with a git status.
+    const again = api.requests.findLast(
+      (r) => r.tools.length > 0 && r.text.includes('SAY again237'),
+    );
+    expect(again?.raw).toContain('SAY kept237');
+    await worker.discard(kept, worktree);
+    expect(traces(kept, 'kept237')).toEqual([]);
+
+    // The user's home is byte for byte as it was, and their login was never copied.
+    expect(Object.fromEntries(listAll(home).map((p) => [p, readFileSync(p, 'utf8')]))).toEqual(
+      userBefore,
+    );
+    expect(
+      listAll(state).filter((p) => readFileSync(p, 'utf8').includes('user-login-237')),
+    ).toEqual([]);
+  });
+
   it.runIf(process.platform === 'linux')(
     'keeps the Worker token out of every process command line',
     { timeout: 120_000 },

@@ -43,7 +43,10 @@ export interface BuildWorkerAdaptersOptions {
   /** How `{ keychain }` secret references are read (#160); replaced in tests. */
   keychain?: KeychainOptions;
   /** Passed through to the adapters as they are built; for tests and the entry point. */
-  claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
+  claude?: Pick<
+    ClaudeSdkAdapterOptions,
+    'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions' | 'stateDir'
+  >;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs' | 'stateDir'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
   /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
@@ -134,7 +137,12 @@ export function buildWorkerAdapters(
     const common = { baseEnv, envPolicy, onEnvDropped: dropped };
     if (id === 'claude-sdk') {
       // Unattended: file tools only, no shell, reads asked about too (#206; policy #200).
+      // Each session's config dir lives under the repo's state dir, keyed by the main checkout,
+      // and is kept as long as the event log keeps transcripts (#237).
+      const days = config.events?.retention?.transcript_days;
       return new ClaudeSdkAdapter({
+        ...(days !== undefined ? { retentionDays: days } : {}),
+        ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.claude,
         ...common,
         authRoute: 'api_key',
