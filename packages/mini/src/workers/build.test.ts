@@ -120,13 +120,6 @@ describe('buildWorkerAdapters', () => {
         /agents\.goose\.env\.K: environment variable GOOSE_KEY is not set/,
       ],
       [
-        {
-          tiers: { worker: { adapter: 'acp:goose' } },
-          agents: { goose: { kind: 'acp', command: ['goose'], env: { K: { keychain: 'a/b' } } } },
-        },
-        /agents\.goose\.env\.K: keychain references are not supported yet/,
-      ],
-      [
         { tiers: { worker: { adapter: 'pty:nope' } } },
         /tiers\.worker\.adapter: no PTY preset "nope"/,
       ],
@@ -164,6 +157,38 @@ describe('buildWorkerAdapters', () => {
       expect(() => buildWorkerAdapters(config(over), { baseEnv: {} })).toThrow(WorkerConfigError);
       expect(() => buildWorkerAdapters(config(over), { baseEnv: {} })).toThrow(error);
     }
+  });
+
+  it('reads keychain references through the platform tool, and names the path when it cannot (#160)', () => {
+    const over = {
+      tiers: { worker: { adapter: 'acp:goose' as const } },
+      agents: {
+        goose: {
+          kind: 'acp' as const,
+          command: ['goose'],
+          env: { K: { keychain: 'tacet/goose' } },
+        },
+      },
+    };
+    const calls: string[][] = [];
+    const built = buildWorkerAdapters(config(over), {
+      baseEnv: {},
+      keychain: {
+        platform: 'linux',
+        run: (_file, args) => {
+          calls.push(args);
+          return { status: 0, stdout: 'keychain-value-1234', stderr: '' };
+        },
+      },
+    });
+    expect(built['acp:goose']?.adapter.id).toBe('acp:goose');
+    expect(calls).toEqual([['lookup', 'service', 'tacet', 'account', 'goose']]);
+    expect(() =>
+      buildWorkerAdapters(config(over), {
+        baseEnv: {},
+        keychain: { platform: 'linux', run: () => ({ status: 1, stdout: '', stderr: '' }) },
+      }),
+    ).toThrow(/agents\.goose\.env\.K: no keyring item for service "tacet" and account "goose"/);
   });
 
   it('resolves only the secret references of agents a Worker tier uses', () => {

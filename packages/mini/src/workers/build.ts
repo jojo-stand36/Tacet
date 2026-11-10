@@ -14,7 +14,7 @@ import {
   type PtyCliAdapterOptions,
 } from '@tacet/adapter-pty';
 import { type AgentAdapter, type TacetConfig, workerEnvPolicy } from '@tacet/core';
-import { resolveSecretRef, SecretRefError } from '@tacet/core/node';
+import { type KeychainOptions, resolveSecretRef, SecretRefError } from '@tacet/core/node';
 import type { WorkerAdapter } from '../daemon/ports.js';
 
 /** The config cannot be turned into Workers. Names the config path, never a secret value. */
@@ -35,6 +35,8 @@ export interface BuildWorkerAdaptersOptions {
    * on every session start, so a caller that logs it should log each adapter's names once.
    */
   onEnvDropped?: (adapterId: string, names: string[]) => void;
+  /** How `{ keychain }` secret references are read (#160); replaced in tests. */
+  keychain?: KeychainOptions;
   /** Passed through to the adapters as they are built; for tests and the entry point. */
   claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs'>;
@@ -179,7 +181,9 @@ export function buildWorkerAdapters(
     const env: Record<string, string> = {};
     for (const [name, ref] of Object.entries(refs ?? {})) {
       try {
-        env[name] = resolveSecretRef(ref, `agents.${slug}.env.${name}`, baseEnv).reveal();
+        env[name] = resolveSecretRef(ref, `agents.${slug}.env.${name}`, baseEnv, {
+          ...(opts.keychain ? { keychain: opts.keychain } : {}),
+        }).reveal();
       } catch (err) {
         if (err instanceof SecretRefError) throw new WorkerConfigError(err.message, { cause: err });
         throw err;
