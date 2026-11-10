@@ -247,6 +247,8 @@ describe('a Codex Worker built from config (#186)', () => {
   }, async () => {
     const api = await startMockResponsesApi();
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-build-codex-')));
+    // Closed in `finally` too, so a failure part-way never leaves Codex running.
+    let close = async () => {};
     try {
       const home = join(root, 'home');
       const repo = join(root, 'repo');
@@ -278,6 +280,7 @@ describe('a Codex Worker built from config (#186)', () => {
       const adapter = built['codex-app-server']?.adapter;
       if (!adapter) throw new Error('no codex adapter');
       const h = await adapter.start({ cwd: wt });
+      close = () => adapter.close(h).catch(() => {});
       const tap = new EventTap(adapter.events(h));
       await adapter.send(h, { text: 'SAY built' });
       const end = await tap.waitFor(
@@ -285,11 +288,19 @@ describe('a Codex Worker built from config (#186)', () => {
         60_000,
         1,
       );
-      await adapter.close(h);
+      await close();
       expect(end.event).toMatchObject({ state: 'idle' });
       expect(api.requests.some((r) => r.text === 'SAY built')).toBe(true);
       expect(existsSync(join(repoStateDir(repo, defaultStateDir(home)), 'codex'))).toBe(true);
+      // It ran in the worktree as an unattended Worker: the adapter detached its HEAD (#116).
+      expect(() =>
+        execFileSync('git', ['-C', wt, 'symbolic-ref', '-q', 'HEAD'], {
+          env: gitEnv,
+          stdio: 'ignore',
+        }),
+      ).toThrow();
     } finally {
+      await close();
       await api.close();
       rmSync(root, { recursive: true, force: true });
     }
