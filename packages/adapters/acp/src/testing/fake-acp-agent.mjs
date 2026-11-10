@@ -4,6 +4,7 @@
 // fails with -32000 until `authenticate` succeeded. FAKE_STDERR: text to write to stderr at
 // start, in two chunks.
 // FAKE_CAPS: JSON merged into `agentCapabilities` (e.g. `loadSession`, `sessionCapabilities`).
+// FAKE_SESSION: JSON merged into the `session/new` result (e.g. `modes`, `configOptions`).
 // Prompts are scripted by their text:
 // - `PERMS`: asks two permissions at once; ends the turn `cancelled` on `session/cancel`, once
 //   both are answered, or `end_turn` if both were answered without a cancel.
@@ -106,7 +107,12 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   } else if (m.method === 'session/new') {
     if (process.env.FAKE_NEEDS_LOGIN === '1' && !authed) {
       send({ id: m.id, error: { code: -32000, message: 'Authentication required' } });
-    } else send({ id: m.id, result: { sessionId: 'fake-session-1' } });
+    } else {
+      const extra = JSON.parse(process.env.FAKE_SESSION ?? '{}');
+      send({ id: m.id, result: { sessionId: 'fake-session-1', ...extra } });
+    }
+  } else if (m.method === 'session/set_config_option' || m.method === 'session/set_mode') {
+    send({ id: m.id, result: {} });
   } else if (m.method === 'session/load') {
     // The history is replayed as updates before the answer.
     say(m.params.sessionId, 'replayed history');

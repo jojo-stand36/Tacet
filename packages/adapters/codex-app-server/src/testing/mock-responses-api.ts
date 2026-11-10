@@ -8,6 +8,9 @@ import type { AddressInfo } from 'node:net';
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: calls the shell tool Codex offers (`exec_command`) with `touch tool-ran.txt`.
  * - `RUN_CMD <shell command>`: calls the same tool with the rest of the line.
+ * - `RUN_ESCALATED`: as `RUN_TOOL`, asking to run outside the sandbox
+ *   (`sandbox_permissions: "require_escalated"` with a `justification`, both in Codex 0.166's
+ *   `exec_command` schema): with `on-request` approvals Codex asks before it runs.
  * - `ESCALATE`: calls the Tacet MCP `escalate` tool. Codex 0.167.0 offers each MCP server as a
  *   `namespace` tool (`mcp__<server>`) holding plain functions, and the model calls one with a
  *   `function_call` carrying `namespace` and `name`. `requests[].tools` lists nested tools as
@@ -27,6 +30,8 @@ export interface MockResponsesApi {
     toolResult: boolean;
     toolOutput?: string;
     authorized: boolean;
+    /** Which known credential it carried (see `startMockResponsesApi`); `none` if none. */
+    credential: string;
     tools: string[];
     /** Number of input items: the conversation so far. */
     inputs: number;
@@ -70,10 +75,24 @@ function lastUser(body: Body): { text: string; toolResult: boolean; toolOutput?:
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let n = 0;
 
+/**
+ * Which of the known test credentials a request carried (#145): the label of the one in its
+ * `x-api-key` header or `Authorization: Bearer` token, `other` for an unknown one, or `none`.
+ * Values are compared, never kept.
+ */
+function credentialOf(req: IncomingMessage, known: Record<string, string>): string {
+  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const xKey = req.headers['x-api-key'];
+  const sent = typeof xKey === 'string' ? xKey : bearer;
+  if (sent === undefined) return 'none';
+  return Object.entries(known).find(([, v]) => v === sent)?.[0] ?? 'other';
+}
+
 async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   log: MockResponsesApi['requests'],
+  known: Record<string, string>,
 ): Promise<void> {
   let raw = '';
   for await (const c of req) raw += c;
@@ -93,6 +112,7 @@ async function handle(
     toolResult: last.toolResult,
     ...(last.toolOutput !== undefined ? { toolOutput: last.toolOutput } : {}),
     authorized: /^Bearer \S+/.test(req.headers.authorization ?? ''),
+    credential: credentialOf(req, known),
     tools: (body.tools ?? []).flatMap((t) =>
       t.type === 'namespace'
         ? (t.tools ?? []).map((x) => `${t.name}/${x.name ?? ''}`)
@@ -130,12 +150,24 @@ async function handle(
     };
     sse({ type: 'response.output_item.added', output_index: 0, item });
     sse({ type: 'response.output_item.done', output_index: 0, item });
-  } else if (!last.toolResult && (runCmd !== undefined || /RUN_TOOL/.test(last.text))) {
+  } else if (
+    !last.toolResult &&
+    (runCmd !== undefined || /RUN_TOOL|RUN_ESCALATED/.test(last.text))
+  ) {
     const tools = (body.tools ?? []).map((t) => t.name ?? '');
     const name = tools.find((t) => t === 'exec_command') ?? tools.find((t) => /shell/.test(t));
     const cmd = runCmd ?? 'touch tool-ran.txt';
     // Codex's default tool is `exec_command` ({ cmd }); older models get a `shell` tool instead.
-    const args = name && name !== 'exec_command' ? { command: ['sh', '-c', cmd] } : { cmd };
+    const escalate = /RUN_ESCALATED/.test(last.text)
+      ? {
+          sandbox_permissions: 'require_escalated',
+          justification: 'Mock: run outside the sandbox.',
+        }
+      : {};
+    const args =
+      name && name !== 'exec_command'
+        ? { command: ['sh', '-c', cmd], ...escalate }
+        : { cmd, ...escalate };
     const item = {
       type: 'function_call',
       id: `fc_mock_${n}`,
@@ -193,10 +225,12 @@ async function handle(
   res.end();
 }
 
-export async function startMockResponsesApi(): Promise<MockResponsesApi> {
+export async function startMockResponsesApi(
+  opts: { credentials?: Record<string, string> } = {},
+): Promise<MockResponsesApi> {
   const requests: MockResponsesApi['requests'] = [];
   const server: Server = createServer((req, res) => {
-    handle(req, res, requests).catch(() => res.destroy());
+    handle(req, res, requests, opts.credentials ?? {}).catch(() => res.destroy());
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as AddressInfo;

@@ -292,6 +292,7 @@ export class AcpAdapter implements AgentAdapter {
       handle.vendorSessionId = created.sessionId;
       const modelOption = (created.configOptions ?? []).find((o) => o.category === 'model');
       if (modelOption) s.modelOption = modelOption.id;
+      if (spec.sessionMode !== undefined) await this.#setMode(s, created, spec.sessionMode);
       if (opts.model !== undefined && !spec.modelArgs) await this.#setModel(s, opts.model);
     } catch (err) {
       s = undefined;
@@ -491,6 +492,36 @@ export class AcpAdapter implements AgentAdapter {
       }
     }
     throw new Error(`${this.id} offers neither session/resume nor session/load`);
+  }
+
+  /** Put the session in `mode`, or fail: an agent left in its own mode may not ask (#145). */
+  async #setMode(s: Session, created: NewSessionResponse, mode: string): Promise<void> {
+    const option = (created.configOptions ?? []).find((o) => o.category === 'mode');
+    if (option && option.type === 'select') {
+      const values = option.options.flatMap((o) =>
+        'value' in o ? [o.value] : o.options.map((x) => x.value),
+      );
+      if (!values.includes(mode)) {
+        throw new Error(
+          `${this.id} offers no session mode ${JSON.stringify(mode)} (it has ${values.join(', ')})`,
+        );
+      }
+      if (option.currentValue !== mode) {
+        await s.conn.agent.request('session/set_config_option', {
+          sessionId: s.acpSessionId,
+          configId: option.id,
+          value: mode,
+        });
+      }
+      return;
+    }
+    const modes = created.modes;
+    if (!modes?.availableModes.some((m) => m.id === mode)) {
+      throw new Error(`${this.id} offers no session mode ${JSON.stringify(mode)}`);
+    }
+    if (modes.currentModeId !== mode) {
+      await s.conn.agent.request('session/set_mode', { sessionId: s.acpSessionId, modeId: mode });
+    }
   }
 
   async #setModel(s: Session, model: string): Promise<void> {

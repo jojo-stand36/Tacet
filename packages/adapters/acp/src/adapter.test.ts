@@ -39,6 +39,19 @@ const ends = (e: AgentEvent) => e.t === 'status' && e.state !== 'running';
 const text = (events: AgentEvent[]) =>
   events.map((e) => (e.t === 'message.delta' ? e.text : '')).join('');
 
+/** The session modes the built-in specs put their sessions in (#145), as an agent offers them. */
+const BUILTIN_MODES = {
+  FAKE_SESSION: JSON.stringify({
+    modes: {
+      currentModeId: 'default',
+      availableModes: [
+        { id: 'default', name: 'Manual' },
+        { id: 'workspace-write', name: 'Workspace access' },
+      ],
+    },
+  }),
+};
+
 describe('AcpAdapter (fake ACP agent)', () => {
   let root: string;
   let logFile: string;
@@ -54,7 +67,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
       agent,
       executable: [process.execPath, FAKE],
       killTimeoutMs: 1000,
-      baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...env },
+      baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...BUILTIN_MODES, ...env },
       // The fake agent is steered by FAKE_* variables (#147: passed through on purpose).
       envPolicy: { pass: ['FAKE_*'] },
       ...extra,
@@ -376,6 +389,77 @@ describe('AcpAdapter (fake ACP agent)', () => {
     expect(lines.join('')).toContain('debug: [redacted] and [redacted]');
   });
 
+  describe('session mode (#145)', () => {
+    const spec = (sessionMode: string): AcpAgentSpec => ({
+      ...customAcpAgent('modes', { command: ['modes'] }),
+      sessionMode,
+    });
+    const select = (currentValue: string) => ({
+      configOptions: [
+        {
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue,
+          options: [
+            { value: 'ask', name: 'Ask' },
+            { value: 'auto', name: 'Auto' },
+          ],
+        },
+      ],
+    });
+    const modes = {
+      currentModeId: 'auto',
+      availableModes: [
+        { id: 'ask', name: 'Ask' },
+        { id: 'auto', name: 'Auto' },
+      ],
+    };
+
+    it('sets it by the mode config option right after the session opens', async () => {
+      const adapter = make(spec('ask'), {
+        FAKE_SESSION: JSON.stringify({ ...select('auto'), modes }),
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      const sent = methods().map((m) => m.method);
+      expect(sent.indexOf('session/set_config_option')).toBe(sent.indexOf('session/new') + 1);
+      expect(methods().find((m) => m.method === 'session/set_config_option')?.params).toEqual({
+        sessionId: 'fake-session-1',
+        configId: 'mode',
+        value: 'ask',
+      });
+      expect(sent).not.toContain('session/set_mode');
+    });
+
+    it('uses session/set_mode when the agent has no mode config option', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+        sessionId: 'fake-session-1',
+        modeId: 'ask',
+      });
+    });
+
+    it('sends nothing when the session is already in the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(select('ask')) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().map((m) => m.method)).not.toContain('session/set_config_option');
+    });
+
+    it('fails to start when the agent does not offer the mode', async () => {
+      for (const session of [{}, { modes }, select('auto')]) {
+        const adapter = make(spec('manual'), { FAKE_SESSION: JSON.stringify(session) });
+        await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+          /offers no session mode "manual"/,
+        );
+      }
+    });
+  });
+
   it('keeps the error type when a profile is refused at start', async () => {
     const adapter = make(customAcpAgent('plain', { command: ['plain'] }));
     await expect(adapter.start({ cwd: join(root, 'wt'), model: 'm' })).rejects.toThrow(
@@ -428,7 +512,14 @@ describe('ACP agent registry', () => {
   });
 
   it('registers only agents whose API-key-only auth was verified live', () => {
-    expect(Object.keys(BUILTIN_ACP_AGENTS)).toEqual(['gemini']);
+    expect(Object.keys(BUILTIN_ACP_AGENTS)).toEqual(['gemini', 'claude-acp', 'codex-acp']);
     expect(GEMINI_AGENT.apiKeyEnv).toEqual(['GEMINI_API_KEY']);
+    // Each has a home of its own, so the user's login is never used or changed (#145).
+    for (const spec of Object.values(BUILTIN_ACP_AGENTS)) expect(spec.home).toBeDefined();
+    // codex-acp never logs in: its api-key login overwrites the user's Codex login.
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.apiKeyAuthMethods).toEqual([]);
+    // Both start in a mode that runs tools unasked; Workers use one that asks (#145).
+    expect(BUILTIN_ACP_AGENTS['claude-acp']?.sessionMode).toBe('default');
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.sessionMode).toBe('workspace-write');
   });
 });

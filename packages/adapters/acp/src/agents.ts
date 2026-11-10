@@ -51,6 +51,12 @@ export interface AcpAgentSpec {
   home?: { env: string; files: Readonly<Record<string, string>> };
   /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
   envDeny?: readonly string[];
+  /**
+   * The ACP session mode every session is put in right after it opens (#145), for agents whose
+   * default runs tools without asking. Set by the `mode` config option, or `session/set_mode` when
+   * the agent has none; a session the agent can't put in this mode fails to start.
+   */
+  sessionMode?: string;
 }
 
 /**
@@ -118,10 +124,14 @@ export const GEMINI_AGENT: AcpAgentSpec = {
 };
 
 /**
- * Claude Code through `@agentclientprotocol/claude-agent-acp` (spike #62, 0.101.1; not run live
- * here). Not in `BUILTIN_ACP_AGENTS`: that it uses `ANTHROPIC_API_KEY` over a subscription login
- * already in `~/.claude` is not verified yet (#145). `--hide-claude-auth` hides the "Claude Subscription" login: Workers use
- * `ANTHROPIC_API_KEY` only (owner decision 2026-11-09). The native Agent SDK adapter stays first
+ * Claude Code through `@agentclientprotocol/claude-agent-acp`, verified live on 0.101.0 (Agent SDK
+ * 0.3.318) against the mock Messages API with a subscription login already in the user's
+ * `~/.claude` (#145): every request carried `ANTHROPIC_API_KEY`, and the stored login was neither
+ * used nor changed. Run with the user's own config dir it writes there (`~/.claude.json`, a
+ * backup of it, transcripts, a plugin store), so it gets a config dir of its own
+ * (`CLAUDE_CONFIG_DIR`, under the repo's state dir). `--hide-claude-auth` hides the "Claude
+ * Subscription" login: Workers use `ANTHROPIC_API_KEY` only (owner decision 2026-11-09). Its Bash
+ * tool sees the key until the scrub is decided (#150). The native Agent SDK adapter stays first
  * choice.
  */
 export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
@@ -131,31 +141,73 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   apiKeyEnv: ['ANTHROPIC_API_KEY'],
   apiKeyAuthMethods: [],
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
+  home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
+  // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`
+  // ("Manual: always ask before making changes") sends `session/request_permission` (verified).
+  sessionMode: 'default',
 };
 
+/** The model provider codex-acp's Codex uses for Workers: the key comes from the environment. */
+export const CODEX_ACP_PROVIDER = 'tacet-openai-api-key';
+
+/** `config.toml` for codex-acp's own `CODEX_HOME` (#145); `baseUrl` is for tests. */
+export function codexAcpConfig(baseUrl = 'https://api.openai.com/v1'): string {
+  return [
+    `model_provider = "${CODEX_ACP_PROVIDER}"`,
+    '',
+    `[model_providers.${CODEX_ACP_PROVIDER}]`,
+    'name = "OpenAI (API key, via Tacet)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'env_key = "OPENAI_API_KEY"',
+    'wire_api = "responses"',
+    '',
+    '# No plugin sync from GitHub when a Worker starts (as the native adapter, #116).',
+    '[features]',
+    'plugins = false',
+    '',
+    '# The commands the Worker runs never see the key (as the native adapter, #150).',
+    '[shell_environment_policy]',
+    'exclude = ["OPENAI_API_KEY", "CODEX_API_KEY"]',
+    '',
+  ].join('\n');
+}
+
 /**
- * Codex through `@agentclientprotocol/codex-acp` (spike #62, 2.6.0; not run live here). Not in
- * `BUILTIN_ACP_AGENTS`: what its `api-key` method does to the user's `~/.codex` login is not
- * verified yet (#145; Codex app-server needs its own `CODEX_HOME` for a key, capability matrix §2).
- * `NO_BROWSER=1` hides the ChatGPT login; the `api-key` method reads `CODEX_API_KEY` or
- * `OPENAI_API_KEY`. The native app-server adapter stays first choice.
+ * Codex through `@agentclientprotocol/codex-acp`, verified live on 2.6.0 (Codex 0.166.0) against
+ * the mock Responses API with a ChatGPT login already in the user's `~/.codex` (#145). Its
+ * `api-key` auth method is never used: it runs Codex's `account/login/start`, which replaced the
+ * user's ChatGPT login in `~/.codex/auth.json` with the key, on disk; and in `~/.codex` it also
+ * synced a plugin marketplace from GitHub. So it gets a `CODEX_HOME` of its own (under the repo's
+ * state dir) whose config routes through a model provider with `env_key`, as the native adapter
+ * does: verified, it starts sessions without any login, every request carried the key, no
+ * `auth.json` is written, the user's `~/.codex` is untouched, and the commands Codex runs see no
+ * key. `NO_BROWSER=1` hides the ChatGPT login. The native app-server adapter stays first choice.
  */
 export const CODEX_ACP_AGENT: AcpAgentSpec = {
   id: 'codex-acp',
   command: ['codex-acp'],
   env: { NO_BROWSER: '1' },
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
-  apiKeyEnv: ['CODEX_API_KEY', 'OPENAI_API_KEY'],
-  apiKeyAuthMethods: ['api-key'],
+  apiKeyEnv: ['OPENAI_API_KEY'],
+  apiKeyAuthMethods: [],
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  verifiedVersion: '@agentclientprotocol/codex-acp 2.6.0',
+  home: { env: 'CODEX_HOME', files: { 'config.toml': codexAcpConfig() } },
+  // It starts in `agent` ("Auto review: only ask for actions detected as potentially unsafe").
+  // `workspace-write` is the native adapter's default (`on-request`): edits in the checkout run in
+  // the sandbox, and leaving it (other files, the network) asks. `read-only` asks for every edit.
+  sessionMode: 'workspace-write',
 };
 
 /**
  * The agents a Worker can be configured with by id: only those whose API-key-only auth was
- * verified live. Claude and Codex have native adapters; their ACP specs join once verified.
+ * verified live, each with a home of its own so the user's login is never used or changed.
  */
 export const BUILTIN_ACP_AGENTS: Readonly<Record<string, AcpAgentSpec>> = {
   gemini: GEMINI_AGENT,
+  'claude-acp': CLAUDE_ACP_AGENT,
+  'codex-acp': CODEX_ACP_AGENT,
 };
 
 /** Config for an ACP agent that has no built-in spec. */

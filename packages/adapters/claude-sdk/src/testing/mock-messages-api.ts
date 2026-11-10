@@ -32,6 +32,13 @@ export interface MockRequest {
   betas: string[];
   /** Names of the tools offered. */
   tools: string[];
+  /** Which known credential authenticated it (see `startMockMessagesApi`); `none` if none. */
+  credential: string;
+}
+
+export interface MockMessagesApiOptions {
+  /** Test credentials by label: each request records the label of the one it carried. */
+  credentials?: Record<string, string>;
 }
 
 export interface MockMessagesApi {
@@ -63,6 +70,19 @@ function lastUser(body: Body): { text: string; toolResult: boolean } {
       .join('\n'),
     toolResult: m.content.some((b) => b.type === 'tool_result'),
   };
+}
+
+/**
+ * Which of the known test credentials a request carried (#145): the label of the one in its
+ * `x-api-key` header or `Authorization: Bearer` token, `other` for an unknown one, or `none`.
+ * Values are compared, never kept.
+ */
+function credentialOf(req: IncomingMessage, known: Record<string, string>): string {
+  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const xKey = req.headers['x-api-key'];
+  const sent = typeof xKey === 'string' ? xKey : bearer;
+  if (sent === undefined) return 'none';
+  return Object.entries(known).find(([, v]) => v === sent)?.[0] ?? 'other';
 }
 
 let n = 0;
@@ -146,6 +166,7 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   log: MockMessagesApi['requests'],
+  known: Record<string, string>,
 ): Promise<void> {
   let raw = '';
   for await (const c of req) raw += c;
@@ -165,6 +186,7 @@ async function handle(
   }
   const beta = req.headers['anthropic-beta'];
   log.push({
+    credential: credentialOf(req, known),
     model: body.model,
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
@@ -245,10 +267,12 @@ async function handle(
   res.end();
 }
 
-export async function startMockMessagesApi(): Promise<MockMessagesApi> {
+export async function startMockMessagesApi(
+  opts: MockMessagesApiOptions = {},
+): Promise<MockMessagesApi> {
   const requests: MockMessagesApi['requests'] = [];
   const server: Server = createServer((req, res) => {
-    handle(req, res, requests).catch(() => res.destroy());
+    handle(req, res, requests, opts.credentials ?? {}).catch(() => res.destroy());
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as AddressInfo;
