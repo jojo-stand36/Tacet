@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, realpathSync, rmdirSync, rmSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
 import {
+  openEventStore,
   type RepoStatePaths,
   repoStatePaths,
   resolveStateDir,
@@ -31,7 +32,10 @@ export interface StatePlan {
   events: boolean;
   /** Everything directly in the state dir, all of which goes (Worker homes, logs, the lock). */
   entries: string[];
-  /** Tacet's internal refs (`refs/tacet/*`, e.g. a task's pinned target, #236): all deleted. */
+  /**
+   * This state's internal refs (`refs/tacet/<task>/target`, #236): those of tasks its event log
+   * knows, never another run state's on the same repository. All deleted.
+   */
   refs: string[];
   checkouts: StateCheckout[];
   /** Set when the config could not be read and the default state dir was assumed. */
@@ -102,7 +106,7 @@ export async function planState(io: Io, root: string, userDir: string): Promise<
   const pid = await liveRun(paths.lock);
   if (pid !== undefined) throw liveRunError(pid);
   plan.entries = readdirSync(paths.dir).sort();
-  plan.refs = [...internalRefs(io, root).keys()];
+  plan.refs = [...(await ownRefs(io, root, paths)).refs.keys()];
   // Only looked at when it exists: the manager would create it.
   if (!existsSync(paths.worktrees)) return plan;
   const worktrees = await manager(io, root, paths);
@@ -179,8 +183,10 @@ export async function applyState(
       if (result.refused.length > 0) return;
       result.leftovers = registeredUnder(io, root, paths.dir);
       if (result.leftovers.length > 0) return;
-      // Tacet's internal refs go with its state; the tacet/* branches are the user's to keep.
-      for (const [ref, tip] of internalRefs(io, root)) {
+      // This state's internal refs go with it; the tacet/* branches are the user's to keep.
+      const own = await ownRefs(io, root, paths);
+      if (own.warning) result.warnings.push(own.warning);
+      for (const [ref, tip] of own.refs) {
         try {
           execFileSync('git', [...SAFE_GIT_ARGS, '-C', root, 'update-ref', '-d', ref, tip], {
             stdio: 'ignore',
@@ -216,6 +222,42 @@ export async function applyState(
     }
   }
   return result;
+}
+
+/**
+ * The `refs/tacet/<task>/target` refs (and tips) of the tasks this state's event log pinned (#236).
+ * `refs/tacet/*` is shared by every run state of the repository (another checkout of it has its
+ * own state dir), so only this state's own are named. An unreadable log names none.
+ */
+async function ownRefs(
+  io: Io,
+  root: string,
+  paths: RepoStatePaths,
+): Promise<{ refs: Map<string, string>; warning?: string }> {
+  const all = internalRefs(io, root);
+  if (all.size === 0 || !existsSync(paths.events)) return { refs: new Map() };
+  const { targetRef } = await import('@tacet/mini');
+  const wanted = new Set<string>();
+  try {
+    const store = openEventStore(paths.events, { readonly: true });
+    try {
+      for (const { envelope } of store.query({ typePrefix: 'task.target' })) {
+        try {
+          if (envelope.taskId) wanted.add(targetRef(envelope.taskId));
+        } catch {
+          // A task id no ref can be made for: it has none.
+        }
+      }
+    } finally {
+      store.close();
+    }
+  } catch {
+    return {
+      refs: new Map(),
+      warning: 'the event log could not be read, so no refs/tacet/* ref was deleted',
+    };
+  }
+  return { refs: new Map([...all].filter(([ref]) => wanted.has(ref))) };
 }
 
 /** `refs/tacet/*` and their tips (#236): never branches, only Tacet's own bookkeeping. */

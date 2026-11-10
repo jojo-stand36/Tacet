@@ -1542,6 +1542,17 @@
         "agent:claude"
       ],
       "body": "Follow-up from #219 (PR #233). A task's `task.target` pins the commit its sub-tasks start from, but no ref holds that commit. Live checkouts keep it alive. But if the user resets or rewrites the branch during a long task and `git gc` prunes the commit, a later fresh checkout for the task (a retry, a new sub-task) fails to start (\"base commit does not name a commit\").\n\n### Tasks\n- [ ] When the Mini-conductor pins a target, also point `refs/tacet/<task>/target` at the commit. The repo's git side is behind a port (for example `Workspaces.pin?(taskId, commit)`), so the daemon stays git-free. The task id must be made ref-safe, as `taskBranch` does.\n- [ ] Delete the ref where the task's other Tacet refs are cleaned up. Today nothing deletes them: `tacet/*` branches are kept on purpose. At minimum, `tacet uninstall --purge --apply` removes every `refs/tacet/*` ref, which is internal and never a user branch, and its preview lists them.\n- [ ] Docs: ARCHITECTURE §2.4 and §3 (the `task.target` paragraph says no ref holds the commit today).\n\n### Acceptance criteria\n- After the pinned branch is reset and `git gc --prune=now` runs, a new checkout for the task still starts at the pinned commit (test).\n- `tacet uninstall --purge --apply` leaves no `refs/tacet/*` ref (test).\n\n_See #219, PR #233, packages/mini/src/daemon/daemon.ts (`#pinTarget`) and packages/cli/src/commands/purge-state.ts._"
+    },
+    {
+      "title": "Delete a task's pinned-target ref once its result lands",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #236 (PR #243). The Mini-conductor writes `refs/tacet/<task>/target` to keep a task's pinned target commit safe from `git gc`. Today only `tacet uninstall --purge` deletes it, so every task leaves one ref behind for good. The ref is cheap, but they pile up.\n\n### Tasks\n- [ ] Delete the task's `refs/tacet/<task>/target` (compare-and-swap on the pinned commit) in the landed sweep (#210), once `task.landed` is recorded and the task's checkouts are removed or none are left\n- [ ] Decide whether a task that ends without landing (failed, canceled, or a result never merged) also drops its ref, and when\n- [ ] Update docs/ARCHITECTURE.md §2.4\n\n### Acceptance criteria\n- After a task's result lands and the sweep runs, `refs/tacet/<task>/target` is gone, and other tasks' refs are untouched (test)\n- A task that has not finished keeps its ref (test)\n\n_See #219, #236 and docs/ARCHITECTURE.md §2.4._"
     }
   ]
 }

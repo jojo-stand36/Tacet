@@ -96,6 +96,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
 - [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
+- [ ] **Delete a task's pinned-target ref once its result lands** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation
 
