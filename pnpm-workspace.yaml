@@ -5,3 +5,8 @@ engineStrict: true
 catalog:
   # One zod for the whole workspace; ADR-003 §7 relies on sharing it with the MCP and Claude SDKs.
   zod: 4.6.7
+# Native builds pulled in by @google/gemini-cli (a test-only dependency of @tacet/adapter-acp):
+# not needed to run it over ACP, so they stay off.
+allowBuilds:
+  "@github/keytar": false
+  node-pty: false
