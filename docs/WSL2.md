@@ -34,7 +34,7 @@ corepack enable            # pnpm, as pinned in package.json
 
 `build-essential` is for `node-pty`, which the PTY adapter builds from source.
 
-Check that `which node` and `which git` point inside the distro, not to `/mnt/c/...`. WSL appends the Windows `PATH` by default (`appendWindowsPath`, [WSL config](https://learn.microsoft.com/windows/wsl/wsl-config)), so a Windows Node can shadow the distro's one.
+Check that `which node` and `which git` point inside the distro, not to `/mnt/c/...`. WSL appends the Windows `PATH` by default (`appendWindowsPath`, [WSL config](https://learn.microsoft.com/windows/wsl/wsl-config)), so a Windows Node can shadow the distro's one. A Windows npm on that `PATH` can also stop nvm: on a GitHub-hosted runner, nvm found the Windows npm's global prefix and exited with code 3 (observed in this repo's `wsl2` CI job, run 42880615723). Remove the Windows entries from `PATH` (`appendWindowsPath = false` under `[interop]` in `/etc/wsl.conf`, then `wsl --shutdown`), or install Node another way. The CI job installs the official Node 24 tarball from nodejs.org and checks it against `SHASUMS256.txt`.
 
 ## 3. Keep repos in the distro's file system
 

@@ -55,6 +55,9 @@ jobs:
         # name is letters, digits, `.`, `_` and `-`. github.sha is the merge commit ci.yml tests.
         run: |
           set -euo pipefail
+          # Only the distro's own tools: drop the Windows PATH WSL appends (/mnt/<drive>/...).
+          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/mnt/' | paste -sd: -)
+          export PATH
           export DEBIAN_FRONTEND=noninteractive
           SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
           $SUDO apt-get update -qq
@@ -63,13 +66,17 @@ jobs:
           git init -q
           git fetch -q --depth 1 'https://github.com/${{ github.repository }}.git' '${{ github.sha }}'
           git checkout -q FETCH_HEAD
-          curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
-          export NVM_DIR="$HOME/.nvm"
-          # nvm is not written for `set -u`, which the wsl-bash wrapper turns on.
-          set +u
-          . "$NVM_DIR/nvm.sh"
-          nvm install 24
-          set -u
+          # Node 24 from nodejs.org, checked against its SHA256SUMS, not nvm: WSL appends the Windows
+          # PATH, and nvm exits 3 on the runner's Windows npm (a Windows npm prefix, run 42880615723).
+          cd /tmp
+          curl -fsSLO https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt
+          TARBALL=$(grep -oE 'node-v24\.[0-9.]+-linux-x64\.tar\.xz' SHASUMS256.txt | head -n1)
+          curl -fsSLO "https://nodejs.org/dist/latest-v24.x/$TARBALL"
+          grep " $TARBALL\$" SHASUMS256.txt | sha256sum -c -
+          $SUDO tar -xJf "$TARBALL" -C /usr/local --strip-components=1
+          rm -f "$TARBALL" SHASUMS256.txt
+          cd ~/tacet
+          node --version
           corepack enable
           pnpm install --frozen-lockfile
           pnpm lint
@@ -82,10 +89,8 @@ jobs:
         shell: wsl-bash {0}
         run: |
           set -euo pipefail
-          export NVM_DIR="$HOME/.nvm"
-          set +u
-          . "$NVM_DIR/nvm.sh"
-          set -u
+          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/mnt/' | paste -sd: -)
+          export PATH
           cd ~/tacet
           grep -E ' /mnt/[a-z] ' /proc/self/mountinfo || true
           node --input-type=module -e "
