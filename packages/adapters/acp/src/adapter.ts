@@ -123,6 +123,8 @@ interface Session {
   loading: boolean;
   /** The config option that selects the model, when the agent has one. */
   modelOption?: string;
+  /** The spec's `sessionMode`, once set, and the config option that sets it, if any (#145). */
+  pinnedMode?: { mode: string; configId?: string };
   exited: Promise<void>;
   exit?: { code: number | null; signal: NodeJS.Signals | null };
   stderrTail: string;
@@ -292,8 +294,9 @@ export class AcpAdapter implements AgentAdapter {
       handle.vendorSessionId = created.sessionId;
       const modelOption = (created.configOptions ?? []).find((o) => o.category === 'model');
       if (modelOption) s.modelOption = modelOption.id;
-      if (spec.sessionMode !== undefined) await this.#setMode(s, created, spec.sessionMode);
       if (opts.model !== undefined && !spec.modelArgs) await this.#setModel(s, opts.model);
+      // Last: an agent may revisit its mode when the model changes.
+      if (spec.sessionMode !== undefined) await this.#setMode(s, created, spec.sessionMode);
     } catch (err) {
       s = undefined;
       conn.close();
@@ -348,7 +351,13 @@ export class AcpAdapter implements AgentAdapter {
       return;
     }
     s.approvals.delete(requestId);
-    pending.resolve(permissionOutcome(pending.options, decision));
+    // With a pinned mode, "always" is answered once: agents offer mode changes as their
+    // `allow_always` options (claude-agent-acp: "Yes, and use auto mode"; #145).
+    const answer: ApprovalDecision =
+      s.pinnedMode && decision.kind === 'allow_always'
+        ? { ...decision, kind: 'allow_once', persist: false }
+        : decision;
+    pending.resolve(permissionOutcome(pending.options, answer));
   }
 
   async close(h: SessionHandle): Promise<void> {
@@ -506,12 +515,17 @@ export class AcpAdapter implements AgentAdapter {
           `${this.id} offers no session mode ${JSON.stringify(mode)} (it has ${values.join(', ')})`,
         );
       }
+      s.pinnedMode = { mode, configId: option.id };
       if (option.currentValue !== mode) {
-        await s.conn.agent.request('session/set_config_option', {
+        const r = await s.conn.agent.request('session/set_config_option', {
           sessionId: s.acpSessionId,
           configId: option.id,
           value: mode,
         });
+        const now = (r.configOptions ?? []).find((o) => o.id === option.id)?.currentValue;
+        if (now !== mode) {
+          throw new Error(`${this.id} did not switch to session mode ${JSON.stringify(mode)}`);
+        }
       }
       return;
     }
@@ -519,8 +533,37 @@ export class AcpAdapter implements AgentAdapter {
     if (!modes?.availableModes.some((m) => m.id === mode)) {
       throw new Error(`${this.id} offers no session mode ${JSON.stringify(mode)}`);
     }
+    s.pinnedMode = { mode };
     if (modes.currentModeId !== mode) {
       await s.conn.agent.request('session/set_mode', { sessionId: s.acpSessionId, modeId: mode });
+    }
+  }
+
+  /** The agent left the pinned mode on its own: set it back, or end the session (#145). */
+  async #restoreMode(s: Session): Promise<void> {
+    const pin = s.pinnedMode;
+    if (!pin || s.closing || s.ended) return;
+    try {
+      if (pin.configId !== undefined) {
+        await s.conn.agent.request('session/set_config_option', {
+          sessionId: s.acpSessionId,
+          configId: pin.configId,
+          value: pin.mode,
+        });
+      } else {
+        await s.conn.agent.request('session/set_mode', {
+          sessionId: s.acpSessionId,
+          modeId: pin.mode,
+        });
+      }
+    } catch (err) {
+      if (s.closing || s.ended) return;
+      this.#setState(
+        s,
+        'error',
+        `${this.id} left session mode ${JSON.stringify(pin.mode)} and could not be set back: ${this.#scrub(errorMessage(err), s.secrets)}`,
+      );
+      await this.close(s.handle);
     }
   }
 
@@ -580,7 +623,18 @@ export class AcpAdapter implements AgentAdapter {
 
   #onUpdate(s: Session, n: SessionNotification): void {
     if (s.loading || s.ended || n.sessionId !== s.acpSessionId) return;
-    for (const e of updateToEvents(n.update, s.turn)) this.#emit(s, e);
+    const u = n.update;
+    const pin = s.pinnedMode;
+    if (pin) {
+      const now =
+        u.sessionUpdate === 'current_mode_update'
+          ? u.currentModeId
+          : u.sessionUpdate === 'config_option_update' && pin.configId !== undefined
+            ? u.configOptions.find((o) => o.id === pin.configId)?.currentValue
+            : undefined;
+      if (now !== undefined && now !== pin.mode) void this.#restoreMode(s);
+    }
+    for (const e of updateToEvents(u, s.turn)) this.#emit(s, e);
   }
 
   #onPermission(

@@ -143,6 +143,8 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
   verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
   home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
+  // Never a subscription or gateway token, whatever the user passes through (#145).
+  envDeny: ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
   // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`
   // ("Manual: always ask before making changes") sends `session/request_permission` (verified).
   sessionMode: 'default',
@@ -194,6 +196,8 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
   verifiedVersion: '@agentclientprotocol/codex-acp 2.6.0',
   home: { env: 'CODEX_HOME', files: { 'config.toml': codexAcpConfig() } },
+  // `CODEX_API_KEY` would be a second key route besides the provider's `env_key` (#145).
+  envDeny: ['CODEX_API_KEY'],
   // It starts in `agent` ("Auto review: only ask for actions detected as potentially unsafe").
   // `workspace-write` is the native adapter's default (`on-request`): edits in the checkout run in
   // the sandbox, and leaving it (other files, the network) asks. `read-only` asks for every edit.

@@ -191,6 +191,31 @@ for (const c of CASES) {
       expect(own.some((p) => p.includes('/.tmp/plugins/'))).toBe(false);
     });
 
+    it.runIf(c.name === 'claude-agent-acp')(
+      'runs tools unasked without its session mode: the control for the approval probe',
+      { timeout: 120_000 },
+      async () => {
+        const { sessionMode, ...unpinned } = c.agent(api.url);
+        expect(sessionMode).toBe('default');
+        const plain = new AcpAdapter({
+          agent: unpinned,
+          executable: [process.execPath, c.bin],
+          killTimeoutMs: 2000,
+          stateDir: state,
+          baseEnv: { PATH: process.env.PATH, HOME: home, ...c.env(api.url) },
+        });
+        const cwd = join(root, 'wt-control');
+        mkdirSync(cwd, { recursive: true });
+        const h = await plain.start({ cwd });
+        const tap = new EventTap(plain.events(h));
+        await plain.send(h, { text: 'RUN_TOOL' });
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
+        await plain.close(h);
+        expect(tap.events.some((e) => e.t === 'approval.request')).toBe(false);
+        expect(tap.events.some((e) => e.t === 'tool.call')).toBe(true);
+      },
+    );
+
     it.runIf(c.name === 'codex-acp')(
       'keeps the key from the commands it runs (#150)',
       { timeout: 120_000 },

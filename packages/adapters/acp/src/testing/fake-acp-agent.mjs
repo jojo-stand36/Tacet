@@ -5,11 +5,15 @@
 // start, in two chunks.
 // FAKE_CAPS: JSON merged into `agentCapabilities` (e.g. `loadSession`, `sessionCapabilities`).
 // FAKE_SESSION: JSON merged into the `session/new` result (e.g. `modes`, `configOptions`).
+// `session/set_config_option` sets the option's `currentValue` and answers with them all;
+// FAKE_SET=fail fails it and `session/set_mode`, FAKE_SET=ignore leaves the value as it was.
 // Prompts are scripted by their text:
 // - `PERMS`: asks two permissions at once; ends the turn `cancelled` on `session/cancel`, once
 //   both are answered, or `end_turn` if both were answered without a cancel.
 // - `ABORT`: waits for `session/cancel`, then fails the request with -32800.
 // - `CRASH`: exits with code 3 mid-turn.
+// - `ASK_ALWAYS`: asks one permission offering allow_once, allow_always and reject_once.
+// - `DRIFT`: reports a switch to mode `auto` on its own (`current_mode_update`), then replies.
 // - `SLOW <text>`: replies `<text>` after 300 ms. Anything else: replies with the prompt text.
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
@@ -36,6 +40,7 @@ if (process.env.FAKE_STDERR) {
   setTimeout(() => process.stderr.write(`${t.slice(half)}\n`), 100);
 }
 
+const session = JSON.parse(process.env.FAKE_SESSION ?? '{}');
 let authed = false;
 let nextId = 1000;
 /** Our own requests to the client, by id. */
@@ -67,6 +72,26 @@ function prompt(m) {
       ask('session/request_permission', { sessionId, toolCall: toolCall('t1'), options }),
       ask('session/request_permission', { sessionId, toolCall: toolCall('t2'), options }),
     ]).then(() => end(cancelled ? 'cancelled' : 'end_turn'));
+  } else if (text === 'ASK_ALWAYS') {
+    const options = [
+      { optionId: 'once', name: 'Yes', kind: 'allow_once' },
+      { optionId: 'always', name: 'Yes, and use auto mode', kind: 'allow_always' },
+      { optionId: 'no', name: 'No', kind: 'reject_once' },
+    ];
+    const toolCall = { toolCallId: 't1', title: 'tool t1', kind: 'edit' };
+    ask('session/request_permission', { sessionId, toolCall, options }).then(() => end('end_turn'));
+  } else if (text === 'DRIFT') {
+    send({
+      method: 'session/update',
+      params: {
+        sessionId,
+        update: { sessionUpdate: 'current_mode_update', currentModeId: 'auto' },
+      },
+    });
+    setTimeout(() => {
+      say(sessionId, 'drifted');
+      end('end_turn');
+    }, 100);
   } else if (text === 'ABORT') {
     onCancel = () => send({ id: m.id, error: { code: -32800, message: 'Request cancelled' } });
   } else if (text === 'CRASH') {
@@ -107,11 +132,17 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   } else if (m.method === 'session/new') {
     if (process.env.FAKE_NEEDS_LOGIN === '1' && !authed) {
       send({ id: m.id, error: { code: -32000, message: 'Authentication required' } });
-    } else {
-      const extra = JSON.parse(process.env.FAKE_SESSION ?? '{}');
-      send({ id: m.id, result: { sessionId: 'fake-session-1', ...extra } });
-    }
-  } else if (m.method === 'session/set_config_option' || m.method === 'session/set_mode') {
+    } else send({ id: m.id, result: { sessionId: 'fake-session-1', ...session } });
+  } else if (
+    process.env.FAKE_SET === 'fail' &&
+    /^session\/set_(config_option|mode)$/.test(m.method)
+  ) {
+    send({ id: m.id, error: { code: -32603, message: 'cannot change that now' } });
+  } else if (m.method === 'session/set_config_option') {
+    const option = (session.configOptions ?? []).find((o) => o.id === m.params.configId);
+    if (option && process.env.FAKE_SET !== 'ignore') option.currentValue = m.params.value;
+    send({ id: m.id, result: { configOptions: session.configOptions ?? [] } });
+  } else if (m.method === 'session/set_mode') {
     send({ id: m.id, result: {} });
   } else if (m.method === 'session/load') {
     // The history is replayed as updates before the answer.

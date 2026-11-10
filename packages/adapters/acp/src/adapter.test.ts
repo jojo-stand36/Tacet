@@ -458,6 +458,81 @@ describe('AcpAdapter (fake ACP agent)', () => {
         );
       }
     });
+
+    it('finds the mode among grouped select options', async () => {
+      const grouped = select('auto');
+      const [option] = grouped.configOptions;
+      const opts = option?.options ?? [];
+      Object.assign(option ?? {}, { options: [{ group: 'g', name: 'All', options: opts }] });
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(grouped) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().map((m) => m.method)).toContain('session/set_config_option');
+    });
+
+    it('fails to start when the agent refuses or ignores the switch', async () => {
+      for (const [how, session] of [
+        ['fail', select('auto')],
+        ['fail', { modes }],
+        ['ignore', select('auto')],
+      ] as const) {
+        const adapter = make(spec('ask'), {
+          FAKE_SESSION: JSON.stringify(session),
+          FAKE_SET: how,
+        });
+        await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+          how === 'fail' ? /cannot change that now/ : /did not switch to session mode "ask"/,
+        );
+      }
+    });
+
+    it('fails a resume whose answer does not offer the mode', async () => {
+      // The fake's `session/load` answers `null`: no modes to set.
+      const resumable = spec('ask');
+      resumable.capabilities = { ...resumable.capabilities, resume: true };
+      const adapter = make(resumable, {
+        FAKE_SESSION: JSON.stringify({ modes }),
+        FAKE_CAPS: JSON.stringify({ loadSession: true }),
+      });
+      await expect(
+        adapter.start({ cwd: join(root, 'wt'), resume: { vendorSessionId: 'old' } }),
+      ).rejects.toThrow(/offers no session mode "ask"/);
+    });
+
+    for (const [via, session] of [
+      ['config option', select('auto')],
+      ['session/set_mode', { modes }],
+    ] as const) {
+      it(`sets the mode back when the agent leaves it (${via})`, async () => {
+        const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(session) });
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const tap = new EventTap(adapter.events(h));
+        const setters = () =>
+          methods().filter((m) => /^session\/set_(config_option|mode)$/.test(m.method ?? ''));
+        const before = setters().length;
+        await adapter.send(h, { text: 'DRIFT' });
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+        await until(() => setters().length === before + 1);
+        expect(JSON.stringify(setters().at(-1)?.params)).toContain('"ask"');
+        await adapter.close(h);
+      });
+    }
+
+    it('answers "always" once when the mode is pinned', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'ASK_ALWAYS' });
+      const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+      if (req.event.t !== 'approval.request') throw new Error('no approval request');
+      await adapter.respond(h, req.event.id, { kind: 'allow_always', persist: true });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, req.index);
+      await adapter.close(h);
+      const answer = received().find(
+        (l) => l.received !== undefined && JSON.stringify(l.received).includes('"optionId"'),
+      );
+      expect(JSON.stringify(answer?.received)).toContain('"optionId":"once"');
+    });
   });
 
   it('keeps the error type when a profile is refused at start', async () => {
@@ -521,5 +596,8 @@ describe('ACP agent registry', () => {
     // Both start in a mode that runs tools unasked; Workers use one that asks (#145).
     expect(BUILTIN_ACP_AGENTS['claude-acp']?.sessionMode).toBe('default');
     expect(BUILTIN_ACP_AGENTS['codex-acp']?.sessionMode).toBe('workspace-write');
+    // No subscription or second key route, whatever the user passes through.
+    expect(BUILTIN_ACP_AGENTS['claude-acp']?.envDeny).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.envDeny).toEqual(['CODEX_API_KEY']);
   });
 });
