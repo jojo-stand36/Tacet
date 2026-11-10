@@ -72,12 +72,18 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
 
   return startRpcServer({
     token: o.token,
+    // The CLI only: a Mini-conductor dials the Conductor, never another Mini-conductor.
+    roles: ['cli'],
     serverInfo: o.serverInfo ?? { name: 'tacet-mini', version: '0.0.0' },
     ...(o.onError ? { onError: o.onError } : {}),
     handlers: {
       ListTasks: (p) => {
         const req = params(A2AListTasksRequest, p);
-        const all = entries().filter((e) => !req.status || toA2AState(e.state) === req.status);
+        // Every task here shares the one context.
+        const inContext = !req.contextId || req.contextId === o.contextId;
+        const all = entries().filter(
+          (e) => inContext && (!req.status || toA2AState(e.state) === req.status),
+        );
         const size = req.pageSize ?? PAGE_SIZE;
         const start = req.pageToken ? Number.parseInt(req.pageToken, 10) : 0;
         if (!Number.isInteger(start) || start < 0 || String(start) !== (req.pageToken ?? '0')) {
@@ -100,7 +106,12 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
         if (DONE_STATES.has(entry(req.id).state)) {
           throw new RpcError(A2A_ERRORS.taskNotCancelable, `task ${req.id} has already ended`);
         }
-        await o.mini.cancel(req.id);
+        try {
+          await o.mini.cancel(req.id);
+        } catch (err) {
+          // Ended meanwhile, or another reason the Mini-conductor gives: its message names ids only.
+          throw new RpcError(A2A_ERRORS.taskNotCancelable, (err as Error).message);
+        }
         return toA2ATask(entry(req.id), o.contextId);
       },
       SendMessage: (p) => {
@@ -126,7 +137,12 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
           .flatMap((part) => ('text' in part ? [part.text] : []))
           .join('\n')
           .trim();
-        o.mini.answer(escalationId, text || decision.data.choice);
+        try {
+          o.mini.answer(escalationId, text || decision.data.choice);
+        } catch (err) {
+          // Resolved meanwhile, or an empty answer: the message names the escalation only.
+          throw new RpcError(-32602, (err as Error).message);
+        }
         return { task: toA2ATask(entry(task.id), o.contextId) };
       },
     },

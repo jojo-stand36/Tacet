@@ -251,6 +251,6 @@ A standalone Mini-conductor serves the ยง4 methods on its own port to the CLI (ย
 
 Also recorded:
 - **WebSocket library.** The port uses the `ws` package (pinned 8.22.1, no dependencies). Node 24 has a WebSocket client but no server. It is configured with `noServer` (Host, Origin and bearer checks run on the HTTP upgrade before a socket exists), no compression and 1 MiB frames.
-- **What the CLI may do.** Only `cli` hellos are served; a `ui` hello is refused until browser sessions are served there. `SendMessage` without `taskId` answers `-32004`: new tasks still start with `tacet run`.
+- **What the CLI may do.** A standalone Mini-conductor's port serves `cli` hellos only: a `ui` hello is refused until browser sessions are served there, and a `mini` hello is refused because Mini-conductors dial the Conductor, not each other. `SendMessage` without `taskId` answers `-32004`: new tasks still start with `tacet run`.
 - **Paging.** `ListTasks` pages with an opaque `pageToken` (an offset today).
 - **Answering.** `tacet answer <id> <text>` is the CLI verb for an answer to a live run.

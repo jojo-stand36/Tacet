@@ -93,7 +93,6 @@ export function formatEvent(e: EventEnvelope): string {
   return terminalSafe(`${time} ${where} ${what}`);
 }
 
-/** A task and its sub-tasks as `tacet status` shows them. */
 /**
  * One task as `tacet status` prints it (#201): the same lines as `formatTask`, built from a status
  * entry so a live run and the log print alike. Only escalations still open are listed.
@@ -127,6 +126,7 @@ export function formatStatusEntry(e: TaskStatusEntry): string {
   return terminalSafe(lines.join('\n'));
 }
 
+/** A task and its sub-tasks as `tacet run` reports them. */
 export function formatTask(view: TaskView, subs: TaskView[]): string {
   const lines = [`${view.task.id} ${view.state}: ${oneLine(view.task.goal)}`];
   for (const s of subs) {

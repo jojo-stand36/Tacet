@@ -13,7 +13,6 @@ import {
   DONE_STATES,
   isSubtaskOf,
   openLog,
-  pendingEscalations,
   readState,
   repoRootFrom,
   rootTasks,

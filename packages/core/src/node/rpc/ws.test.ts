@@ -226,6 +226,84 @@ describe('Tacet RPC server security (#201, ADR-003 §3)', () => {
   });
 });
 
+describe('Tacet RPC server limits (#201)', () => {
+  it('refuses a hello role it does not serve', async () => {
+    const token = randomToken();
+    const server = await startRpcServer({
+      token,
+      serverInfo: { name: 'test', version: '0' },
+      handlers: {},
+      roles: ['cli'],
+    });
+    servers.push(server);
+    const ws = await rawSocket(server.port, token);
+    const done = closed(ws);
+    ws.send(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tacet/hello',
+        params: {
+          protocolVersions: [1],
+          role: 'mini',
+          clientInfo: { name: 't', version: '0' },
+          capabilities: {},
+          repoId: 'r',
+          repoPath: '/r',
+          adapters: [],
+          miniVersion: '0',
+        },
+      }),
+    );
+    const r = await done;
+    expect(r.code).toBe(1008);
+    expect(r.messages[0]).toMatchObject({ error: { message: 'hello rejected' } });
+    expect((await client(server.port, token)).hello.protocolVersion).toBe(1);
+  });
+
+  it('closes a socket that never says hello', async () => {
+    const token = randomToken();
+    const server = await startRpcServer({
+      token,
+      serverInfo: { name: 'test', version: '0' },
+      handlers: {},
+      helloTimeoutMs: 200,
+    });
+    servers.push(server);
+    const ws = await rawSocket(server.port, token);
+    expect((await closed(ws)).code).toBe(1008);
+  });
+
+  it('answers -32000 beyond the requests one socket may have in flight', async () => {
+    const token = randomToken();
+    let release = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const server = await startRpcServer({
+      token,
+      serverInfo: { name: 'test', version: '0' },
+      handlers: { wait: () => gate.then(() => 'done') },
+      maxInFlight: 2,
+    });
+    servers.push(server);
+    const c = await client(server.port, token);
+    const a = c.call('wait');
+    const b = c.call('wait');
+    const ws = await rawSocket(server.port, token);
+    // Per socket: a second socket has its own allowance.
+    const other = await client(server.port, token);
+    const third = c.call('wait', undefined, { timeoutMs: 500 });
+    await expect(third).rejects.toMatchObject({ code: -32000, message: 'too many requests' });
+    const fine = other.call('wait');
+    release();
+    expect(await Promise.all([a, b, fine])).toEqual(['done', 'done', 'done']);
+    ws.close();
+    await c.close();
+    await other.close();
+  });
+});
+
 describe('Tacet RPC server and client', () => {
   it('says hello, then answers calls with results and JSON-RPC errors', async () => {
     const { server, token, errors } = await serve();

@@ -28,7 +28,7 @@ export async function answer(
   }
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
   const paths = statePaths(repoRoot, o['user-dir'], io.home);
-  const client = await liveControl(io, repoRoot, paths);
+  const client = await liveControl(io, repoRoot, paths, 'cannot answer through it');
   if (!client) {
     io.err(
       `no run is live for this repo: answer as it resumes, with tacet run --resume --answer ${terminalSafe(escalationId)}=<text>`,

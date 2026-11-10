@@ -28,7 +28,7 @@ export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<
   const { cancelStopped, miniLockHolder } = await import('@tacet/mini');
   const pid = miniLockHolder(paths.lock);
   if (pid !== undefined) {
-    const client = await liveControl(io, repoRoot, paths);
+    const client = await liveControl(io, repoRoot, paths, 'cannot cancel through it');
     if (client) return cancelLive(io, client, taskId, o);
     io.err(
       `a run is live for this repo (pid ${pid}) but its control port did not answer: interrupt it (Ctrl-C), then tacet cancel ${terminalSafe(taskId)}`,

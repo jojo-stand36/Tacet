@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -552,6 +553,52 @@ describe('tacet standalone (#21)', () => {
         expect(log).not.toContain(token);
         expect(workers).not.toContain(token);
       }
+    });
+
+    it('uses the port only when the runtime file names the run holding the lock', async () => {
+      const paths = repoStatePaths(repo, state);
+      script = () => {
+        raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      const sources: Record<string, string> = {};
+      const notes: string[] = [];
+      await tacet(['run', ...user(), 'pick a database'], {
+        prompt: async () => {
+          const file = runtimeFile();
+          const real = readFileSync(file, 'utf8');
+          sources.real = (await status()).source;
+          // The live port and token, but another process's pid: not the lock holder.
+          writeFileSync(file, JSON.stringify({ ...JSON.parse(real), pid: process.pid + 100_000 }), {
+            mode: 0o600,
+          });
+          sources.otherPid = (await status()).source;
+          // Readable by others: refused, with a note.
+          writeFileSync(file, real, { mode: 0o600 });
+          chmodSync(file, 0o644);
+          const loose = await tacet(['status', ...user(), '--json']);
+          sources.loose = (JSON.parse(loose.out) as Status).source;
+          notes.push(loose.err);
+          chmodSync(file, 0o600);
+          sources.restored = (await status()).source;
+          return '';
+        },
+      });
+      expect(sources).toEqual({ real: 'run', otherPid: 'log', loose: 'log', restored: 'run' });
+      expect(notes[0]).toContain('expected 600');
+    });
+
+    it('stops cleanly and leaves no file when the port cannot be set up', async () => {
+      script = () => ({ do: 'reply', text: 'done' });
+      // Where the run directory should be, a file: the runtime file cannot be written.
+      mkdirSync(join(root, 'home', '.tacet'), { recursive: true });
+      writeFileSync(join(root, 'home', '.tacet', 'run'), '');
+      const r = await tacet(['run', ...user(), 'a task']);
+      expect(r.code).toBe(1);
+      // The Mini-conductor was stopped: its lock is free and a new run can start.
+      expect(await status()).toMatchObject({ running: null });
+      rmSync(join(root, 'home', '.tacet', 'run'));
+      expect((await tacet(['run', ...user(), '--resume'])).code).not.toBe(1);
     });
 
     it('falls back to the log when the runtime file is stale or broken', async () => {

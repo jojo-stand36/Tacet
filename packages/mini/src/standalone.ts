@@ -188,9 +188,11 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
           try {
             try {
               removeRuntimeFile(file, token);
-            } finally {
-              await port.close();
+            } catch (err) {
+              // Changed under us (mode, owner): left in place, and the run still stops cleanly.
+              o.onError?.(`control: ${(err as Error).message}`);
             }
+            await port.close();
             await mini.stop();
           } finally {
             await mcp.close();

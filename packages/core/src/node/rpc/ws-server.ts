@@ -40,6 +40,12 @@ export interface RpcServerOptions {
   maxPayload?: number;
   /** Told about handler failures, by message only (never a request's params or headers). */
   onError?: (message: string) => void;
+  /** Hello roles accepted. Default `cli` and `mini`; `ui` is never served here. */
+  roles?: readonly ('cli' | 'mini')[];
+  /** Milliseconds a socket may take to say hello before it is closed. Default 10000. */
+  helloTimeoutMs?: number;
+  /** Requests one socket may have in flight; more get `-32000`. Default 32. */
+  maxInFlight?: number;
 }
 
 export interface RpcServer {
@@ -97,9 +103,19 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
       // The upgrade carried the daemon token; a `ui` hello is still refused (no session verifier).
       upgradeAuth: 'bearer',
       onHello: (hello) => {
+        // A throw here closes the socket ("hello rejected").
+        if (!(o.roles ?? ['cli', 'mini']).includes(hello.role as 'cli' | 'mini')) {
+          throw new Error('role not served');
+        }
         ctx = { sessionId: '', hello };
       },
     });
+    let inFlight = 0;
+    const helloTimer = setTimeout(() => {
+      if (!ctx?.sessionId) ws.close(1008, 'no hello');
+    }, o.helloTimeoutMs ?? 10_000);
+    helloTimer.unref();
+    ws.on('close', () => clearTimeout(helloTimer));
     const send = (msg: unknown) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
     };
@@ -120,7 +136,21 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
         ws.close(1003, 'text frames only');
         return;
       }
-      void dispatch(data.toString('utf8'), ctx).then((reply) => reply && send(reply));
+      if (inFlight >= (o.maxInFlight ?? 32)) {
+        let id: unknown = null;
+        try {
+          id = (JSON.parse(data.toString('utf8')) as { id?: unknown }).id ?? null;
+        } catch {}
+        const rpcId = typeof id === 'string' || typeof id === 'number' ? id : null;
+        send({ jsonrpc: '2.0', id: rpcId, error: { code: -32000, message: 'too many requests' } });
+        return;
+      }
+      inFlight++;
+      void dispatch(data.toString('utf8'), ctx)
+        .then((reply) => reply && send(reply))
+        .finally(() => {
+          inFlight--;
+        });
     });
   };
 

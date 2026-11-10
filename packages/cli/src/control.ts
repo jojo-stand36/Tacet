@@ -26,6 +26,8 @@ export async function liveControl(
   io: Io,
   repoRoot: string,
   paths: RepoStatePaths,
+  /** What the caller does without the port, for the note. */
+  fallback = 'reading the log instead',
 ): Promise<RpcClient | undefined> {
   const file = runtimeFileFor(io, repoRoot);
   let info: ReturnType<typeof readRuntimeFile>;
@@ -33,7 +35,7 @@ export async function liveControl(
     info = readRuntimeFile(file);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      io.err(`note: ${terminalSafe((err as Error).message)}; reading the log instead`);
+      io.err(`note: ${terminalSafe((err as Error).message)}; ${fallback}`);
     }
     return undefined;
   }
@@ -49,7 +51,7 @@ export async function liveControl(
     });
   } catch (err) {
     io.err(
-      `note: the live run's control port did not answer (${terminalSafe((err as Error).message)}); reading the log instead`,
+      `note: the live run's control port did not answer (${terminalSafe((err as Error).message)}); ${fallback}`,
     );
     return undefined;
   }
