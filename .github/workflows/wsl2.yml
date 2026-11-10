@@ -1,0 +1,103 @@
+name: wsl2
+
+# Experimental (#193): the suite inside a WSL2 distro on a GitHub-hosted Windows runner. Not a
+# required check. GitHub's docs do not say WSL2 (nested virtualisation) is supported on hosted
+# runners; the windows-2025 image ships WSL 2 and users report it starting there
+# (actions/runner-images README and issue #11869, read 2026-11-10), so this may break with the
+# platform. It runs weekly, on demand, and on pull requests that change it or the WSL checks.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+  pull_request:
+    paths:
+      - .github/workflows/wsl2.yml
+      - packages/core/src/node/wsl.ts
+      - packages/core/src/node/wsl.test.ts
+      - packages/cli/src/commands/run.ts
+      - docs/WSL2.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wsl2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wsl2:
+    name: WSL2 / Ubuntu 24.04 / Node 24
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      # v7.2.0, pinned by commit: a third-party action. Its `wsl-version` input defaults to 2;
+      # set anyway (github.com/Vampire/setup-wsl README, read 2026-11-10).
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+
+      # From Windows, as the research recommends: `wsl -l -v` lists each distro's WSL version.
+      # Its output is UTF-16, so NULs are dropped before matching.
+      - name: Assert WSL 2, not WSL 1
+        shell: pwsh
+        run: |
+          $out = (wsl -l -v | Out-String) -replace "`0", ''
+          Write-Output $out
+          if ($out -notmatch 'Ubuntu-24\.04\s+\S+\s+2') { throw 'Ubuntu-24.04 is not running on WSL 2' }
+
+      # Inside the distro's own file system, as docs/WSL2.md tells users to work: a fresh clone
+      # of this commit in ~, not the Windows checkout under /mnt.
+      - name: Install, lint, typecheck and test inside WSL2
+        shell: wsl-bash {0}
+        # The wsl-bash wrapper passes no environment into WSL (it sets no WSLENV), so the values
+        # are written into the script. Both are safe there: a commit SHA is hex, and a repository
+        # name is letters, digits, `.`, `_` and `-`. github.sha is the merge commit ci.yml tests.
+        run: |
+          set -euo pipefail
+          # Only the distro's own tools: drop the Windows PATH WSL appends (/mnt/<drive>/...).
+          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/mnt/' | paste -sd: -)
+          export PATH
+          export DEBIAN_FRONTEND=noninteractive
+          SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq curl git ca-certificates build-essential python3
+          rm -rf ~/tacet && mkdir ~/tacet && cd ~/tacet
+          git init -q
+          git fetch -q --depth 1 'https://github.com/${{ github.repository }}.git' '${{ github.sha }}'
+          git checkout -q FETCH_HEAD
+          # Node 24 from nodejs.org, checked against its SHA256SUMS, not nvm: WSL appends the Windows
+          # PATH, and nvm exits 3 on the runner's Windows npm (a Windows npm prefix, run 42880615723).
+          cd /tmp
+          curl -fsSLO https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt
+          TARBALL=$(grep -oE 'node-v24\.[0-9.]+-linux-x64\.tar\.xz' SHASUMS256.txt | head -n1)
+          curl -fsSLO "https://nodejs.org/dist/latest-v24.x/$TARBALL"
+          grep " $TARBALL\$" SHASUMS256.txt | sha256sum -c -
+          $SUDO tar -xJf "$TARBALL" -C /usr/local --strip-components=1
+          rm -f "$TARBALL" SHASUMS256.txt
+          cd ~/tacet
+          node --version
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+
+      # The Windows-drive check (#193) on a real WSL2 mount table, whose shape Microsoft does
+      # not document: C: must read as a Windows drive, the home directory must not.
+      - name: Windows-drive detection on the real mount table
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/mnt/' | paste -sd: -)
+          export PATH
+          cd ~/tacet
+          grep -E ' /mnt/[a-z] ' /proc/self/mountinfo || true
+          node --input-type=module -e "
+            const m = await import('./packages/core/dist/node/wsl.js');
+            const p = m.hostWslProbe();
+            const c = m.windowsDrive('/mnt/c', p);
+            const home = m.windowsDrive(process.env.HOME, p);
+            console.log({ c, home, wsl: m.isWsl(p) });
+            if (c !== 'C:' || home !== undefined) process.exit(1);
+          "
