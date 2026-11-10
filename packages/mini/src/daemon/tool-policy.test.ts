@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -35,7 +43,10 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Write', { path: 'src/c.ts', content: '' }).allow).toBe(true);
     expect(ask('NotebookEdit', { notebook_path: 'n.ipynb', new_source: '' }).allow).toBe(true);
     expect(ask('Glob', { pattern: '**/*.ts' }).allow).toBe(true);
-    expect(ask('Grep', { pattern: 'x', path: 'src', glob: '*.ts' }).allow).toBe(true);
+    expect(ask('Glob', { pattern: 'src/**/*.ts', path: 'src' }).allow).toBe(true);
+    expect(ask('Grep', { pattern: 'x', path: 'src', glob: '*.ts', '-n': true }).allow).toBe(true);
+    // Grep's pattern is a regex over contents, not a path.
+    expect(ask('Grep', { pattern: '\\.git|\\.\\./', output_mode: 'content' }).allow).toBe(true);
     const r = ask('Edit', { file_path: join(wt, 'src', 'a.ts') });
     expect(r.reason).toBe('Edit inside the worktree (src/a.ts)');
   });
@@ -49,6 +60,9 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Edit', { file_path: 'src/../src/a.ts' }).reason).toMatch(/\(\.\.\)/);
     expect(ask('Glob', { pattern: '../**' }).allow).toBe(false);
     expect(ask('Grep', { pattern: 'x', glob: '../*' }).allow).toBe(false);
+    // Brace expansion is refused outright.
+    expect(ask('Glob', { pattern: '{..,src}/*' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: '{/etc,src}/*' }).allow).toBe(false);
   });
 
   it('refuses absolute paths elsewhere, home paths and an absolute search pattern', () => {
@@ -85,6 +99,8 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Read', { file_path: 'sub/.git/config' }).allow).toBe(false);
     expect(ask('Grep', { pattern: 'x', path: '.git' }).allow).toBe(false);
     expect(ask('Glob', { pattern: '.git/**' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: '.gi[t]/hooks/*' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: 'sub/.g?t/*' }).allow).toBe(false);
     // Through a symlink into a git dir.
     mkdirSync(join(wt, 'nested', '.git'), { recursive: true });
     symlinkSync(join(wt, 'nested', '.git'), join(wt, 'g'));
@@ -119,6 +135,43 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Edit', { file_path: '' }).allow).toBe(false);
     // Every spelling present is checked: one inside does not excuse one outside.
     expect(ask('Write', { file_path: 'src/a.ts', path: '/etc/x' }).allow).toBe(false);
+    // A key the tool's verified input does not have is refused, not ignored.
+    expect(ask('Read', { file_path: 'src/a.ts', filePath: '/etc/passwd' }).allow).toBe(false);
+    expect(
+      ask('Edit', { file_path: 'src/a.ts', old_string: 'x', new_string: 'y', extra: 1 }).allow,
+    ).toBe(false);
+  });
+
+  it('refuses input the adapter redacted: the tool runs on the original (#200 review)', () => {
+    // `bearer ` + 20 path characters, or a private-key header, is scrubbed to [redacted].
+    expect(ask('Write', { file_path: `${wt}/[redacted]`, content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'src/a.ts', content: 'key: [redacted]' }).allow).toBe(false);
+    expect(ask('Read', { file_path: '[redacted]' }).reason).toMatch(/redacted/);
+  });
+
+  it('refuses backslashes and NUL: ordinary name characters, never separators', () => {
+    symlinkSync('/etc', join(wt, 'a\\b'));
+    expect(ask('Read', { file_path: `${wt}/a\\b/passwd` }).allow).toBe(false);
+    expect(ask('Read', { file_path: 'a\\b/passwd' }).allow).toBe(false);
+    expect(ask('Read', { file_path: 'src\\..\\..\\outside' }).allow).toBe(false);
+    expect(ask('Read', { file_path: 'src/\0/x' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: 'a\\b/*' }).allow).toBe(false);
+  });
+
+  it('fails closed on a path it cannot check, and on a write to a hard-linked file', () => {
+    expect(ask('Write', { file_path: `src/${'x'.repeat(300)}/y`, content: '' }).allow).toBe(false);
+    linkSync(join(outside, 'secret'), join(wt, 'src', 'linked'));
+    expect(
+      ask('Edit', { file_path: 'src/linked', old_string: 'x', new_string: 'y' }).reason,
+    ).toMatch(/hard links/);
+    // Reading it is fine: nothing changes.
+    expect(ask('Read', { file_path: 'src/linked' }).allow).toBe(true);
+  });
+
+  it('checks the literal directory of a glob like a path', () => {
+    symlinkSync(outside, join(wt, 'out'));
+    expect(ask('Glob', { pattern: 'out/**' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: 'src/**/*.ts' }).allow).toBe(true);
   });
 
   it('applies Claude Code tool names only to Claude adapters', () => {

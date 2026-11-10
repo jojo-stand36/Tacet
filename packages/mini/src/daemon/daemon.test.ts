@@ -981,6 +981,7 @@ describe('MiniConductor', () => {
           'Write .git/config',
           'Bash ls',
           'Read /etc/passwd',
+          'Write [redacted]',
         ].map((call, i) => ({
           key: `k${i}`,
           goal: `do [tool ${call}]`,
@@ -999,6 +1000,7 @@ describe('MiniConductor', () => {
       'reject',
       'reject',
       'reject',
+      'reject',
     ]);
     expect(claude.approvalsAnswered[1]?.message).toMatch(/leaves the worktree.*escalate/);
     const recorded = ofType('worker.approval').map((e) => e.data as Record<string, unknown>);
@@ -1008,6 +1010,7 @@ describe('MiniConductor', () => {
       ['Write', 'refused'],
       ['Bash', 'refused'],
       ['Read', 'refused'],
+      ['Write', 'refused'],
     ]);
     // No path outside the checkout in the summary-grade record.
     expect(JSON.stringify(recorded)).not.toContain('/etc/passwd');

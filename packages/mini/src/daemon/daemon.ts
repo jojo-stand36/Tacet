@@ -1155,10 +1155,10 @@ export class MiniConductor {
                 'worker.approval',
                 {
                   sessionId: run.sessionId,
-                  requestId: e.id,
-                  ...(e.toolName ? { toolName: e.toolName } : {}),
+                  requestId: e.id.slice(0, 200),
+                  ...(e.toolName ? { toolName: e.toolName.slice(0, 200) } : {}),
                   decision: d.allow ? 'allowed' : 'refused',
-                  reason: d.reason,
+                  reason: d.reason.slice(0, 2000),
                 },
                 run.sessionId,
               ),

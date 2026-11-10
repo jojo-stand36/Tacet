@@ -189,9 +189,9 @@ export type WorkerThrottled = z.infer<typeof WorkerThrottled>;
  */
 export const WorkerApproval = z.object({
   sessionId: Id,
-  requestId: z.string().min(1).describe("The adapter's approval request id"),
-  toolName: z.string().min(1).optional(),
+  requestId: z.string().min(1).max(200).describe("The adapter's approval request id"),
+  toolName: z.string().min(1).max(200).optional(),
   decision: openEnum(['allowed', 'refused'], 'refused'),
-  reason: z.string().min(1),
+  reason: z.string().min(1).max(2000),
 });
 export type WorkerApproval = z.infer<typeof WorkerApproval>;
