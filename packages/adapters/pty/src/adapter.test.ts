@@ -232,6 +232,7 @@ describe('PtyAdapter (fake claude)', () => {
     const bin = join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
     const adapter = make({ PATH: bin }, { subprocessScrub: true });
     const h = await adapter.start({ cwd: join(root, 'wt') });
     expect(fake().opts.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');

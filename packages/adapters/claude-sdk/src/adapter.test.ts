@@ -267,6 +267,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     const bin = join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
     const scrubbed = new ClaudeSdkAdapter({
       query: stub.fn,
       baseEnv: { PATH: bin, ANTHROPIC_API_KEY: FAKE_KEY },

@@ -58,11 +58,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: pnpm
 
-      # Claude Workers on Linux need bubblewrap (#150): without it they refuse to start, so the
-      # tests that run the real Claude Code binary need it too.
-      - name: Install bubblewrap
+      # Claude Workers on Linux run their commands in Claude Code's sandbox, which needs bubblewrap
+      # and socat (#150): without them they refuse to start, so the tests that run the real
+      # Claude Code binary need them too.
+      - name: Install bubblewrap and socat
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap socat
 
       # Diagnostics for #150: whether bubblewrap can make the namespaces Claude Code's sandbox uses.
       - name: Check bubblewrap
