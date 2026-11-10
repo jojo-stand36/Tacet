@@ -14,6 +14,8 @@ import type { WorkerBinding } from '@tacet/core/node';
 export interface Workspace {
   id: string;
   path: string;
+  /** The local branch it started from, when it started from one: its task's target (#210). */
+  baseBranch?: string;
 }
 
 export interface Workspaces {
@@ -27,8 +29,9 @@ export interface Workspaces {
   /**
    * Delete a checkout; a no-op for an id that is gone. Refuses (throws) rather than lose work
    * nothing else has, such as local files or commits no other branch contains, unless `force`.
+   * `landed` names commits that landed in their target (#210); work they contain counts as kept.
    */
-  remove(id: string, options?: { force?: boolean }): Promise<void>;
+  remove(id: string, options?: { force?: boolean; landed?: readonly string[] }): Promise<void>;
 }
 
 /** The Worker's checkout failed its integrity checks: nothing was run in it. */
@@ -56,6 +59,20 @@ export interface Integrator {
   combine(commits: readonly string[]): Promise<string | undefined>;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
+  /**
+   * Whether `commit` landed in `target` (`refs/heads/<branch>`), merged or squash-merged, from
+   * the repo's own refs only (#210). Undefined when it has not (or cannot tell).
+   */
+  landed?(
+    commit: string,
+    target: string,
+  ): Promise<{ how: 'merge' | 'squash'; landedAs?: string } | undefined>;
+  /**
+   * Whether `later` is an amend of `earlier` in `workspace` (#210): the same first parent, and the
+   * Worker's own reflog made `later` by amending or squashing, not by a commit after a reset.
+   * Without it, no integrated commit counts as superseded.
+   */
+  replaces?(earlier: string, later: string, workspace: Workspace): Promise<boolean>;
 }
 
 /** Commits that cannot be combined without a person: `files` conflict. */

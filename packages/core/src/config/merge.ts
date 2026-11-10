@@ -134,6 +134,12 @@ export function mergeConfig(
         }
       }
     }
+    if (layer.name === 'task' && layer.data.worktrees !== undefined) {
+      // Cleanup is the repo's and the user's choice, not one task's (#210).
+      layerErrors.push(
+        `worktrees: the task layer (${layer.origin}) may not change worktree cleanup`,
+      );
+    }
     if (layer.name === 'task' && layer.data.review?.enabled === false) {
       // A task may ask for review, never skip one the repo or the user asked for (#19).
       layerErrors.push(`review.enabled: the task layer (${layer.origin}) may not turn review off`);

@@ -11,5 +11,9 @@
     "status": "passed",
     "commands": ["pnpm test rate-limit"]
   },
-  "openQuestions": []
+  "openQuestions": [],
+  "published": {
+    "ref": "refs/heads/tacet/task-42/result",
+    "commit": "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+  }
 }
