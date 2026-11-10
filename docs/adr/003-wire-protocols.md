@@ -240,9 +240,9 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 - **Adapter-only (no MCP).** Works for tier-1 adapters, but loses "any MCP-speaking agent can join the hierarchy", which is the key trick in `RESEARCH.md` §4.
 - **Token in tool arguments instead of transport auth.** Leaks into transcripts and logs. Rejected.
 
-### Addendum (2026-11-10, proposed, awaiting the owner): the standalone control port (#201)
+### Addendum (2026-11-10): the standalone control port (#201)
 
-Status of this addendum: **proposed**. It takes effect when the owner accepts it; the ADR above stays accepted either way.
+Status of this addendum: **accepted** on 2026-11-10, approved by the owner, together with the `ws` runtime dependency.
 
 A standalone Mini-conductor serves the §4 methods on its own port to the CLI (§4, "Topology"). Building it (#201) needs two decisions beyond the text above.
 
