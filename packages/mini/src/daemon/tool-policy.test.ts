@@ -44,7 +44,7 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('NotebookEdit', { notebook_path: 'n.ipynb', new_source: '' }).allow).toBe(true);
     expect(ask('Glob', { pattern: '**/*.ts' }).allow).toBe(true);
     expect(ask('Glob', { pattern: 'src/**/*.ts', path: 'src' }).allow).toBe(true);
-    expect(ask('Grep', { pattern: 'x', path: 'src', glob: '*.ts', '-n': true }).allow).toBe(true);
+    expect(ask('Grep', { pattern: 'x', path: 'src', type: 'ts', '-n': true }).allow).toBe(true);
     // Grep's pattern is a regex over contents, not a path.
     expect(ask('Grep', { pattern: '\\.git|\\.\\./', output_mode: 'content' }).allow).toBe(true);
     const r = ask('Edit', { file_path: join(wt, 'src', 'a.ts') });
@@ -59,7 +59,10 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     // Even one that would come back inside: `..` is never resolved.
     expect(ask('Edit', { file_path: 'src/../src/a.ts' }).reason).toMatch(/\(\.\.\)/);
     expect(ask('Glob', { pattern: '../**' }).allow).toBe(false);
-    expect(ask('Grep', { pattern: 'x', glob: '../*' }).allow).toBe(false);
+    // Grep's glob is not taken at all (Claude Code splits it and it can override `!.git`).
+    for (const glob of ['../*', '*.ts', 'src/*.ts,.git/**', 'a .git/**']) {
+      expect(ask('Grep', { pattern: 'x', glob }).allow).toBe(false);
+    }
     // Brace expansion is refused outright.
     expect(ask('Glob', { pattern: '{..,src}/*' }).allow).toBe(false);
     expect(ask('Glob', { pattern: '{/etc,src}/*' }).allow).toBe(false);
@@ -99,8 +102,19 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Read', { file_path: 'sub/.git/config' }).allow).toBe(false);
     expect(ask('Grep', { pattern: 'x', path: '.git' }).allow).toBe(false);
     expect(ask('Glob', { pattern: '.git/**' }).allow).toBe(false);
-    expect(ask('Glob', { pattern: '.gi[t]/hooks/*' }).allow).toBe(false);
-    expect(ask('Glob', { pattern: 'sub/.g?t/*' }).allow).toBe(false);
+    for (const pattern of [
+      '.gi[t]/hooks/*',
+      'sub/.g?t/*',
+      '?git/*',
+      '*git/*',
+      '[.]git/x',
+      '*.GIT/x',
+    ]) {
+      expect({ pattern, allow: ask('Glob', { pattern }).allow }).toEqual({ pattern, allow: false });
+    }
+    // The bare wildcards a search needs stay: Glob lists names only, and reading .git is refused.
+    expect(ask('Glob', { pattern: '**/*.ts' }).allow).toBe(true);
+    expect(ask('Glob', { pattern: '*' }).allow).toBe(true);
     // Through a symlink into a git dir.
     mkdirSync(join(wt, 'nested', '.git'), { recursive: true });
     symlinkSync(join(wt, 'nested', '.git'), join(wt, 'g'));
@@ -149,6 +163,38 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Read', { file_path: '[redacted]' }).reason).toMatch(/redacted/);
   });
 
+  it('refuses surrounding whitespace and control characters: Claude Code trims before resolving', () => {
+    for (const p of [
+      ' /etc/passwd',
+      '\n/etc/passwd',
+      ' ~/.ssh',
+      ' .claude/settings.json',
+      'src/a.ts ',
+      '\tsrc',
+    ]) {
+      expect({ p, allow: ask('Read', { file_path: p }).allow }).toEqual({ p, allow: false });
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+      expect({ p, allow: ask('Grep', { pattern: '.', path: p }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+      expect({ p, allow: ask('Glob', { pattern: 'x', path: p }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
+    expect(ask('Glob', { pattern: ' /etc/*' }).allow).toBe(false);
+    expect(ask('Glob', { pattern: 'src/*\n' }).allow).toBe(false);
+    expect(ask('Read', { file_path: 'src/a\u0007.ts' }).allow).toBe(false);
+    // The reason is built from the resolved path, never the given string.
+    expect(ask('Read', { file_path: join(wt, 'src', 'a.ts') }).reason).toBe(
+      'Read inside the worktree (src/a.ts)',
+    );
+  });
+
   it('refuses backslashes and NUL: ordinary name characters, never separators', () => {
     symlinkSync('/etc', join(wt, 'a\\b'));
     expect(ask('Read', { file_path: `${wt}/a\\b/passwd` }).allow).toBe(false);
@@ -166,6 +212,9 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     ).toMatch(/hard links/);
     // Reading it is fine: nothing changes.
     expect(ask('Read', { file_path: 'src/linked' }).allow).toBe(true);
+    // Nor through a symlink to it.
+    symlinkSync(join(wt, 'src', 'linked'), join(wt, 'lnk'));
+    expect(ask('Write', { file_path: 'lnk', content: '' }).reason).toMatch(/hard links/);
   });
 
   it('refuses writes to agent, hook and tool config, at any depth and in any case (owner, #200)', () => {

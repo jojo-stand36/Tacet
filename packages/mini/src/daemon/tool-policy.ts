@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { redactSecrets } from '@tacet/core';
 
@@ -62,9 +62,11 @@ const FILE_TOOLS: Record<string, FileTool> = {
   },
   // The search tools default to the working directory (the checkout) without a path.
   Glob: { paths: ['path'], globs: ['pattern'], other: [], needsPath: false, writes: false },
+  // Grep's `glob` is not taken: Claude Code splits it on spaces and commas and passes each piece
+  // after its own `!.git` exclude, so a piece like `*` would search git internals again.
   Grep: {
     paths: ['path', 'file_path'],
-    globs: ['glob'],
+    globs: [],
     other: [
       'pattern',
       'output_mode',
@@ -90,7 +92,9 @@ const FILE_TOOLS: Record<string, FileTool> = {
  * 2026-11-10). Tacet's own sessions never load them (no setting sources, a strict MCP config,
  * git hooks off), but the user's tools would, once the user opens or merges the branch: a hook,
  * an MCP server command or a task there runs code. Matched at any depth and in any letter case,
- * on the path after symlinks are resolved. A task that needs one of these escalates.
+ * on the path after symlinks are resolved. A task that needs one of these escalates. The list
+ * cannot be complete (`package.json` scripts and a `Makefile` run code too, but are the work
+ * itself); it covers the files that run without the user choosing to build or test.
  * Directories: anything inside them. Files: that name anywhere.
  */
 const PROTECTED_DIRS: readonly string[][] = [
@@ -216,12 +220,15 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
  * The literal segments before the first wildcard must lead inside the checkout like a path.
  */
 function badGlob(root: string, given: string, v: string): string | undefined {
-  if (v.includes('\\') || v.includes('\0')) return 'has a backslash or NUL';
+  if (v !== v.trim() || hasControl(v)) return 'has surrounding space or control characters';
+  if (v.includes('\\')) return 'has a backslash';
   if (isAbsolute(v) || v.startsWith('~')) return 'names an absolute path';
   if (/[{}]/.test(v)) return 'uses brace expansion';
   const segs = v.split('/');
   if (segs.includes('..')) return 'leaves the worktree';
-  if (segs.some((s) => isGitName(s) || (s.startsWith('.') && /[*?[\]]/.test(s)))) {
+  // A wildcard segment that matches `.git` reaches it, except the bare `*` and `**` a search needs:
+  // Glob only lists names, so those can show `.git` names, never contents (Read is refused there).
+  if (segs.some((s) => isGitName(s) || (s !== '*' && s !== '**' && segmentMatches(s, '.git')))) {
     return 'reaches git internals';
   }
   const literal: string[] = [];
@@ -234,6 +241,38 @@ function badGlob(root: string, given: string, v: string): string | undefined {
     if (typeof at !== 'string') return at.why.replace(/^the path/, 'its directory');
   }
   return undefined;
+}
+
+/** Whether the glob segment `seg` (`*`, `?`, `[...]`; braces are refused before) matches `name`, ignoring case. */
+function segmentMatches(seg: string, name: string): boolean {
+  let re = '';
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i] as string;
+    if (c === '*') re += '.*';
+    else if (c === '?') re += '.';
+    else if (c === '[') {
+      const end = seg.indexOf(']', i + 2);
+      if (end < 0) return true; // An unclosed class: assume the worst.
+      let body = seg.slice(i + 1, end);
+      if (body.startsWith('!')) body = `^${body.slice(1)}`;
+      re += `[${body.replace(/[\\\]]/g, '\\$&')}]`;
+      i = end;
+    } else re += c.replace(/[.+^$(){}|\\]/g, '\\$&');
+  }
+  try {
+    return new RegExp(`^${re}$`, 'i').test(name);
+  } catch {
+    return true;
+  }
+}
+
+/** Whether `s` has a C0 control character or DEL. */
+function hasControl(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return true;
+  }
+  return false;
 }
 
 /** Whether `marker` appears in any string inside `v`. */
@@ -251,8 +290,13 @@ function mentions(v: unknown, marker: string): boolean {
  * refused too. Components that do not exist yet are new names the tool would create.
  */
 function inside(root: string, given: string, p: string, writes: boolean): string | { why: string } {
+  // Claude Code trims a path before it expands `~` and resolves it: " /etc" is /etc to it.
+  // Anything not already trimmed, or with a control character, is refused.
+  if (p !== p.trim() || hasControl(p)) {
+    return { why: 'the path has surrounding space or control characters' };
+  }
   // A backslash is an ordinary name character on POSIX: refused rather than guessed at.
-  if (p.includes('\\') || p.includes('\0')) return { why: 'the path has a backslash or NUL' };
+  if (p.includes('\\')) return { why: 'the path has a backslash' };
   const segs = p.split('/').filter((s) => s !== '' && s !== '.');
   if (segs.includes('..')) return { why: 'the path leaves the worktree (..)' };
   let rel: string[];
@@ -302,6 +346,16 @@ function inside(root: string, given: string, p: string, writes: boolean): string
       if (writes && i === rel.length - 1 && st.isFile() && st.nlink > 1) {
         return { why: 'the file has other hard links' };
       }
+    }
+  }
+  // The last component may be a symlink to a hard-linked file: what a write would change.
+  if (writes) {
+    try {
+      const st = statSync(cur);
+      if (st.isFile() && st.nlink > 1) return { why: 'the file has other hard links' };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+        return { why: 'the path cannot be checked' };
     }
   }
   return relative(root, cur);
