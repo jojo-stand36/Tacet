@@ -9,5 +9,5 @@ applyTo: "packages/adapters/**,docs/adapters/**"
 - Every adapter must pass the shared conformance suite. Add vendor-specific tests next to it, using recorded fixtures, never live vendor calls in CI.
 - Pin the vendor CLI/SDK version you tested against, and record it in `docs/adapters/capability-matrix.md` with the date and a source link.
 - Never read, store or forward vendor OAuth tokens. Launch the vendor's own binary or SDK and let it use the user's existing login or an API key from the environment.
-- Process hygiene: kill child process trees on close, handle crashes as `status: error` events, never leave orphaned PTYs.
+- Process hygiene: kill child process trees on close, handle crashes as `status: error` events, never leave orphaned PTYs. Exception: helpers a CLI detaches (and may share between sessions, like Codex's managed daemon) are left to the crash sweep; presets turn them off where the CLI allows (ARCHITECTURE.md §6, #127, #171).
 - Before relying on any flag, method name or event shape, verify it against primary docs (`verify-vendor-facts` skill).

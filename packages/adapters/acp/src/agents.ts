@@ -65,6 +65,11 @@ export interface AcpAgentSpec {
    * session options (e.g. claude-agent-acp's `claudeCode.options`, #181).
    */
   sessionMeta?: Readonly<Record<string, unknown>>;
+  /**
+   * Why unattended Workers may not run on this agent, if they may not: `buildWorkerAdapters`
+   * refuses a Worker tier that names it. Direct (interactive) use of the adapter is unaffected.
+   */
+  workerRefused?: string;
 }
 
 /**
@@ -207,6 +212,11 @@ export function codexAcpConfig(baseUrl = 'https://api.openai.com/v1'): string {
 export const CODEX_ACP_AGENT: AcpAgentSpec = {
   id: 'codex-acp',
   command: ['codex-acp'],
+  // Interim default while the owner decides #183: verified live (#181), it marks every session
+  // root trusted after any config Tacet can pass, so a Worker-written checkout's
+  // `.codex/config.toml` (an MCP server command ran) and AGENTS.md apply.
+  workerRefused:
+    'it trusts every session directory itself, so a checkout a Worker or anyone else wrote can run commands through its .codex/config.toml; Tacet cannot turn that off (interim default until #183 is decided; use codex-app-server)',
   env: { NO_BROWSER: '1' },
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
   apiKeyEnv: ['OPENAI_API_KEY'],

@@ -87,6 +87,11 @@ describe('AcpAdapter (fake ACP agent)', () => {
       : [];
   const methods = () => received().flatMap((l) => (l.received?.method ? [l.received] : []));
 
+  it('exposes why an agent may not run Workers (#183)', () => {
+    expect(make(CODEX_ACP_AGENT).workerRefused).toMatch(/#183/);
+    expect(make(GEMINI_AGENT).workerRefused).toBeUndefined();
+  });
+
   it('authenticates only with an API-key method, never a subscription login', async () => {
     const offered = [
       { id: 'oauth-personal', name: 'Log in with Google' },

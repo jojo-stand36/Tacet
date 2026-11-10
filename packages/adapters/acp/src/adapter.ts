@@ -156,6 +156,11 @@ export class AcpAdapter implements AgentAdapter {
   readonly #opts: AcpAdapterOptions;
   readonly #sessions = new Map<string, Session>();
 
+  /** Why unattended Workers may not run on this agent (`AcpAgentSpec.workerRefused`), if so. */
+  get workerRefused(): string | undefined {
+    return this.#opts.agent.workerRefused;
+  }
+
   constructor(opts: AcpAdapterOptions) {
     this.#opts = opts;
     this.id = opts.agent.id;
