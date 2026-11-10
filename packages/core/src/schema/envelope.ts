@@ -26,6 +26,15 @@ export const EventType = z
   .string()
   .regex(/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/, 'expected a dotted lowercase event type');
 
+/** Namespaces that stay with the Mini-conductor and are never forwarded upward (ADR-003 §3). */
+export const LOCAL_EVENT_NAMESPACES = ['workspace'] as const;
+
+/** False for an event type a forwarder must keep local, such as the worktree registry (#126). */
+export function isForwardable(type: string): boolean {
+  const ns = type.split('.', 1)[0];
+  return !(LOCAL_EVENT_NAMESPACES as readonly string[]).includes(ns ?? '');
+}
+
 /** True if `type` belongs to a namespace this version of Tacet knows. */
 export function isKnownEventNamespace(type: string): boolean {
   const ns = type.split('.', 1)[0];

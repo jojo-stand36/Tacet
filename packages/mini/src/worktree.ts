@@ -16,7 +16,8 @@ import path from 'node:path';
 import {
   type EventEnvelope,
   newUlid,
-  project,
+  type WorkspaceCreated,
+  type WorkspaceRemoved,
   type WorkspacesState,
   workspacesProjection,
 } from '@tacet/core';
@@ -466,26 +467,45 @@ export class WorktreeManager implements Workspaces {
       const known = (await this.registry()).has(id) || (await this.removedIds()).has(id);
       if (!known) {
         const info = await this.readLegacy(root, id);
-        if (info) {
-          await this.record('workspace.created', {
-            workspaceId: id,
-            workerId: info.workerId,
-            baseCommit: info.baseCommit,
-            ...(info.baseBranch !== undefined ? { baseBranch: info.baseBranch } : {}),
-            migrated: true,
-          });
-        }
+        // Unreadable or no longer where the manager put it: left as it is, never adopted.
+        if (!info || info.path !== path.join(root, id)) continue;
+        await this.record('workspace.created', {
+          workspaceId: id,
+          workerId: info.workerId,
+          baseCommit: info.baseCommit,
+          ...(info.baseBranch !== undefined ? { baseBranch: info.baseBranch } : {}),
+          migrated: true,
+        });
       }
       // Only once it is in the log: a crash in between leaves the file for the next start.
       await rm(this.legacyPath(root, id), { force: true });
     }
-    const commonDirectory = await this.commonGitDirectory();
     for (const id of (await this.registry()).keys()) {
-      const checkout = await lstat(path.join(root, id)).catch(() => undefined);
-      const admin = await lstat(path.join(commonDirectory, 'worktrees', id)).catch(() => undefined);
-      if (!checkout && !admin)
+      // Being created right now: its intent is recorded and git is still at work.
+      if (this.#pending.has(id)) continue;
+      const left = await this.leftOnDisk(id);
+      if (left === false)
         await this.record('workspace.removed', { workspaceId: id, reason: 'gone' });
     }
+  }
+
+  /**
+   * Whether anything of a workspace is on disk: its checkout or its git admin directory.
+   * Undefined when that cannot be told (an error other than "no such file"): never "gone" then.
+   */
+  private async leftOnDisk(id: string): Promise<boolean | undefined> {
+    const { root } = await this.paths();
+    const commonDirectory = await this.commonGitDirectory();
+    for (const at of [path.join(root, id), path.join(commonDirectory, 'worktrees', id)]) {
+      try {
+        await lstat(at);
+        return true;
+      } catch (error) {
+        const code = errorCode(error);
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
+      }
+    }
+    return false;
   }
 
   private async registeredEntry(
@@ -593,6 +613,8 @@ export class WorktreeManager implements Workspaces {
     strategy: MergeStrategy,
     targetBranch: string,
   ): Promise<MergeResult> {
+    // It integrates (writes refs and objects) and may create a staging worktree.
+    this.requireWritable();
     await this.requireWorktree(worktreeId);
     await this.requireLocalBranch(targetBranch);
     const release = await this.hold([worktreeId]);
@@ -710,6 +732,22 @@ export class WorktreeManager implements Workspaces {
     const branchName = taskBranch(id).slice('refs/heads/'.length);
     const worktreePath = path.join(root, id);
     // Intent first: a crash from here on leaves a record that `reconcile` settles.
+    this.#pending.add(id);
+    try {
+      return await this.makeWorktree(id, workerId, baseBranch, baseCommit, worktreePath, options);
+    } finally {
+      this.#pending.delete(id);
+    }
+  }
+
+  private async makeWorktree(
+    id: string,
+    workerId: string,
+    baseBranch: string | undefined,
+    baseCommit: string,
+    worktreePath: string,
+    options: CreateWorktreeOptions,
+  ): Promise<WorktreeInfo> {
     await this.record('workspace.created', {
       workspaceId: id,
       workerId,
@@ -729,11 +767,18 @@ export class WorktreeManager implements Workspaces {
       } catch {
         // Keep the original error; Git may still need manual cleanup.
       }
-      await this.record('workspace.removed', { workspaceId: id, reason: 'gone' }).catch(() => {});
+      // Gone only if nothing of it is left: otherwise it stays registered, for remove or purge.
+      if ((await this.leftOnDisk(id).catch(() => undefined)) === false) {
+        await this.record('workspace.removed', { workspaceId: id, reason: 'gone' }).catch(() => {});
+      }
       throw error;
     }
     const info = (await this.registry()).get(id);
-    if (!info) throw new Error(`worktree ${id} is missing from the registry`);
+    if (!info) {
+      // Recorded as gone meanwhile: nothing may be left on disk that the registry does not know.
+      await this.worktreeGit(['worktree', 'remove', '--force', worktreePath]).catch(() => {});
+      throw new Error(`worktree ${id} is missing from the registry`);
+    }
 
     if (options.setup) {
       const timeoutMs = options.setup.timeoutMs ?? commandTimeoutMs;
@@ -1356,7 +1401,9 @@ export class WorktreeManager implements Workspaces {
   /** In-memory registry, when there is no event log: never written anywhere. */
   readonly #memory = new Map<string, WorktreeInfo>();
   readonly #memoryRemoved = new Set<string>();
-  #view: { count: number; state: WorkspacesState } | undefined;
+  #view: { seq: number; state: WorkspacesState } | undefined;
+  /** Ids between their recorded intent and the end of `git worktree add`: never reconciled. */
+  readonly #pending = new Set<string>();
 
   private requireWritable(): void {
     if (this.options.log?.readonly) {
@@ -1369,17 +1416,16 @@ export class WorktreeManager implements Workspaces {
   private workspacesState(): WorkspacesState | undefined {
     const log = this.options.log;
     if (!log) return undefined;
-    const count = log.store.count();
-    if (this.#view?.count !== count) {
-      this.#view = {
-        count,
-        state: project(
-          workspacesProjection,
-          log.store.query({ typePrefix: 'workspace' }).map((e) => e.envelope),
-        ),
-      };
+    // Folded on from the last event seen: `workspace.*` is never compacted, so this stays exact.
+    let view = this.#view ?? { seq: 0, state: workspacesProjection.initial() };
+    const fresh = log.store.query({ typePrefix: 'workspace', afterSeq: view.seq });
+    if (fresh.length > 0 || !this.#view) {
+      let state = view.state;
+      for (const e of fresh) state = workspacesProjection.apply(state, e.envelope);
+      view = { seq: fresh.at(-1)?.seq ?? view.seq, state };
+      this.#view = view;
     }
-    return this.#view.state;
+    return view.state;
   }
 
   /** Every registered workspace, by id, in creation order. */
@@ -1413,24 +1459,26 @@ export class WorktreeManager implements Workspaces {
   }
 
   private async record(
-    type: 'workspace.created' | 'workspace.removed',
-    data: Record<string, unknown>,
+    ...[type, data]:
+      | ['workspace.created', WorkspaceCreated]
+      | ['workspace.removed', WorkspaceRemoved]
   ): Promise<void> {
     const log = this.options.log;
-    const id = data.workspaceId as string;
+    const id = data.workspaceId;
     if (!log) {
       if (type === 'workspace.created') {
         if (this.#memoryRemoved.has(id) || this.#memory.has(id)) return;
         const { root } = await this.paths();
         const branchName = taskBranch(id).slice('refs/heads/'.length);
+        const created = data as WorkspaceCreated;
         this.#memory.set(id, {
           id,
-          workerId: data.workerId as string,
+          workerId: created.workerId,
           branch: branchName,
           branchName,
           path: path.join(root, id),
-          ...(typeof data.baseBranch === 'string' ? { baseBranch: data.baseBranch } : {}),
-          baseCommit: data.baseCommit as string,
+          ...(created.baseBranch !== undefined ? { baseBranch: created.baseBranch } : {}),
+          baseCommit: created.baseCommit,
           createdAt: Date.now(),
         });
       } else {

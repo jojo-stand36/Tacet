@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import {
   chmod,
   lstat,
@@ -1127,10 +1128,62 @@ describe('WorktreeManager', () => {
       expect(events('workspace.removed')).toHaveLength(2);
     });
 
-    it('records a failed creation as gone', async () => {
+    it('records the intent before git makes the checkout', async () => {
+      const seen: boolean[] = [];
+      const append = store.append.bind(store);
+      store.append = ((e: Parameters<EventStore['append']>[0]) => {
+        for (const one of Array.isArray(e) ? e : [e]) {
+          if (one.type === 'workspace.created') {
+            const id = (one.data as { workspaceId: string }).workspaceId;
+            seen.push(existsSync(path.join(root(), id)));
+          }
+        }
+        return append(e);
+      }) as EventStore['append'];
+      await manager.create('ordered');
+      expect(seen).toEqual([false]);
+    });
+
+    it('records a creation that git refused as gone, and one with a bad base not at all', async () => {
       await expect(manager.create('bad', 'f'.repeat(40))).rejects.toThrow();
-      // The base is checked before anything is recorded.
       expect(events('workspace.created')).toEqual([]);
+      // `git worktree add` fails after the intent is recorded.
+      const worktreesDir = await adminDir('');
+      await rm(worktreesDir, { recursive: true, force: true });
+      await writeFile(worktreesDir.replace(/\/$/, ''), 'not a directory');
+      await expect(manager.create('refused')).rejects.toThrow();
+      const [created] = events('workspace.created');
+      expect(events('workspace.removed')).toEqual([
+        { workspaceId: created?.workspaceId, reason: 'gone' },
+      ]);
+    });
+
+    it('never reconciles a workspace away while it is being created', async () => {
+      const making = manager.create('racing');
+      while (events('workspace.created').length === 0) await new Promise((r) => setImmediate(r));
+      await manager.reconcile();
+      const made = await making;
+      expect(events('workspace.removed')).toEqual([]);
+      expect(await manager.get(made.id)).toBeDefined();
+    });
+
+    it('leaves a registry file it cannot read, or that points elsewhere, where it is', async () => {
+      const moved = await new WorktreeManager(repository, root()).create('moved');
+      const unreadable = path.join(root(), '.tacet-broken-1.json');
+      await writeFile(unreadable, '{ not json');
+      const elsewhere = path.join(root(), `.tacet-${moved.id}.json`);
+      await writeFile(
+        elsewhere,
+        JSON.stringify({
+          ...moved,
+          path: path.join(temporaryDirectory, 'elsewhere'),
+          lastActivityAt: 1,
+        }),
+      );
+      await manager.reconcile();
+      expect(events('workspace.created')).toEqual([]);
+      expect(await lstat(unreadable)).toBeTruthy();
+      expect(await lstat(elsewhere)).toBeTruthy();
     });
 
     it('imports pre-#126 registry files once, deleting each only after it is in the log', async () => {

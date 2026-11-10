@@ -398,5 +398,26 @@ describe('tacet uninstall --purge: run state (#211)', () => {
       expect(removed).toEqual([clean.id]);
       expect(await manager().get(dirty.id)).toBeDefined();
     });
+
+    it('still previews and purges when the event log cannot be read', async () => {
+      const old = await new WorktreeManager(repo, paths().worktrees, { env }).create('old');
+      writeFileSync(
+        join(paths().worktrees, `.tacet-${old.id}.json`),
+        JSON.stringify({ ...old, lastActivityAt: old.createdAt }),
+      );
+      store?.close();
+      store = undefined;
+      for (const f of readdirSync(paths().dir)) {
+        if (f.startsWith('events.db')) rmSync(join(paths().dir, f));
+      }
+      writeFileSync(paths().events, 'not really a database');
+
+      const preview = await tacet(['uninstall', '--purge']);
+      expect(preview.code).toBe(0);
+      expect(preview.err).toContain('the event log cannot be read');
+      expect(preview.out).toContain(`would remove checkout ${old.path}`);
+      expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(0);
+      expect(existsSync(paths().dir)).toBe(false);
+    });
   });
 });

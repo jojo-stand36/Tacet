@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SummaryPacket, TacetConfig, TaskLanded } from '@tacet/core';
+import { newUlid, type SummaryPacket, type TacetConfig, type TaskLanded } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitIntegrator } from '../git/integrate.js';
@@ -286,5 +286,25 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     for (const workspaceId of started) {
       expect(await restarted.get(workspaceId)).toMatchObject({ id: workspaceId });
     }
+  });
+
+  it('reconciles the worktree registry when it starts (#126)', async () => {
+    // A checkout whose creation a crashed Mini-conductor never finished.
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'mini', id: 'mini' },
+      type: 'workspace.created',
+      data: {
+        workspaceId: 'crashed-1',
+        workerId: 'w',
+        baseCommit: git(repo, ['rev-parse', 'HEAD']),
+      },
+    });
+    await runTask(commitWork, { remove_merged: false });
+    expect(
+      store.query({ typePrefix: 'workspace.removed' }).map((e) => e.envelope.data),
+    ).toContainEqual({ workspaceId: 'crashed-1', reason: 'gone' });
   });
 });

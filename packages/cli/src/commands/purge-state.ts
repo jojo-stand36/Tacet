@@ -81,16 +81,24 @@ const liveRunError = (pid: number) =>
  */
 async function manager(io: Io, root: string, paths: RepoStatePaths, writable: boolean) {
   const { WorktreeManager } = await import('@tacet/mini');
-  const store = existsSync(paths.events)
-    ? openEventStore(paths.events, { readonly: !writable })
-    : undefined;
+  let store: ReturnType<typeof openEventStore> | undefined;
+  let warning: string | undefined;
+  if (existsSync(paths.events)) {
+    try {
+      store = openEventStore(paths.events, { readonly: !writable });
+    } catch (err) {
+      // Purge is the way out of a broken setup: go on with what the disk shows. A checkout git
+      // still lists in the state dir keeps the dir anyway.
+      warning = `the event log cannot be read (${err instanceof Error ? err.message : String(err)}): checkouts it registered are not listed`;
+    }
+  }
   const worktrees = new WorktreeManager(root, paths.worktrees, {
     env: io.env ?? process.env,
     ...(store
       ? { log: { store, repo: paths.repoId, miniId: 'tacet-uninstall', readonly: !writable } }
       : {}),
   });
-  return { worktrees, close: () => store?.close() };
+  return { worktrees, warning, close: () => store?.close() };
 }
 
 /**
@@ -114,7 +122,8 @@ export async function planState(io: Io, root: string, userDir: string): Promise<
   plan.entries = readdirSync(paths.dir).sort();
   // Only looked at when it exists: the manager would create it.
   if (!existsSync(paths.worktrees)) return plan;
-  const { worktrees, close } = await manager(io, root, paths, false);
+  const { worktrees, warning, close } = await manager(io, root, paths, false);
+  if (warning) plan.note = plan.note ? `${plan.note}; ${warning}` : warning;
   try {
     const tips = tacetTips(io, root);
     for (const w of await worktrees.registered()) {
