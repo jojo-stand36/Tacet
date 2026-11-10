@@ -143,6 +143,10 @@ export interface AgentTerminal {
   readonly rows: number;
   /** The most recent output (bounded), so a viewer can redraw the screen when it attaches. */
   scrollback(): string;
-  /** Output from now on, until the session ends. Each call is its own stream. */
+  /**
+   * Output from now on, until the session ends. Each call is its own stream. A reader that falls
+   * too far behind sees its stream end early; check `status()` before taking that as the end of
+   * the session, and call `output()` again (with `scrollback()` to redraw) to go on watching.
+   */
   output(): AsyncIterable<string>;
 }

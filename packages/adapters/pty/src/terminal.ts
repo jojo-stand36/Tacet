@@ -29,6 +29,7 @@ export class TerminalBuffer implements AgentTerminal {
 
   push(data: string): void {
     if (this.#ended) return;
+    // The cut may split an escape sequence at the start; a terminal redrawing it ignores that.
     this.#scrollback = (this.#scrollback + data).slice(-SCROLLBACK);
     for (const v of this.#viewers) {
       v.chunks.push(data);
@@ -52,6 +53,11 @@ export class TerminalBuffer implements AgentTerminal {
     return this.#scrollback;
   }
 
+  /**
+   * A stream for one reader: `for await` reads it one chunk at a time (two `next()` calls at once
+   * are not supported). It ends when the session ends, or early if this reader falls `MAX_BEHIND`
+   * behind; `status()` tells the two apart.
+   */
   output(): AsyncIterable<string> {
     const v: Viewer = { chunks: [], size: 0, wake: undefined, ended: this.#ended };
     if (!this.#ended) this.#viewers.add(v);

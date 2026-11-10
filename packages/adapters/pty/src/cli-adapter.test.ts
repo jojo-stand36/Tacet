@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import type { SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { PtyCliAdapter } from './cli-adapter.js';
-import { loadPty } from './pty.js';
+import { PtyCliAdapter, stripEcho } from './cli-adapter.js';
+import { loadPty, type Pty, type PtySpawnOptions } from './pty.js';
 
 const FAKE = join(import.meta.dirname, 'testing', 'fake-cli.mjs');
 
@@ -29,6 +29,15 @@ describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
         OPENAI_API_KEY: 'sk-other-vendor',
       },
       ...extra,
+    });
+  const withEnv = (env: Record<string, string>, secrets?: string[]) =>
+    make({
+      preset: {
+        command: [process.execPath, FAKE],
+        env,
+        readyPrompt: 'fake>',
+        ...(secrets ? { secrets } : {}),
+      },
     });
 
   beforeAll(async () => {
@@ -137,5 +146,217 @@ describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
       'error',
     ]);
     await adapter.close(h);
+  });
+
+  it('after an interrupt, holds input until the CLI shows its prompt again', {
+    timeout: 60_000,
+  }, async () => {
+    const a = withEnv({ FAKE_SLOW_CANCEL: '1' });
+    const h = await a.start({ cwd: root });
+    const tap = new EventTap(a.events(h));
+    await a.send(h, { text: 'SLOW' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000);
+    await new Promise((r) => setTimeout(r, 700));
+    await a.interrupt(h);
+    expect(a.status(h)).toBe('cancelled');
+    // Sent while the CLI is still busy cancelling: typed only once its prompt is back.
+    await a.send(h, { text: 'after' });
+    await tap.waitFor((e) => e.t === 'message.delta' && e.text.includes('after'), 30_000);
+    const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+    expect(deltas).toEqual(['echo: after']);
+    await a.close(h);
+  });
+
+  it("scrubs the preset's secret values from events", { timeout: 60_000 }, async () => {
+    for (const [env, secrets] of [
+      [{ FAKE_SECRET: 'plain-value-1234' }, ['plain-value-1234']],
+      // No secret list: the variable's name says it is one.
+      [{ FAKE_SECRET: 'plain-value-1234', FAKE_API_KEY: 'plain-value-1234' }, undefined],
+    ] as const) {
+      const a = withEnv({ ...env }, secrets ? [...secrets] : undefined);
+      const h = await a.start({ cwd: root });
+      const tap = new EventTap(a.events(h));
+      const { events } = await turn(a, h, tap, 'PRINT_SECRET');
+      expect(events.find((e) => e.t === 'message.delta')).toEqual({
+        t: 'message.delta',
+        text: 'value: [redacted]',
+      });
+      await a.close(h);
+    }
+  });
+});
+
+/** A scripted terminal: what the CLI prints is up to the test. */
+class ScriptedPty implements Pty {
+  readonly pid = 2 ** 22 + Math.floor(Math.random() * 1000);
+  writes: string[] = [];
+  onWrite: (data: string) => void = () => {};
+  #data: ((d: string) => void)[] = [];
+  #exit: ((e: { exitCode: number }) => void)[] = [];
+  constructor(readonly opts: PtySpawnOptions) {}
+  print(d: string) {
+    for (const l of this.#data) l(d);
+  }
+  onData(l: (d: string) => void) {
+    this.#data.push(l);
+    return { dispose() {} };
+  }
+  onExit(l: (e: { exitCode: number }) => void) {
+    this.#exit.push(l);
+    return { dispose() {} };
+  }
+  write(d: string) {
+    this.writes.push(d);
+    this.onWrite(d);
+  }
+  resize() {}
+  kill() {
+    this.exit(0);
+  }
+  exit(code: number) {
+    for (const l of this.#exit) l({ exitCode: code });
+    this.#exit = [];
+  }
+}
+
+describe('PtyCliAdapter (scripted terminal)', () => {
+  const root = realpathSync(tmpdir());
+  function make(extra: object = {}, readyPrompt: string | null = '>') {
+    let pty: ScriptedPty | undefined;
+    const adapter = new PtyCliAdapter({
+      slug: 'scripted',
+      preset: { command: ['scripted'], ...(readyPrompt ? { readyPrompt } : {}) },
+      quietMs: 50,
+      killTimeoutMs: 100,
+      baseEnv: {},
+      spawn: (_f, _a, opts) => {
+        pty = new ScriptedPty(opts);
+        return pty;
+      },
+      ...extra,
+    });
+    return { adapter, pty: () => pty as ScriptedPty };
+  }
+  const later = (fn: () => void, ms = 10) => setTimeout(fn, ms);
+
+  it('finds a coloured prompt split across chunks', async () => {
+    const { adapter, pty } = make();
+    const started = adapter.start({ cwd: root });
+    later(() => {
+      pty().print('\x1b[32m> \x1b[');
+      pty().print('0m');
+    });
+    const h = await started;
+    const tap = new EventTap(adapter.events(h));
+    pty().onWrite = (d) =>
+      later(() => {
+        pty().print(`${d.replace(/\r$/, '')}\r\n`);
+        pty().print('answer\r\n\x1b[32m> \x1b');
+        pty().print('[0m');
+      });
+    await adapter.send(h, { text: 'question' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    expect(tap.events.filter((e) => e.t === 'message.delta')).toEqual([
+      { t: 'message.delta', text: 'answer' },
+    ]);
+    await adapter.close(h);
+  });
+
+  it('ends a turn only when the whole last line is the prompt', async () => {
+    const { adapter, pty } = make();
+    const started = adapter.start({ cwd: root });
+    later(() => pty().print('> '));
+    const h = await started;
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    pty().print('a -> b\r\n<div>');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(adapter.status(h)).toBe('running');
+    pty().print('\r\n> ');
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    await adapter.close(h);
+  });
+
+  it('pastes several lines when the CLI turned on bracketed paste, and types tabs as spaces otherwise', async () => {
+    const { adapter, pty } = make();
+    const started = adapter.start({ cwd: root });
+    later(() => pty().print('\x1b[?2004h> '));
+    const h = await started;
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'a\nb' });
+    expect(pty().writes.at(-1)).toBe('\x1b[200~a\nb\x1b[201~\r');
+    pty().print('\x1b[?2004l\r\n> ');
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    await adapter.send(h, { text: 'x\ty\nz' });
+    expect(pty().writes.at(-1)).toBe('x y z\r');
+    await adapter.close(h);
+  });
+
+  it('ends a turn on quiet output when no prompt is set', async () => {
+    const { adapter, pty } = make({}, null);
+    const started = adapter.start({ cwd: root });
+    later(() => pty().print('ready'));
+    const h = await started;
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    pty().print('go\r\ndone');
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    expect(tap.events.filter((e) => e.t === 'message.delta')).toEqual([
+      { t: 'message.delta', text: 'done' },
+    ]);
+    await adapter.close(h);
+  });
+
+  it('reports a turn with no prompt for a long time as waiting, and running again on output', async () => {
+    const { adapter, pty } = make({ stallMs: 150 });
+    const started = adapter.start({ cwd: root });
+    later(() => pty().print('> '));
+    const h = await started;
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    pty().print('Overwrite? [y/N] ');
+    const w = await tap.waitFor((e) => e.t === 'status' && e.state === 'waiting_input', 5000);
+    expect(w.event).toMatchObject({ message: expect.stringContaining('terminal') });
+    pty().print('y\r\ndone\r\n');
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, w.index + 1);
+    pty().print('> ');
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, w.index + 1);
+    await adapter.close(h);
+  });
+
+  it('reports a CLI that never shows its prompt after an interrupt, and what it did not type', async () => {
+    const { adapter, pty } = make({ settleTimeoutMs: 200 });
+    const started = adapter.start({ cwd: root });
+    later(() => pty().print('> '));
+    const h = await started;
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    await adapter.interrupt(h);
+    expect(pty().writes.at(-1)).toBe('\x03');
+    await adapter.send(h, { text: 'next' });
+    const w = await tap.waitFor((e) => e.t === 'status' && e.state === 'waiting_input', 5000);
+    expect(w.event).toMatchObject({ message: expect.stringMatching(/1 input\(s\).*not typed/) });
+    expect(pty().writes.filter((d) => d.startsWith('next'))).toEqual([]);
+    await adapter.close(h);
+  });
+
+  it('fails a start that times out or exits, and refuses effort and context size', async () => {
+    const quiet = make({ startTimeoutMs: 200 });
+    await expect(quiet.adapter.start({ cwd: root })).rejects.toThrow(/did not become ready/);
+    const early = make();
+    const started = early.adapter.start({ cwd: root });
+    later(() => early.pty().exit(2));
+    await expect(started).rejects.toThrow(/exited during start \(code 2\)/);
+    const { adapter } = make();
+    await expect(adapter.start({ cwd: root, effort: 'high' })).rejects.toThrow(/effort/);
+    await expect(adapter.start({ cwd: root, contextWindow: 1000 })).rejects.toThrow(/context/);
+  });
+});
+
+describe('stripEcho', () => {
+  it('removes the echo, also when it is wrapped or follows a redraw', () => {
+    expect(stripEcho('hello\nreply', 'hello')).toBe('\nreply');
+    expect(stripEcho('> hel \nlo\nreply', 'hello')).toBe('\nreply');
+    expect(stripEcho('reply only', 'hello')).toBe('reply only');
   });
 });

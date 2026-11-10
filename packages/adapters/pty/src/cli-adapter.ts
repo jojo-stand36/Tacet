@@ -8,12 +8,14 @@ import {
   type ApprovalDecision,
   AsyncQueue,
   type InterruptResult,
+  looksSecret,
   ProfileRefusedError,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
   type SessionOptions,
   type SessionState,
+  scrubLiterals,
   type UserInput,
   type WorkerEnvPolicy,
   workerEnv,
@@ -25,8 +27,9 @@ import { plainText, TerminalBuffer } from './terminal.js';
 /**
  * What a CLI with no structured interface supports through the PTY adapter (#15). Its state is
  * read from its output: the turn ends when the CLI shows its ready prompt again (or goes quiet),
- * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals, its
- * model cannot be chosen, and it is not resumed.
+ * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals, and
+ * it is not resumed. `modelSwitch` is `launch-only` because the preset's command fixes the model:
+ * `start({ model })` is refused, never ignored.
  */
 export const PTY_CLI_CAPABILITIES: AdapterCapabilities = {
   streaming: false,
@@ -46,7 +49,16 @@ export interface PtyPreset {
   command: string[];
   /** Fixed environment for the CLI (secret references resolved by the caller). */
   env?: Record<string, string>;
-  /** Text the CLI shows when it waits for input, e.g. `> `. Without it, quiet output means ready. */
+  /**
+   * Values the caller resolved from secret references: scrubbed from every event. Values of
+   * variables whose name looks secret are scrubbed too, listed here or not.
+   */
+  secrets?: string[];
+  /**
+   * Text the CLI shows when it waits for input, e.g. `> `: the turn ends when the last line of
+   * output is this prompt. Without it, a pause of `quietMs` ends the turn, which is unreliable for
+   * a CLI that can think silently for longer than that.
+   */
   readyPrompt?: string;
 }
 
@@ -60,6 +72,13 @@ export interface PtyCliAdapterOptions {
   onEnvDropped?: (names: string[]) => void;
   /** Milliseconds the output must stay unchanged before a prompt or a turn's end counts. Default 800. */
   quietMs?: number;
+  /** Milliseconds after an interrupt for the CLI to show its prompt again. Default 10000. */
+  settleTimeoutMs?: number;
+  /**
+   * Milliseconds of silence without the ready prompt after which a turn is reported as
+   * `waiting_input` (the CLI may be asking something in the terminal). Default 60000.
+   */
+  stallMs?: number;
   /** Milliseconds `start()` waits for the CLI to be ready. Default 30000. */
   startTimeoutMs?: number;
   /** Milliseconds to wait after SIGTERM before SIGKILL. Default 5000. */
@@ -76,11 +95,26 @@ interface Session {
   events: AsyncQueue<AgentEvent>;
   state: SessionState;
   screen: TerminalBuffer;
-  /** Plain text of the output since the current turn's input was typed (bounded). */
+  /**
+   * Raw output since the current turn's input was typed (bounded). Kept raw and made plain text
+   * only when read, so an escape sequence split across two chunks is still recognised.
+   */
   turnOutput: string;
-  /** Plain text of the recent output, to find the ready prompt (bounded). */
+  /** Raw recent output, to find the ready prompt (bounded). */
   tail: string;
   lastOutputAt: number;
+  /** Chunks of output so far: "output since X" compares these, not clock times. */
+  outputs: number;
+  /** A turn is in progress (`running`, or `waiting_input` after a stall). */
+  inTurn: boolean;
+  /** The turn went quiet without the prompt: when that was reported. */
+  stalledAt: number;
+  /** After an interrupt, until the CLI shows its prompt again: input sent meanwhile is queued. */
+  cancelledAt: number;
+  /** `outputs` when the interrupt was sent. */
+  cancelledOutputs: number;
+  /** Literal values scrubbed from every event. */
+  secrets: string[];
   /** The CLI turned on bracketed paste: several lines can go as one paste. */
   pasteMode: boolean;
   /** The text typed for the current turn, to leave its echo out of the reply. */
@@ -154,6 +188,14 @@ export class PtyCliAdapter implements AgentAdapter {
       ),
     };
     env.TERM ??= 'xterm-256color';
+    const secrets = [
+      ...new Set([
+        ...(preset.secrets ?? []).filter((v) => v !== ''),
+        ...Object.entries(env)
+          .filter(([k, v]) => looksSecret(k) && v.length >= 8)
+          .map(([, v]) => v),
+      ]),
+    ];
     const cols = this.#opts.cols ?? 200;
     const rows = this.#opts.rows ?? 50;
     const [file, ...args] = preset.command as [string, ...string[]];
@@ -172,6 +214,12 @@ export class PtyCliAdapter implements AgentAdapter {
       turnOutput: '',
       tail: '',
       lastOutputAt: 0,
+      outputs: 0,
+      inTurn: false,
+      stalledAt: 0,
+      cancelledAt: 0,
+      cancelledOutputs: 0,
+      secrets,
       pasteMode: false,
       typed: '',
       queue: [],
@@ -182,12 +230,12 @@ export class PtyCliAdapter implements AgentAdapter {
     };
     pty.onData((d) => {
       s.lastOutputAt = Date.now();
+      s.outputs++;
       s.screen.push(d);
       if (d.includes('\x1b[?2004h')) s.pasteMode = true;
       if (d.includes('\x1b[?2004l')) s.pasteMode = false;
-      const text = plainText(d);
-      s.tail = (s.tail + text).slice(-4096);
-      if (s.state === 'running') s.turnOutput = (s.turnOutput + text).slice(-MAX_TEXT);
+      s.tail = (s.tail + d).slice(-8192);
+      if (s.inTurn) s.turnOutput = (s.turnOutput + d).slice(-MAX_TEXT);
     });
     pty.onExit((e) => {
       s.exit = e;
@@ -198,10 +246,11 @@ export class PtyCliAdapter implements AgentAdapter {
     const by = Date.now() + timeout;
     while (!this.#readyNow(s)) {
       if (s.exit || Date.now() > by) {
+        const exit = s.exit;
         await this.#terminate(s);
         throw new Error(
-          s.exit
-            ? `${this.id} exited during start (code ${s.exit.exitCode})`
+          exit
+            ? `${this.id} exited during start (code ${exit.exitCode})`
             : `${this.id} did not become ready within ${timeout} ms`,
         );
       }
@@ -221,7 +270,8 @@ export class PtyCliAdapter implements AgentAdapter {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
     const text = promptText(input.text);
-    if (s.state === 'running') {
+    // During a turn, and after an interrupt until the CLI takes input again.
+    if (s.inTurn || s.cancelledAt !== 0) {
       s.queue.push(text);
       return;
     }
@@ -231,11 +281,38 @@ export class PtyCliAdapter implements AgentAdapter {
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
     const s = this.#live(h);
     s.queue.length = 0;
-    if (s.state !== 'running') return {};
+    if (!s.inTurn) return {};
     clearInterval(s.poll);
-    // Ctrl-C: a line-based CLI drops the turn and shows its prompt again.
+    // Ctrl-C: a line-based CLI drops the turn and shows its prompt again. Until it does, it may
+    // still print the turn's output and ignore input, so input sent meanwhile waits.
     s.pty.write('\x03');
+    s.inTurn = false;
+    s.cancelledAt = Date.now();
+    s.cancelledOutputs = s.outputs;
     this.#setState(s, 'cancelled');
+    const settleMs = this.#opts.settleTimeoutMs ?? 10_000;
+    s.poll = setInterval(() => {
+      if (s.ended || s.closing) return clearInterval(s.poll);
+      if (this.#readyNow(s, s.cancelledOutputs)) {
+        clearInterval(s.poll);
+        s.cancelledAt = 0;
+        const next = s.queue.shift();
+        if (next !== undefined) this.#type(s, next);
+        return;
+      }
+      if (Date.now() - s.cancelledAt < settleMs) return;
+      clearInterval(s.poll);
+      s.cancelledAt = 0;
+      const dropped = s.queue.length;
+      s.queue.length = 0;
+      this.#setState(
+        s,
+        'waiting_input',
+        `${this.id} did not show its prompt after the interrupt; check the terminal` +
+          (dropped > 0 ? ` (${dropped} input(s) sent meanwhile were not typed)` : ''),
+      );
+    }, 50);
+    s.poll.unref();
     return {};
   }
 
@@ -273,12 +350,22 @@ export class PtyCliAdapter implements AgentAdapter {
 
   // ---- internals -------------------------------------------------------------------------
 
-  /** The CLI waits for input: its output stayed still, ending with the ready prompt if set. */
+  /**
+   * The CLI waits for input: there was output after the first `since` chunks, it stayed still, and
+   * the prompt is shown.
+   */
   #readyNow(s: Session, since = 0): boolean {
-    if (s.lastOutputAt <= since) return false;
+    if (s.outputs <= since) return false;
     if (Date.now() - s.lastOutputAt < (this.#opts.quietMs ?? 800)) return false;
-    const prompt = this.#opts.preset.readyPrompt?.trimEnd();
-    return prompt === undefined || s.tail.trimEnd().endsWith(prompt);
+    return this.#promptShown(s);
+  }
+
+  /** The last line of output is the ready prompt (always true without one). */
+  #promptShown(s: Session): boolean {
+    const prompt = this.#opts.preset.readyPrompt?.trim();
+    if (!prompt) return true;
+    const text = plainText(s.tail).trimEnd();
+    return text.slice(text.lastIndexOf('\n') + 1).trim() === prompt;
   }
 
   /**
@@ -287,30 +374,53 @@ export class PtyCliAdapter implements AgentAdapter {
    * take each line as its own input.
    */
   #type(s: Session, text: string): void {
-    const line = s.pasteMode ? `\x1b[200~${text}\x1b[201~` : text.replace(/\s*\n\s*/g, ' ');
+    // Outside a paste, a tab is a key (completion in a readline-style CLI): type a space.
+    const line = s.pasteMode
+      ? `\x1b[200~${text}\x1b[201~`
+      : text.replace(/\s*\n\s*/g, ' ').replace(/\t/g, ' ');
     s.typed = s.pasteMode ? text : line;
     s.turnOutput = '';
+    s.inTurn = true;
+    s.stalledAt = 0;
     this.#setState(s, 'running');
     const typedAt = Date.now();
+    const typedOutputs = s.outputs;
     s.pty.write(`${line}\r`);
     clearInterval(s.poll);
+    const stallMs = this.#opts.stallMs ?? 60_000;
     s.poll = setInterval(() => {
-      if (s.state !== 'running' || s.ended || s.closing) return clearInterval(s.poll);
-      if (!this.#readyNow(s, typedAt)) return;
-      clearInterval(s.poll);
-      this.#endTurn(s);
+      if (!s.inTurn || s.ended || s.closing) return clearInterval(s.poll);
+      if (this.#readyNow(s, typedOutputs)) {
+        clearInterval(s.poll);
+        this.#endTurn(s);
+        return;
+      }
+      if (s.stalledAt !== 0) {
+        // Output again after a stall: the turn goes on.
+        if (s.lastOutputAt > s.stalledAt) {
+          s.stalledAt = 0;
+          this.#setState(s, 'running');
+        }
+      } else if (Date.now() - Math.max(s.lastOutputAt, typedAt) >= stallMs) {
+        s.stalledAt = Date.now();
+        this.#setState(
+          s,
+          'waiting_input',
+          `no prompt from ${this.id} for ${Math.round(stallMs / 1000)} s; it may be waiting for input in the terminal`,
+        );
+      }
     }, 50);
     s.poll.unref();
   }
 
   #endTurn(s: Session): void {
-    let reply = s.turnOutput.replace(/\r/g, '');
+    s.inTurn = false;
+    s.stalledAt = 0;
     // Leave out the echo of what was typed, and the prompt the CLI showed again.
-    const echo = reply.indexOf(s.typed);
-    if (echo !== -1 && echo < 16) reply = reply.slice(echo + s.typed.length);
-    const prompt = this.#opts.preset.readyPrompt?.trimEnd();
-    reply = reply.trimEnd();
-    if (prompt && reply.endsWith(prompt)) reply = reply.slice(0, -prompt.length);
+    let reply = stripEcho(plainText(s.turnOutput), s.typed).trimEnd();
+    const prompt = this.#opts.preset.readyPrompt?.trim();
+    const last = reply.lastIndexOf('\n') + 1;
+    if (prompt && reply.slice(last).trim() === prompt) reply = reply.slice(0, last);
     reply = reply.trim();
     if (reply) this.#emit(s, { t: 'message.delta', text: reply });
     this.#setState(s, 'idle');
@@ -353,9 +463,9 @@ export class PtyCliAdapter implements AgentAdapter {
     }
   }
 
-  /** Known key formats are scrubbed from everything that leaves as an event. */
+  /** Known key formats, and the session's own secret values, are scrubbed from every event. */
   #emit(s: Session, e: AgentEvent): void {
-    s.events.push(redactSecrets(e));
+    s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {
@@ -369,4 +479,26 @@ export class PtyCliAdapter implements AgentAdapter {
     if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
     return s;
   }
+}
+
+/**
+ * The reply without the echo of the typed input at its start. The echo may be wrapped at the
+ * terminal's width, which puts line breaks (and, for some line editors, a space before them)
+ * inside it; it starts within the first few characters (a `^C` or prompt redraw before it).
+ */
+export function stripEcho(reply: string, typed: string): string {
+  if (!typed) return reply;
+  for (let start = 0; start <= Math.min(16, reply.length); start++) {
+    let i = start;
+    let j = 0;
+    while (j < typed.length && i < reply.length) {
+      if (reply[i] === typed[j]) {
+        i++;
+        j++;
+      } else if (reply[i] === '\n' || (reply[i] === ' ' && reply[i + 1] === '\n')) i++;
+      else break;
+    }
+    if (j === typed.length) return reply.slice(i);
+  }
+  return reply;
 }
