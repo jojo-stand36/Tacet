@@ -18,6 +18,11 @@
       "@tacet/source": "./src/workers/index.ts",
       "types": "./dist/workers/index.d.ts",
       "default": "./dist/workers/index.js"
+    },
+    "./standalone": {
+      "@tacet/source": "./src/standalone.ts",
+      "types": "./dist/standalone.d.ts",
+      "default": "./dist/standalone.js"
     }
   },
   "files": [

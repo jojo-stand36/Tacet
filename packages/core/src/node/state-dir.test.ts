@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { defaultStateDir, repoStateDir, resolveStateDir } from './state-dir.js';
+import { defaultStateDir, repoStateDir, repoStatePaths, resolveStateDir } from './state-dir.js';
 
 describe('repoStateDir', () => {
   let dir: string;
@@ -22,6 +22,17 @@ describe('repoStateDir', () => {
     expect(key).toMatch(new RegExp(`^${state}/[0-9a-f]{16}$`));
     // A path that does not exist yet is keyed as written.
     expect(repoStateDir(join(dir, 'missing'), state)).not.toBe(key);
+  });
+
+  it("names every piece of a repo's state under its directory", () => {
+    const p = repoStatePaths(join(dir, 'repo'), join(dir, 'state'));
+    expect(p.dir).toBe(repoStateDir(join(dir, 'repo'), join(dir, 'state')));
+    expect(p.repoId).toMatch(/^[0-9a-f]{16}$/);
+    expect([p.events, p.lock, p.worktrees]).toEqual([
+      join(p.dir, 'events.db'),
+      join(p.dir, 'mini.lock'),
+      join(p.dir, 'worktrees'),
+    ]);
   });
 
   it('defaults under ~/.tacet/state', () => {

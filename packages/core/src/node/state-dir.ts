@@ -61,6 +61,34 @@ export function repoStateDir(repoPath: string, stateDir: string = defaultStateDi
   return join(stateDir, tokenKey(canonical(resolve(repoPath))).slice(0, 16));
 }
 
+/** Where each piece of a repo's Tacet state lives, under `repoStateDir` (#21). */
+export interface RepoStatePaths {
+  /** `<stateDir>/<repo-hash>` */
+  dir: string;
+  /** Its `<repo-hash>`: the repo id on events, never a path. */
+  repoId: string;
+  /** The event log (`defaultEventDbPath`). */
+  events: string;
+  /** The Mini-conductor's single-instance lock. */
+  lock: string;
+  /** The Workers' checkouts (standalone mode). */
+  worktrees: string;
+}
+
+export function repoStatePaths(
+  repoPath: string,
+  stateDir: string = defaultStateDir(),
+): RepoStatePaths {
+  const dir = repoStateDir(repoPath, stateDir);
+  return {
+    dir,
+    repoId: basename(dir),
+    events: join(dir, 'events.db'),
+    lock: join(dir, 'mini.lock'),
+    worktrees: join(dir, 'worktrees'),
+  };
+}
+
 function canonical(path: string): string {
   try {
     return realpathSync.native(path);
