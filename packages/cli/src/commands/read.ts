@@ -39,7 +39,6 @@ async function open(
   return { store, live: () => miniLockHolder(paths.lock) !== undefined };
 }
 
-/** `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live. */
 /** Where a task starts and lands, as recorded when it started (#219); undefined for older tasks. */
 function targetOf(store: EventStore, taskId: string): TaskTarget | undefined {
   const data = store.query({ taskId, typePrefix: 'task.target' }).at(-1)?.envelope.data;
@@ -47,6 +46,7 @@ function targetOf(store: EventStore, taskId: string): TaskTarget | undefined {
   return parsed.success ? parsed.data : undefined;
 }
 
+/** `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live. */
 export async function status(io: Io, o: Where & { json?: boolean }): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
   const paths = statePaths(repoRoot, o['user-dir'], io.home);
@@ -62,22 +62,25 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
     const state = readState(store);
     const roots = rootTasks(state);
     if (o.json) {
-      const tasks = roots.map((t) => ({
-        id: t.task.id,
-        goal: t.task.goal,
-        state: t.state,
-        ...(t.result ? { outcome: t.result.outcome } : {}),
-        ...(targetOf(store, t.task.id) ? { target: targetOf(store, t.task.id) } : {}),
-        usage: t.usage,
-        subtasks: subtasksOf(state, t.task.id).map((s) => ({
-          id: s.task.id,
-          goal: s.task.goal,
-          state: s.state,
-          activeWorkers: s.activeWorkers,
-          usage: s.usage,
-        })),
-        escalations: pendingEscalations(state, t.task.id),
-      }));
+      const tasks = roots.map((t) => {
+        const target = targetOf(store, t.task.id);
+        return {
+          id: t.task.id,
+          goal: t.task.goal,
+          state: t.state,
+          ...(t.result ? { outcome: t.result.outcome } : {}),
+          ...(target ? { target } : {}),
+          usage: t.usage,
+          subtasks: subtasksOf(state, t.task.id).map((s) => ({
+            id: s.task.id,
+            goal: s.task.goal,
+            state: s.state,
+            activeWorkers: s.activeWorkers,
+            usage: s.usage,
+          })),
+          escalations: pendingEscalations(state, t.task.id),
+        };
+      });
       io.out(safeJson({ running: pid ?? null, tasks }));
       return 0;
     }

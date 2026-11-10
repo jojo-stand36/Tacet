@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SummaryPacket, TacetConfig, TaskLanded } from '@tacet/core';
+import { newUlid, type SummaryPacket, type TacetConfig, type TaskLanded } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitIntegrator } from '../git/integrate.js';
@@ -10,7 +10,7 @@ import { CommandVerifier } from '../verify/command-verifier.js';
 import { WorktreeManager } from '../worktree.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
-import type { Planner } from './ports.js';
+import type { Planner, Workspaces } from './ports.js';
 import { type Script, ScriptedAdapter } from './testing.js';
 
 /**
@@ -70,6 +70,7 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     script: (cwd: string, input: string) => void,
     worktrees?: TacetConfig['worktrees'],
     verify?: string[],
+    more: { workspaces?: Workspaces; planner?: Planner; workersMax?: number } = {},
   ): Promise<{ id: string; published: { ref: string; commit: string } }> {
     const fake = new ScriptedAdapter('fake', (input, s): Script => {
       script(s.opts.cwd, input);
@@ -80,7 +81,15 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       config: {
         tiers: { worker: { adapter: 'fake', model: 'cheap' } },
         ...(worktrees ? { worktrees } : {}),
-        ...(verify ? { verify, workers: { verify_fix_attempts: 2 } } : {}),
+        ...(verify || more.workersMax
+          ? {
+              ...(verify ? { verify } : {}),
+              workers: {
+                ...(verify ? { verify_fix_attempts: 2 } : {}),
+                ...(more.workersMax ? { max: more.workersMax } : {}),
+              },
+            }
+          : {}),
       },
       ...(verify
         ? {
@@ -93,9 +102,9 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
           }
         : {}),
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
-      workspaces: manager,
+      workspaces: more.workspaces ?? manager,
       integrator: new GitIntegrator(repo, env),
-      planner: new SingleStepPlanner(),
+      planner: more.planner ?? new SingleStepPlanner(),
       mcp: {
         workerConfig: () => ({
           config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
@@ -324,6 +333,191 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     expect(store.query({ taskId: id, typePrefix: 'task.target' })[0]?.envelope.data).toEqual({
       branch: 'main',
       commit: mainTip,
+    });
+  });
+
+  describe('the pinned target (#219)', () => {
+    const twoSubtasks: Planner = {
+      async plan() {
+        return {
+          subtasks: [
+            { key: 'a', goal: 'a', acceptanceCriteria: ['ok'] },
+            { key: 'b', goal: 'b', acceptanceCriteria: ['ok'] },
+          ],
+          rationale: 'two independent sub-tasks',
+          planner: { adapter: 'test' },
+        };
+      },
+    };
+    /** The worktree manager as a Workspaces without `head`: as before #219. */
+    const withoutHead = (): Workspaces => ({
+      create: (workerId, base) => manager.create(workerId, base),
+      get: (id) => manager.get(id),
+      remove: (id, o) => manager.remove(id, o),
+    });
+    /** The user switches the main checkout to another branch, after the first Worker turn. */
+    let switched = false;
+    const switchOnce = () => {
+      if (switched) return;
+      switched = true;
+      git(repo, ['checkout', '-q', '-b', 'elsewhere']);
+      writeFileSync(join(repo, 'elsewhere.txt'), 'x\n');
+      git(repo, ['add', 'elsewhere.txt']);
+      git(repo, ['commit', '-qm', 'elsewhere']);
+    };
+    const commitFile = (name: string) => (cwd: string) => {
+      writeFileSync(join(cwd, name), `${name}\n`);
+      workerGit(cwd, ['add', name]);
+      workerGit(cwd, ['commit', '-qm', name]);
+    };
+    /** Squash `commit` onto main without checking main out: the user is on another branch. */
+    const squashOntoMain = (commit: string) => {
+      const squashed = git(repo, [
+        'commit-tree',
+        `${commit}^{tree}`,
+        '-p',
+        'refs/heads/main',
+        '-m',
+        'squash-merged',
+      ]);
+      git(repo, ['update-ref', 'refs/heads/main', squashed]);
+    };
+    beforeEach(() => {
+      switched = false;
+    });
+
+    it('lands a task in its pinned branch after the user switched branch mid-task', async () => {
+      let n = 0;
+      const { id, published } = await runTask(
+        (cwd) => {
+          n += 1;
+          commitFile(`work-${n}.txt`)(cwd);
+          switchOnce();
+        },
+        undefined,
+        undefined,
+        { planner: twoSubtasks, workersMax: 1 },
+      );
+      expect(git(repo, ['symbolic-ref', '--short', 'HEAD'])).toBe('elsewhere');
+      squashOntoMain(published.commit);
+      await vi.waitFor(async () => expect(await manager.list()).toEqual([]), { timeout: 3_000 });
+      expect((landedEvents(id)[0]?.data as TaskLanded | undefined)?.target).toBe('refs/heads/main');
+    });
+
+    it('falls back to the branch older tasks agree on, and skips them when they disagree', async () => {
+      const agreed = await runTask(commitWork, undefined, undefined, {
+        workspaces: withoutHead(),
+      });
+      expect(store.query({ taskId: agreed.id, typePrefix: 'task.target' })).toEqual([]);
+      squashIntoMain(agreed.published.commit);
+      await vi.waitFor(() => expect(landedEvents(agreed.id)).toHaveLength(1), { timeout: 3_000 });
+      await daemon?.stop();
+      daemon = undefined;
+
+      let n = 0;
+      const split = await runTask(
+        (cwd) => {
+          n += 1;
+          commitFile(`split-${n}.txt`)(cwd);
+          switchOnce();
+        },
+        undefined,
+        undefined,
+        { workspaces: withoutHead(), planner: twoSubtasks, workersMax: 1 },
+      );
+      squashOntoMain(split.published.commit);
+      await severalSweeps();
+      expect(landedEvents(split.id)).toEqual([]);
+    });
+
+    it('pins no branch on a detached HEAD, and the sweep then checks none', async () => {
+      git(repo, ['checkout', '-q', '--detach']);
+      const { id, published } = await runTask(commitWork);
+      const target = store.query({ taskId: id, typePrefix: 'task.target' })[0]?.envelope.data;
+      expect(target).toEqual({ commit: git(repo, ['rev-parse', 'HEAD']) });
+      squashOntoMain(published.commit);
+      await severalSweeps();
+      expect(landedEvents(id)).toEqual([]);
+      expect(await manager.list()).toHaveLength(1);
+    });
+
+    it('fails planning when it cannot tell the target, and plans at the pinned commit', async () => {
+      const failing: Workspaces = {
+        ...withoutHead(),
+        head: () => Promise.reject(new Error('no branch here')),
+      };
+      await expect(
+        runTask(commitWork, undefined, undefined, { workspaces: failing }),
+      ).rejects.toThrow('the task published no result');
+      const status = store
+        .query({ typePrefix: 'task.status' })
+        .map((e) => e.envelope.data as { state: string; message?: string });
+      expect(status.at(-1)).toMatchObject({
+        state: 'failed',
+        message: expect.stringContaining('cannot tell which branch the task targets'),
+      });
+    });
+
+    it('keeps a target pinned before a crash, and plans there', async () => {
+      const pinned = git(repo, ['rev-parse', 'HEAD']);
+      writeFileSync(join(repo, 'later.txt'), 'later\n');
+      git(repo, ['add', 'later.txt']);
+      git(repo, ['commit', '-qm', 'after the pin']);
+      // A Mini-conductor that crashed after pinning, before the plan.
+      const id = 'crashed-task';
+      const envelope = (type: string, data: unknown) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId: id,
+        type,
+        data,
+      });
+      store.append([
+        envelope('task.created', {
+          id,
+          goal: 'g',
+          acceptanceCriteria: ['ok'],
+          priority: 'p2',
+          createdAt: new Date().toISOString(),
+        }),
+        envelope('task.status', { state: 'submitted' }),
+        envelope('task.target', { branch: 'main', commit: pinned }),
+      ]);
+      const bases: Array<string | undefined> = [];
+      const planner: Planner = {
+        async plan(task, opts) {
+          bases.push(opts?.base);
+          return new SingleStepPlanner().plan(task);
+        },
+      };
+      let startedAt: string | undefined;
+      const fake = new ScriptedAdapter('fake', (_input, s): Script => {
+        startedAt = workerGit(s.opts.cwd, ['rev-parse', 'HEAD']);
+        return { do: 'reply', text: 'done' };
+      });
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+        workspaces: manager,
+        integrator: new GitIntegrator(repo, env),
+        planner,
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        pollMs: 20,
+      });
+      await daemon.start();
+      await daemon.settled();
+      expect(store.query({ taskId: id, typePrefix: 'task.target' })).toHaveLength(1);
+      expect(bases).toEqual([pinned]);
+      expect(startedAt).toBe(pinned);
     });
   });
 });

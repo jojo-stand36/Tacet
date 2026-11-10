@@ -21,7 +21,8 @@ export interface Workspace {
 export interface Workspaces {
   /**
    * A fresh checkout for the Worker session `workerId`; never an existing one. It starts at
-   * `base`, a commit in the repo (#134: its dependencies' work), or at the main branch.
+   * `base`, a commit in the repo (#134: its dependencies' work; #219: the task's pinned target),
+   * or, without one, where the main checkout is now.
    */
   create(workerId: string, base?: string): Promise<Workspace>;
   /**
@@ -177,8 +178,11 @@ export interface PlanResult {
 }
 
 export interface Planner {
-  /** `signal` aborts when the Mini-conductor stops; the planner should end its session. */
-  plan(task: Task, opts?: { signal?: AbortSignal }): Promise<PlanResult>;
+  /**
+   * `signal` aborts when the Mini-conductor stops; the planner should end its session. `base` is
+   * the commit the task's sub-tasks start from (#219): a planner that reads the code reads it there.
+   */
+  plan(task: Task, opts?: { signal?: AbortSignal; base?: string }): Promise<PlanResult>;
 }
 
 /**

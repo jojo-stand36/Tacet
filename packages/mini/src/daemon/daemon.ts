@@ -508,11 +508,13 @@ export class MiniConductor {
       (async () => {
         try {
           if (this.#o.workspaces.head && !this.#target(task.id)) {
-            await this.#pinTarget(task.id);
+            await this.#pinTarget(task.id, dropped);
             if (dropped()) return;
           }
+          const base = this.#target(task.id)?.commit;
           const proposal = await this.#o.planner.plan(task, {
             signal: AbortSignal.any([this.#abort.signal, abort.signal]),
+            ...(base !== undefined ? { base } : {}),
           });
           if (dropped()) return;
           const idOf = new Map(proposal.subtasks.map((s, i) => [s.key, `${task.id}/${i + 1}`]));
@@ -847,20 +849,22 @@ export class MiniConductor {
   /**
    * Record where a task starts and lands, once, before it is planned: the repo's checked-out branch
    * and commit now. Sub-tasks without dependencies start from that commit, so the user switching
-   * branch mid-task moves none of them. Without `Workspaces.head`, or if it fails, nothing is
-   * recorded and sub-tasks start where the main checkout is when they start, as before.
+   * branch mid-task moves none of them. Without `Workspaces.head` nothing is recorded and
+   * sub-tasks start where the main checkout is when they start, as before. If it fails, it throws,
+   * and planning fails with its message: no checkout could be made there either.
    */
-  async #pinTarget(taskId: string): Promise<void> {
+  async #pinTarget(taskId: string, dropped: () => boolean): Promise<void> {
     if (this.#target(taskId) || !this.#o.workspaces.head) return;
     let head: { branch?: string; commit: string };
     try {
       head = await this.#o.workspaces.head();
     } catch (err) {
-      this.#errors.push(err);
-      return;
+      throw new Error(`cannot tell which branch the task targets: ${(err as Error).message}`);
     }
+    // Canceled, or the Mini-conductor stopped, meanwhile: nothing more is written for it.
+    if (dropped() || this.#target(taskId)) return;
     const target = TaskTarget.safeParse(head);
-    if (!target.success || this.#target(taskId)) return;
+    if (!target.success) throw new Error('cannot tell which branch the task targets');
     this.#o.store.append(this.#env(taskId, 'task.target', target.data));
   }
 
@@ -1070,7 +1074,7 @@ export class MiniConductor {
 
   /**
    * Where a new checkout of `subtaskId` starts (#134): the combined work of the sub-tasks it
-   * depends on, or the main branch. When their work conflicts, the user is asked first
+   * depends on, or the task's pinned target (#219; older tasks: the main branch). When their work conflicts, the user is asked first
    * (undefined: nothing runs). Once they answered, it starts from the first dependency's work,
    * and the Worker is told to merge the rest.
    */
