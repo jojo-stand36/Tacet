@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLAUDE_ACP_AGENT, claudeAcpWorkerSpec } from '@tacet/adapter-acp';
 import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
+import { PtyCliAdapter } from '@tacet/adapter-pty';
 import { gatedTitle, ptyGate } from '@tacet/adapter-pty/testing';
 import type { TacetConfig } from '@tacet/core';
 import {
@@ -27,7 +28,7 @@ import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
 import { TempWorkspaces } from '../daemon/testing.js';
-import { buildWorkerAdapters, runsGemini, WorkerConfigError } from './build.js';
+import { buildWorkerAdapters, commandWords, runsGemini, WorkerConfigError } from './build.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
@@ -149,6 +150,41 @@ describe('buildWorkerAdapters', () => {
     for (const w of ['gemini-helper', 'my-gemini', 'codex', 'aider', '@google/genai']) {
       expect(runsGemini(w), w).toBe(false);
     }
+    // The Worker build sets it for a preset that runs Gemini, and only then.
+    const escapes = (command: string[]) => {
+      const { adapter } =
+        buildWorkerAdapters(
+          {
+            tiers: { worker: { adapter: 'pty:mine' } },
+            agents: { mine: { kind: 'pty', command } },
+          },
+          { baseEnv: {} },
+        )['pty:mine'] ?? {};
+      if (!(adapter instanceof PtyCliAdapter)) throw new Error('not a PTY CLI adapter');
+      return adapter.preset.escapeAt === true;
+    };
+    expect(escapes(['gemini'])).toBe(true);
+    expect(escapes(['npx', '-y', '@google/gemini-cli@0.67.0'])).toBe(true);
+    expect(escapes(['env', 'X=1', 'gemini', '-m', 'm'])).toBe(true);
+    expect(escapes(['sh', '-c', 'cd x && exec gemini'])).toBe(true);
+    expect(escapes(['aider'])).toBe(false);
+    expect(escapes(['aider', '--model', 'gemini'])).toBe(false);
+  });
+
+  it('reads only the words of a command that name what it runs (#245 review)', () => {
+    expect(commandWords(['aider', '--model', 'claude'])).toEqual(['aider']);
+    expect(commandWords(['opencode', '--config', '/home/me/.config/claude'])).toEqual(['opencode']);
+    expect(commandWords(['sh', '-c', 'cd ~/claude && aider'])).toEqual(['sh', 'cd', 'aider']);
+    expect(commandWords(['env', '-i', 'A=1', 'npx', '-y', 'pkg', '--flag'])).toEqual([
+      'env',
+      'npx',
+      'pkg',
+    ]);
+    expect(commandWords(['pnpm', 'dlx', '@google/gemini-cli'])).toEqual([
+      'pnpm',
+      '@google/gemini-cli',
+    ]);
+    expect(commandWords(['pnpm', 'run', 'gemini'])).toEqual(['pnpm']);
   });
 
   it('refuses a custom PTY preset running Claude Code for Workers: pty:claude is hardened (#245)', () => {
@@ -169,8 +205,16 @@ describe('buildWorkerAdapters', () => {
         /agents\.mine runs Claude Code; use pty:claude/,
       );
     }
-    // Other CLIs, and names that only contain the word, still build.
-    for (const command of [['aider'], ['codex'], ['claude-helper'], ['my-claude'], ['gemini']]) {
+    // Other CLIs, names that only contain the word, and the word as an argument, still build.
+    for (const command of [
+      ['aider'],
+      ['codex'],
+      ['claude-helper'],
+      ['my-claude'],
+      ['gemini'],
+      ['aider', '--model', 'claude'],
+      ['sh', '-c', 'cd ~/claude && aider'],
+    ]) {
       const built = buildWorkerAdapters(
         { tiers: { worker: { adapter: 'pty:mine' } }, agents: { mine: { kind: 'pty', command } } },
         { baseEnv: {} },

@@ -203,9 +203,7 @@ export function buildWorkerAdapters(
           ...(preset.resume_flag !== undefined ? { resumeArgs: [preset.resume_flag].flat() } : {}),
           // Gemini CLI reads an `@path` in a prompt unasked, or after a Yes-by-default question
           // (#245): its prompts are typed with every `@` escaped.
-          ...(preset.command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).some(runsGemini)
-            ? { escapeAt: true }
-            : {}),
+          ...(commandWords(preset.command).some(runsGemini) ? { escapeAt: true } : {}),
         },
       });
     }
@@ -310,10 +308,7 @@ export function buildWorkerAdapters(
    */
   function refusePtyForWorkers(slug: string, where: string): void {
     const preset = config.agents?.[slug];
-    if (
-      preset?.kind === 'pty' &&
-      preset.command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).some(runsClaudeCode)
-    ) {
+    if (preset?.kind === 'pty' && commandWords(preset.command).some(runsClaudeCode)) {
       throw new WorkerConfigError(
         `${where}: agents.${slug} runs Claude Code; use pty:claude for Workers, which runs it with the Worker hardening (#245)`,
       );
@@ -361,6 +356,49 @@ function runsClaudeAcp(word: string): boolean {
     ['claude-agent-acp', 'claude-code-acp'].includes(base) ||
     /(^|\/)(claude-agent-acp|claude-code-acp)(\/|@|$)/.test(word)
   );
+}
+
+const LAUNCHERS = new Set(['env', 'npx', 'bunx', 'pnpx', 'node', 'deno', 'exec', 'nohup']);
+const RUNNERS = new Set(['npm', 'pnpm', 'yarn']);
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
+
+/**
+ * The words of a command line that name what it runs (#245 review): the executable, what a
+ * launcher runs (`env`, `npx`, `node`, `exec`, `pnpm dlx`: the first word that is not an option
+ * or a `NAME=value`), and each command of a `sh -c` script. Arguments are not, so
+ * `aider --model claude` runs aider. A wrapper script that hides the CLI is not seen through.
+ */
+export function commandWords(argv: string[], depth = 0): string[] {
+  const [head, ...rest] = argv;
+  if (head === undefined || depth > 5) return [];
+  const base = head.split('/').pop() ?? head;
+  if (SHELLS.has(base)) {
+    const script = rest[rest.indexOf('-c') + 1];
+    if (!rest.includes('-c') || script === undefined) return [head];
+    return [
+      head,
+      ...script.split(/[;&|()\n]+/).flatMap((cmd) =>
+        commandWords(
+          cmd
+            .trim()
+            .split(/\s+/)
+            .map((w) => w.replace(/^["'`]+|["'`]+$/g, ''))
+            .filter(Boolean),
+          depth + 1,
+        ),
+      ),
+    ];
+  }
+  let args = rest;
+  if (RUNNERS.has(base)) {
+    const sub = args.findIndex((a) => !a.startsWith('-'));
+    if (sub < 0 || !['dlx', 'exec', 'x'].includes(args[sub] ?? '')) return [head];
+    args = args.slice(sub + 1);
+  } else if (!LAUNCHERS.has(base)) {
+    return [head];
+  }
+  const next = args.findIndex((a) => !a.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(a));
+  return next < 0 ? [head] : [head, ...commandWords(args.slice(next), depth + 1)];
 }
 
 /**

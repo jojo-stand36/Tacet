@@ -167,7 +167,7 @@ budget:
 auth:
   unattended: api_key      # default: API key for parallel or unattended Workers
   interactive: subscription
-agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt, resume_flag = argument(s) that continue the CLI's last session in the Worker's checkout, e.g. [resume, --last], only for a CLI whose resume is scoped to its working directory, or a Worker could continue another's; the built-in Claude preset is pty:claude; Workers may not use a preset whose command runs Claude Code, which would get none of pty:claude's hardening, and a preset running Gemini CLI has every `@` in its prompts typed as `\@`, so no `@path` is read in, #245)
+agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt, resume_flag = argument(s) that continue the CLI's last session in the Worker's checkout, e.g. [resume, --last], only for a CLI whose resume is scoped to its working directory, or a Worker could continue another's; the built-in Claude preset is pty:claude; Workers may not use a preset whose command runs Claude Code, which would get none of pty:claude's hardening, and a preset running Gemini CLI has every `@` in its prompts typed as `\@` and ` .` appended, so Gemini reads no file named in a prompt (an `@path`, or a paste of only file paths, which it converts to one), #245; detection reads only the words that name what a command runs, not its arguments)
   goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
   # a tier on such an agent: tiers.worker: { adapter: "acp:goose" } (no model: its command fixes it)
 policies:

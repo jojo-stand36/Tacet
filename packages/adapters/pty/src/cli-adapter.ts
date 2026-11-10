@@ -77,11 +77,14 @@ export interface PtyPreset {
    */
   resumeArgs?: string[];
   /**
-   * Type every `@` as `\@` (#245): for Gemini CLI, which otherwise reads an `@path` in a prompt
-   * into it with `ReadManyFiles`, a file in the workspace without asking and one outside after a
-   * confirmation whose default is Yes (the next Enter Tacet types would accept it). Gemini takes
-   * `\@` as a literal at sign and sends it as typed. Verified live on Gemini CLI 0.67.0 against a
-   * local mock of its API (capability matrix, "Generic PTY presets: `@path` mentions").
+   * For Gemini CLI (#245), which reads files named in a prompt into it with `ReadManyFiles`: a
+   * file in the workspace without asking, one outside after a confirmation whose default is Yes
+   * (the next Enter Tacet types would accept it). Two routes, both closed: an `@path` (also an
+   * `@agent` or MCP `@resource`), so every `@` is typed as `\@`, which Gemini takes as a literal
+   * at sign and sends as typed; and a paste made only of existing file paths (`./a.txt`, a quoted
+   * path), which Gemini turns into `@path` itself, so the prompt ends with ` .`, a segment that is
+   * a directory and so never a file. Verified live on Gemini CLI 0.67.0 against a local mock of
+   * its API (capability matrix, "Generic PTY presets: `@path` mentions").
    */
   escapeAt?: boolean;
 }
@@ -174,6 +177,11 @@ const deadline = (ms: number) => new Promise((r) => setTimeout(r, ms).unref());
 export class PtyCliAdapter implements AgentAdapter {
   readonly id: string;
   readonly #opts: PtyCliAdapterOptions;
+
+  /** The preset this adapter runs, read-only. */
+  get preset(): Readonly<PtyPreset> {
+    return this.#opts.preset;
+  }
   readonly #sessions = new Map<string, Session>();
 
   constructor(opts: PtyCliAdapterOptions) {
@@ -322,7 +330,7 @@ export class PtyCliAdapter implements AgentAdapter {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
     const typed = promptText(input.text);
-    const text = this.#opts.preset.escapeAt ? typed.replaceAll('@', '\\@') : typed;
+    const text = this.#opts.preset.escapeAt ? `${typed.replaceAll('@', '\\@')} .` : typed;
     // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
     if (s.stalled) {
       s.stalled = false;
