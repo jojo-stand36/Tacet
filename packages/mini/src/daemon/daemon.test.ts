@@ -2243,6 +2243,9 @@ describe('handoff reseed (#129)', () => {
       { workerSessionId: minted[0] ?? '', taskId: sub },
       { reason: 'context', packet: packet('carry on') },
     );
+    const vendor = (
+      ofType('worker.vendor_session', sub)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
     // The process dies: nothing is closed or recorded.
     first.crashForTest();
     fake = new ScriptedAdapter('fake', (input) =>
@@ -2257,6 +2260,12 @@ describe('handoff reseed (#129)', () => {
     expect(successor?.opts.resume).toBeUndefined();
     expect(successor?.inputs[0]).toContain('read_task');
     expect(ofType('handoff.accepted', sub)).toHaveLength(1);
+    // The session that handed off is dropped before its successor starts, as one that is never
+    // resumed is (#153); the successor is dropped when it finishes.
+    expect(fake.discarded.map((x) => x.vendorSessionId)).toEqual([
+      vendor,
+      successor?.handle.vendorSessionId,
+    ]);
   });
 
   it('keeps the seed for a retry when the successor fails to start', async () => {
@@ -2287,7 +2296,38 @@ describe('handoff reseed (#129)', () => {
     expect(ofType('handoff.accepted', sub)).toHaveLength(1);
   });
 
-  it('refuses a handoff while the turn is being checked, after the task ended, or past max_handoffs', async () => {
+  it('refuses a handoff while the turn is being checked, recording nothing', async () => {
+    let release: () => void = () => {};
+    let checking = false;
+    const verifier: Verifier = {
+      async verify() {
+        checking = true;
+        await new Promise<void>((r) => {
+          release = r;
+        });
+        return { status: 'passed', commands: ['pnpm test'], notes: '' };
+      },
+    };
+    fake = new ScriptedAdapter('fake', () => ({ do: 'reply', text: 'done' }));
+    const d = make({ config: { ...CONFIG, verify: ['pnpm test'] }, verifier });
+    const backend = backendFor(d);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => checking, { timeout: 5000 }).toBe(true);
+    await expect(
+      backend.requestHandoff(
+        { workerSessionId: minted[0] ?? '', taskId: sub },
+        { reason: 'context', packet: packet('late') },
+      ),
+    ).rejects.toThrow(/being checked/);
+    expect(ofType('handoff.requested', sub)).toHaveLength(0);
+    release();
+    await d.settled();
+    expect(reasons(sub)).toEqual(['finished']);
+  });
+
+  it('refuses a handoff from a session that is not running, or past max_handoffs', async () => {
     fake = new ScriptedAdapter('fake', () => ({ do: 'hold' }));
     const d = make({ config: { ...CONFIG, workers: { ...CONFIG.workers, max_handoffs: 1 } } });
     const backend = backendFor(d);
@@ -2308,7 +2348,8 @@ describe('handoff reseed (#129)', () => {
       backend.requestHandoff(second, { reason: 'context', packet: packet('two') }),
     ).rejects.toThrow(/handoff limit reached \(1 for this sub-task\)/);
     expect(ofType('handoff.requested', sub)).toHaveLength(1);
+    // A canceled task's session is gone at once.
     await d.cancel(id);
-    expect(d.handoffRefusal(minted[1] ?? '')).toMatch(/not running|ended/);
+    expect(d.handoffRefusal(minted[1] ?? '')).toMatch(/not running/);
   });
 });

@@ -1290,8 +1290,15 @@ export class MiniConductor {
         ? { vendorSessionId: last.vendorSessionId }
         : undefined;
     // A session stopped for a restart that is not resumed after all (another adapter or
-    // checkout now) never will be: its adapter may drop what it kept for that (#153).
-    if (!resume && last?.ended === 'restart' && last.vendorSessionId && last.adapter) {
+    // checkout now) never will be: its adapter may drop what it kept for that (#153). Nor is
+    // one that handed off (#129); ending it live discards it too, but not when it ended at a
+    // restart, and a second discard is harmless.
+    if (
+      !resume &&
+      (last?.ended === 'restart' || last?.ended === 'handoff') &&
+      last.vendorSessionId &&
+      last.adapter
+    ) {
       // Its own checkout, refused or not, locates its state; the new one only if that is gone.
       const old = last.workspaceId ? await this.#o.workspaces.get(last.workspaceId) : undefined;
       await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
@@ -1459,8 +1466,9 @@ export class MiniConductor {
       await worker.adapter.send(handle, { text });
       if (this.#live(gen)) {
         this.#markDelivered(run, answers);
-        // Taken up only once its successor has it: a start that fails keeps the seed (#129).
-        if (seed) {
+        // Taken up only once its successor has it: a start that fails, or a session that ended
+        // while its first message was on the way, keeps the seed (#129).
+        if (seed && this.#runs.get(subtaskId) === run) {
           this.#o.store.append(
             this.#env(
               subtaskId,
