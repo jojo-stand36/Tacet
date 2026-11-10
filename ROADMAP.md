@@ -90,6 +90,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **ACP adapter: close() after a self-exit must not poll the reaped process group again** — `chore` `P2` `claude`
+- [ ] **Declare resume and fork for claude-acp and codex-acp after a live check** — `feature` `P2` `claude`
 
 ## M2 · Conductor & escalation
 
