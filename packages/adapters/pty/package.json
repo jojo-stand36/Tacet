@@ -13,6 +13,11 @@
       "@tacet/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@tacet/source": "./src/testing/pty-gate.ts",
+      "types": "./dist/testing/pty-gate.d.ts",
+      "default": "./dist/testing/pty-gate.js"
     }
   },
   "files": [
