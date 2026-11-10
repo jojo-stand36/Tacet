@@ -23,7 +23,8 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@tacet/core": "workspace:*"
+    "@tacet/core": "workspace:*",
+    "@tacet/mini": "workspace:*"
   },
   "bin": {
     "tacet": "./dist/bin.js"

@@ -23,6 +23,11 @@
       "@tacet/source": "./src/standalone.ts",
       "types": "./dist/standalone.d.ts",
       "default": "./dist/standalone.js"
+    },
+    "./testing": {
+      "@tacet/source": "./src/daemon/testing.ts",
+      "types": "./dist/daemon/testing.d.ts",
+      "default": "./dist/daemon/testing.js"
     }
   },
   "files": [

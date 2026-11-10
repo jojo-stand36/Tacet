@@ -10,7 +10,7 @@ import {
 } from '@tacet/core/node';
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
-import type { Planner, Reviewer } from './daemon/ports.js';
+import type { Planner, Reviewer, WorkerAdapter } from './daemon/ports.js';
 import { GitIntegrator } from './git/integrate.js';
 import { GitWorktrees } from './git/worktrees.js';
 import { EventLogBackend } from './mcp/backend.js';
@@ -39,6 +39,8 @@ export interface StandaloneOptions {
    * Never reachable from the command line.
    */
   workers?: Pick<BuildWorkerAdaptersOptions, 'acp' | 'codex' | 'claude' | 'ptyCli' | 'keychain'>;
+  /** Tests only: these adapters instead of building them from config. */
+  adapters?: Record<string, WorkerAdapter>;
 }
 
 /** A running standalone Mini-conductor and what it owns. */
@@ -66,15 +68,17 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
   const stateDir = resolveStateDir(config.events?.state_dir, o.repoRoot, o.home);
   const paths = repoStatePaths(o.repoRoot, stateDir);
   const baseEnv = o.baseEnv ?? process.env;
-  const adapters = buildWorkerAdapters(config, {
-    ...o.workers,
-    repoRoot: o.repoRoot,
-    baseEnv,
-    withPlanner: !o.singleStep,
-    ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
-    codex: { ...o.workers?.codex, stateDir },
-    acp: { ...o.workers?.acp, stateDir },
-  });
+  const adapters =
+    o.adapters ??
+    buildWorkerAdapters(config, {
+      ...o.workers,
+      repoRoot: o.repoRoot,
+      baseEnv,
+      withPlanner: !o.singleStep,
+      ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
+      codex: { ...o.workers?.codex, stateDir },
+      acp: { ...o.workers?.acp, stateDir },
+    });
   const tiers = config.tiers ?? {};
   let planner: Planner = new SingleStepPlanner();
   if (!o.singleStep && tiers.mini) {

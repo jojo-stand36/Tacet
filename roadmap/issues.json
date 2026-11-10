@@ -362,7 +362,7 @@
         "type:feature",
         "area:mini",
         "priority:p1",
-        "agent:copilot"
+        "agent:claude"
       ],
       "body": "Minimal CLI to use a mini-conductor without the Conductor.\n\n### Tasks\n- [ ] `tacet run \"task\"`\n- [ ] `tacet status`\n- [ ] `tacet attach <worker>` (live PTY or stream)\n- [ ] `tacet logs <task>`\n\n### Acceptance criteria\n- End-to-end demo scriptable from CLI only\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
@@ -1295,6 +1295,40 @@
         "needs-human"
       ],
       "body": "Found in #181 (verified live on Gemini CLI 0.67.0 over ACP): a Gemini Worker's checkout is untrusted (Tacet never passes `GEMINI_CLI_TRUST_WORKSPACE`, folder trust is on), which keeps the checkout's `.gemini/settings.json`, `GEMINI.md`, skills, agents and `.gemini/.env` out. But in an untrusted folder Gemini also never contacts the MCP server Tacet passes in `session/new` (no request at all; one once trusted), so Gemini Workers cannot use `escalate`, `report_progress` or the other Mini-conductor tools. Trusting the checkout would load everything above; no flag trusts a folder for MCP only.\n\n### Tasks\n- [ ] Owner decision: Gemini Workers without Mini-conductor tools (escalation through ACP permission requests only), trust the checkout and accept what it loads, or find or ask upstream for an MCP-only trust.\n- [ ] Implement it, with a test against the real CLI, and update ARCHITECTURE §6 and the capability matrix.\n\n### Acceptance criteria\n- A Gemini Worker either reaches Tacet's MCP server with none of the checkout's project files loaded (real-CLI test with a hostile checkout), or its missing tools are declared and handled so a Gemini Worker never waits on a tool it cannot call.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (Gemini, #181)._"
+    },
+    {
+      "title": "Unattended Worker tool policy before #25: let Workers change their own worktree",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Standalone `tacet run` (#21) works end to end, but a Claude Worker cannot change anything yet. The Mini-conductor refuses every approval request except for its own MCP tools until policies exist (#25, M2; `packages/mini/src/daemon/daemon.ts`, \"refused until policies exist\"). The Claude Agent SDK, in its default permission mode with a `canUseTool` callback and no allow rules, routes Edit, Write and Bash commands that are not read-only to that callback. It runs file reads in the working directory and read-only Bash without asking (https://code.claude.com/docs/en/agent-sdk/permissions, checked 2026-11-10, recorded in `docs/adapters/capability-matrix.md`). So under Tacet a Claude Worker can read and escalate, but not edit. Codex Workers can write in their sandbox (`workspace-write`).\n\nThe owner decides the interim policy. Options:\n- (a) Allow file edits and writes inside the Worker's own worktree, decided in the Mini-conductor's approval handler. Every decision stays an `agent.approval` event.\n- (b) A tier setting for the SDK permission mode, e.g. `acceptEdits`, which approves edits inside the working directories without asking. It is simpler, but those calls produce no approval event unless a `PreToolUse` hook records them.\n- (c) A configured Bash allowlist (e.g. the `verify` commands) alongside (a) or (b).\n- (d) Keep refusing until #25.\n\n### Tasks\n- [ ] Owner picks an option (record it on this issue).\n- [ ] Implement it for unattended Workers only, behind config that is off by default if the owner asks for that, with tests that a path outside the worktree is still refused.\n- [ ] Update ARCHITECTURE §6 and the capability matrix.\n\n### Acceptance criteria\n- A Claude Worker started by `tacet run` can edit files in its worktree under the chosen policy, and cannot edit outside it.\n- Every allowed or refused call is visible in the event log.\n\n_See #21, #25, docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md._"
+    },
+    {
+      "title": "Standalone Mini-conductor control port: status and live attach over ADR-003 §4",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "In standalone mode (#21), `tacet run` hosts the Mini-conductor in its own process. `status`, `logs` and `attach` read the event log read-only. ADR-003 §4 says a standalone Mini-conductor serves the Conductor's methods on its own port, for the CLI and the UI. Building that port replaces the interim design.\n\n### Tasks\n- [ ] Serve the ADR-003 methods on a loopback port with a token (`tacet/hello` with role `cli`, the runtime file).\n- [ ] A background mode (`tacet up` for one repo, or `tacet run --detach`).\n- [ ] `tacet status` and `tacet attach` over the port, and live terminal attach for PTY Workers (`/pty/<sessionId>`, ADR-003).\n- [ ] Answering escalations and cancelling over the port, so a second process never writes the log.\n\n### Acceptance criteria\n- `tacet attach <worker>` shows a PTY Worker's terminal live.\n- `tacet status` answers from the running Mini-conductor, and falls back to the log when none is running.\n- The port binds to 127.0.0.1 only and refuses a request without the token.\n\n_See #21, docs/adr/003-wire-protocols.md §4 and docs/ARCHITECTURE.md §1._"
+    },
+    {
+      "title": "tacet cancel <task> in standalone mode",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Standalone mode (#21) can run, resume and answer, but cannot cancel a task. The task state `canceled` exists in the projection, but nothing records it.\n\n### Tasks\n- [ ] `MiniConductor.cancel(taskId)`: end the task's open Worker sessions, record `task.status canceled` for the task and its sub-tasks, and start nothing more for it.\n- [ ] `tacet cancel <task>`: cancel in the running process (Ctrl-C, then `tacet cancel`, then `tacet run --resume` continues the rest), or through the control port once it exists.\n\n### Acceptance criteria\n- After `tacet cancel <task>`, `tacet status` shows the task and its sub-tasks as canceled, no Worker of it is running, and `tacet run --resume` does not pick it up.\n\n_See #21._"
     }
   ]
 }
