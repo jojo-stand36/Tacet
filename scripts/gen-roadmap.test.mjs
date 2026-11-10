@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -53,8 +53,12 @@ test("sorts by milestone order, epics first, then title by code unit", () => {
   assert.deepEqual(out, ["Zed", "`code` first?", "Ábc", "epic", "a", "b"]);
 });
 
-test("refuses an unknown milestone and a duplicate title", () => {
+test("refuses an unknown milestone, a duplicate or untrimmed title and a malformed entry", () => {
   assert.throws(() => sortIssues(data([issue("x", "M9")])), /Unknown milestone "M9"/);
+  assert.throws(() => sortIssues(data([issue("x ", "M0")])), /surrounding whitespace/);
+  assert.throws(() => sortIssues(data([{ ...issue("x", "M0"), extra: 1 }])), /unknown "extra"/);
+  const { labels: _, ...noLabels } = issue("x", "M0");
+  assert.throws(() => sortIssues(data([noLabels])), /missing "labels"/);
   assert.throws(() => sortIssues(data([issue("x", "M0"), issue("x", "M1")])), /Duplicate issue title "x"/);
 });
 
@@ -82,6 +86,15 @@ test("--check fails on an unsorted issues.json, a stale ROADMAP.md or a duplicat
   assert.equal(main(["--root", dir], quiet), 0);
   assert.equal(main(["--check", "--root", dir], quiet), 0);
 
+  // Keys out of order, at the top and in an entry, are not canonical either.
+  const { body, ...rest } = d.issues[0];
+  writeJson(dir, { issues: [{ body, ...rest }, ...d.issues.slice(1)], labels: d.labels, milestones: d.milestones });
+  assert.equal(main(["--check", "--root", dir], quiet), 1);
+  assert.equal(main(["--root", dir], quiet), 0);
+  assert.deepEqual(readJson(dir), d);
+  assert.equal(main(["--check", "--root", dir], quiet), 0);
+  assert.equal(main(["--check", "--root"], quiet), 2);
+
   writeJson(dir, { ...d, issues: [...d.issues, d.issues[0]] });
   assert.equal(main(["--check", "--root", dir], quiet), 1);
   assert.equal(main(["--root", dir], quiet), 1);
@@ -89,26 +102,41 @@ test("--check fails on an unsorted issues.json, a stale ROADMAP.md or a duplicat
 
 test("two branches that each add an entry merge without a conflict", (t) => {
   const dir = scratch(t);
-  const git = (...args) => execFileSync("git", args, { cwd: dir, stdio: "pipe" }).toString();
+  // No user or system git config: a merge driver or merge.ff there would change the outcome.
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_NOSYSTEM: "1" };
+  const git = (...args) => execFileSync("git", args, { cwd: dir, stdio: "pipe", env }).toString();
   git("init", "-q", "-b", "main");
   git("config", "user.email", "test@example.invalid");
   git("config", "user.name", "test");
   git("config", "commit.gpgsign", "false");
   git("add", ".");
   git("commit", "-qm", "base");
-  const add = (branch, title, milestone) => {
+  const add = (branch, title, milestone, generated) => {
     git("checkout", "-q", "-b", branch, "main");
     const d = readJson(dir);
     writeJson(dir, { ...d, issues: [...d.issues, issue(title, milestone)] });
-    assert.equal(main(["--root", dir], quiet), 0);
+    if (generated) assert.equal(main(["--root", dir], quiet), 0);
     git("commit", "-qam", branch);
   };
   const m1 = readJson(dir).milestones[1].title;
-  // Both appended to the end of the same milestone before #231: the conflict it fixes.
-  add("one", "Add a fixture for the alpha adapter", m1);
-  add("two", "Teach the Mini-conductor to retry", m1);
+  const one = "Add a fixture for the alpha adapter";
+  const two = "Teach the Mini-conductor to retry";
+  // Control: appended without sorting, as before #231, the two entries conflict.
+  add("raw-one", one, m1, false);
+  add("raw-two", two, m1, false);
   git("checkout", "-q", "main");
-  git("merge", "-q", "--no-edit", "one");
-  git("merge", "-q", "--no-edit", "two"); // throws on a conflict
+  git("merge", "-q", "--no-ff", "--no-edit", "raw-one");
+  assert.throws(() => git("merge", "-q", "--no-ff", "--no-edit", "raw-two"));
+  assert.match(git("diff", "--name-only", "--diff-filter=U"), /roadmap\/issues\.json/);
+  git("merge", "--abort");
+  git("reset", "-q", "--hard", "HEAD~1");
+  // Sorted by the generator, the same two land apart and merge cleanly.
+  add("one", one, m1, true);
+  add("two", two, m1, true);
+  git("checkout", "-q", "main");
+  git("merge", "-q", "--no-ff", "--no-edit", "one");
+  git("merge", "-q", "--no-ff", "--no-edit", "two"); // throws on a conflict
   assert.equal(main(["--check", "--root", dir], quiet), 0);
+  const titles = readJson(dir).issues.map((i) => i.title);
+  assert.ok(titles.includes(one) && titles.includes(two));
 });

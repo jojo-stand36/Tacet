@@ -31,7 +31,7 @@ Read `.github/instructions/roadmap.instructions.md` first.
 
 ## Merge conflicts
 
-Two branches that each add an entry merge cleanly unless their titles sort next to each other in the same milestone. If `roadmap/issues.json` or `ROADMAP.md` still conflicts when you merge main: take main's `issues.json` (`git checkout --theirs` when merging main in), add back this branch's entries that main lacks, run `node scripts/gen-roadmap.mjs`, and commit both files. Never resolve `ROADMAP.md` by hand.
+Two branches that each add an entry merge cleanly unless their titles sort next to each other in the same milestone. If `roadmap/issues.json` or `ROADMAP.md` still conflicts when you merge main: take main's `issues.json` (`git checkout --theirs roadmap/issues.json` when merging main in; under a rebase the sides swap and main is `--ours`), re-apply this branch's additions and edits (`git diff main...HEAD -- roadmap/issues.json` lists them), run `node scripts/gen-roadmap.mjs`, then `git add roadmap/issues.json ROADMAP.md` and commit. Never resolve `ROADMAP.md` by hand.
 
 ## Discovered work during another issue
 
