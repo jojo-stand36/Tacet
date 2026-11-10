@@ -1,6 +1,6 @@
 import { statusEntries, type TaskStatusEntry, TaskTarget } from '@tacet/core';
-import type { EventStore, StoredEvent } from '@tacet/core/node';
-import { liveControl, liveStatus } from '../control.js';
+import type { EventStore, RepoStatePaths, StoredEvent } from '@tacet/core/node';
+import { liveControl, livePty, liveStatus } from '../control.js';
 import type { Io } from '../io.js';
 import {
   formatEvent,
@@ -33,7 +33,9 @@ export interface Where {
 async function open(
   io: Io,
   where: Where,
-): Promise<{ store: EventStore; live: () => boolean } | undefined> {
+): Promise<
+  { store: EventStore; live: () => boolean; repoRoot: string; paths: RepoStatePaths } | undefined
+> {
   const repoRoot = repoRootFrom(where.repo ?? io.cwd);
   const paths = statePaths(repoRoot, where['user-dir'], io.home);
   const store = openLog(paths);
@@ -42,7 +44,7 @@ async function open(
     return undefined;
   }
   const { miniLockHolder } = await import('@tacet/mini');
-  return { store, live: () => miniLockHolder(paths.lock) !== undefined };
+  return { store, live: () => miniLockHolder(paths.lock) !== undefined, repoRoot, paths };
 }
 
 /** Where a task starts and lands, as recorded when it started (#219); undefined for older tasks. */
@@ -143,8 +145,9 @@ export async function logs(
 
 /**
  * `tacet attach <session | task/n>`: follow one Worker session from the log as it runs, until it
- * ends. Given a sub-task, its latest session, then each one that replaces it. Live PTY attach
- * needs the Mini-conductor's control endpoint, which standalone mode does not have yet.
+ * ends. Given a sub-task, its latest session, then each one that replaces it. A PTY Worker
+ * running in a live run is shown as its terminal instead, live from the run's port (#201), when
+ * the output is a terminal and not `--json`: until that session ends.
  */
 export async function attach(
   io: Io,
@@ -181,6 +184,28 @@ export async function attach(
     if (!session) {
       io.err(`no Worker session for ${terminalSafe(target)}`);
       return 1;
+    }
+    // A PTY Worker running in a live run: its terminal itself, as it draws (#201, ADR-003 §5).
+    const raw = io.raw;
+    if (!o.json && raw) {
+      const pty = await livePty(io, opened.repoRoot, opened.paths, session, raw);
+      if (pty) {
+        const stop = () => pty.close();
+        io.signal?.addEventListener('abort', stop, { once: true });
+        try {
+          const { code } = await pty.closed;
+          if (!io.signal?.aborted) {
+            io.err(
+              code === 1000
+                ? '\r\n[the Worker session ended]'
+                : `\r\n[the terminal stream closed (${code})]`,
+            );
+          }
+        } finally {
+          io.signal?.removeEventListener('abort', stop);
+        }
+        return 0;
+      }
     }
     const followed = new Set([session]);
     let after = 0;

@@ -46,6 +46,16 @@ export interface RpcServerOptions {
   helloTimeoutMs?: number;
   /** Requests one socket may have in flight; more get `-32000`. Default 32. */
   maxInFlight?: number;
+  /**
+   * A live byte stream for `/pty/<id>` (ADR-003 §5, #201): the terminal of the Worker session
+   * `id`, or undefined when there is none (404). The upgrade passes the same Host, Origin and
+   * bearer checks as `/`, and no hello is said: the socket carries the stream's chunks, as binary
+   * frames, from server to client only. It closes 1000 when the stream ends; a frame from the
+   * client closes it 1003. The stream is pulled only as fast as the client reads it.
+   */
+  pty?: (id: string) => AsyncIterable<Uint8Array> | undefined;
+  /** `/pty` sockets open at once; more are refused (503). Default 8. */
+  maxPtySockets?: number;
 }
 
 export interface RpcServer {
@@ -56,10 +66,12 @@ export interface RpcServer {
 }
 
 const MAX_PAYLOAD = 1024 * 1024;
+/** A `/pty/<id>` path: the id is a Worker session id, so a short token of safe characters. */
+const PTY_PATH = /^\/pty\/([A-Za-z0-9._-]{1,128})$/;
 
 /** Refuse an upgrade before any WebSocket is made: status line only, no body that could echo. */
-function refuse(socket: Duplex, status: 401 | 403 | 404): void {
-  const text = { 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found' }[status];
+function refuse(socket: Duplex, status: 401 | 403 | 404 | 503): void {
+  const text = { 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 503: 'Busy' }[status];
   socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
 }
 
@@ -88,9 +100,53 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
       'bearer',
     );
     if (!check.ok) return refuse(socket, check.httpStatus);
-    if (req.url !== '/') return refuse(socket, 404);
+    // The token before the path, so nobody without it learns which session ids exist.
     if (!checkBearer(req.headers.authorization, o.token)) return refuse(socket, 401);
-    wss.handleUpgrade(req, socket, head, (ws) => serve(ws));
+    if (req.url === '/') {
+      wss.handleUpgrade(req, socket, head, (ws) => serve(ws));
+      return;
+    }
+    const id = o.pty ? PTY_PATH.exec(req.url ?? '')?.[1] : undefined;
+    const stream = id === undefined ? undefined : o.pty?.(id);
+    if (!stream) return refuse(socket, 404);
+    if (ptySockets >= (o.maxPtySockets ?? 8)) return refuse(socket, 503);
+    ptySockets++;
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.once('close', () => {
+        ptySockets--;
+      });
+      void streamTo(ws, stream);
+    });
+  };
+  let ptySockets = 0;
+
+  /** Send `stream` until it ends or the client goes; each chunk once the last one is written. */
+  const streamTo = async (ws: WebSocket, stream: AsyncIterable<Uint8Array>) => {
+    const it = stream[Symbol.asyncIterator]();
+    let gone = false;
+    ws.on('error', () => ws.terminate());
+    ws.on('message', () => ws.close(1003, 'read only'));
+    ws.once('close', () => {
+      gone = true;
+      // Let the stream's producer let go of what it holds.
+      void it.return?.();
+    });
+    try {
+      for (;;) {
+        const next = await it.next();
+        if (gone) return;
+        if (next.done) break;
+        // Backpressure: the next chunk is pulled only once this one is handed to the socket.
+        const sent = await new Promise<boolean>((resolve) =>
+          ws.send(next.value, { binary: true }, (err) => resolve(!err)),
+        );
+        if (!sent || gone) return;
+      }
+      ws.close(1000, 'session ended');
+    } catch (err) {
+      report(err);
+      if (!gone) ws.close(1011, 'stream failed');
+    }
   };
 
   const serve = (ws: WebSocket) => {

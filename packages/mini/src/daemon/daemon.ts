@@ -11,6 +11,7 @@ import {
 import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
+  type AgentTerminal,
   type Decision,
   Escalation,
   type EventEnvelope,
@@ -231,6 +232,8 @@ const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'cancel
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
 const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
+/** Session states after which a Worker's terminal shows nothing new (#201). */
+const ENDED_STATES: ReadonlySet<string> = new Set(['done', 'error', 'cancelled']);
 
 /**
  * The Mini-conductor's core loop (#17): accept a task, plan it into sub-tasks, schedule them
@@ -366,6 +369,49 @@ export class MiniConductor {
     const view = this.#state().tasks[id];
     if (view) this.#plan(view.task);
     return id;
+  }
+
+  /**
+   * The live terminal of Worker session `sessionId` as bytes, for the control port's `/pty` path
+   * (#201, ADR-003 §5); undefined when that session is not running here or its adapter has no
+   * terminal. It starts with the scrollback, so a viewer can draw the screen, then follows the
+   * output. A viewer that fell behind gets a reset (`ESC c`) and the scrollback again. It ends when
+   * the session is no longer running here, decided by this Mini-conductor, not by the terminal.
+   * Never logged: it is the Worker's own terminal and may show what the Worker printed.
+   */
+  terminalStream(sessionId: string): AsyncIterable<Uint8Array> | undefined {
+    const run = [...this.#runs.values()].find((r) => r.sessionId === sessionId);
+    const adapter = run && this.#o.adapters[run.adapterId]?.adapter;
+    let term: AgentTerminal | undefined;
+    try {
+      term = run && adapter?.terminal?.(run.handle);
+    } catch {
+      // Closed meanwhile: no terminal to show.
+    }
+    if (!run || !adapter || !term) return undefined;
+    const live = () =>
+      this.#started &&
+      this.#runs.get(run.subtaskId) === run &&
+      !ENDED_STATES.has(adapter.status(run.handle));
+    const encoder = new TextEncoder();
+    return (async function* () {
+      let reset = '';
+      while (live()) {
+        // Subscribe before taking the screen: nothing written in between is lost.
+        const output = term.output();
+        const screen = reset + term.scrollback();
+        if (screen) yield encoder.encode(screen);
+        let chunks = 0;
+        for await (const chunk of output) {
+          chunks++;
+          yield encoder.encode(chunk);
+        }
+        // An end with nothing read is the session's own end, even before this one notices: a
+        // stream that fell behind always had output to fall behind on.
+        if (chunks === 0) return;
+        reset = '\x1bc';
+      }
+    })();
   }
 
   /**

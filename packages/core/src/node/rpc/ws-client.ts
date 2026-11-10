@@ -9,6 +9,8 @@ export class RpcClientError extends Error {
     message: string,
     /** The JSON-RPC error code, when the server answered with one. */
     readonly code?: number,
+    /** The HTTP status the server refused the upgrade with, if it did. */
+    readonly httpStatus?: number,
   ) {
     super(message);
   }
@@ -123,4 +125,75 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
     ws.terminate();
     throw err instanceof RpcClientError ? err : new RpcClientError('hello failed');
   }
+}
+
+export interface PtyConnection {
+  /** Settles when the stream ends: the server's close code and reason. */
+  closed: Promise<{ code: number; reason: string }>;
+  close(): void;
+}
+
+/**
+ * Watch the terminal of Worker session `sessionId` on a Tacet server's `/pty/<id>` path (ADR-003
+ * §5, #201): each binary frame is handed to `onData` as it comes. Rejects with an
+ * `RpcClientError` whose `httpStatus` is 404 when the server has no terminal for that session.
+ * The token goes in the upgrade's `Authorization` header only.
+ */
+export async function connectPty(o: {
+  port: number;
+  token: Secret;
+  sessionId: string;
+  onData: (chunk: Buffer) => void;
+  timeoutMs?: number;
+}): Promise<PtyConnection> {
+  const ws = new WebSocket(`ws://127.0.0.1:${o.port}/pty/${encodeURIComponent(o.sessionId)}`, {
+    headers: { authorization: `Bearer ${o.token.reveal()}` },
+    perMessageDeflate: false,
+    maxPayload: 16 * 1024 * 1024,
+    handshakeTimeout: o.timeoutMs ?? 10_000,
+  });
+  let status: number | undefined;
+  ws.on('unexpected-response', (_req, res) => {
+    status = res.statusCode;
+    res.resume();
+    ws.terminate();
+  });
+  const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+    ws.on('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+  });
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) o.onData(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer));
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve());
+      ws.once('error', (err) =>
+        reject(
+          status
+            ? new RpcClientError(`refused (${status})`, undefined, status)
+            : new RpcClientError(`cannot connect: ${err.message}`),
+        ),
+      );
+      ws.once('close', () =>
+        reject(
+          new RpcClientError(
+            status ? `refused (${status})` : 'connection closed',
+            undefined,
+            status,
+          ),
+        ),
+      );
+    });
+  } catch (err) {
+    ws.terminate();
+    throw err;
+  }
+  ws.on('error', () => {});
+  return {
+    closed,
+    close: () => {
+      if (ws.readyState === ws.OPEN) ws.close(1000);
+      setTimeout(() => ws.terminate(), 2000).unref();
+    },
+  };
 }

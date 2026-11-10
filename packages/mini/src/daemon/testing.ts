@@ -5,6 +5,7 @@ import type {
   AdapterCapabilities,
   AgentAdapter,
   AgentEvent,
+  AgentTerminal,
   ApprovalDecision,
   SessionHandle,
   SessionOptions,
@@ -246,5 +247,65 @@ export class TempWorkspaces implements Workspaces {
 
   dispose(): void {
     rmSync(this.root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A Worker terminal a test writes to (#201): `push` is the Worker printing, `lag()` ends every
+ * viewer's stream as a viewer that fell behind is dropped, `end()` is the session ending.
+ */
+export class ScriptedTerminal implements AgentTerminal {
+  readonly cols = 80;
+  readonly rows = 24;
+  #screen = '';
+  #ended = false;
+  readonly #viewers = new Set<Channel<string>>();
+
+  push(data: string): void {
+    if (this.#ended) return;
+    this.#screen += data;
+    for (const v of this.#viewers) v.push(data);
+  }
+
+  lag(): void {
+    for (const v of this.#viewers) v.end();
+    this.#viewers.clear();
+  }
+
+  end(): void {
+    this.#ended = true;
+    this.lag();
+  }
+
+  /** Streams open now. */
+  get viewers(): number {
+    return this.#viewers.size;
+  }
+
+  scrollback(): string {
+    return this.#screen;
+  }
+
+  output(): AsyncIterable<string> {
+    const c = new Channel<string>();
+    if (this.#ended) c.end();
+    else this.#viewers.add(c);
+    return c;
+  }
+}
+
+/** A `ScriptedAdapter` whose sessions have a terminal, as PTY Workers do (#201). */
+export class ScriptedTerminalAdapter extends ScriptedAdapter {
+  readonly #terms = new Map<string, ScriptedTerminal>();
+
+  terminal(h: SessionHandle): ScriptedTerminal {
+    const t = this.#terms.get(h.id) ?? new ScriptedTerminal();
+    this.#terms.set(h.id, t);
+    return t;
+  }
+
+  override async close(h: SessionHandle): Promise<void> {
+    await super.close(h);
+    this.#terms.get(h.id)?.end();
   }
 }

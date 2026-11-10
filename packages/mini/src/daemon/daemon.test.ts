@@ -38,7 +38,12 @@ import type {
   VerifyContext,
   WorkerMcp,
 } from './ports.js';
-import { type Script, ScriptedAdapter, TempWorkspaces } from './testing.js';
+import {
+  type Script,
+  ScriptedAdapter,
+  ScriptedTerminalAdapter,
+  TempWorkspaces,
+} from './testing.js';
 
 const CONFIG: TacetConfig = {
   tiers: { worker: { adapter: 'fake', model: 'cheap' }, review: { adapter: 'other', model: 'x' } },
@@ -2159,5 +2164,48 @@ describe('MiniConductor review fixes', () => {
       await new Promise((r) => setTimeout(r, 150));
       expect(ofType('worker.nudged', sub)).toHaveLength(0);
     });
+  });
+});
+
+describe('terminalStream (#201)', () => {
+  const text = (b: Uint8Array) => new TextDecoder().decode(b);
+
+  it('is there only for a running session whose adapter has a terminal', async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'hold' }));
+    const d = make();
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('worker.vendor_session', `${id}/1`).length).toBe(1);
+    expect(d.terminalStream(minted[0] ?? '')).toBeUndefined();
+    expect(d.terminalStream('no-such-session')).toBeUndefined();
+  });
+
+  it('draws the screen, follows the output, redraws a viewer that fell behind, and ends with the session', async () => {
+    const term = new ScriptedTerminalAdapter('fake', () => ({ do: 'hold' }));
+    fake = term;
+    const d = make();
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('worker.vendor_session', `${id}/1`).length).toBe(1);
+    const handle = fake.sessions[0]?.handle;
+    if (!handle) throw new Error('no session');
+    const t = term.terminal(handle);
+    t.push('$ before\r\n');
+    const stream = d.terminalStream(minted[0] ?? '');
+    if (!stream) throw new Error('no terminal stream');
+    const it = stream[Symbol.asyncIterator]();
+    expect(text((await it.next()).value)).toBe('$ before\r\n');
+    // Subscribed when the screen was taken: what comes next arrives once.
+    t.push('live 1');
+    expect(text((await it.next()).value)).toBe('live 1');
+    // Fell behind: a reset, then the whole screen again.
+    t.lag();
+    t.push('live 2');
+    expect(text((await it.next()).value)).toBe('\x1bc$ before\r\nlive 1live 2');
+    // The session ends here: the stream ends, however the terminal behaves.
+    await d.cancel(id);
+    t.lag();
+    expect((await it.next()).done).toBe(true);
+    expect(t.viewers).toBe(0);
   });
 });

@@ -20,8 +20,8 @@ import {
   workerGitEnv,
   workerWorktree,
 } from '@tacet/core/node';
-import { type Script, ScriptedAdapter } from '@tacet/mini/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { type Script, ScriptedAdapter, ScriptedTerminalAdapter } from '@tacet/mini/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Io } from './io.js';
 import { main } from './main.js';
 
@@ -642,6 +642,45 @@ describe('tacet standalone (#21)', () => {
     expect(bad.code).toBe(1);
     expect(bad.err).toContain('tiers.worker');
     expect(JSON.parse((await tacet(['status', ...user(), '--json'])).out).running).toBeNull();
+  });
+
+  it("attach shows a PTY Worker's terminal live from the run's port, until the session ends (#201)", async () => {
+    const term = new ScriptedTerminalAdapter('claude-sdk', () => ({ do: 'hold' }));
+    const adapters = { 'claude-sdk': { adapter: term, authRoute: 'api_key' as const } };
+    const running = tacet(['run', ...user(), 'watch the terminal'], {
+      standalone: { adapters },
+    });
+    const runtimeFile = miniRuntimePath(repo, join(root, 'home', '.tacet', 'run'));
+    await vi.waitFor(
+      () => {
+        if (!term.sessions[0] || !existsSync(runtimeFile)) throw new Error('not running yet');
+      },
+      { timeout: 10_000 },
+    );
+    const handle = term.sessions[0]?.handle;
+    if (!handle) throw new Error('no session');
+    const screen = term.terminal(handle);
+    screen.push('$ make test\r\n');
+    const live = JSON.parse((await tacet(['status', ...user(), '--json'])).out) as {
+      tasks: { id: string }[];
+    };
+    const id = live.tasks[0]?.id as string;
+
+    const got: Uint8Array[] = [];
+    const text = () => Buffer.concat(got).toString('utf8');
+    const attaching = tacet(['attach', ...user(), `${id}/1`], { raw: (b) => got.push(b) });
+    await vi.waitFor(() => expect(text()).toBe('$ make test\r\n'));
+    screen.push('\x1b[32mok\x1b[0m 12 tests');
+    // The terminal's own bytes, escape sequences and all.
+    await vi.waitFor(() => expect(text()).toBe('$ make test\r\n\x1b[32mok\x1b[0m 12 tests'));
+
+    // The session ends: so does attach.
+    expect((await tacet(['cancel', ...user(), id])).code).toBe(0);
+    const a = await attaching;
+    expect(a.code).toBe(0);
+    expect(a.err).toContain('the Worker session ended');
+    expect(a.out).toBe('');
+    expect((await running).code).toBe(1);
   });
 });
 

@@ -3,7 +3,7 @@ import { request } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { randomToken, Secret } from '../auth/secret.js';
-import { connectRpc, RpcClientError } from './ws-client.js';
+import { connectPty, connectRpc, RpcClientError } from './ws-client.js';
 import { RpcError, type RpcServer, startRpcServer } from './ws-server.js';
 
 const servers: RpcServer[] = [];
@@ -12,7 +12,10 @@ afterEach(async () => {
   await Promise.all(servers.splice(0).map((s) => s.close()));
 });
 
-async function serve(token = randomToken(), extra: { maxPayload?: number } = {}) {
+async function serve(
+  token = randomToken(),
+  extra: Partial<Parameters<typeof startRpcServer>[0]> = {},
+) {
   const errors: string[] = [];
   const server = await startRpcServer({
     token,
@@ -329,5 +332,116 @@ describe('Tacet RPC server and client', () => {
     await server.close();
     await expect(c.call('echo', {})).rejects.toBeInstanceOf(RpcClientError);
     await expect(client(port, token)).rejects.toBeInstanceOf(RpcClientError);
+  });
+});
+
+describe('/pty/<session> (#201, ADR-003 §5)', () => {
+  /** A stream of `chunks`, recording how many were pulled and whether it was let go. */
+  function source(chunks: Uint8Array[], hold = false) {
+    const seen = { pulled: 0, released: false };
+    async function* gen() {
+      try {
+        for (const c of chunks) {
+          seen.pulled++;
+          yield c;
+        }
+        // A live terminal: more output now and then, never an end.
+        while (hold) {
+          await new Promise((r) => setTimeout(r, 20));
+          yield new Uint8Array([46]);
+        }
+      } finally {
+        seen.released = true;
+      }
+    }
+    return { seen, stream: gen() };
+  }
+  const bytes = (t: string) => new TextEncoder().encode(t);
+
+  it('checks the token before the path, so a session id is never confirmed without it', async () => {
+    const { server, token } = await serve(randomToken(), {
+      pty: (id) => (id === 'live' ? source([bytes('x')]).stream : undefined),
+    });
+    const host = `127.0.0.1:${server.port}`;
+    expect(await upgrade(server.port, { host }, '/pty/live')).toBe(401);
+    expect(await upgrade(server.port, { host }, '/pty/none')).toBe(401);
+    expect(await upgrade(server.port, { host }, '/other')).toBe(401);
+    const authorization = `Bearer ${token.reveal()}`;
+    expect(await upgrade(server.port, { host, authorization }, '/pty/none')).toBe(404);
+    // Only a plain session id: no encoded separators, no traversal.
+    for (const path of ['/pty/a%2Fb', '/pty/../x', '/pty/', '/pty/live/x', '/pty/live?x=1']) {
+      expect(await upgrade(server.port, { host, authorization }, path), path).toBe(404);
+    }
+    // A foreign Host is refused first, as on `/`.
+    expect(await upgrade(server.port, { host: 'evil.test', authorization }, '/pty/live')).toBe(403);
+  });
+
+  it('streams the chunks in order as binary frames, then closes 1000', async () => {
+    const { server, token } = await serve(randomToken(), {
+      pty: (id) => (id === 'abc-1' ? source([bytes('hello '), bytes('world')]).stream : undefined),
+    });
+    const got: Buffer[] = [];
+    const c = await connectPty({
+      port: server.port,
+      token,
+      sessionId: 'abc-1',
+      onData: (b) => got.push(b),
+    });
+    expect(await c.closed).toEqual({ code: 1000, reason: 'session ended' });
+    expect(Buffer.concat(got).toString('utf8')).toBe('hello world');
+    await expect(
+      connectPty({ port: server.port, token, sessionId: 'nope', onData: () => {} }),
+    ).rejects.toMatchObject({ httpStatus: 404 });
+    await expect(
+      connectPty({ port: server.port, token: randomToken(), sessionId: 'abc-1', onData: () => {} }),
+    ).rejects.toMatchObject({ httpStatus: 401 });
+  });
+
+  it('is read only, lets the stream go when the client leaves, and caps open sockets', async () => {
+    const made: ReturnType<typeof source>[] = [];
+    const { server, token } = await serve(randomToken(), {
+      maxPtySockets: 1,
+      pty: () => {
+        const s = source([bytes('x')], true);
+        made.push(s);
+        return s.stream;
+      },
+    });
+    const host = `127.0.0.1:${server.port}`;
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/pty/s1`, {
+      headers: { host, authorization: `Bearer ${token.reveal()}` },
+    });
+    await new Promise((r) => ws.once('message', r));
+    // A second watcher over the cap is refused before any WebSocket is made.
+    expect(
+      await upgrade(server.port, { host, authorization: `Bearer ${token.reveal()}` }, '/pty/s2'),
+    ).toBe(503);
+    const closed = new Promise<number>((r) => ws.once('close', (code) => r(code)));
+    ws.send('typed into the terminal');
+    expect(await closed).toBe(1003);
+    await vi.waitFor(() => expect(made[0]?.seen.released).toBe(true));
+    // The slot is free again.
+    await vi.waitFor(async () =>
+      expect(
+        await upgrade(server.port, { host, authorization: `Bearer ${token.reveal()}` }, '/pty/s3'),
+      ).toBe(101),
+    );
+  });
+
+  it('pulls the stream only as fast as a slow client reads it', async () => {
+    const chunk = new Uint8Array(256 * 1024);
+    const s = source(Array.from({ length: 400 }, () => chunk));
+    const { server, token } = await serve(randomToken(), { pty: () => s.stream });
+    const ws = new WebSocket(`ws://127.0.0.1:${server.port}/pty/slow`, {
+      headers: { authorization: `Bearer ${token.reveal()}` },
+    });
+    // The client stops reading at once: its socket buffers fill and the server must wait.
+    ws.once('upgrade', (res) => res.socket.pause());
+    await new Promise((r) => ws.once('open', r));
+    await new Promise((r) => setTimeout(r, 500));
+    expect(s.seen.pulled).toBeGreaterThan(0);
+    // 100 MB in all: without backpressure every chunk is pulled (and held) at once.
+    expect(s.seen.pulled).toBeLessThan(200);
+    ws.terminate();
   });
 });
