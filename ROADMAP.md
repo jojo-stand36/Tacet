@@ -44,7 +44,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision…)** — `feature` `P0` `either`
 - [ ] **Verification pipeline: commands + reviewer agent** — `feature` `P1` `either`
 - [ ] **`tacet init` installer for repos** — `feature` `P0` `copilot`
-- [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `copilot`
+- [ ] **CLI: tacet run / status / attach / logs (standalone mode)** — `feature` `P1` `claude`
 - [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
 - [ ] **Local auth module: token file, tacet/hello, Host/Origin checks, one-time-code browser login, per-worker MCP tokens** — `feature` `P0` `claude`
 - [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
@@ -82,6 +82,9 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
 - [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
 - [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
+- [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude + human`
+- [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
+- [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 
 ## M2 · Conductor & escalation
 

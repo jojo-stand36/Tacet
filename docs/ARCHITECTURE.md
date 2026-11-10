@@ -32,6 +32,8 @@ _This is a proposal to be ratified via ADRs in milestone M0. Wire protocols and 
 
 The Conductor listens on one local port and mini-conductors dial in over JSON-RPC/WebSocket, so there is one port and no per-repo port discovery. A mini-conductor that runs standalone serves the same methods on its own port for the CLI and UI ([ADR-003 §4](adr/003-wire-protocols.md#4-conductor--mini-conductor-a2a-shapes-over-a-json-rpc-websocket)).
 
+**Standalone today (M1, #21).** Until that port exists, `tacet run "<task>"` hosts the Mini-conductor in its own process until the task is done (`@tacet/mini/standalone`), answering escalations at the terminal or through `tacet run --resume --answer <id>=<text>`. `tacet status`, `tacet logs` and `tacet attach` read the repo's event log read-only from another process and never write to it, so the log keeps one writer, under the Mini-conductor's lock. Workers' checkouts are interim detached git worktrees under the repo's state directory (`GitWorktrees`, replaced by the worktree manager of #16). `attach` follows a Worker session through the log; live terminal attach needs the port (#201). Claude Workers cannot edit yet: every approval but the Mini-conductor's own tools is refused until a policy exists (#200, #25).
+
 | Role | Lives | Owns | Talks to |
 |---|---|---|---|
 | **Conductor** | One per machine, `tacet up` | User attention, cross-repo plans, global policy, registry of mini-conductors, aggregated cost | User (UI/channels), mini-conductors |
@@ -218,7 +220,7 @@ When an adapter refuses a part, the Mini-conductor logs it and starts the sessio
 | `@tacet/adapter-*` | `claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty` |
 | `@tacet/web` | React UI: board, inbox, live terminals (xterm.js), cost |
 | `@tacet/tui` | Ink-based terminal mode |
-| `tacet` (cli) | `tacet up`, `tacet init`, `tacet status`, `tacet attach` |
+| `tacet` (cli) | `tacet up`, `tacet init`, `tacet status`, `tacet attach`; in standalone mode today (#21) `tacet run`, `tacet status`, `tacet logs`, `tacet attach` and `tacet config explain` |
 
 ### Interop
 

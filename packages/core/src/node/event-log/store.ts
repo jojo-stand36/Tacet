@@ -110,11 +110,22 @@ export function defaultEventDbPath(repoPath: string, stateDir = defaultStateDir(
   return join(repoStateDir(repoPath, stateDir), 'events.db');
 }
 
+export interface OpenEventStoreOptions {
+  /**
+   * Open an existing log for reading only, from a process other than its writer (`tacet status`,
+   * `logs`, `attach`, #21): the log is never written, and `append` and `compact` throw. SQLite may
+   * create its `-wal` and `-shm` files beside the log, in the log's own 0700 directory. Reads
+   * while the writer appends are safe (WAL). Throws, creating nothing, when there is no log.
+   */
+  readonly?: boolean;
+}
+
 /**
  * Open (creating if needed) the event log at `path`. The containing directory is created with
  * mode 0700 and must be a real directory, not a symlink.
  */
-export function openEventStore(path: string): EventStore {
+export function openEventStore(path: string, opts: OpenEventStoreOptions = {}): EventStore {
+  if (opts.readonly) return openReadonly(path);
   if (path !== ':memory:') {
     const dir = dirname(path);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -126,10 +137,25 @@ export function openEventStore(path: string): EventStore {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.exec(DDL);
+  return storeOn(db, false);
+}
+
+function openReadonly(path: string): EventStore {
+  const db = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    return storeOn(db, true);
+  } catch (err) {
+    db.close();
+    throw err;
+  }
+}
+
+function storeOn(db: Database.Database, readonly: boolean): EventStore {
   const version = db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get() as
     | { value: string }
     | undefined;
   if (version === undefined) {
+    if (readonly) throw new Error('event log has no schema version');
     db.prepare(`INSERT INTO meta (key, value) VALUES ('schema_version', ?)`).run(
       String(SCHEMA_VERSION),
     );
@@ -216,14 +242,20 @@ export function openEventStore(path: string): EventStore {
   });
 
   return {
-    append: (events) => appendMany(Array.isArray(events) ? events : [events]),
+    append: (events) => {
+      if (readonly) throw new Error('event log opened read-only');
+      return appendMany(Array.isArray(events) ? events : [events]);
+    },
     query: (filter) => select(filter).map(toStored),
     replay: (projection, filter) =>
       project(
         projection,
         select(filter).map((r) => toStored(r).envelope),
       ),
-    compact: (policy) => compactTx(policy),
+    compact: (policy) => {
+      if (readonly) throw new Error('event log opened read-only');
+      return compactTx(policy);
+    },
     count: () => (db.prepare('SELECT count(*) AS n FROM events').get() as { n: number }).n,
     close: () => db.close(),
   };
