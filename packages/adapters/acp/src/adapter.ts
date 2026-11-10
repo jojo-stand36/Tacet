@@ -372,6 +372,8 @@ export class AcpAdapter implements AgentAdapter {
       },
       this.#opts.envPolicy,
     );
+    // Reported before the key check below: a missing key is when the names help most.
+    this.#opts.onEnvDropped?.(filtered.dropped);
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries({ ...filtered.env, ...spec.env, ...opts.env })) {
       if (v !== undefined) env[k] = v;
@@ -381,7 +383,6 @@ export class AcpAdapter implements AgentAdapter {
         `${spec.id}: Workers use an API key only; set ${spec.apiKeyEnv.join(' or ')}`,
       );
     }
-    this.#opts.onEnvDropped?.(filtered.dropped);
     return env;
   }
 

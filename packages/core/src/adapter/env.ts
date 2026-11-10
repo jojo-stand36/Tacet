@@ -41,6 +41,7 @@ export const BASE_ENV_NAMES: readonly string[] = [
   'GIT_AUTHOR_EMAIL',
   'GIT_COMMITTER_NAME',
   'GIT_COMMITTER_EMAIL',
+  'EMAIL',
   'DO_NOT_TRACK',
   // Trust stores for corporate proxies.
   'NODE_EXTRA_CA_CERTS',
@@ -85,10 +86,16 @@ export const TOOLCHAIN_ENV_NAMES: readonly string[] = [
   'XDG_RUNTIME_DIR',
 ];
 
-/** Variables an adapter's vendor process needs, by exact name or by prefix. */
+/**
+ * Variables an adapter's vendor process needs. `names` pass as they are: the vendor's own key
+ * variables belong here. `prefixes` pass only names that do not look secret, so a vendor prefix
+ * never carries a login token or another product's key along. `credentialPrefixes` pass whole:
+ * only for a credential chain the user chose (e.g. `AWS_*` when Claude Code runs on Bedrock).
+ */
 export interface EnvAllow {
   names?: readonly string[];
   prefixes?: readonly string[];
+  credentialPrefixes?: readonly string[];
 }
 
 /**
@@ -113,11 +120,9 @@ export const ENV_PASS_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*\*?$/;
 export function looksSecret(name: string): boolean {
   const n = name.toUpperCase();
   return (
-    /(^|_)(KEY|KEYS|APIKEY|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASS|CREDENTIAL|CREDENTIALS|AUTH|DSN|COOKIE|PRIVATE|SESSION|SIGNATURE)(_|$)/.test(
+    /(^|_)(KEY|APIKEY|TOKEN|SECRET|SECRETS|PASSWORD|PASSWD|PASS|PWD|PASSPHRASE|CREDENTIAL|CREDENTIALS|AUTH|DSN|COOKIE|SIGNATURE|PAT|JWT|BEARER|WEBHOOK)(_|$)/.test(
       n,
-    ) ||
-    /(API_?KEY|ACCESS_?KEY|SECRET|PASSWORD|TOKEN|CREDENTIAL)/.test(n) ||
-    n.startsWith('AWS_')
+    ) || /(API_?KEY|ACCESS_?KEY|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL)/.test(n)
   );
 }
 
@@ -152,15 +157,18 @@ export function workerEnv(
     ...(vendor.names ?? []),
     ...pass.filter((p) => !p.endsWith('*')),
   ]);
-  const prefixes = [...BASE_ENV_PREFIXES, ...(vendor.prefixes ?? [])];
-  const passPrefixes = pass.filter((p) => p.endsWith('*')).map((p) => p.slice(0, -1));
+  const whole = [...BASE_ENV_PREFIXES, ...(vendor.credentialPrefixes ?? [])];
+  const filtered = [
+    ...(vendor.prefixes ?? []),
+    ...pass.filter((p) => p.endsWith('*')).map((p) => p.slice(0, -1)),
+  ];
   for (const [k, v] of Object.entries(base)) {
     if (v === undefined) continue;
     const keep =
       all ||
       names.has(k) ||
-      prefixes.some((p) => k.startsWith(p)) ||
-      (passPrefixes.some((p) => k.startsWith(p)) && !looksSecret(k));
+      whole.some((p) => k.startsWith(p)) ||
+      (filtered.some((p) => k.startsWith(p)) && !looksSecret(k));
     if (keep) env[k] = v;
     else dropped.push(k);
   }

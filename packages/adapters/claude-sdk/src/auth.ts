@@ -66,28 +66,46 @@ export function authEnv(
 
 /**
  * The variables a Claude Code Worker needs beyond the common base set (#147), verified on Claude
- * Code 2.1.319 (capability matrix §1, "Worker environment"): `ANTHROPIC_*` and `CLAUDE_*` cover
- * the key, base URL, model overrides, mTLS and config dir. A cloud provider route the user chose
- * adds its own credential chain: Bedrock `AWS_*`; Vertex `CLOUD_ML_*`, `VERTEX_*`, `GOOGLE_*`,
- * `GCLOUD_*`, `CLOUDSDK_*`; Foundry `AZURE_*` (the exact Azure set is unverified).
+ * Code 2.1.319 (capability matrix §1, "Worker environment"). `ANTHROPIC_*` and `CLAUDE_*` pass
+ * only names that do not look secret (base URL, model overrides, config dir, cert paths); the
+ * credentials pass by name. A cloud provider route the user chose adds its own credentials:
+ * Bedrock the whole `AWS_*` chain; Vertex the Google project and credentials file; Foundry its
+ * keys and the Azure identity variables found in the binary (the exact Azure set is
+ * unverified: pass others with `workers.env.pass`). Never `GOOGLE_*` or `AZURE_*` as a whole,
+ * which hold other products' keys (`GOOGLE_API_KEY`, `AZURE_OPENAI_API_KEY`).
  */
-export function claudeEnvAllow(base: Record<string, string | undefined>): EnvAllow {
-  const on = (k: string) => base[k] !== undefined && base[k] !== '' && base[k] !== '0';
+export function claudeEnvAllow(env: Record<string, string | undefined>): EnvAllow {
+  // As `authEnv` reads them: set, and not `0`.
+  const on = (k: string) => Boolean(env[k]) && env[k] !== '0';
+  const names = [
+    ...API_KEY_VARS,
+    'CLAUDE_CODE_CLIENT_CERT',
+    'CLAUDE_CODE_CLIENT_KEY',
+    'CLAUDE_CODE_CLIENT_KEY_PASSPHRASE',
+    // The user's opt-outs and timeouts, from Claude Code's environment reference.
+    'DISABLE_TELEMETRY',
+    'DISABLE_ERROR_REPORTING',
+    'DISABLE_AUTOUPDATER',
+    'DISABLE_UPDATES',
+    'API_TIMEOUT_MS',
+  ];
   const prefixes = ['ANTHROPIC_', 'CLAUDE_'];
-  if (on('CLAUDE_CODE_USE_BEDROCK')) prefixes.push('AWS_');
+  const credentialPrefixes: string[] = [];
+  if (on('CLAUDE_CODE_USE_BEDROCK')) credentialPrefixes.push('AWS_');
   if (on('CLAUDE_CODE_USE_VERTEX')) {
-    prefixes.push('CLOUD_ML_', 'VERTEX_', 'GOOGLE_', 'GCLOUD_', 'CLOUDSDK_');
+    names.push('GOOGLE_APPLICATION_CREDENTIALS', 'GOOGLE_CLOUD_PROJECT', 'GCLOUD_PROJECT');
+    prefixes.push('CLOUD_ML_', 'VERTEX_', 'CLOUDSDK_');
   }
-  if (on('CLAUDE_CODE_USE_FOUNDRY')) prefixes.push('AZURE_');
-  return {
-    prefixes,
-    // The user's opt-outs and timeouts, documented in Claude Code's environment reference.
-    names: [
-      'DISABLE_TELEMETRY',
-      'DISABLE_ERROR_REPORTING',
-      'DISABLE_AUTOUPDATER',
-      'DO_NOT_TRACK',
-      'API_TIMEOUT_MS',
-    ],
-  };
+  if (on('CLAUDE_CODE_USE_FOUNDRY')) {
+    names.push(
+      'ANTHROPIC_FOUNDRY_API_KEY',
+      'ANTHROPIC_FOUNDRY_AUTH_TOKEN',
+      'AZURE_CLIENT_ID',
+      'AZURE_TENANT_ID',
+      'AZURE_CLIENT_SECRET',
+      'AZURE_FEDERATED_TOKEN_FILE',
+      'AZURE_CONFIG_DIR',
+    );
+  }
+  return { names, prefixes, credentialPrefixes };
 }

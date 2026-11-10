@@ -99,8 +99,9 @@ export function codexLaunch(
 
 /**
  * The variables a Codex Worker needs beyond the common base set (#147), verified on Codex
- * 0.167.0 (capability matrix §2, "Worker environment"): `CODEX_*` (home, CA certificate, knobs)
- * and `OPENAI_*` (the key the provider's `env_key` names, organization, project). Codex does not
- * read `OPENAI_BASE_URL`.
+ * 0.167.0 (capability matrix §2, "Worker environment"): the key variables the provider's
+ * `env_key` may name, and the non-secret `CODEX_*` and `OPENAI_*` settings (home, CA
+ * certificate, organization, project). Other secret-looking `CODEX_*` names, such as
+ * `CODEX_ACCESS_TOKEN`, stay out. Codex does not read `OPENAI_BASE_URL`.
  */
-export const CODEX_ENV_ALLOW: EnvAllow = { prefixes: ['CODEX_', 'OPENAI_'] };
+export const CODEX_ENV_ALLOW: EnvAllow = { names: KEY_VARS, prefixes: ['CODEX_', 'OPENAI_'] };

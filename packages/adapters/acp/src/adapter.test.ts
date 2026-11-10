@@ -20,6 +20,7 @@ import {
   type AcpAgentSpec,
   BUILTIN_ACP_AGENTS,
   CLAUDE_ACP_AGENT,
+  CODEX_ACP_AGENT,
   customAcpAgent,
   GEMINI_AGENT,
 } from './agents.js';
@@ -138,6 +139,25 @@ describe('AcpAdapter (fake ACP agent)', () => {
       ['ANTHROPIC_API_KEY', 'GITHUB_SHA', 'GOOGLE_APPLICATION_CREDENTIALS', 'OPENAI_API_KEY'],
     ]);
   });
+
+  for (const [spec, own, other] of [
+    [CLAUDE_ACP_AGENT, 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'],
+    [CODEX_ACP_AGENT, 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'],
+  ] as const) {
+    it(`gives ${spec.id} its own key only`, async () => {
+      const adapter = make(spec, {
+        [own]: 'placeholder',
+        [other]: 'other-vendor',
+        GEMINI_API_KEY: 'x',
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      const names = (received()[0] as { envNames?: string[] }).envNames ?? [];
+      expect(names).toContain(own);
+      expect(names).not.toContain(other);
+      expect(names).not.toContain('GEMINI_API_KEY');
+    });
+  }
 
   it('refuses to start without an API key, and when the agent wants a login', async () => {
     await expect(make(GEMINI_AGENT).start({ cwd: join(root, 'wt') })).rejects.toThrow(

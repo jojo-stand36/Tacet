@@ -227,6 +227,7 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
       OPENAI_API_KEY: FAKE_KEY,
       OPENAI_ORGANIZATION: 'org-1',
       ANTHROPIC_API_KEY: 'sk-ant-other-vendor',
+      CODEX_ACCESS_TOKEN: 'login',
       GITHUB_TOKEN: 'ghp_x',
       RUST_LOG: 'trace',
       FAKE_ENV_LOG: envLog,
@@ -248,9 +249,11 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
         'TACET_WORKER_MARKER',
       ]),
     );
-    for (const n of ['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'RUST_LOG'])
+    for (const n of ['ANTHROPIC_API_KEY', 'CODEX_ACCESS_TOKEN', 'GITHUB_TOKEN', 'RUST_LOG'])
       expect(names).not.toContain(n);
-    expect(dropped).toEqual([['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'RUST_LOG']]);
+    expect(dropped).toEqual([
+      ['ANTHROPIC_API_KEY', 'CODEX_ACCESS_TOKEN', 'GITHUB_TOKEN', 'RUST_LOG'],
+    ]);
     const interactive = await run({
       mode: 'interactive',
       authRoute: 'subscription',

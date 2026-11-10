@@ -21,7 +21,10 @@ const USER_ENV = {
 
 describe('workerEnv', () => {
   it('keeps the base set, toolchains and the adapter own variables; drops the rest', () => {
-    const { env, dropped } = workerEnv(USER_ENV, { prefixes: ['ANTHROPIC_'] });
+    const { env, dropped } = workerEnv(USER_ENV, {
+      names: ['ANTHROPIC_API_KEY'],
+      prefixes: ['ANTHROPIC_'],
+    });
     expect(env).toEqual({
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -43,6 +46,27 @@ describe('workerEnv', () => {
     ]);
   });
 
+  it('passes vendor prefixes without secret-looking names, credential prefixes whole', () => {
+    const user = {
+      VENDOR_API_KEY: 'k',
+      VENDOR_MODEL: 'm',
+      VENDOR_OAUTH_TOKEN: 'login',
+      AWS_REGION: 'eu-west-1',
+      AWS_SECRET_ACCESS_KEY: 'aws-x',
+    };
+    expect(
+      workerEnv(user, { names: ['VENDOR_API_KEY'], prefixes: ['VENDOR_', 'AWS_'] }).env,
+    ).toEqual({
+      VENDOR_API_KEY: 'k',
+      VENDOR_MODEL: 'm',
+      AWS_REGION: 'eu-west-1',
+    });
+    expect(workerEnv(user, { credentialPrefixes: ['AWS_'] }).env).toEqual({
+      AWS_REGION: 'eu-west-1',
+      AWS_SECRET_ACCESS_KEY: 'aws-x',
+    });
+  });
+
   it('passes exact names as given, and prefixes without secret-looking names', () => {
     const { env } = workerEnv(USER_ENV, {}, { pass: ['NPM_TOKEN', 'MYAPP_*', 'AWS_*'] });
     expect(env.NPM_TOKEN).toBe('npm-x');
@@ -53,7 +77,8 @@ describe('workerEnv', () => {
 
   it('inherits everything only when asked to', () => {
     const { env, dropped } = workerEnv(USER_ENV, {}, { inherit: 'all' });
-    expect(Object.keys(env)).toHaveLength(Object.keys(USER_ENV).length - 1);
+    const { UNSET: _, ...set } = USER_ENV;
+    expect(env).toEqual(set);
     expect(dropped).toEqual([]);
   });
 
@@ -70,17 +95,32 @@ describe('looksSecret', () => {
     'OPENAI_API_KEY',
     'STRIPE_SECRET',
     'DB_PASSWORD',
-    'AWS_REGION',
+    'AWS_SECRET_ACCESS_KEY',
+    'AWS_SESSION_TOKEN',
+    'MYSQL_PWD',
+    'GPG_PASSPHRASE',
+    'CI_JOB_JWT',
+    'AZURE_DEVOPS_EXT_PAT',
+    'SLACK_WEBHOOK_URL',
     'GOOGLE_APPLICATION_CREDENTIALS',
     'SENTRY_DSN',
     'HF_TOKEN',
     'SLACK_WEBHOOK_SECRET',
     'MYAPIKEY',
   ])('%s looks secret', (n) => expect(looksSecret(n)).toBe(true));
-  it.each(['PATH', 'JAVA_HOME', 'MYAPP_HOME', 'KEYBOARD_LAYOUT', 'NODE_ENV', 'CI'])(
-    '%s does not',
-    (n) => expect(looksSecret(n)).toBe(false),
-  );
+  it.each([
+    'PATH',
+    'JAVA_HOME',
+    'MYAPP_HOME',
+    'KEYBOARD_LAYOUT',
+    'NODE_ENV',
+    'CI',
+    'AWS_REGION',
+    'AWS_PROFILE',
+    'TOKENIZERS_PARALLELISM',
+    'MAX_THINKING_TOKENS',
+    'MYAPP_SESSION_TIMEOUT',
+  ])('%s does not', (n) => expect(looksSecret(n)).toBe(false));
   it('only an exact name passes a secret', () => {
     expect(passesSecret('NPM_TOKEN')).toBe(true);
     expect(passesSecret('NPM_*')).toBe(false);

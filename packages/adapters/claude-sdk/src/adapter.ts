@@ -186,7 +186,11 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     }
     const id = randomUUID();
     const base = this.#opts.baseEnv ?? process.env;
-    const filtered = workerEnv(base, claudeEnvAllow(base), this.#opts.envPolicy);
+    const filtered = workerEnv(
+      base,
+      claudeEnvAllow({ ...base, ...opts.env }),
+      this.#opts.envPolicy,
+    );
     this.#opts.onEnvDropped?.(filtered.dropped);
     // The SDK's `env` replaces the child's environment (verified, 0.3.319): only this reaches it.
     const env = authEnv(this.#opts.authRoute ?? 'api_key', {

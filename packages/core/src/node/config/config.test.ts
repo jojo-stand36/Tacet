@@ -202,6 +202,14 @@ describe('loadConfig', () => {
       'MYAPP_*',
       'ROLLUP_CACHE',
     ]);
+    // Each value shows every layer that added to it.
+    expect(formatExplain(loadConfig({ userDir, repoRoot }))).toMatch(
+      /^workers\.env\.pass = .*# user \(.*\) \+ repo \(.*\) \+ local \(.*\)$/m,
+    );
+    // The local layer, which is the user's own, may name a secret.
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [GITHUB_TOKEN] } }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.workers?.env?.pass).toContain('GITHUB_TOKEN');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [ROLLUP_CACHE] } }\n');
     // A prefix is fine in the repo layer: it never lets a secret-looking name through.
     write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [AWS_*] } }\n');
     expect(() => loadConfig({ userDir, repoRoot })).not.toThrow();
