@@ -21,7 +21,12 @@ import {
   type Verification,
   type VerificationStatus,
 } from '@tacet/core';
-import type { EventStore } from '@tacet/core/node';
+import {
+  type EventStore,
+  endProcessGroup,
+  type ProcessGroupRecord,
+  processStartTime,
+} from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
 import {
   type Integrator,
@@ -52,6 +57,11 @@ export interface MiniConductorOptions {
   mcp: WorkerMcp;
   /** Single-instance lock, e.g. `<repoStateDir>/mini.lock`. */
   lockPath: string;
+  /**
+   * Where the process groups of running Worker sessions are kept (0600), so a restarted
+   * Mini-conductor can end what a crashed one left running (#127). Default `<lockPath>.workers`.
+   */
+  processFile?: string;
   /** Repo id stamped on events. */
   repo?: string;
   miniId?: string;
@@ -146,6 +156,8 @@ export class MiniConductor {
   readonly #planning = new Set<string>();
   /** Background work (plans, Worker event loops) that `stop()` waits for. */
   readonly #inflight = new Set<Promise<unknown>>();
+  /** Process groups of running Worker sessions, by session (#127). */
+  readonly #groups = new Map<string, ProcessGroupRecord>();
   /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
@@ -186,6 +198,13 @@ export class MiniConductor {
   async start(): Promise<void> {
     if (this.#started) return;
     this.#lock();
+    try {
+      // Before anything resumes: a Worker a crashed predecessor left running would race it.
+      await this.#endStaleGroups();
+    } catch (err) {
+      this.#unlock();
+      throw err;
+    }
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -900,6 +919,7 @@ export class MiniConductor {
       openTools: new Map(),
     };
     this.#runs.set(subtaskId, run);
+    this.#noteProcess(run);
     this.#noteVendorSession(run);
     this.#track(this.#consume(run, worker, gen));
     // Answers that came while no session was open go into the first message.
@@ -944,6 +964,7 @@ export class MiniConductor {
       for await (const e of worker.adapter.events(run.handle)) {
         if (this.#runs.get(run.subtaskId) !== run || !this.#live(gen)) return;
         this.#record(run, e);
+        this.#noteProcess(run);
         run.lastActivity = this.#now().getTime();
         run.nudgedAt = undefined;
         if (e.t === 'tool.call') run.openTools.set(e.id, run.lastActivity);
@@ -1210,6 +1231,69 @@ export class MiniConductor {
     await this.#o.adapters[run.adapterId]?.adapter
       .close(run.handle)
       .catch((err: unknown) => this.#errors.push(err));
+    // Closed by its adapter: nothing of it is left to end after a crash.
+    if (this.#groups.delete(run.sessionId)) this.#saveGroups();
+  }
+
+  // ---- Worker processes (#127) -----------------------------------------------------------
+
+  get #processFile(): string {
+    return this.#o.processFile ?? `${this.#o.lockPath}.workers`;
+  }
+
+  /** Record the vendor process group of a running session once its adapter reports it. */
+  #noteProcess(run: Run): void {
+    const pgid = run.handle.processGroup;
+    if (pgid === undefined || this.#groups.has(run.sessionId)) return;
+    if (this.#runs.get(run.subtaskId) !== run) return;
+    const startTime = processStartTime(pgid);
+    this.#groups.set(run.sessionId, { pgid, ...(startTime !== undefined ? { startTime } : {}) });
+    this.#saveGroups();
+  }
+
+  #saveGroups(): void {
+    const file = this.#processFile;
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify([...this.#groups.values()])}\n`, {
+        flag: 'wx',
+        mode: 0o600,
+      });
+      renameSync(tmp, file);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      this.#errors.push(err);
+    }
+  }
+
+  /** End the Worker process groups a predecessor recorded and never closed. */
+  async #endStaleGroups(): Promise<void> {
+    let text: string;
+    try {
+      text = readFileSync(this.#processFile, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw err;
+    }
+    let records: unknown;
+    try {
+      records = JSON.parse(text);
+    } catch {
+      records = [];
+    }
+    await Promise.all(
+      (Array.isArray(records) ? records : [])
+        .map((r) => r as Partial<ProcessGroupRecord>)
+        .filter((r) => typeof r.pgid === 'number')
+        .map((r) =>
+          endProcessGroup({
+            pgid: r.pgid as number,
+            ...(typeof r.startTime === 'string' ? { startTime: r.startTime } : {}),
+          }),
+        ),
+    );
+    this.#groups.clear();
+    this.#saveGroups();
   }
 
   // ---- escalation answers ----------------------------------------------------------------

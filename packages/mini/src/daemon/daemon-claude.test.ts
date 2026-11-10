@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ClaudeSdkAdapter } from '@tacet/adapter-claude-sdk';
 import { type MockMessagesApi, startMockMessagesApi } from '@tacet/adapter-claude-sdk/testing';
+import type { SessionHandle, SessionOptions } from '@tacet/core';
 import { newUlid, tasksProjection } from '@tacet/core';
 import { type EventStore, openEventStore, WorkerTokens } from '@tacet/core/node';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -110,5 +111,97 @@ describe('Mini-conductor with a real Claude Worker', () => {
     // The answer reached the model as the Worker's next message.
     expect(api.requests.some((r) => r.text?.includes('Use Postgres'))).toBe(true);
     expect(daemon.errors.map(String)).toEqual([]);
+  });
+
+  it('ends the Worker a crashed Mini-conductor left running before resuming (#127)', {
+    timeout: 120_000,
+  }, async () => {
+    // The first test's Mini-conductor shares the store: it must not pick this task up.
+    await daemon?.stop();
+    const home = join(root, 'home');
+    const options = () => ({
+      authRoute: 'api_key' as const,
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: home,
+        CLAUDE_CONFIG_DIR: join(home, '.claude'),
+        ANTHROPIC_BASE_URL: api.url,
+        ANTHROPIC_API_KEY: 'placeholder-not-a-real-key',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      },
+      mcpConfigDir: join(root, 'run', 'mcp'),
+      sdkOptions: { settingSources: [] },
+    });
+    const groupAlive = (pgid: number) => {
+      try {
+        process.kill(-pgid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    /** Whether the old Worker's group was alive whenever a new session started. */
+    const aliveAtStart: boolean[] = [];
+    let oldGroup = 0;
+    class Probe extends ClaudeSdkAdapter {
+      override async start(o: SessionOptions): Promise<SessionHandle> {
+        if (oldGroup) aliveAtStart.push(groupAlive(oldGroup));
+        return super.start(o);
+      }
+    }
+    const lockPath = join(root, 'crash', 'mini.lock');
+    const make = (adapter: ClaudeSdkAdapter) =>
+      new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'claude-sdk', model: 'claude-sonnet-5-5' } } },
+        adapters: { 'claude-sdk': { adapter, authRoute: 'api_key' } },
+        workspaces: ws,
+        planner: new SingleStepPlanner(),
+        mcp: server,
+        lockPath,
+        pollMs: 50,
+      });
+    // The first Mini-conductor's Worker escalates and stays open, waiting for the answer.
+    const first = make(new ClaudeSdkAdapter(options()));
+    await first.start();
+    const id = first.submit({
+      goal: 'ESCALATE before choosing a queue',
+      acceptanceCriteria: ['ok'],
+    });
+    const sub = `${id}/1`;
+    const state = () => store.replay(tasksProjection).tasks[sub]?.state;
+    await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('input_required');
+    const groups = JSON.parse(readFileSync(`${lockPath}.workers`, 'utf8')) as { pgid: number }[];
+    expect(groups).toHaveLength(1);
+    oldGroup = groups[0]?.pgid ?? 0;
+    expect(oldGroup).toBeGreaterThan(1);
+    // A crash: nothing is closed, and the Claude Code process lives on.
+    first.crashForTest();
+    expect(groupAlive(oldGroup)).toBe(true);
+
+    const escalationId = (
+      store.query({ taskId: sub, typePrefix: 'escalation.raised' })[0]?.envelope.data as
+        | { id: string }
+        | undefined
+    )?.id;
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'conductor', id: 'test' },
+      taskId: sub,
+      type: 'escalation.resolved',
+      data: { escalationId, answer: 'Use a durable queue' },
+    });
+    daemon = make(new Probe(options()));
+    await daemon.start();
+    // Gone as soon as start() returns, before any Worker session starts.
+    expect(groupAlive(oldGroup)).toBe(false);
+    await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('completed');
+    expect(aliveAtStart.length).toBeGreaterThan(0);
+    expect(aliveAtStart.every((a) => a === false)).toBe(true);
+    await daemon.stop();
+    // Every session closed cleanly: nothing left to end next time.
+    expect(JSON.parse(readFileSync(`${lockPath}.workers`, 'utf8'))).toEqual([]);
   });
 });

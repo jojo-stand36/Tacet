@@ -259,7 +259,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
         resolve();
       }),
     );
-    const handle: SessionHandle = { id: randomUUID() };
+    const handle: SessionHandle = {
+      id: randomUUID(),
+      // The group it leads, for cleanup after a Mini-conductor crash (#127).
+      ...(proc.pid !== undefined && process.platform !== 'win32' ? { processGroup: proc.pid } : {}),
+    };
     // Assigned right below; the handlers only run once the process has answered.
     let s: Session | undefined;
     const rpc = new JsonRpcPeer(
