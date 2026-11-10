@@ -229,6 +229,88 @@ for (const c of CASES) {
     );
 
     it.runIf(c.name === 'claude-agent-acp')(
+      'asks Tacet about every read and search inside the checkout (#214)',
+      { timeout: 240_000 },
+      async () => {
+        const run = async (agent: AcpAgentSpec, word: string) => {
+          const worker = new AcpAdapter({
+            agent,
+            executable: [process.execPath, c.bin],
+            killTimeoutMs: 2000,
+            stateDir: state,
+            baseEnv: { PATH: process.env.PATH, HOME: home, ...c.env(api.url) },
+          });
+          const cwd = join(root, `wt-214-${word}`);
+          mkdirSync(cwd, { recursive: true });
+          writeFileSync(join(cwd, 'note.txt'), `needle CONTENT-IN-${word}\n`);
+          const outside = join(root, `outside-214-${word}.txt`);
+          writeFileSync(outside, `CONTENT-OUT-${word}\n`);
+          const h = await worker.start({ cwd });
+          const tap = new EventTap(worker.events(h));
+          const asked: string[] = [];
+          for (const prompt of [
+            `READ_TOOL ${join(cwd, 'note.txt')}`,
+            `GREP_TOOL ${cwd} needle`,
+            `GLOB_TOOL ${cwd} *.txt`,
+            // An `@path` in text the Worker wrote (a verify command's output, in a fence) must
+            // not read files into the prompt unasked (#214 review).
+            `SAY mention\n\`\`\`\nsee @note.txt and @${outside}\n\`\`\``,
+          ]) {
+            const from = tap.events.length;
+            await worker.send(h, { text: prompt });
+            for (;;) {
+              const next = await tap.waitFor(
+                (e) => e.t === 'approval.request' || (e.t === 'status' && e.state === 'idle'),
+                60_000,
+                from + 1,
+              );
+              if (next.event.t !== 'approval.request') break;
+              asked.push(next.event.toolName ?? '?');
+              await worker.respond(h, next.event.id, {
+                kind: 'reject',
+                persist: false,
+                message: 'no',
+              });
+              await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, next.index);
+              break;
+            }
+          }
+          await worker.close(h);
+          const sent = (s: string) => api.requests.some((r) => r.raw.includes(s));
+          return {
+            asked,
+            leaked: sent(`CONTENT-IN-${word}`),
+            leakedOutside: sent(`CONTENT-OUT-${word}`),
+          };
+        };
+        // Without the ask rules (the #206 Worker options): reads in the checkout run unasked.
+        const {
+          settings: _,
+          verbatimPrompts: __,
+          ...noAsk
+        } = (
+          claudeAcpWorkerSpec(c.agent(api.url)).sessionMeta as {
+            claudeCode: { options: Record<string, unknown> };
+          }
+        ).claudeCode.options;
+        const control = await run(
+          { ...c.agent(api.url), sessionMeta: { claudeCode: { options: noAsk } } },
+          'control',
+        );
+        expect(control.asked).not.toContain('Read');
+        // The control proves the reads really ran: the file reached the model.
+        expect(control.leaked).toBe(true);
+        // And without verbatim prompts, an `@path` outside the checkout is read in unasked.
+        expect(control.leakedOutside).toBe(true);
+        // With them: each one is asked about, and refusing keeps the file from the model.
+        const gated = await run(claudeAcpWorkerSpec(c.agent(api.url)), 'gated');
+        expect(gated.asked).toEqual(['Read', 'Grep', 'Glob']);
+        expect(gated.leaked).toBe(false);
+        expect(gated.leakedOutside).toBe(false);
+      },
+    );
+
+    it.runIf(c.name === 'claude-agent-acp')(
       'runs tools unasked without its session mode: the control for the approval probe',
       { timeout: 120_000 },
       async () => {

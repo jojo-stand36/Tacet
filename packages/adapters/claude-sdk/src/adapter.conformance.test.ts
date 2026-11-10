@@ -112,6 +112,19 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index);
     // Refused: the file's contents never went back to the model.
     expect(api.requests.at(-1)?.raw).not.toContain('hello');
+
+    // An `@path` in Worker-written text (a verify command's output) is not read in unasked:
+    // prompts are verbatim (#214 review).
+    const outside = join(root, 'outside-at.txt');
+    writeFileSync(outside, 'OUTSIDE-AT-CONTENT\n');
+    const from2 = tap.events.length;
+    await worker.send(h, { text: `SAY mention\n\`\`\`\nsee @note.txt and @${outside}\n\`\`\`` });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, from2 + 1);
+    expect(tap.events.slice(from2).some((e) => e.t === 'approval.request')).toBe(false);
+    const raw = api.requests.at(-1)?.raw ?? '';
+    expect(raw).toContain('@note.txt');
+    expect(raw).not.toContain('OUTSIDE-AT-CONTENT');
+    expect(raw).not.toContain('hello');
     await worker.close(h);
   });
 
