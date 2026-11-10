@@ -1,3 +1,4 @@
+import type { WslProbe } from '@tacet/core/node';
 import type { StandaloneOptions } from '@tacet/mini/standalone';
 
 /** What the `tacet` command reads from and writes to; replaced in tests. */
@@ -17,4 +18,6 @@ export interface Io {
   pollMs?: number;
   /** Tests only: overrides for the standalone Mini-conductor. */
   standalone?: Partial<StandaloneOptions>;
+  /** Tests only: what the WSL checks read (#193). Default: this machine's. */
+  wslProbe?: WslProbe;
 }

@@ -1,0 +1,88 @@
+name: wsl2
+
+# Experimental (#193): the suite inside a WSL2 distro on a GitHub-hosted Windows runner. Not a
+# required check. GitHub documents no support for WSL2 (nested virtualisation) on hosted
+# runners; the windows-2025 image ships WSL 2 and users report it starting there
+# (actions/runner-images README and issue #11869, read 2026-11-10), so this may break with the
+# platform. It runs weekly, on demand, and on pull requests that change it or the WSL checks.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+  pull_request:
+    paths:
+      - .github/workflows/wsl2.yml
+      - packages/core/src/node/wsl.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wsl2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wsl2:
+    name: WSL2 / Ubuntu 24.04 / Node 24
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      # v7.2.0, pinned by commit: a third-party action. Its `wsl-version` input defaults to 2;
+      # set anyway (github.com/Vampire/setup-wsl README, read 2026-11-10).
+      - uses: Vampire/setup-wsl@4c48163d9f981914dd8caa0fc335fe19cca5bff4
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+
+      - name: Assert WSL 2, not WSL 1
+        shell: wsl-bash {0}
+        run: |
+          set -eu
+          uname -r
+          grep -qi 'wsl2' /proc/sys/kernel/osrelease || { echo 'not WSL 2'; exit 1; }
+
+      # Inside the distro's own file system, as docs/WSL2.md tells users to work: a fresh clone
+      # of this commit in ~, not the Windows checkout under /mnt.
+      - name: Install, lint, typecheck and test inside WSL2
+        shell: wsl-bash {0}
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          SUDO=; [ "$(id -u)" = 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq
+          $SUDO apt-get install -y -qq curl git ca-certificates build-essential python3
+          rm -rf ~/tacet
+          git clone -q "https://github.com/$REPO.git" ~/tacet
+          cd ~/tacet
+          git fetch -q origin "$SHA"
+          git checkout -q "$SHA"
+          curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          nvm install 24
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+
+      # The Windows-drive check (#193) on a real WSL2 mount table, whose shape Microsoft does
+      # not document: C: must read as a Windows drive, the home directory must not.
+      - name: Windows-drive detection on the real mount table
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          cd ~/tacet
+          grep -E ' /mnt/[a-z] ' /proc/self/mountinfo || true
+          node --input-type=module -e "
+            const m = await import('./packages/core/dist/node/wsl.js');
+            const p = m.hostWslProbe();
+            const c = m.windowsDrive('/mnt/c', p);
+            const home = m.windowsDrive(process.env.HOME, p);
+            console.log({ c, home, wsl: m.isWsl(p) });
+            if (c !== 'C:' || home !== undefined) process.exit(1);
+          "

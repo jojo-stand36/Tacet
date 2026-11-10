@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SummaryPacket } from '@tacet/core';
+import { wslPathWarnings } from '@tacet/core/node';
 import type { Standalone } from '@tacet/mini/standalone';
 import type { Io } from '../io.js';
 import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
@@ -11,6 +12,7 @@ import {
   readState,
   repoRootFrom,
   rootTasks,
+  statePaths,
   subtasksOf,
 } from '../state.js';
 
@@ -56,6 +58,22 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
   if (!existsSync(join(repoRoot, '.git'))) {
     io.err(`${terminalSafe(repoRoot)} is not in a git repository: Tacet works on a git repo`);
     return EXIT.failed;
+  }
+  // Inside WSL, a repo or state directory on a Windows drive works, but badly (#193): say so.
+  let stateDir: string | undefined;
+  try {
+    stateDir = statePaths(repoRoot, o['user-dir'], io.home).dir;
+  } catch {
+    // A bad config or `events.state_dir` is reported by the start below.
+  }
+  for (const w of wslPathWarnings(
+    [
+      { label: 'repo', path: repoRoot },
+      ...(stateDir ? [{ label: 'Tacet state directory', path: stateDir }] : []),
+    ],
+    io.wslProbe,
+  )) {
+    io.err(w);
   }
   const { startStandalone } = await import('@tacet/mini/standalone');
   const dropped = new Set<string>();

@@ -250,6 +250,26 @@ describe('tacet standalone (#21)', () => {
     expect(r.err).toContain('not in a git repository');
   });
 
+  it('warns, and still runs, when the repo is on a Windows drive inside WSL (#193)', async () => {
+    const onC = (p: string) =>
+      p.startsWith(repo) ? `/mnt/c/Users/me/repo${p.slice(repo.length)}` : p;
+    const wsl = {
+      osrelease: '5.15.167.4-microsoft-standard-WSL2',
+      mountinfo: '90 29 0:52 / /mnt/c rw - 9p C:\\134 rw,aname=drvfs',
+      realpath: onC,
+    };
+    const r = await tacet(['run', ...user(), 'add work.txt'], { wslProbe: wsl });
+    expect(r.code).toBe(0);
+    expect(r.err).toMatch(/warning: the repo is on C: \(a Windows drive\) inside WSL/);
+    // The state directory is in the distro's own file system: no warning for it.
+    expect(r.err).not.toMatch(/state directory is on/);
+    // Not WSL, or not a Windows drive: nothing to say.
+    const plain = await tacet(['run', ...user(), 'again'], {
+      wslProbe: { ...wsl, osrelease: '6.8.0' },
+    });
+    expect(plain.err).not.toMatch(/warning: the repo/);
+  });
+
   it('refuses to run beside another live Mini-conductor for the repo', async () => {
     const paths = repoStatePaths(repo, state);
     const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
