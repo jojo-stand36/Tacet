@@ -3,12 +3,17 @@ import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WorktreeManager } from './worktree.js';
 
 const execFileAsync = promisify(execFile);
 
-async function git(repository: string, args: string[]): Promise<string> {
+async function git(
+  repository: string,
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): Promise<string> {
   const { stdout } = await execFileAsync('git', ['-C', repository, ...args], {
     encoding: 'utf8',
     env: {
@@ -16,6 +21,7 @@ async function git(repository: string, args: string[]): Promise<string> {
       HOME: process.env.HOME ?? '',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
+      ...extraEnv,
     },
   });
   return stdout;
@@ -41,11 +47,17 @@ describe('WorktreeManager', () => {
     manager = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'));
   });
 
+  async function workerGit(worktreePath: string, args: string[]): Promise<string> {
+    const worktree = workerWorktree(worktreePath, repository);
+    if (!worktree) throw new Error('expected linked Worker worktree');
+    return git(worktreePath, args, workerGitEnv(worktree));
+  }
+
   afterEach(async () => {
     await rm(temporaryDirectory, { recursive: true, force: true });
   });
 
-  it('creates ten parallel workers with unique branches and paths', async () => {
+  it('creates ten parallel detached workers with unique integration refs and paths', async () => {
     const worktrees = await Promise.all(
       Array.from({ length: 10 }, (_, index) =>
         manager.create(`worker-${index}`, { baseBranch: 'main' }),
@@ -61,6 +73,12 @@ describe('WorktreeManager', () => {
     expect(new Set(worktrees.map(({ path: worktreePath }) => worktreePath)).size).toBe(10);
     expect((await manager.list()).length).toBe(10);
     expect(worktrees.every(({ baseBranch }) => baseBranch === 'main')).toBe(true);
+    for (const worktree of worktrees) {
+      await expect(workerGit(worktree.path, ['symbolic-ref', '--quiet', 'HEAD'])).rejects.toThrow();
+      await expect(
+        git(repository, ['show-ref', '--verify', `refs/heads/${worktree.branchName}`]),
+      ).rejects.toThrow();
+    }
     await expect(manager.get(firstWorktree.id)).resolves.toMatchObject({
       id: firstWorktree.id,
       path: firstWorktree.path,
@@ -104,7 +122,7 @@ describe('WorktreeManager', () => {
   it('handles worker IDs with long hyphen runs', async () => {
     const worktree = await manager.create(`${'-'.repeat(10_000)}worker${'-'.repeat(10_000)}`);
 
-    expect(worktree.branchName).toMatch(/^tacet\/workers\/worker-/);
+    expect(worktree.branchName).toMatch(/^tacet\/worker-/);
   });
 
   it('creates from an explicit base branch and runs an opt-in setup command', async () => {
@@ -175,8 +193,86 @@ describe('WorktreeManager', () => {
     await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('retains unreachable Worker commits in gc and remove until integrated', async () => {
+    const worktree = await manager.create('unintegrated-worker');
+    await writeFile(path.join(worktree.path, 'private.txt'), 'not integrated yet\n');
+    await workerGit(worktree.path, ['add', 'private.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'private worker commit']);
+    const head = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
+
+    await expect(manager.remove(worktree.id, { force: true })).rejects.toThrow(
+      'worker HEAD is not reachable from a ref',
+    );
+    expect(await manager.gc({ olderThanMs: 0 })).toMatchObject({
+      removed: [],
+      skipped: [{ id: worktree.id, reason: 'worker HEAD is not reachable from a ref' }],
+    });
+    await expect(git(repository, ['cat-file', '-e', `${head}^{commit}`])).rejects.toThrow();
+
+    expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+    expect((await git(repository, ['rev-parse', `refs/heads/${worktree.branchName}`])).trim()).toBe(
+      head,
+    );
+    await manager.remove(worktree.id);
+    expect((await manager.list()).map(({ id }) => id)).not.toContain(worktree.id);
+    expect((await git(repository, ['cat-file', '-e', `${head}^{commit}`])).trim()).toBe('');
+  });
+
+  it('includes the worktree ID when setup fails and retains it for recovery', async () => {
+    let worktreeId: string | undefined;
+    try {
+      await manager.create('setup-failure-worker', {
+        setup: { command: process.execPath, args: ['-e', 'process.exit(1)'] },
+      });
+    } catch (error) {
+      const match = /failed for ([a-z0-9-]+)/.exec((error as Error).message);
+      worktreeId = match?.[1];
+    }
+
+    expect(worktreeId).toBeDefined();
+    expect((await manager.list()).map(({ id }) => id)).toContain(worktreeId);
+  });
+
+  it('force-cleans a failed squash without hiding its original error', async () => {
+    const worktree = await manager.create('failed-squash-worker');
+    await writeFile(path.join(worktree.path, 'new.txt'), 'worker content\n');
+    await workerGit(worktree.path, ['add', 'new.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'worker commit']);
+
+    const realGit = (await execFileAsync('which', ['git'], { encoding: 'utf8' })).stdout.trim();
+    const wrapperDirectory = path.join(temporaryDirectory, 'git-wrapper');
+    const wrapper = path.join(wrapperDirectory, 'git');
+    await mkdir(wrapperDirectory);
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\ncase " $* " in *" merge --squash "*) echo squash-command-failed >&2; exit 42;; esac\nexec '${realGit}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${wrapperDirectory}${path.delimiter}${originalPath ?? ''}`;
+    let failure: unknown;
+    try {
+      await manager.merge(worktree.id, 'squash-to-branch', 'main');
+    } catch (error) {
+      failure = error;
+    } finally {
+      process.env.PATH = originalPath;
+    }
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain('squash-command-failed');
+    expect((await manager.list()).map(({ id }) => id)).toEqual([worktree.id]);
+    expect(
+      (await git(repository, ['for-each-ref', '--format=%(refname)', 'refs/heads/tacet'])).trim(),
+    ).toBe(`refs/heads/${worktree.branchName}`);
+  });
+
   it('replaces a hostile .git symlink without writing through it during removal', async () => {
     const worktree = await manager.create('symlink-worker');
+    const head = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    expect(
+      await workerGit(worktree.path, ['for-each-ref', `--contains=${head}`, '--format=%(refname)']),
+    ).toContain('refs/heads/main');
     const sentinel = path.join(temporaryDirectory, 'outside-file');
     await writeFile(sentinel, 'do not overwrite\n');
     await rm(path.join(worktree.path, '.git'));
@@ -264,14 +360,13 @@ describe('WorktreeManager', () => {
 
   it('keeps detached-head worktrees listed and uses their HEAD for merge checks', async () => {
     const worktree = await manager.create('detached-worker');
-    await git(worktree.path, ['checkout', '--detach']);
     await writeFile(path.join(worktree.path, 'detached.txt'), 'worker commit\n');
-    await git(worktree.path, ['add', 'detached.txt']);
-    await git(worktree.path, ['commit', '-m', 'detached worker commit']);
+    await workerGit(worktree.path, ['add', 'detached.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'detached worker commit']);
 
     expect((await manager.list()).map(({ id }) => id)).toContain(worktree.id);
     expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
-    const headSha = (await git(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    const headSha = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
     expect(await manager.merge(worktree.id, 'pr', 'main')).toMatchObject({
       status: 'ready',
       headSha,
@@ -370,9 +465,9 @@ describe('WorktreeManager', () => {
     const worktree = await manager.create('conflicting-worker');
     await git(repository, ['tag', 'main', 'HEAD']);
     await writeFile(path.join(worktree.path, 'file.txt'), 'worker change\n');
-    await git(worktree.path, ['add', 'file.txt']);
-    await git(worktree.path, ['commit', '-m', 'worker change']);
-    const workerCommit = (await git(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    await workerGit(worktree.path, ['add', 'file.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'worker change']);
+    const workerCommit = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
     await writeFile(path.join(repository, 'file.txt'), 'target change\n');
     await git(repository, ['commit', '-am', 'target change']);
 
@@ -389,10 +484,10 @@ describe('WorktreeManager', () => {
   it('prepares PR and manual strategies and stages squash results on an isolated target branch', async () => {
     const worktree = await manager.create('merge-worker');
     await writeFile(path.join(worktree.path, 'addition.txt'), 'worker result\n');
-    await git(worktree.path, ['add', 'addition.txt']);
-    await git(worktree.path, ['commit', '-m', 'worker result']);
+    await workerGit(worktree.path, ['add', 'addition.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'worker result']);
 
-    const workerCommit = (await git(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    const workerCommit = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
     expect(await manager.merge(worktree.id, 'pr', 'main')).toMatchObject({
       status: 'ready',
       headSha: workerCommit,
@@ -409,7 +504,15 @@ describe('WorktreeManager', () => {
     });
     expect((await git(repository, ['status', '--porcelain'])).trim()).toBe('');
     const resultWorktreePath = result.resultWorktreePath;
+    const resultBranchName = result.resultBranchName;
     if (!resultWorktreePath) throw new Error('squash result worktree was not returned');
+    if (!resultBranchName) throw new Error('squash result branch was not returned');
+    expect((await git(resultWorktreePath, ['symbolic-ref', '--short', 'HEAD'])).trim()).toBe(
+      resultBranchName,
+    );
+    expect(
+      (await git(repository, ['show-ref', '--verify', `refs/heads/${resultBranchName}`])).trim(),
+    ).toContain(resultBranchName);
     expect((await git(resultWorktreePath, ['diff', '--cached', '--name-only'])).trim()).toBe(
       'addition.txt',
     );

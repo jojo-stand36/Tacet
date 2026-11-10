@@ -66,11 +66,11 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 - The same packet type is used for mini→conductor summaries and for the Conductor's own self-handoff.
 
 ### 2.4 Worker worktrees
-- The Mini-conductor creates each Worker in a uniquely named local branch and a dedicated worktree outside the repository. Creation uses an explicit local base branch (or the checked-out branch).
+- The Mini-conductor creates each Worker at a detached HEAD in a dedicated worktree outside the repository. Creation uses an explicit local base branch (or the checked-out branch); unattended Workers write new objects only to their private per-worktree object store.
 - Git maintenance of Worker worktrees uses the manager-owned Git directory explicitly, disables fsmonitor, hooks, reflogs, and background maintenance; detached HEAD Workers remain tracked by their worktree path. Rebase is not exposed until it can update refs without reading Worker-controlled admin state.
 - Setup commands are opt-in, run with argv rather than shell interpolation, have a timeout, and receive a limited environment by default. Tacet does not copy `.env` files.
 - Garbage collection removes only stale, manager-owned, clean worktrees; active, modified, untracked, or ignored-file worktrees are retained. Explicit removal also refuses dirty or ignored files unless forced. Callers stop Workers before cleanup; path-based operations protect the `.git` entry from symlink following but assume the worktree directory itself is not concurrently renamed or replaced.
-- PR and manual strategies leave the Worker branch for review or user handling and return the Worker HEAD SHA, including for detached-HEAD Workers. Squash-to-branch stages the result in a separate managed worktree based on the target branch; it does not change the target, commit, or push. Conflict checks do not modify branches.
+- Worker commits are brought into the shared object store and a `refs/heads/tacet/<worktree-id>` integration ref through the existing `integrateWorktree` path before conflict checks or merge preparation. The Worker never writes that shared ref. PR and manual strategies return the integration ref and Worker HEAD SHA for review or user handling. Squash-to-branch stages the integrated result in a separate managed worktree based on the target branch; it does not change the target, commit, or push. Conflict checks do not modify the target branch.
 
 ## 3. Key interfaces (sketch)
 

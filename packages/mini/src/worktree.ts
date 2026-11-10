@@ -2,7 +2,8 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
+import { readWorkerFile, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
+import { integrateWorktree, taskBranch } from './git/integrate.js';
 
 export interface WorktreeSetup {
   command: string;
@@ -67,8 +68,6 @@ const maxBuffer = 1024 * 1024;
 const worktreeIdPattern = /^[a-z0-9-]+$/;
 const managerGitArgs = [
   ...SAFE_GIT_ARGS,
-  '-c',
-  'extensions.worktreeConfig=false',
   '-c',
   'gc.auto=0',
   '-c',
@@ -198,22 +197,15 @@ export class WorktreeManager {
     await this.requireLocalBranch(repository, baseBranch);
 
     const id = `${workerSlug(workerId)}-${randomUUID()}`;
-    const branchName = `tacet/workers/${id}`;
+    const branchName = taskBranch(id).slice('refs/heads/'.length);
     const worktreePath = path.join(root, id);
-    await runGit(repository, ['check-ref-format', '--branch', branchName]);
     await runGit(repository, [
       'worktree',
       'add',
-      '-b',
-      branchName,
+      '--detach',
       worktreePath,
       `refs/heads/${baseBranch}`,
     ]);
-    const commonDirectory = await this.commonGitDirectory();
-    await mkdir(path.join(commonDirectory, 'worktrees', id, 'objects'), {
-      recursive: true,
-      mode: 0o700,
-    });
 
     const timestamp = Date.now();
     const info: WorktreeInfo = {
@@ -227,11 +219,15 @@ export class WorktreeManager {
       lastActivityAt: timestamp,
     };
     try {
+      const commonDirectory = await this.commonGitDirectory();
+      await mkdir(path.join(commonDirectory, 'worktrees', id, 'objects'), {
+        recursive: true,
+        mode: 0o700,
+      });
       await this.writeInfo(root, info);
     } catch (error) {
       try {
-        await runGit(repository, ['worktree', 'remove', worktreePath]);
-        await runGit(repository, ['update-ref', '-d', `refs/heads/${branchName}`]);
+        await runGit(repository, ['worktree', 'remove', '--force', worktreePath]);
       } catch {
         // Keep the original metadata error; Git may still need manual cleanup.
       }
@@ -264,7 +260,9 @@ export class WorktreeManager {
           env,
         );
       } catch {
-        throw new Error('worktree setup command failed; the worktree was retained for recovery');
+        throw new Error(
+          `worktree setup command failed for ${id}; the worktree was retained for recovery`,
+        );
       }
     }
 
@@ -319,6 +317,9 @@ export class WorktreeManager {
           'worktree contains local or ignored files; pass { force: true } to remove it',
         );
       }
+    }
+    if (!(await this.headIsReachable(info))) {
+      throw new Error('worker HEAD is not reachable from a ref; integrate it before removal');
     }
     const gitDirectory = await this.managerWorktreeGitDirectory(info);
     await this.restoreAdminGitdir(info, gitDirectory);
@@ -388,8 +389,12 @@ export class WorktreeManager {
       try {
         await this.remove(info.id);
         result.removed.push(info.id);
-      } catch {
-        result.skipped.push({ id: info.id, reason: 'Git refused to remove the worktree' });
+      } catch (error) {
+        const reason =
+          error instanceof Error && error.message.includes('not reachable')
+            ? 'worker HEAD is not reachable from a ref'
+            : 'Git refused to remove the worktree';
+        result.skipped.push({ id: info.id, reason });
       }
     }
     return result;
@@ -399,7 +404,7 @@ export class WorktreeManager {
     const info = await this.requireWorktree(worktreeId);
     const { repository } = await this.paths();
     await this.requireLocalBranch(repository, targetBranch);
-    const workerCommit = await this.worktreeHead(info);
+    const workerCommit = await this.integrate(info);
     return this.findConflicts(repository, targetBranch, workerCommit);
   }
 
@@ -432,7 +437,7 @@ export class WorktreeManager {
       return [];
     } catch (error) {
       const failure = error as ProcessFailure;
-      if (failure.code !== 1) throw error;
+      if (failure.code !== 1) throw new Error('unable to check worktree conflicts');
       const fields = (failure.stdout ?? '').split('\0');
       const endOfNames = fields.indexOf('', 1);
       const names = fields.slice(1, endOfNames < 0 ? undefined : endOfNames);
@@ -449,7 +454,7 @@ export class WorktreeManager {
     const { repository } = await this.paths();
     await this.requireLocalBranch(repository, targetBranch);
 
-    const workerCommit = await this.worktreeHead(info);
+    const workerCommit = await this.integrate(info);
     const conflicts = await this.findConflicts(repository, targetBranch, workerCommit);
     if (conflicts.length > 0) {
       return {
@@ -476,7 +481,12 @@ export class WorktreeManager {
     const stagingWorktree = await this.create(`squash-${info.id}`, {
       baseBranch: targetBranch,
     });
+    let stagingBranchCreated = false;
+    let stagingBase: string | undefined;
     try {
+      stagingBase = await this.worktreeHead(stagingWorktree);
+      await this.attachStagingBranch(stagingWorktree, stagingBase);
+      stagingBranchCreated = true;
       await this.runWorktreeGit(stagingWorktree, ['merge', '--squash', workerCommit]);
       return {
         strategy,
@@ -489,11 +499,16 @@ export class WorktreeManager {
         resultWorktreePath: stagingWorktree.path,
       };
     } catch (error) {
-      const unmerged = await this.runWorktreeGit(stagingWorktree, [
-        'diff',
-        '--name-only',
-        '--diff-filter=U',
-      ]);
+      let unmerged = '';
+      try {
+        unmerged = await this.runWorktreeGit(stagingWorktree, [
+          'diff',
+          '--name-only',
+          '--diff-filter=U',
+        ]);
+      } catch {
+        // Preserve the original squash failure.
+      }
       if (unmerged.trim()) {
         return {
           strategy,
@@ -506,7 +521,10 @@ export class WorktreeManager {
           resultWorktreePath: stagingWorktree.path,
         };
       }
-      await this.remove(stagingWorktree.id);
+      await this.remove(stagingWorktree.id, { force: true }).catch(() => {});
+      if (stagingBranchCreated && stagingBase) {
+        await this.deleteStagingBranch(stagingWorktree, stagingBase).catch(() => {});
+      }
       throw error;
     }
   }
@@ -601,8 +619,59 @@ export class WorktreeManager {
     );
   }
 
+  private async integrate(info: WorktreeInfo): Promise<string> {
+    const { repository } = await this.paths();
+    const integrated = await integrateWorktree({
+      cwd: info.path,
+      repoRoot: repository,
+      ref: `refs/heads/${info.branchName}`,
+    });
+    return integrated?.commit ?? this.worktreeHead(info);
+  }
+
+  private async attachStagingBranch(info: WorktreeInfo, commit: string): Promise<void> {
+    const { repository } = await this.paths();
+    const ref = `refs/heads/${info.branchName}`;
+    await runGit(repository, ['update-ref', ref, commit, '0'.repeat(commit.length)]);
+    try {
+      await this.runWorktreeGit(info, ['symbolic-ref', 'HEAD', ref]);
+    } catch (error) {
+      await runGit(repository, ['update-ref', '-d', ref, commit]).catch(() => {});
+      throw error;
+    }
+  }
+
+  private async deleteStagingBranch(info: WorktreeInfo, commit: string): Promise<void> {
+    const { repository } = await this.paths();
+    await runGit(repository, ['update-ref', '-d', `refs/heads/${info.branchName}`, commit]);
+  }
+
   private async worktreeHead(info: WorktreeInfo): Promise<string> {
     return (await this.runWorktreeGit(info, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
+  }
+
+  private async headIsReachable(info: WorktreeInfo): Promise<boolean> {
+    try {
+      const { repository } = await this.paths();
+      const gitDirectory = await this.managerWorktreeGitDirectory(info);
+      const head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
+      let commit = head;
+      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) {
+        const ref = /^ref: (refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
+        if (!ref) return false;
+        commit = (await runGit(repository, ['rev-parse', '--verify', `${ref}^{commit}`])).trim();
+      }
+      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) return false;
+      await runGit(repository, ['cat-file', '-e', `${commit}^{commit}`]);
+      const refs = await runGit(repository, [
+        'for-each-ref',
+        `--contains=${commit}`,
+        '--format=%(refname)',
+      ]);
+      return refs.trim().length > 0;
+    } catch {
+      return false;
+    }
   }
 
   private async commonGitDirectory(): Promise<string> {
@@ -653,13 +722,13 @@ export class WorktreeManager {
         typeof info.branchName !== 'string' ||
         typeof info.path !== 'string' ||
         typeof info.baseBranch !== 'string' ||
-        !info.branchName.startsWith('tacet/workers/') ||
         !Number.isSafeInteger(info.createdAt) ||
         !Number.isSafeInteger(info.lastActivityAt)
       ) {
         return undefined;
       }
-      return { ...info, branch: info.branchName };
+      const branchName = taskBranch(id).slice('refs/heads/'.length);
+      return { ...info, branch: branchName, branchName };
     } catch {
       return undefined;
     }
