@@ -33,6 +33,8 @@ export interface MockRequest {
   betas: string[];
   /** Names of the tools offered. */
   tools: string[];
+  /** The text of the tool result this request carries, if any (what the tool printed). */
+  toolOutput?: string;
 }
 
 export interface MockMessagesApi {
@@ -49,7 +51,10 @@ interface Body {
   model?: string;
   output_config?: { effort?: unknown };
   stream?: boolean;
-  messages?: { role: string; content: string | { type: string; text?: string; id?: string }[] }[];
+  messages?: {
+    role: string;
+    content: string | { type: string; text?: string; id?: string; content?: unknown }[];
+  }[];
   tools?: { name?: string }[];
 }
 
@@ -67,6 +72,22 @@ function lastUser(body: Body): { text: string; toolResult: boolean } {
 }
 
 let n = 0;
+
+/** The text of the last user message's tool results (a string, or text blocks). */
+function toolOutput(body: Body): string | undefined {
+  const m = [...(body.messages ?? [])].reverse().find((x) => x.role === 'user');
+  if (!m || typeof m.content === 'string') return undefined;
+  const parts = m.content
+    .filter((b) => b.type === 'tool_result')
+    .map((b) =>
+      typeof b.content === 'string'
+        ? b.content
+        : Array.isArray(b.content)
+          ? (b.content as { text?: string }[]).map((c) => c.text ?? '').join('')
+          : '',
+    );
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
 
 function firstUserText(body: Body): string {
   const m = (body.messages ?? []).find((x) => x.role === 'user');
@@ -175,7 +196,9 @@ async function handle(
     return json(404, { type: 'error', error: { type: 'not_found_error', message: 'mock' } });
   }
   const beta = req.headers['anthropic-beta'];
+  const output = toolOutput(body);
   log.push({
+    ...(output !== undefined ? { toolOutput: output } : {}),
     model: body.model,
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
