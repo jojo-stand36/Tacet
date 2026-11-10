@@ -56,8 +56,9 @@ async function miniServer() {
 /** Run one `ESCALATE` turn, allowing every approval the vendor asks for, then close. */
 async function escalateTurn(adapter: AgentAdapter, h: SessionHandle): Promise<EventTap> {
   const tap = new EventTap(adapter.events(h));
+  let done = false;
   void (async () => {
-    for (let from = 0; ; ) {
+    for (let from = 0; !done; ) {
       const req = await tap
         .waitFor((e) => e.t === 'approval.request', 60_000, from)
         .catch(() => undefined);
@@ -72,6 +73,7 @@ async function escalateTurn(adapter: AgentAdapter, h: SessionHandle): Promise<Ev
   await adapter.send(h, { text: 'ESCALATE' });
   await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 60_000, from);
   await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, from + 1);
+  done = true;
   await adapter.close(h);
   return tap;
 }
@@ -126,29 +128,31 @@ describe('a resumed Worker reaches the restarted Mini-conductor (#128)', () => {
       first.revoke();
       await one.server.close();
       const firstCalls = api.requests.length;
+      const firstToolUses = api.requests.flatMap((r) => r.toolUseIds);
+      expect(firstToolUses.length).toBeGreaterThan(0);
 
       const second = two.server.workerConfig({ workerSessionId: 'worker-2', taskId: TASK });
       expect(second.config.url).not.toBe(first.config.url);
       const vendorSessionId = h1.vendorSessionId ?? '';
+      expect(vendorSessionId).not.toBe('');
       const h2 = await adapter.start({
         cwd,
         model: 'claude-sonnet-5-5',
         mcpServers: [second.config],
         resume: { vendorSessionId },
       });
-      expect(h2.vendorSessionId).toBe(vendorSessionId);
       expect(escalateSucceeded(await escalateTurn(adapter, h2))).toBe(true);
+      // Read after the turn: the id the CLI reported, not the one the adapter was given.
+      expect(h2.vendorSessionId).toBe(vendorSessionId);
       second.revoke();
       // The call reached the new server, as the Worker its new token names.
       const raised = two.store.query({ typePrefix: 'escalation.raised' });
       expect(raised).toHaveLength(1);
       expect(raised[0]?.envelope.sessionId).toBe('worker-2');
-      // And it was the same conversation: the model saw the first session's messages.
-      const resumed = api.requests.slice(firstCalls);
-      const before = api.requests.slice(0, firstCalls);
-      expect(Math.min(...resumed.map((r) => r.messages))).toBeGreaterThan(
-        Math.max(...before.map((r) => r.messages)),
-      );
+      // And it was the same conversation: the model got the first session's tool call back.
+      const resumed = api.requests.slice(firstCalls).filter((r) => r.text === 'ESCALATE');
+      expect(resumed.length).toBeGreaterThan(0);
+      for (const r of resumed) expect(r.toolUseIds).toEqual(expect.arrayContaining(firstToolUses));
     } finally {
       await one.server.close().catch(() => {});
       await two.server.close();
@@ -185,6 +189,8 @@ describe('a resumed Worker reaches the restarted Mini-conductor (#128)', () => {
       first.revoke();
       await one.server.close();
       const firstCalls = api.requests.length;
+      const firstCallIds = api.requests.flatMap((r) => r.callIds);
+      expect(firstCallIds.length).toBeGreaterThan(0);
 
       const second = two.server.workerConfig({ workerSessionId: 'worker-2', taskId: TASK });
       expect(second.config.url).not.toBe(first.config.url);
@@ -202,11 +208,9 @@ describe('a resumed Worker reaches the restarted Mini-conductor (#128)', () => {
       const raised = two.store.query({ typePrefix: 'escalation.raised' });
       expect(raised).toHaveLength(1);
       expect(raised[0]?.envelope.sessionId).toBe('worker-2');
-      const resumed = api.requests.slice(firstCalls);
-      const before = api.requests.slice(0, firstCalls);
-      expect(Math.min(...resumed.map((r) => r.inputs))).toBeGreaterThan(
-        Math.max(...before.map((r) => r.inputs)),
-      );
+      const resumed = api.requests.slice(firstCalls).filter((r) => r.text === 'ESCALATE');
+      expect(resumed.length).toBeGreaterThan(0);
+      for (const r of resumed) expect(r.callIds).toEqual(expect.arrayContaining(firstCallIds));
     } finally {
       await one.server.close().catch(() => {});
       await two.server.close();

@@ -19,6 +19,8 @@ export interface MockRequest {
   model: string | undefined;
   text: string;
   messages: number;
+  /** Ids of the `tool_use` blocks in the conversation sent, so a resumed one can be recognised. */
+  toolUseIds: string[];
   /** `output_config.effort` as sent, if any. */
   effort?: unknown;
   /** The `anthropic-beta` header values. */
@@ -41,7 +43,7 @@ interface Body {
   model?: string;
   output_config?: { effort?: unknown };
   stream?: boolean;
-  messages?: { role: string; content: string | { type: string; text?: string }[] }[];
+  messages?: { role: string; content: string | { type: string; text?: string; id?: string }[] }[];
   tools?: { name?: string }[];
 }
 
@@ -118,6 +120,11 @@ async function handle(
     model: body.model,
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
+    toolUseIds: (body.messages ?? []).flatMap((m) =>
+      typeof m.content === 'string'
+        ? []
+        : m.content.flatMap((b) => (b.type === 'tool_use' && b.id ? [b.id] : [])),
+    ),
     ...(body.output_config?.effort !== undefined ? { effort: body.output_config.effort } : {}),
     betas: (Array.isArray(beta) ? beta.join(',') : (beta ?? ''))
       .split(',')

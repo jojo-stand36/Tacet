@@ -28,8 +28,10 @@ export interface MockResponsesApi {
     toolOutput?: string;
     authorized: boolean;
     tools: string[];
-    /** Number of input items: the conversation so far, so a resumed thread shows its history. */
+    /** Number of input items: the conversation so far. */
     inputs: number;
+    /** `call_id`s of the function calls in the input, so a resumed thread can be recognised. */
+    callIds: string[];
   }[];
   close(): Promise<void>;
 }
@@ -39,6 +41,7 @@ interface InputItem {
   role?: string;
   content?: string | { text?: string }[];
   output?: string | { text?: string }[];
+  call_id?: string;
 }
 
 const joinText = (c: InputItem['content']): string =>
@@ -96,6 +99,9 @@ async function handle(
         : [t.name ?? t.type ?? ''],
     ),
     inputs: body.input?.length ?? 0,
+    callIds: (body.input ?? []).flatMap((it) =>
+      it.type === 'function_call' && it.call_id ? [it.call_id] : [],
+    ),
   });
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
   const sse = (event: Record<string, unknown> & { type: string }) =>
