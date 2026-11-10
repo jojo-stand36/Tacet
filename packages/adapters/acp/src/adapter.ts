@@ -408,7 +408,7 @@ export class AcpAdapter implements AgentAdapter {
     s.closing = true;
     s.queue.length = 0;
     this.#cancelApprovals(s);
-    if (!s.ended && s.init.agentCapabilities?.sessionCapabilities?.close) {
+    if (!s.ended && !s.exit && s.init.agentCapabilities?.sessionCapabilities?.close) {
       await Promise.race([
         s.conn.agent.request('session/close', { sessionId: s.acpSessionId }).catch(() => {}),
         new Promise((r) => setTimeout(r, 1000).unref()),
@@ -592,7 +592,7 @@ export class AcpAdapter implements AgentAdapter {
    * switch that fails or is not reported, or a third drift, ends the session.
    */
   #onDrift(s: Session, now: string): void {
-    if (!s.ready || s.restoring || s.closing || s.ended || !s.pinnedMode) return;
+    if (!s.ready || s.restoring || s.closing || s.ended || s.exit || !s.pinnedMode) return;
     s.restoring = true;
     s.drifts += 1;
     this.#restoreMode(s, now)
@@ -632,7 +632,8 @@ export class AcpAdapter implements AgentAdapter {
         failure = `it could not be set back: ${this.#scrub(errorMessage(err), s.secrets)}`;
       }
     }
-    if (s.closing || s.ended) return;
+    // An agent that exited is reported by the exit handler, with its own reason.
+    if (s.closing || s.ended || s.exit) return;
     if (failure === undefined) {
       this.#emit(s, {
         t: 'status',
@@ -811,7 +812,9 @@ export class AcpAdapter implements AgentAdapter {
   #live(h: SessionHandle): Session {
     const s = this.#sessions.get(h.id);
     if (!s || s.closing) throw new Error(`unknown or closed session ${h.id}`);
-    if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
+    // Exited but not yet reported (its group is still being reaped) counts as ended.
+    if (s.ended || s.exit)
+      throw new Error(`session ${h.id} has ended (${s.exit ? 'exited' : s.state})`);
     return s;
   }
 }

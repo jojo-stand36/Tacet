@@ -28,31 +28,6 @@ import {
 
 const FAKE = join(import.meta.dirname, 'testing', 'fake-acp-agent.mjs');
 
-/**
- * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
- * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
- * where `kill(pid, 0)` also finds a zombie.
- */
-function running(pid: number): boolean {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
-  } catch {
-    if (process.platform === 'linux') return false;
-  }
-  try {
-    process.kill(pid, 0);
-  } catch {
-    return false;
-  }
-  try {
-    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
-    return state.trim() !== '' && !state.trim().startsWith('Z');
-  } catch {
-    // `ps` exits non-zero once the pid is gone.
-    return false;
-  }
-}
 const TOKEN = 'worker-token-0123456789abcdef';
 
 async function until(ok: () => boolean, ms = 5000): Promise<void> {
@@ -78,6 +53,33 @@ const BUILTIN_MODES = {
     },
   }),
 };
+
+/**
+ * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
+ * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
+ * where `kill(pid, 0)` also finds a zombie.
+ */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+  } catch {
+    if (process.platform === 'linux') return false;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    return state.trim() !== '' && !state.trim().startsWith('Z');
+  } catch (err) {
+    // `ps` exits 1 once the pid is gone; anything else is a broken check, not an answer.
+    if ((err as { status?: number }).status === 1) return false;
+    throw err;
+  }
+}
 
 describe('AcpAdapter (fake ACP agent)', () => {
   let root: string;
@@ -411,16 +413,20 @@ describe('AcpAdapter (fake ACP agent)', () => {
           for await (const _ of adapter.events(h));
         })();
         await adapter.send(h, { text: 'CRASH' });
+        // Exited (after 50 ms) but not yet reported while its group is reaped (at least
+        // killTimeoutMs): the session takes no more input.
+        await new Promise((r) => setTimeout(r, 150));
+        await expect(adapter.send(h, { text: 'more' })).rejects.toThrow(/has ended \(exited\)/);
         await done;
         expect(adapter.status(h)).toBe('error');
-        // The SIGTERM-ignoring child got SIGKILL before the error was reported.
+        // The SIGTERM-ignoring child is gone by the time the events end.
         const pid = childPid();
         expect(pid).toBeTypeOf('number');
         expect(running(pid as number)).toBe(false);
         await adapter.close(h);
       } finally {
         const p = childPid();
-        if (p !== undefined) {
+        if (p !== undefined && running(p)) {
           try {
             process.kill(p, 'SIGKILL');
           } catch {}
@@ -726,7 +732,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
         expect(running(pid as number)).toBe(false);
       } finally {
         const p = childPid();
-        if (p !== undefined) {
+        if (p !== undefined && running(p)) {
           try {
             process.kill(p, 'SIGKILL');
           } catch {}
