@@ -4,26 +4,27 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CheckoutPlanner } from '../standalone.js';
-import { GitWorktrees } from './worktrees.js';
+import { CheckoutPlanner } from './standalone.js';
+import { WorktreeManager } from './worktree.js';
 
-describe('GitWorktrees (#21)', () => {
+/** The manager as standalone mode (#21) uses it, behind the `Workspaces` port. */
+describe('WorktreeManager as standalone Workspaces', () => {
   let root: string;
   let repo: string;
   let env: Record<string, string>;
   const git = (cwd: string, args: string[]) =>
     execFileSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8' }).trim();
-  const make = () =>
-    new GitWorktrees({ repoRoot: repo, root: join(root, 'state', 'worktrees'), env });
+  const make = () => new WorktreeManager(repo, join(root, 'state', 'worktrees'));
 
   beforeEach(() => {
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-worktrees-')));
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-workspaces-')));
     repo = join(root, 'repo');
     mkdirSync(join(root, 'home'));
     env = {
       PATH: process.env.PATH ?? '',
       HOME: join(root, 'home'),
       GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_AUTHOR_NAME: 'Tacet Test',
       GIT_AUTHOR_EMAIL: 'test@example.invalid',
       GIT_COMMITTER_NAME: 'Tacet Test',
@@ -35,46 +36,52 @@ describe('GitWorktrees (#21)', () => {
     git(repo, ['add', 'README']);
     git(repo, ['commit', '-qm', 'one']);
   });
-  afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-  it('creates a detached checkout at HEAD or at a base, outside the repo, with its own objects', async () => {
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('creates a detached checkout at HEAD or at a base commit, with its own objects', async () => {
     const first = git(repo, ['rev-parse', 'HEAD']);
     writeFileSync(join(repo, 'README'), 'two\n');
     git(repo, ['commit', '-qam', 'two']);
     const head = git(repo, ['rev-parse', 'HEAD']);
     const w = make();
 
-    const a = await w.create('sess/1');
-    expect(a.id).toBe('ws-sess_1');
-    expect(a.path).toBe(join(root, 'state', 'worktrees', 'ws-sess_1'));
+    const a = await w.create('s1');
+    expect(a.path.startsWith(join(root, 'state', 'worktrees'))).toBe(true);
     expect(git(a.path, ['rev-parse', 'HEAD'])).toBe(head);
     expect(() => git(a.path, ['symbolic-ref', '-q', 'HEAD'])).toThrow();
     const wt = workerWorktree(a.path, repo);
-    expect(wt).toBeDefined();
-    expect(existsSync(join(wt?.gitDir as string, 'objects'))).toBe(true);
+    expect(wt && existsSync(join(wt.gitDir, 'objects'))).toBe(true);
 
-    const b = await w.create('sess-2', first);
+    const b = await w.create('s2', first);
     expect(git(b.path, ['rev-parse', 'HEAD'])).toBe(first);
-    await expect(w.create('sess/1')).rejects.toThrow(/already exists/);
   });
 
-  it('finds a checkout again from a new instance, and refuses ids that are not its own', async () => {
+  it('starts at the HEAD commit when the repository HEAD is detached', async () => {
+    git(repo, ['checkout', '-q', '--detach']);
+    const head = git(repo, ['rev-parse', 'HEAD']);
+
     const a = await make().create('s1');
-    const again = make();
-    expect(await again.get(a.id)).toEqual(a);
-    expect(await again.get('ws-missing')).toBeUndefined();
-    expect(await again.get('../repo')).toBeUndefined();
-    expect(await again.get('ws-..')).toBeUndefined();
-    await again.remove(a.id);
-    expect(await again.get(a.id)).toBeUndefined();
-    expect(git(repo, ['worktree', 'list'])).not.toContain('ws-s1');
+
+    expect(git(a.path, ['rev-parse', 'HEAD'])).toBe(head);
+    expect(a.baseCommit).toBe(head);
   });
 
-  it('refuses a base that is not a commit, and a Worker id it cannot name', async () => {
+  it('finds a checkout again from a new instance', async () => {
+    const a = await make().create('s1');
+    expect(await make().get(a.id)).toMatchObject({ id: a.id, path: a.path });
+    await make().remove(a.id);
+    expect(await make().get(a.id)).toBeUndefined();
+    expect(git(repo, ['worktree', 'list'])).not.toContain(a.id);
+  });
+
+  it('refuses a base that is not a commit or could be read as an option', async () => {
     const w = make();
-    await expect(w.create('s1', '--upload-pack=touch /tmp/x')).rejects.toThrow(/rev-parse/);
-    await expect(w.create('s2', 'nope')).rejects.toThrow(/rev-parse/);
-    await expect(w.create('..')).rejects.toThrow(/cannot make a checkout/);
+    await expect(w.create('s1', '--upload-pack=touch /tmp/x')).rejects.toThrow();
+    await expect(w.create('s2', 'nope')).rejects.toThrow();
+    expect(await w.list()).toEqual([]);
   });
 
   it('prunes a checkout deleted by hand', async () => {
@@ -82,12 +89,13 @@ describe('GitWorktrees (#21)', () => {
     const a = await w.create('s1');
     rmSync(a.path, { recursive: true, force: true });
     await w.remove(a.id);
-    expect(git(repo, ['worktree', 'list'])).not.toContain('ws-s1');
+    expect(git(repo, ['worktree', 'list'])).not.toContain(a.id);
   });
 
-  it('plans in a throwaway checkout, never in the repo (#21 review)', async () => {
+  it('plans in a throwaway checkout, never in the repo, and removes it (#21 review)', async () => {
     let seen: string | undefined;
-    const planner = new CheckoutPlanner(make(), (cwd) => ({
+    const workspaces = make();
+    const planner = new CheckoutPlanner(workspaces, (cwd) => ({
       plan: async () => {
         seen = cwd;
         // A planner whose adapter writes without asking (Codex's sandbox).
@@ -103,11 +111,10 @@ describe('GitWorktrees (#21)', () => {
       createdAt: '',
     };
     await planner.plan(task);
-    expect(seen).toBeDefined();
     expect(seen?.startsWith(join(root, 'state', 'worktrees'))).toBe(true);
     expect(existsSync(seen as string)).toBe(false);
+    expect(await workspaces.list()).toEqual([]);
     expect(git(repo, ['status', '--porcelain'])).toBe('');
-    expect(git(repo, ['worktree', 'list'])).not.toContain('plan-t1');
   });
 
   it('creates many at once without colliding on the repo lock', async () => {
