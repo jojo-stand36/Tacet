@@ -61,7 +61,7 @@ jobs:
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      # ADR-002: macOS and Ubuntu Linux only; Node 24 minimum, also tested on 26.
+      # ADR-002: macOS and Ubuntu; WSL2 CI tracked in #193; Node 24 minimum, also tested on 26.
       # Owner decision (2026-11-09): pull requests run a lighter matrix (Ubuntu on 24 and 26,
       # macOS on 24); pushes to main run the full {ubuntu, macos} x {24, 26} matrix.
       matrix:

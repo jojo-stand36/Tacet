@@ -76,6 +76,12 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
 - [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
+- [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
+- [ ] **Codex adapter: report a self-exit only once the process group is gone** — `feature` `P2` `claude`
+- [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
+- [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
+- [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
+- [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
 - [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude + human`
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
@@ -144,3 +150,5 @@ Plugins, A2A/ACP exposure, sandboxing, evals, docs, release.
 - [ ] **Docs site + quickstart + vendor auth/billing guide** — `docs` `P1` `either + human`
 - [ ] **v0.1 release: packaging (npm, Homebrew), installers, changelog** — `chore` `P1` `copilot`
 - [ ] **Re-check Bun when oven-sh/bun#25822 closes** — `spike` `P2` `claude`
+- [ ] **ADR: native Windows support** — `adr` `P2` `claude + human`
+- [ ] **Native Windows support (after the ADR)** — `epic` `P2` `claude + human`
