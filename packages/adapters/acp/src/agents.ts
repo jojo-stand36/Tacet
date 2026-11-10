@@ -180,8 +180,13 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
  * there is no hook to ask with. Verified against the mock API by the vendor conformance test.
  */
 export const CLAUDE_ACP_WORKER_OPTIONS = {
-  tools: ['Read', 'Write', 'Edit', 'NotebookEdit'],
+  tools: ['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep'],
   disallowedTools: ['Bash', 'PowerShell', 'Monitor'],
+  // Ask rules come before a tool's own approval of a read inside its working directory, so every
+  // read and search reaches `canUseTool`, which claude-agent-acp turns into
+  // `session/request_permission` (#214). Inline: the flag layer, which `settingSources: []` does
+  // not drop; never a path, which would resolve inside the Worker's checkout.
+  settings: { permissions: { ask: ['Read', 'Glob', 'Grep'] } },
 } as const;
 
 /** `spec` with `CLAUDE_ACP_WORKER_OPTIONS` merged into its `_meta.claudeCode.options`. */
@@ -197,6 +202,9 @@ export function claudeAcpWorkerSpec(spec: AcpAgentSpec): AcpAgentSpec {
           ...meta.claudeCode?.options,
           tools: [...CLAUDE_ACP_WORKER_OPTIONS.tools],
           disallowedTools: [...CLAUDE_ACP_WORKER_OPTIONS.disallowedTools],
+          settings: {
+            permissions: { ask: [...CLAUDE_ACP_WORKER_OPTIONS.settings.permissions.ask] },
+          },
         },
       },
     },

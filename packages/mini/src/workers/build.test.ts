@@ -135,6 +135,31 @@ describe('buildWorkerAdapters', () => {
     }
   });
 
+  it('refuses a custom preset running claude-agent-acp for Workers: the built-in is hardened (#214)', () => {
+    for (const command of [
+      ['claude-agent-acp'],
+      ['/opt/bin/claude-agent-acp', '--x'],
+      ['npx', '-y', '@agentclientprotocol/claude-agent-acp@0.101.0'],
+      ['sh', '-c', 'exec claude-agent-acp'],
+    ]) {
+      expect(() =>
+        buildWorkerAdapters(
+          {
+            tiers: { worker: { adapter: 'acp:mine' } },
+            agents: { mine: { kind: 'acp', command } },
+          },
+          { baseEnv: {} },
+        ),
+      ).toThrow(/agents\.mine runs claude-agent-acp; use acp:claude-acp/);
+    }
+    // The built-in builds, with the Worker options: file tools, no shell, reads asked about.
+    const ok = buildWorkerAdapters(
+      { tiers: { worker: { adapter: 'acp:claude-acp' } } },
+      { baseEnv: {} },
+    );
+    expect(Object.keys(ok)).toEqual(['acp:claude-acp']);
+  });
+
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
     for (const tiers of [
       { worker: { adapter: 'acp:codex-acp' } },

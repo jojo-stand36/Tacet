@@ -281,6 +281,20 @@ export function buildWorkerAdapters(
     if (refused) {
       throw new WorkerConfigError(`${where}: acp:${slug} is refused for Workers: ${refused}`);
     }
+    // A custom preset running claude-agent-acp would get none of the built-in's Worker hardening
+    // (no settings isolation, no pinned mode, a shell, unasked reads; #214): use the built-in.
+    const claude = BUILTIN_ACP_AGENTS['claude-acp'];
+    if (
+      preset?.kind === 'acp' &&
+      claude &&
+      preset.command
+        .flatMap((arg) => arg.split(/\s+/))
+        .some((w) => runsAgent(w, claude.command[0] ?? '', claude.id))
+    ) {
+      throw new WorkerConfigError(
+        `${where}: agents.${slug} runs claude-agent-acp; use acp:claude-acp for Workers, which runs it with the Worker hardening (#214)`,
+      );
+    }
   }
 
   /** Throws unless `id` names an adapter this function can build. */
