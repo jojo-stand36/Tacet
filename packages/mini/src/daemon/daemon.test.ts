@@ -2161,3 +2161,195 @@ describe('MiniConductor review fixes', () => {
     });
   });
 });
+
+describe('handoff reseed (#129)', () => {
+  const packet = (next: string) => ({
+    goal: 'g',
+    acceptanceCriteria: ['ok'],
+    stateSummary: 'half done',
+    decisions: [],
+    filesTouched: ['a.ts'],
+    commandsRun: [],
+    openQuestions: [],
+    nextAction: next,
+    verification: { status: 'partial', commands: [] },
+  });
+  /** The backend as standalone wires it: the Mini-conductor decides and reseeds. */
+  const backendFor = (d: MiniConductor) =>
+    new EventLogBackend({
+      store,
+      canHandoff: (b) => d.handoffRefusal(b.workerSessionId),
+      onHandoff: (b) => d.handoff(b.workerSessionId),
+    });
+  const reasons = (sub: string) =>
+    ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason);
+
+  it('ends the session and seeds a successor from the packet, in the same checkout, with the same restrictions', async () => {
+    // The first session holds its turn and hands off; the successor finishes.
+    fake = new ScriptedAdapter('fake', (input) =>
+      input.includes('handed off') ? { do: 'reply', text: 'done' } : { do: 'hold' },
+    );
+    const d = make();
+    const backend = backendFor(d);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 }).toBe(1);
+    const first = { workerSessionId: minted[0] ?? '', taskId: sub };
+    await expect(
+      backend.requestHandoff(first, { reason: 'context', packet: packet('write the burst test') }),
+    ).resolves.toMatchObject({ accepted: true });
+    await d.settled();
+    expect(reasons(sub)).toEqual(['handoff', 'finished']);
+    expect(tasks()[sub]?.state).toBe('completed');
+    const [a, b] = fake.sessions;
+    // Not resumed: a new vendor session, seeded by its first message and read_task.
+    expect(b?.opts.resume).toBeUndefined();
+    expect(b?.inputs[0]).toContain('handed off');
+    expect(b?.inputs[0]).toContain('read_task');
+    const successor = { workerSessionId: minted[1] ?? '', taskId: sub };
+    expect((await backend.readTask(successor)).handoff?.nextAction).toBe('write the burst test');
+    // The same checkout, the same Worker restrictions, a fresh MCP token; the old one revoked.
+    expect(b?.opts.cwd).toBe(a?.opts.cwd);
+    const { mcpServers: ma, env: ea, ...restA } = a?.opts ?? {};
+    const { mcpServers: mb, env: eb, ...restB } = b?.opts ?? {};
+    expect(restB).toEqual(restA);
+    expect(Object.keys(eb ?? {})).toEqual(Object.keys(ea ?? {}));
+    expect(mb?.[0]?.headers).not.toEqual(ma?.[0]?.headers);
+    expect(revoked).toContain(minted[0]);
+    // Not an attempt: the successor is attempt 1 again, and it records taking the handoff up.
+    const started = ofType('worker.started', sub).map(
+      (e) => e.data as { attempt: number; previousSessionId?: string },
+    );
+    expect(started.map((x) => x.attempt)).toEqual([1, 1]);
+    expect(started[1]?.previousSessionId).toBe(minted[0]);
+    expect(ofType('handoff.accepted', sub).map((e) => e.data)).toEqual([
+      expect.objectContaining({ sessionId: minted[1] }),
+    ]);
+  });
+
+  it('starts the successor from the packet after a crash, never resuming the old session', async () => {
+    fake = new ScriptedAdapter('fake', (input) =>
+      input.includes('handed off') ? { do: 'reply', text: 'done' } : { do: 'hold' },
+    );
+    // A Mini-conductor that records the packet but crashes before acting on it.
+    const first = make();
+    const backend = new EventLogBackend({ store });
+    await first.start();
+    const id = first.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 }).toBe(1);
+    await backend.requestHandoff(
+      { workerSessionId: minted[0] ?? '', taskId: sub },
+      { reason: 'context', packet: packet('carry on') },
+    );
+    const vendor = (
+      ofType('worker.vendor_session', sub)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
+    // The process dies: nothing is closed or recorded.
+    first.crashForTest();
+    fake = new ScriptedAdapter('fake', (input) =>
+      input.includes('handed off') ? { do: 'reply', text: 'done' } : { do: 'hold' },
+    );
+    const second = make();
+    await second.start();
+    await second.settled();
+    expect(reasons(sub)).toEqual(['handoff', 'finished']);
+    const successor = fake.sessions.at(-1);
+    expect(fake.sessions).toHaveLength(1);
+    expect(successor?.opts.resume).toBeUndefined();
+    expect(successor?.inputs[0]).toContain('read_task');
+    expect(ofType('handoff.accepted', sub)).toHaveLength(1);
+    // The session that handed off is dropped before its successor starts, as one that is never
+    // resumed is (#153); the successor is dropped when it finishes.
+    expect(fake.discarded.map((x) => x.vendorSessionId)).toEqual([
+      vendor,
+      successor?.handle.vendorSessionId,
+    ]);
+  });
+
+  it('keeps the seed for a retry when the successor fails to start', async () => {
+    let starts = 0;
+    fake = new ScriptedAdapter('fake', (input) =>
+      input.includes('handed off') ? { do: 'reply', text: 'done' } : { do: 'hold' },
+    );
+    const start = fake.start.bind(fake);
+    fake.start = async (o) => {
+      starts += 1;
+      // The second start, the first successor, fails before its first message.
+      if (starts === 2) throw new Error('vendor down');
+      return start(o);
+    };
+    const d = make();
+    const backend = backendFor(d);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 }).toBe(1);
+    await backend.requestHandoff(
+      { workerSessionId: minted[0] ?? '', taskId: sub },
+      { reason: 'context', packet: packet('carry on') },
+    );
+    await d.settled();
+    expect(tasks()[sub]?.state).toBe('completed');
+    expect(fake.sessions.at(-1)?.inputs[0]).toContain('read_task');
+    expect(ofType('handoff.accepted', sub)).toHaveLength(1);
+  });
+
+  it('refuses a handoff while the turn is being checked, recording nothing', async () => {
+    let release: () => void = () => {};
+    let checking = false;
+    const verifier: Verifier = {
+      async verify() {
+        checking = true;
+        await new Promise<void>((r) => {
+          release = r;
+        });
+        return { status: 'passed', commands: ['pnpm test'], notes: '' };
+      },
+    };
+    fake = new ScriptedAdapter('fake', () => ({ do: 'reply', text: 'done' }));
+    const d = make({ config: { ...CONFIG, verify: ['pnpm test'] }, verifier });
+    const backend = backendFor(d);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => checking, { timeout: 5000 }).toBe(true);
+    await expect(
+      backend.requestHandoff(
+        { workerSessionId: minted[0] ?? '', taskId: sub },
+        { reason: 'context', packet: packet('late') },
+      ),
+    ).rejects.toThrow(/being checked/);
+    expect(ofType('handoff.requested', sub)).toHaveLength(0);
+    release();
+    await d.settled();
+    expect(reasons(sub)).toEqual(['finished']);
+  });
+
+  it('refuses a handoff from a session that is not running, or past max_handoffs', async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'hold' }));
+    const d = make({ config: { ...CONFIG, workers: { ...CONFIG.workers, max_handoffs: 1 } } });
+    const backend = backendFor(d);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 }).toBe(1);
+    expect(d.handoffRefusal('not-a-session')).toMatch(/not running/);
+    await backend.requestHandoff(
+      { workerSessionId: minted[0] ?? '', taskId: sub },
+      { reason: 'context', packet: packet('one') },
+    );
+    await expect.poll(() => fake.sessions.length, { timeout: 5000 }).toBe(2);
+    await expect.poll(() => ofType('handoff.accepted', sub).length, { timeout: 5000 }).toBe(1);
+    // The limit: refused before anything is recorded.
+    const second = { workerSessionId: minted[1] ?? '', taskId: sub };
+    await expect(
+      backend.requestHandoff(second, { reason: 'context', packet: packet('two') }),
+    ).rejects.toThrow(/handoff limit reached \(1 for this sub-task\)/);
+    expect(ofType('handoff.requested', sub)).toHaveLength(1);
+    // A canceled task's session is gone at once.
+    await d.cancel(id);
+    expect(d.handoffRefusal(minted[1] ?? '')).toMatch(/not running/);
+  });
+});

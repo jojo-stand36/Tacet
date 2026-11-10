@@ -59,5 +59,9 @@ export function safePrompt(lines: string[], sep = '\n'): string {
   return assertSafePrompt(lines.join(sep));
 }
 
+/** Added to a successor's first message (#129): its predecessor's packet is in `read_task`. */
+export const HANDOFF_NOTE =
+  "You continue this sub-task from an earlier Worker session that handed off. Call read_task first: its `handoff` field holds that session's HandoffPacket (what is done, what is left, and the next action). Continue from its nextAction, in this same checkout.";
+
 export const RESUME_PROMPT =
   'The Mini-conductor restarted. Continue the sub-task from where you were; if it is already done, reply with a short summary.';
