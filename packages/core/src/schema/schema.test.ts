@@ -17,11 +17,14 @@ import {
   isKnownEventNamespace,
   type JsonSchemaName,
   jsonSchemas,
+  LOCAL_EVENT_NAMESPACES,
   parseAgentEvent,
   Task,
   TaskExt,
   toJsonSchema,
   Ulid,
+  UPWARD_EVENT_NAMESPACES,
+  UPWARD_EVENT_TYPES,
 } from '../index.js';
 
 // ajv-formats ships CommonJS; depending on the loader the plugin is the module or its `.default`.
@@ -218,12 +221,62 @@ describe('JSON Schema export', () => {
   });
 });
 
-describe('local event namespaces (#126)', () => {
-  it('keeps the worktree registry local, and forwards the rest', () => {
-    expect(isForwardable('workspace.created')).toBe(false);
-    expect(isForwardable('workspace.removed')).toBe(false);
-    expect(isForwardable('worker.started')).toBe(true);
-    expect(isForwardable('task.landed')).toBe(true);
-    expect(isForwardable('workspacex.created')).toBe(true);
+describe('forwarding upward: the ADR-003 §4 allowlist (#256)', () => {
+  it('is exactly the §4 list, and shares nothing with the local namespaces', () => {
+    // Widening the upward stream is a protocol decision (ADR-003 §4), not a code change.
+    expect([...UPWARD_EVENT_NAMESPACES]).toEqual([
+      'task',
+      'escalation',
+      'decision',
+      'handoff',
+      'worker',
+    ]);
+    expect([...UPWARD_EVENT_TYPES]).toEqual(['agent.usage']);
+    for (const ns of LOCAL_EVENT_NAMESPACES) {
+      expect(UPWARD_EVENT_NAMESPACES as readonly string[]).not.toContain(ns);
+    }
+  });
+
+  it('forwards each allowlisted type', () => {
+    for (const type of [
+      'task.created',
+      'task.status',
+      'task.landed',
+      'escalation.raised',
+      'decision.recorded',
+      'handoff.created',
+      'worker.started',
+      'worker.ended',
+      'agent.usage',
+    ]) {
+      expect(isForwardable(type), type).toBe(true);
+    }
+  });
+
+  it('keeps everything else local, a new namespace included', () => {
+    for (const type of [
+      // Local namespaces (#126, #254).
+      'workspace.created',
+      'workspace.removed',
+      'maintenance.problem',
+      // Transcripts.
+      'agent.message.delta',
+      'agent.tool.call',
+      'agent.approval.request',
+      'agent.usage.extra',
+      // Not on the §4 list.
+      'budget.spent',
+      // Unknown, or only looking like an allowed one.
+      'workspacex.created',
+      'taskx.created',
+      'newthing.happened',
+      // Malformed.
+      'task',
+      'Task.created',
+      '',
+      '.task.created',
+    ]) {
+      expect(isForwardable(type), type).toBe(false);
+    }
   });
 });
