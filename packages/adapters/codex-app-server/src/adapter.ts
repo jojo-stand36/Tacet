@@ -646,8 +646,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   /**
    * End a Codex process: end of input asks it to finish; then SIGTERM to its group (the npm
-   * wrapper forwards it to the native binary), then SIGKILL. Signals are sent only while the
-   * process is still running, so a long-dead group id is never signalled.
+   * wrapper forwards it to the native binary), then SIGKILL; then it waits for the rest of the
+   * group and SIGKILLs what is left. The group is signalled only while it has a running member
+   * (the process itself, or a member seen just before), so a reused group id is never signalled.
    */
   async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
     const within = (ms: number) =>
@@ -663,9 +664,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
         await exited;
       }
     }
-    // Codex's own children (tool commands, MCP servers, its plugin sync) got SIGTERM when it
-    // exited, but may still be shutting down and writing into the Worker's CODEX_HOME or
-    // checkout: wait for the whole group, so nothing of a closed session is left running (#191).
+    // Children Codex starts in its group (its plugin sync, and may include tool commands and MCP
+    // servers: not verified) got SIGTERM when it exited, but may still be shutting down and
+    // writing into the Worker's CODEX_HOME or checkout: wait for the whole group (#191). A child
+    // that starts a group or session of its own is not covered.
     // SIGKILL only right after seeing a running member, synchronously: a pid is not reused while
     // it is the id of a group with members, so this cannot reach a reused group id.
     if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
