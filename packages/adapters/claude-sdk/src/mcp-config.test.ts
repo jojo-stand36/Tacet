@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -8,11 +9,20 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { isProcessRunning } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { realish, removeMcpConfig, writeMcpConfig } from './mcp-config.js';
+import {
+  ownerDirName,
+  ownOwnerDirName,
+  realish,
+  removeMcpConfig,
+  sweepStaleMcpConfigs,
+  writeMcpConfig,
+} from './mcp-config.js';
 
 const servers = [
   { name: 'tacet', url: 'http://127.0.0.1:1/mcp', headers: { authorization: 'Bearer t' } },
@@ -28,7 +38,7 @@ describe('writeMcpConfig', () => {
   it('writes a 0600 file in a 0700 directory outside the worktree, and removes it', () => {
     const dir = join(root, 'run', 'mcp');
     const path = writeMcpConfig(servers, { sessionId: 's1', worktree: join(root, 'wt'), dir });
-    expect(path).toBe(join(dir, 's1.json'));
+    expect(path).toBe(join(dir, ownOwnerDirName(), 's1.json'));
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
@@ -89,7 +99,7 @@ describe('writeMcpConfig', () => {
     mkdirSync(join(root, 'real'));
     symlinkSync(join(root, 'real'), join(root, 'mcp'));
     const path = writeMcpConfig(servers, { sessionId: 's2', worktree: wt, dir: join(root, 'mcp') });
-    expect(path).toBe(join(realish(join(root, 'real')), 's2.json'));
+    expect(path).toBe(join(realish(join(root, 'real')), ownOwnerDirName(), 's2.json'));
   });
 
   it('resolves a relative directory to an absolute path', () => {
@@ -102,7 +112,7 @@ describe('writeMcpConfig', () => {
         dir: 'rel/mcp',
       });
       expect(isAbsolute(path)).toBe(true);
-      expect(path).toBe(join(realish(root), 'rel', 'mcp', 's3.json'));
+      expect(path).toBe(join(realish(root), 'rel', 'mcp', ownOwnerDirName(), 's3.json'));
     } finally {
       process.chdir(cwd);
     }
@@ -117,5 +127,77 @@ describe('writeMcpConfig', () => {
     expect(() =>
       writeMcpConfig(servers, { sessionId: '../x', worktree: join(root, 'wt'), dir }),
     ).toThrow(/invalid session id/);
+  });
+
+  it('sweeps only the files of owners that are gone (#108)', async () => {
+    const dir = join(root, 'run', 'mcp');
+    const worktree = join(root, 'wt');
+    const ns = ownOwnerDirName().split('-')[0];
+    const servers = [
+      { name: 't', url: 'http://127.0.0.1:1/mcp', headers: { a: 'Bearer secret-token-1' } },
+    ];
+    // This process's own file, and one of another live owner.
+    const mine = writeMcpConfig(servers, { sessionId: 'mine', worktree, dir });
+    const live = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    const deadExited = new Promise((r) => dead.once('exit', r));
+    try {
+      const plant = (owner: string, file: string) => {
+        mkdirSync(join(dir, owner), { recursive: true, mode: 0o700 });
+        writeFileSync(join(dir, owner, file), '{"token":"secret-token-1"}', { mode: 0o600 });
+      };
+      await new Promise((r) => setTimeout(r, 100));
+      const liveOwner = ownerDirName(live.pid as number);
+      plant(liveOwner, 'a.json');
+      // A dead owner: its process has exited.
+      const deadOwner = ownerDirName(dead.pid as number);
+      await deadExited;
+      await expect.poll(() => isProcessRunning(dead.pid as number)).toBe(false);
+      plant(deadOwner, 'b.json');
+      plant(deadOwner, 'c.json');
+      // A live pid whose start time does not match: a reused pid, so a dead owner.
+      plant(`${ns}-${live.pid}-000000000000`, 'd.json');
+      // A writer that could not read its own start time: kept while its pid lives, not after.
+      plant(`${ns}-${live.pid}-unknown`, 'e.json');
+      plant(`${ns}-${dead.pid}-unknown`, 'f.json');
+      // Another pid namespace (a container sharing the home directory): never touched.
+      plant(`${ns}7-${dead.pid}-000000000000`, 'g.json');
+      // A symlinked owner directory: never followed or removed.
+      mkdirSync(join(root, 'elsewhere'));
+      writeFileSync(join(root, 'elsewhere', 'keep.json'), '{}');
+      symlinkSync(join(root, 'elsewhere'), join(dir, `${ns}-${dead.pid}-111111111111`));
+      // Not an owner directory: never touched.
+      writeFileSync(join(dir, 'legacy.json'), '{}');
+      expect(sweepStaleMcpConfigs(dir)).toBe(4);
+      expect(readdirSync(dir).sort()).toEqual(
+        [
+          liveOwner,
+          ownOwnerDirName(),
+          'legacy.json',
+          `${ns}-${live.pid}-unknown`,
+          `${ns}7-${dead.pid}-000000000000`,
+          `${ns}-${dead.pid}-111111111111`,
+        ].sort(),
+      );
+      expect(existsSync(join(root, 'elsewhere', 'keep.json'))).toBe(true);
+      expect(existsSync(mine)).toBe(true);
+      expect(existsSync(join(dir, liveOwner, 'a.json'))).toBe(true);
+      expect(sweepStaleMcpConfigs(dir)).toBe(0);
+    } finally {
+      live.kill('SIGKILL');
+    }
+  });
+
+  it('removes the owner directory with its last file', () => {
+    const dir = join(root, 'run', 'mcp');
+    const servers = [{ name: 't', url: 'http://127.0.0.1:1/mcp' }];
+    const a = writeMcpConfig(servers, { sessionId: 'a', worktree: join(root, 'wt'), dir });
+    const b = writeMcpConfig(servers, { sessionId: 'b', worktree: join(root, 'wt'), dir });
+    removeMcpConfig(a);
+    expect(existsSync(b)).toBe(true);
+    removeMcpConfig(b);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
