@@ -42,7 +42,7 @@ Notes:
   - `-c features.daemon_auto_start=false`, or `[features] daemon_auto_start = false` in `config.toml`, stops it. Run that way, no daemon was left and resume behaved the same (`DAEMON=flag` and `DAEMON=off` in `codex-tui.mjs`).
   - `codex exec` started no daemon.
   - Whether the daemon sends telemetry during a mock run (`--analytics-default-enabled`) was not checked.
-  - #171: the daemon keeps the session's `TACET_WORKER_MARKER`, so the Mini-conductor's crash sweep (#127) ends it (`codex-daemon-marker.mjs`: both daemon processes carried the marker; the sweep ended both). It is not swept at a clean close: it is shared by every Codex session with the same `CODEX_HOME`, and ending it while another session uses it cut that session off (seen live). Codex presets set `daemon_auto_start=false` instead.
+  - #171: the daemon keeps the session's `TACET_WORKER_MARKER`, so the Mini-conductor's crash sweep (#127) ends it (`codex-daemon-marker.mjs`: both daemon processes carried the marker; the sweep ended both). It is not swept at a clean close: it is shared by every Codex session with the same `CODEX_HOME`. `codex-shared-daemon.mjs` runs two concurrent interactive sessions A and B with one `CODEX_HOME`: B connects to the daemon A started (A's marker; B's own marker is on its `codex` only). After A closed and its marker was swept, B's next turn reached the mock API 0 times (B stayed `running`); in the control run (`NOSWEEP=1`) it reached it 2 times. Linux only; macOS was not run. Codex presets set `daemon_auto_start=false` instead.
   - Telemetry: `codex app-server --help` (0.167.0) says analytics are off by default for the app-server, and `--analytics-default-enabled`, which the managed daemon runs with, turns them on unless `config.toml` sets `[analytics] enabled = false`. No traffic was observed in the mock runs, which does not show there is none.
 - The interactive Codex UI sent one title-generation request to the model per session started or resumed. Each run here had one turn, so whether it repeats per turn was not checked. Either way it is extra cost.
 - An interactive Gemini preset must get past the API-key dialog. This is a preset setup question, not a resume one.
@@ -56,6 +56,7 @@ node docs/adapters/spikes/168-resume-scope/codex-exec.mjs "$PWD" <path to the co
 node docs/adapters/spikes/168-resume-scope/codex-tui.mjs  "$PWD" <path to the codex binary>
 node docs/adapters/spikes/168-resume-scope/gemini.mjs     "$PWD" <path to gemini's bundle/gemini.js>
 node docs/adapters/spikes/168-resume-scope/codex-daemon-marker.mjs "$PWD" <path to the codex binary>
+node docs/adapters/spikes/168-resume-scope/codex-shared-daemon.mjs "$PWD" <path to the codex binary>   # NOSWEEP=1 for the control
 ```
 
 The binaries are the ones pnpm installs: `@openai/codex` 0.167.0 (`vendor/<target>/bin/codex`, found with `realpath "$(find node_modules/.pnpm -path '*codex@0.167*/bin/codex' -type f | head -1)"`) and `@google/gemini-cli` 0.67.0 (its `bin` entry, `bundle/gemini.js`). `codex-tui.mjs` reports and stops any daemon left running before it removes its temporary home. Each script spawns the CLI asynchronously, because the mock API runs in the same process.
