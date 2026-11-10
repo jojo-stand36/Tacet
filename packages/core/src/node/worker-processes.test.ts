@@ -99,10 +99,12 @@ describe.skipIf(process.platform === 'win32')('Worker processes by marker (#127)
     const kids = [await a.grandchild, await b.grandchild];
     const bystander = await other.grandchild;
     const pids = [a.leader.pid, b.leader.pid, ...kids] as number[];
-    expect(await endMarkedProcesses([m1, m2], { graceMs: 300 })).toBe(pids.length);
+    const ended = await endMarkedProcesses([m1, m2], { graceMs: 300 });
+    expect(ended.found).toEqual(expect.arrayContaining(pids));
+    expect(ended.left).toEqual([]);
     for (const pid of pids) await expect.poll(() => alive(pid)).toBe(false);
     expect(alive(bystander)).toBe(true);
     expect(alive(other.leader.pid as number)).toBe(true);
-    expect(await endMarkedProcesses([m1, m2])).toBe(0);
+    expect(await endMarkedProcesses([m1, m2])).toEqual({ found: [], left: [] });
   });
 });

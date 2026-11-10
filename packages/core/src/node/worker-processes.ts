@@ -58,7 +58,8 @@ export function markedProcesses(markers: readonly string[]): Map<string, number[
     return found;
   }
   // macOS: the environment follows the command, as space-separated `NAME=value` words. An exact
-  // word match is enough: the marker is a random id.
+  // word match is enough: the marker is a random id (a process whose arguments hold the very same
+  // word, such as a `grep` for it, would match too).
   const out = execFileSync(
     '/bin/ps',
     ['-E', '-ww', '-x', '-U', String(process.getuid?.() ?? ''), '-o', 'pid=,command='],
@@ -88,15 +89,15 @@ function signal(pid: number, sig: NodeJS.Signals): void {
  * End every process carrying one of `markers`: SIGTERM (Claude Code ends its own tools on
  * SIGTERM), then SIGKILL for whatever is still there after `graceMs`. Each round looks the
  * processes up again, so only processes that carry a marker at that moment are signalled.
- * Returns how many were found.
+ * Returns the pids found, and those still there after SIGKILL (normally none).
  */
 export async function endMarkedProcesses(
   markers: readonly string[],
   opts: { graceMs?: number } = {},
-): Promise<number> {
+): Promise<{ found: number[]; left: number[] }> {
   const pids = () => [...markedProcesses(markers).values()].flat();
   const first = pids();
-  if (first.length === 0) return 0;
+  if (first.length === 0) return { found: [], left: [] };
   for (const pid of first) signal(pid, 'SIGTERM');
   const deadline = Date.now() + (opts.graceMs ?? 5000);
   let left = pids();
@@ -104,10 +105,12 @@ export async function endMarkedProcesses(
     await new Promise((r) => setTimeout(r, 100));
     left = pids();
   }
-  for (const pid of left) signal(pid, 'SIGKILL');
+  // Each round signals what is there now, so a process forked meanwhile is not missed.
   const killDeadline = Date.now() + 2000;
-  while (pids().length > 0 && Date.now() < killDeadline) {
-    await new Promise((r) => setTimeout(r, 50));
+  while (left.length > 0 && Date.now() < killDeadline) {
+    for (const pid of left) signal(pid, 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 100));
+    left = pids();
   }
-  return first.length;
+  return { found: first, left };
 }

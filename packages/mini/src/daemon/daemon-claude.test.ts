@@ -5,7 +5,13 @@ import { ClaudeSdkAdapter } from '@tacet/adapter-claude-sdk';
 import { type MockMessagesApi, startMockMessagesApi } from '@tacet/adapter-claude-sdk/testing';
 import type { SessionHandle, SessionOptions } from '@tacet/core';
 import { newUlid, tasksProjection } from '@tacet/core';
-import { type EventStore, markedProcesses, openEventStore, WorkerTokens } from '@tacet/core/node';
+import {
+  type EventStore,
+  endMarkedProcesses,
+  markedProcesses,
+  openEventStore,
+  WorkerTokens,
+} from '@tacet/core/node';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import { MiniMcpServer } from '../mcp/server.js';
@@ -39,8 +45,20 @@ describe('Mini-conductor with a real Claude Worker', () => {
     ws = new TempWorkspaces();
   });
 
+  /** Every Worker marker a test recorded, so a failed test leaves no Worker running. */
+  const markerFiles: string[] = [];
+  const leftovers: string[] = [];
+
   afterAll(async () => {
     await daemon?.stop();
+    for (const f of markerFiles) {
+      try {
+        await endMarkedProcesses(JSON.parse(readFileSync(f, 'utf8')) as string[]);
+      } catch {
+        // No file: nothing was recorded.
+      }
+    }
+    await endMarkedProcesses(leftovers);
     await server?.close();
     store?.close();
     await api?.close();
@@ -158,6 +176,7 @@ describe('Mini-conductor with a real Claude Worker', () => {
       }
     }
     const lockPath = join(root, 'crash', 'mini.lock');
+    markerFiles.push(`${lockPath}.workers`);
     const make = (adapter: ClaudeSdkAdapter) =>
       new MiniConductor({
         store,
@@ -181,6 +200,7 @@ describe('Mini-conductor with a real Claude Worker', () => {
     const state = () => store.replay(tasksProjection).tasks[sub]?.state;
     await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('input_required');
     previous = JSON.parse(readFileSync(`${lockPath}.workers`, 'utf8')) as string[];
+    leftovers.push(...previous);
     expect(previous).toHaveLength(1);
     const workspaceId = (
       store.query({ taskId: sub, typePrefix: 'worker.started' })[0]?.envelope.data as

@@ -890,6 +890,12 @@ export class MiniConductor {
       });
     } catch (err) {
       revoke();
+      // Whatever a failed start left running goes now, not at the next restart.
+      this.#track(
+        endMarkedProcesses([marker]).then(() => {
+          if (this.#markers.delete(sessionId)) this.#saveMarkers();
+        }),
+      );
       if (!this.#live(gen)) return;
       this.#errors.push(err);
       this.#o.store.append(
@@ -1286,7 +1292,14 @@ export class MiniConductor {
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.#errors.push(err);
     }
-    if (markers.length > 0) await endMarkedProcesses(markers);
+    if (markers.length > 0) {
+      const { left } = await endMarkedProcesses(markers);
+      if (left.length > 0) {
+        this.#errors.push(
+          new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`),
+        );
+      }
+    }
     this.#markers.clear();
     this.#saveMarkers();
   }
