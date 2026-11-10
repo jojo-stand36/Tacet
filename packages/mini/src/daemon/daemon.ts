@@ -40,7 +40,7 @@ import {
   type Workspaces,
   WorktreeRefusedError,
 } from './ports.js';
-import { RESUME_PROMPT, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
+import { RESUME_PROMPT, safe, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
 
 export interface MiniConductorOptions {
@@ -938,7 +938,7 @@ export class MiniConductor {
     // Answers that came while no session was open go into the first message.
     const answers = this.#undelivered(subtaskId);
     const text = resume
-      ? [RESUME_PROMPT, ...answers.map(answerText)].join('\n\n')
+      ? safe([RESUME_PROMPT, ...answers.map(answerText)], '\n\n')
       : workerPrompt(view.task, this.#lastFeedback(subtaskId), [
           ...(history.length > 0 && v.progress.has(subtaskId)
             ? [`Progress reported before: ${v.progress.get(subtaskId)}`]
@@ -1328,7 +1328,7 @@ export class MiniConductor {
     run.lastActivity = this.#now().getTime();
     run.nudgedAt = undefined;
     try {
-      await worker.adapter.send(run.handle, { text: answers.map(answerText).join('\n') });
+      await worker.adapter.send(run.handle, { text: safe(answers.map(answerText)) });
     } catch (err) {
       run.turnActive = false;
       this.#errors.push(err);
