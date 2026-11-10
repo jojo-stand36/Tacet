@@ -88,6 +88,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
+- [ ] **ACP adapter: close() after a self-exit must not poll the reaped process group again** — `chore` `P2` `claude`
 
 ## M2 · Conductor & escalation
 
