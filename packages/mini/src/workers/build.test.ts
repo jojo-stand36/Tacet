@@ -61,6 +61,18 @@ describe('buildWorkerAdapters', () => {
     );
     expect(pty['pty:claude']?.adapter.id).toBe('pty:claude');
     expect(pty['pty:aider']?.adapter.id).toBe('pty:aider');
+    // Resumable only with resume arguments, one or several (#157).
+    expect(pty['pty:aider']?.adapter.capabilities().resume).toBe(false);
+    for (const resume_flag of ['--restore-chat-history', ['resume', '--last']]) {
+      const resumable = buildWorkerAdapters(
+        config({
+          tiers: { worker: { adapter: 'pty:codex' } },
+          agents: { codex: { kind: 'pty', command: ['codex'], resume_flag } },
+        }),
+        { baseEnv: {} },
+      );
+      expect(resumable['pty:codex']?.adapter.capabilities().resume).toBe(true);
+    }
   });
 
   it('names the tier or config path for everything it cannot build', () => {
