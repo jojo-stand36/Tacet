@@ -1,5 +1,5 @@
-import { type Dirent, lstatSync, readdirSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute, join, relative, sep } from 'node:path';
+import { type Dirent, lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { redactSecrets } from '@tacet/core';
 
 /**
@@ -311,14 +311,15 @@ const LINK_WALK_LIMIT = 2000;
  * Where protected config really is when a symlink is involved, as folded segments relative to the
  * real root (#227 review): a root-level protected name with a symlink at any of its components
  * (`.tacet -> config/tacet`, `.github -> ci/github`), and every symlink inside a protected
- * directory at the root (`.tacet/tacet.yaml -> ../cfg.yaml`). What is written at a target is
- * still read as that config. Null, so every write is refused, when that cannot be told: a dangling
- * link (a write could create its target), a link to the checkout root, or a protected directory
- * too big to walk. A target outside the checkout needs nothing: writes there are refused anyway.
+ * directory at the root, at any depth and through linked directories (`.tacet/tacet.yaml ->
+ * ../cfg.yaml`). What is written at a target is still read as that config, and a dangling link's
+ * target is protected before it exists. A target outside the checkout needs nothing: writes there
+ * are refused anyway. Null, so every write is refused, when that cannot be told: a link that
+ * cannot be followed (a loop), a link to the checkout root, or a walk over the entry limit.
  */
 function linkedConfig(root: string): string[][] | null {
   const out: string[][] = [];
-  /** False when the target is the root itself. */
+  /** Records `real` if it is inside the checkout; false when it is the root itself. */
   const add = (real: string): boolean => {
     const r = relative(root, real);
     if (r === '') return false;
@@ -330,53 +331,72 @@ function linkedConfig(root: string): string[][] | null {
     ...PROTECTED_FILES.map((f) => [f]),
     ...PROTECTED_IN.map(([d, f]) => [d, f]),
   ];
-  let seen = 0;
+  const stack: string[] = [];
   for (const segs of names) {
-    // The deepest existing prefix of the name, and whether a symlink is on the way to it.
-    let link = false;
-    let i = 0;
-    for (; i < segs.length; i++) {
-      try {
-        if (lstatSync(join(root, ...segs.slice(0, i + 1))).isSymbolicLink()) link = true;
-      } catch {
-        break;
-      }
-    }
-    if (i === 0) continue;
-    let real: string;
+    const given = join(root, ...segs);
+    const real = landing(given);
+    if (real === null) return null;
+    if (real !== given && !add(real)) return null;
+    stack.push(real);
+  }
+  // Symlinks inside the protected directories, following linked directories inside the checkout.
+  const visited = new Set<string>();
+  let seen = 0;
+  for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
+    if (visited.has(dir)) continue;
+    visited.add(dir);
+    let entries: Dirent[];
     try {
-      real = realpathSync.native(join(root, ...segs.slice(0, i)));
+      entries = readdirSync(dir, { withFileTypes: true });
     } catch {
-      return null;
+      continue; // Not there, a file, or not readable: nothing inside to follow.
     }
-    if (link && !add(join(real, ...segs.slice(i)))) return null;
-    if (i < segs.length) continue;
-    // Symlinks inside a protected directory, at any depth; links are not followed.
-    const stack = [real];
-    for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
-      let entries: Dirent[];
-      try {
-        entries = readdirSync(dir, { withFileTypes: true });
-      } catch {
-        continue; // A file, or not readable: nothing inside to follow.
-      }
-      for (const e of entries) {
-        if (++seen > LINK_WALK_LIMIT) return null;
-        const p = join(dir, e.name);
-        if (e.isDirectory()) stack.push(p);
-        else if (e.isSymbolicLink()) {
-          let t: string;
-          try {
-            t = realpathSync.native(p);
-          } catch {
-            return null;
-          }
-          if (!add(t)) return null;
-        }
+    for (const e of entries) {
+      if (++seen > LINK_WALK_LIMIT) return null;
+      const p = join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isSymbolicLink()) {
+        const t = landing(p);
+        if (t === null || !add(t)) return null;
+        const r = relative(root, t);
+        if (r !== '..' && !r.startsWith(`..${sep}`) && !isAbsolute(r)) stack.push(t);
       }
     }
   }
   return out;
+}
+
+/**
+ * Where a write to `p` (absolute) would land after symlinks, even where the target does not
+ * exist yet (a dangling link, a missing parent): the real path of the deepest existing prefix and
+ * the rest lexically. Null when that cannot be told (a symlink loop, an unreadable link).
+ */
+function landing(p: string, depth = 0): string | null {
+  if (depth > 40) return null;
+  try {
+    return realpathSync.native(p);
+  } catch {
+    // Missing, or a link that does not resolve: worked out below.
+  }
+  let link: boolean;
+  try {
+    link = lstatSync(p).isSymbolicLink();
+  } catch {
+    const parent = dirname(p);
+    if (parent === p) return null;
+    const at = landing(parent, depth + 1);
+    return at === null ? null : join(at, basename(p));
+  }
+  if (!link) return null;
+  let to: string;
+  try {
+    to = readlinkSync(p);
+  } catch {
+    return null;
+  }
+  const from = landing(dirname(p), depth + 1);
+  if (from === null) return null;
+  return landing(isAbsolute(to) ? to : join(from, to), depth + 1);
 }
 
 /** Whether `at` (relative to the real root) is one of `targets` or inside one, names folded. */

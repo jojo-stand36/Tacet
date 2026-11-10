@@ -398,11 +398,11 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
 
   it('follows symlinks in protected config the way a committed link resolves (#227 review)', () => {
     const w = (p: string) => ask('Write', { file_path: p, content: '' });
-    // A dangling `.tacet` link: a write would create the config it points at. Fails closed.
+    // A dangling `.tacet` link: a write would create the config it points at.
     symlinkSync('config/tacet', join(wt, '.tacet'));
     expect(w('config/tacet/tacet.yaml')).toMatchObject({ allow: false, reason: /escalate/ });
-    expect(w('src/a.ts').allow).toBe(false);
-    // Once it resolves, only what it points at is protected.
+    expect(w('config/other.yaml').allow).toBe(true);
+    // Once it resolves, still only what it points at is protected.
     mkdirSync(join(wt, 'config', 'tacet'), { recursive: true });
     expect(w('config/tacet/tacet.yaml').allow).toBe(false);
     expect(w('config/tacetx').allow).toBe(true);
@@ -427,9 +427,34 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     symlinkSync('../cfg.yaml', join(wt, '.tacet', 'tacet.yaml'));
     expect(ask('Write', { file_path: 'cfg.yaml', content: '' }).allow).toBe(false);
     expect(ask('Write', { file_path: 'other.yaml', content: '' }).allow).toBe(true);
-    // A dangling one inside fails closed.
+    // A dangling one inside protects the file it would create.
     symlinkSync('../later.yaml', join(wt, '.tacet', 'local.yaml'));
-    expect(ask('Write', { file_path: 'other.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'later.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'other.yaml', content: '' }).allow).toBe(true);
+    // Links inside a linked directory are followed too.
+    mkdirSync(join(wt, '.claude'));
+    mkdirSync(join(wt, 'shared'));
+    symlinkSync('../shared', join(wt, '.claude', 'agents'));
+    writeFileSync(join(wt, 'x.md'), '');
+    symlinkSync('../x.md', join(wt, 'shared', 'a.md'));
+    expect(ask('Write', { file_path: 'x.md', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'shared/new.md', content: '' }).allow).toBe(false);
+    // Personal links out of the checkout, dangling in a fresh worktree, change nothing, and a
+    // loop of directory links ends.
+    symlinkSync('/nonexistent/abs/notes.md', join(wt, '.claude', 'CLAUDE.local.md'));
+    symlinkSync('../.local/notes.md', join(wt, '.claude', 'notes.md'));
+    symlinkSync('.', join(wt, '.claude', 'self'));
+    expect(ask('Write', { file_path: 'src/a.ts', content: '' }).allow).toBe(true);
+    expect(ask('Write', { file_path: '.local/notes.md', content: '' }).allow).toBe(false);
+  });
+
+  it('fails closed on a symlink loop in protected config (#227 review)', () => {
+    symlinkSync('b', join(wt, '.tacet'));
+    symlinkSync('.tacet', join(wt, 'b'));
+    expect(ask('Write', { file_path: 'src/a.ts', content: '' })).toMatchObject({
+      allow: false,
+      reason: /escalate/,
+    });
   });
 
   it('fails closed on a protected name linked to the checkout root (#227 review)', () => {
