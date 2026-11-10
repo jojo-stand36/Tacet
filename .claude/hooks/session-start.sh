@@ -20,6 +20,6 @@ if [ -n "$issue" ]; then
 fi
 
 # Warn about stale generated files.
-node scripts/gen-roadmap.mjs --check >/dev/null 2>&1 || echo "[tacet] ROADMAP.md is stale: run node scripts/gen-roadmap.mjs"
+node scripts/gen-roadmap.mjs --check >/dev/null 2>&1 || echo "[tacet] roadmap files are stale (ROADMAP.md, or roadmap/issues.json order): run node scripts/gen-roadmap.mjs"
 node scripts/sync-agents.mjs --check >/dev/null 2>&1 || echo "[tacet] Copilot agents are stale: run node scripts/sync-agents.mjs"
 exit 0

@@ -1241,6 +1241,28 @@ describe('WorktreeManager', () => {
     expect(await manager.head()).toEqual({ commit });
   });
 
+  it('holds a pinned target with a ref, so git gc never prunes it (#236)', async () => {
+    const commitOnMain = async (file: string) => {
+      await writeFile(path.join(repository, file), `${file}\n`);
+      await git(repository, ['add', file]);
+      await git(repository, ['commit', '-m', file]);
+      return (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    };
+    const pinned = await commitOnMain('pinned.txt');
+    const unpinned = await commitOnMain('unpinned.txt');
+    await manager.pin('task-1', pinned);
+    expect((await git(repository, ['rev-parse', 'refs/tacet/task-1/target'])).trim()).toBe(pinned);
+    // The user rewrites the branch, and git prunes what nothing holds.
+    await git(repository, ['reset', '-q', '--hard', 'HEAD~2']);
+    await git(repository, ['reflog', 'expire', '--expire=now', '--all']);
+    await git(repository, ['gc', '-q', '--prune=now']);
+
+    expect((await manager.create('later', pinned)).baseCommit).toBe(pinned);
+    await expect(manager.create('lost', unpinned)).rejects.toThrow();
+    await expect(manager.pin('task-2', 'HEAD')).rejects.toThrow(/full commit id/);
+    await expect(manager.pin('task-2', 'f'.repeat(40))).rejects.toThrow();
+  });
+
   it('ignores busy markers left by a manager that died', async () => {
     const worktree = await manager.create('orphaned-marker-worker');
     const child = execFile(process.execPath, ['-e', '']);

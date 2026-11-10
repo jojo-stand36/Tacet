@@ -36,6 +36,11 @@ export interface Workspaces {
    * when the sub-task starts.
    */
   head?(): Promise<{ branch?: string; commit: string }>;
+  /**
+   * Hold `commit` with a ref of the task's (`refs/tacet/<task>/target`), so git gc never prunes
+   * the commit a task's sub-tasks start from (#236).
+   */
+  pin?(taskId: string, commit: string): Promise<void>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   /**

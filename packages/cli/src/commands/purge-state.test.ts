@@ -11,7 +11,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { newUlid } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { WorktreeManager } from '@tacet/mini';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -419,5 +420,96 @@ describe('tacet uninstall --purge: run state (#211)', () => {
       expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(0);
       expect(existsSync(paths().dir)).toBe(false);
     });
+  });
+
+  /** An event log at `events` in which these tasks pinned their target (#219, #236). */
+  function pinnedIn(events: string, ids: string[]) {
+    // This state's log is the one the fixture keeps open; another state's is made here.
+    const own = events === paths().events;
+    if (!own) mkdirSync(dirname(events), { recursive: true });
+    if (own) store ??= openEventStore(events);
+    const log = own && store ? store : openEventStore(events);
+    const commit = git(repo, ['rev-parse', 'HEAD']);
+    for (const taskId of ids) {
+      log.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'standalone' },
+        taskId,
+        type: 'task.target',
+        data: { branch: 'main', commit },
+      });
+    }
+    if (!own) log.close();
+  }
+
+  it("deletes the internal refs of this state's tasks, and keeps the tacet branches (#236)", async () => {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    pinnedIn(paths().events, ['task-1']);
+    git(repo, ['update-ref', 'refs/tacet/task-1/target', head]);
+    const preview = await tacet(['uninstall', '--purge']);
+    expect(preview.out).toContain('would delete refs/tacet/task-1/target');
+    expect(git(repo, ['rev-parse', 'refs/tacet/task-1/target'])).toBe(head);
+
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain('deleted refs/tacet/task-1/target');
+    expect(git(repo, ['for-each-ref', 'refs/tacet/'])).toBe('');
+    expect(git(repo, ['for-each-ref', '--format=%(refname)', 'refs/heads/tacet/'])).toBe(
+      'refs/heads/tacet/some-task/result',
+    );
+  });
+
+  it("never deletes another run state's refs on the same repository (#236)", async () => {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    // A second checkout of the repository, with its own run state and its own pinned task.
+    const other = join(dir, 'other');
+    git(repo, ['worktree', 'add', '-q', '--detach', other]);
+    const otherPaths = statePaths(other, join(home, '.tacet'), home);
+    expect(otherPaths.dir).not.toBe(paths().dir);
+    pinnedIn(otherPaths.events, ['task-other']);
+    pinnedIn(paths().events, ['task-1']);
+    git(repo, ['update-ref', 'refs/tacet/task-1/target', head]);
+    git(repo, ['update-ref', 'refs/tacet/task-other/target', head]);
+
+    const preview = await tacet(['uninstall', '--purge']);
+    expect(preview.out).toContain('would delete refs/tacet/task-1/target');
+    expect(preview.out).not.toContain('task-other');
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.code).toBe(0);
+    expect(r.out).not.toContain('task-other');
+    expect(git(repo, ['for-each-ref', '--format=%(refname)', 'refs/tacet/'])).toBe(
+      'refs/tacet/task-other/target',
+    );
+  });
+
+  it('deletes no ref when the event log cannot be read, and says so (#236)', async () => {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['update-ref', 'refs/tacet/task-1/target', head]);
+    store?.close();
+    store = undefined;
+    for (const f of readdirSync(paths().dir)) {
+      if (f.startsWith('events.db')) rmSync(join(paths().dir, f));
+    }
+    writeFileSync(paths().events, 'not really a database');
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.err).toContain('the event log could not be read, so no refs/tacet/* ref was deleted');
+    expect(git(repo, ['rev-parse', 'refs/tacet/task-1/target'])).toBe(head);
+  });
+
+  it('warns when it cannot delete an internal ref (#236)', async () => {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    pinnedIn(paths().events, ['task-1']);
+    git(repo, ['update-ref', 'refs/tacet/task-1/target', head]);
+    // A held ref lock makes the delete fail.
+    const lock = join(
+      git(repo, ['rev-parse', '--absolute-git-dir']),
+      'refs/tacet/task-1/target.lock',
+    );
+    writeFileSync(lock, '');
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.err).toContain('could not delete refs/tacet/task-1/target');
+    expect(git(repo, ['rev-parse', 'refs/tacet/task-1/target'])).toBe(head);
   });
 });

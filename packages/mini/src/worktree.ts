@@ -307,6 +307,11 @@ function holderIsLive(pid: number, modifiedMs: number): boolean {
   );
 }
 
+/** `refs/tacet/<task>/target`, with the task id made ref-safe as `taskBranch` does (#236). */
+export function targetRef(taskId: string): string {
+  return `${taskBranch(taskId).replace(/^refs\/heads\/tacet\//, 'refs/tacet/')}/target`;
+}
+
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
 }
@@ -347,6 +352,16 @@ export class WorktreeManager implements Workspaces {
     options: CreateWorktreeOptions = {},
   ): Promise<WorktreeInfo> {
     return this.createWorktree(workerId, base, options, this.newId(workerId));
+  }
+
+  /**
+   * Point `refs/tacet/<task>/target` at `commit` (#236): the commit a task's sub-tasks start from,
+   * held so git gc never prunes it. Outside `refs/heads`, so it is no branch of the user's.
+   */
+  async pin(taskId: string, commit: string): Promise<void> {
+    if (!commitIdPattern.test(commit)) throw new Error('pin: expected a full commit id');
+    await this.git(['rev-parse', '--verify', '--quiet', '--end-of-options', `${commit}^{commit}`]);
+    await this.git(['update-ref', '--no-deref', targetRef(taskId), commit]);
   }
 
   /** The repo's checked-out branch (absent when HEAD is detached) and its commit (#219). */
