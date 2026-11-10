@@ -131,6 +131,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
+- [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
 
 ## M4 · Visual & terminal UI
