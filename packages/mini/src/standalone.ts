@@ -97,6 +97,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
       codex: { ...o.workers?.codex, stateDir },
       acp: { ...o.workers?.acp, stateDir },
+      claude: { ...o.workers?.claude, stateDir },
     });
   const tiers = config.tiers ?? {};
   const workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, { env: baseEnv });
