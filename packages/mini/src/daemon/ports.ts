@@ -111,6 +111,28 @@ export interface Integrator {
     workspace: Workspace,
     commit?: string,
   ): Promise<{ path: string; untracked: boolean }[] | undefined>;
+  /**
+   * Commit the checkout's uncommitted changes for a Worker that cannot run git (#260), onto
+   * `parent` (or its HEAD) by Tacet's own Worker identity, and point the sub-task's branch at it.
+   * `refused` when a change is protected config or too big; undefined when there is nothing.
+   */
+  commitFor?(
+    subtaskId: string,
+    workspace: Workspace,
+    o: {
+      parent?: string;
+      message: string;
+      skip?: (c: { path: string; untracked: boolean }) => boolean;
+    },
+  ): Promise<
+    | { commit: string; ref: string; paths: string[] }
+    | {
+        refused:
+          | { why: 'protected'; paths: string[] }
+          | { why: 'too-big'; bytes: number; files: number };
+      }
+    | undefined
+  >;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
   /**
@@ -144,6 +166,11 @@ export class MergeConflictError extends Error {
 export interface VerifyContext {
   /** The integrated commit the checkout must be at, when the Worker's work was integrated. */
   commit?: string;
+  /**
+   * Untracked paths the Mini-conductor vouches for, which do not make the checkout unclean: the
+   * empty placeholders of Claude Code's sandbox, which no commit has (#260, #263).
+   */
+  ignoreUntracked?: (path: string) => boolean;
   /** Aborted when the session ends or the Mini-conductor stops: the run ends as `not_run`. */
   signal: AbortSignal;
   /**

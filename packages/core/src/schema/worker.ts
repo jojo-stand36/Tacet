@@ -122,12 +122,18 @@ export type WorkerNudged = z.infer<typeof WorkerNudged>;
 
 /**
  * Payload of `worker.integrated`: the Mini-conductor brought the Worker's commit into the repo's
- * shared object store and pointed the sub-task's branch at it (#119).
+ * shared object store and pointed the sub-task's branch at it (#119), or committed the changes in
+ * the Worker's checkout for it (#260).
  */
 export const WorkerIntegrated = z.object({
   sessionId: Id,
   commit: z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id'),
   ref: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
+  by: openEnum(['worker', 'tacet'], 'worker')
+    .optional()
+    .describe(
+      "Who made the commit: the Worker, or Tacet, from the changes in the checkout of a Worker that cannot run git (#260), as 'Tacet Worker'. Absent in older events, and when a retry integrates the checkout's HEAD, which may be Tacet's commit of an earlier attempt (its author says)",
+    ),
 });
 export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;
 
