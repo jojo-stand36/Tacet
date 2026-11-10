@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,7 @@ import { newUlid, tasksProjection } from '@tacet/core';
 import {
   type EventStore,
   endMarkedProcesses,
+  isProcessRunning,
   markedProcesses,
   openEventStore,
   WorkerTokens,
@@ -151,19 +153,17 @@ describe('Mini-conductor with a real Claude Worker', () => {
       // The Mini-conductor refuses every approval but its own tools: Bash is allowed up front.
       sdkOptions: { settingSources: [], allowedTools: ['Bash'] },
     });
-    /** Running, not a zombie (in a container, PID 1 may never reap an orphan). */
-    const alive = (pid: number) => {
+    // Running and not a zombie: this test process is the parent of the Claude Code it started,
+    // and on macOS a killed child it has not reaped yet still answers kill(pid, 0) (#127 flake).
+    const alive = isProcessRunning;
+    /** What `ps` says about a process, for a failure message. */
+    const psLine = (pid: number) => {
       try {
-        process.kill(pid, 0);
+        return execFileSync('ps', ['-o', 'pid=,ppid=,stat=,command=', '-p', String(pid)], {
+          encoding: 'utf8',
+        }).trim();
       } catch {
-        return false;
-      }
-      if (process.platform !== 'linux') return true;
-      try {
-        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-        return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) !== 'Z';
-      } catch {
-        return false;
+        return `${pid}: no such process`;
       }
     };
     /** The previous run's Worker processes, as found when each new session started. */
@@ -234,7 +234,7 @@ describe('Mini-conductor with a real Claude Worker', () => {
     daemon = make(new Probe(options()));
     await daemon.start();
     // Gone as soon as start() returns, before any Worker session starts.
-    for (const pid of before) expect(alive(pid)).toBe(false);
+    for (const pid of before) expect(alive(pid), psLine(pid)).toBe(false);
     await expect.poll(state, { timeout: 60_000, interval: 100 }).toBe('completed');
     expect(leftAtStart.length).toBeGreaterThan(0);
     expect(leftAtStart.flat()).toEqual([]);
