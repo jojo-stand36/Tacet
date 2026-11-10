@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ProfileRefusedError } from '@tacet/core';
+import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -253,7 +253,7 @@ describe('PtyAdapter (fake claude)', () => {
     await expect(ok.start({ cwd, effort: 'high' })).rejects.toThrow(ProfileRefusedError);
     const id = randomUUID();
     await expect(ok.start({ cwd, resume: { vendorSessionId: id, fork: true } })).rejects.toThrow(
-      /fork/,
+      ForkRefusedError,
     );
     await expect(ok.start({ cwd, resume: { vendorSessionId: '../../x' } })).rejects.toThrow(/UUID/);
     await expect(ok.start({ cwd, resume: { vendorSessionId: id } })).rejects.toThrow(
