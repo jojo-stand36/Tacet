@@ -229,6 +229,39 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     expect(adapter.status(h)).toBe('done');
   });
 
+  it('scrubs a Worker token split across two deltas (#109)', async () => {
+    const token = 'w0rkerT0ken-abcdef123456';
+    const adapter = new CodexAppServerAdapter({
+      codexPath: FAKE,
+      killTimeoutMs: 1000,
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: root,
+        OPENAI_API_KEY: FAKE_KEY,
+        FAKE_MODE: 'split-delta',
+        FAKE_DELTAS: JSON.stringify([`echo ${token.slice(0, 9)}`, `${token.slice(9)} done`]),
+        FAKE_LOG: join(root, 'log.jsonl'),
+      },
+    });
+    const h = await adapter.start({
+      cwd: root,
+      mcpServers: [
+        {
+          name: 'tacet',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: { authorization: `Bearer ${token}` },
+        },
+      ],
+    });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+    expect(JSON.stringify(tap.events)).not.toContain(token.slice(0, 9));
+    expect(deltas.join('')).toBe('echo [redacted] done');
+    await adapter.close(h);
+  });
+
   it('maps a failed turn to error with its message', async () => {
     const adapter = make('normal');
     const h = await adapter.start({ cwd: root });

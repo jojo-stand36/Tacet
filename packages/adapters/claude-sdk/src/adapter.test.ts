@@ -234,6 +234,37 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(usage[0]).toMatchObject({ inputTokens: 0, outputTokens: 0, source: 'estimated' });
   });
 
+  it('scrubs a Worker token the model echoes split across two deltas (#109)', async () => {
+    const token = 'w0rkerT0ken-abcdef123456';
+    for (const cut of [1, 7, 12, token.length - 1]) {
+      const stub = stubQuery();
+      const { adapter, h, tap } = await session(stub, {
+        mcpServers: [
+          {
+            name: 'tacet',
+            url: 'http://127.0.0.1:1/mcp',
+            headers: { authorization: `Bearer ${token}` },
+          },
+        ],
+      });
+      const text = (t: string) =>
+        stub.out.push({
+          type: 'stream_event',
+          parent_tool_use_id: null,
+          event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: t } },
+        });
+      text(`my token is ${token.slice(0, cut)}`);
+      text(`${token.slice(cut)} ok`);
+      stub.out.push(result(0));
+      // The turn's usage comes after its text, and flushes the held-back tail first.
+      await usages(tap, 1);
+      const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+      expect(JSON.stringify(tap.events)).not.toContain(token);
+      expect(deltas.join('')).toBe('my token is [redacted] ok');
+      await adapter.close(h);
+    }
+  });
+
   it('reports tokens, model and context per top-level model call', async () => {
     const stub = stubQuery();
     const { adapter, h, tap } = await session(stub, { model: 'requested-model' });
