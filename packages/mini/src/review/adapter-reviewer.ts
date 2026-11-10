@@ -192,9 +192,10 @@ export class AdapterReviewer implements Reviewer {
       return { status: 'passed', ...base, findings: [], notes: 'no change to review' };
     }
     if (ctx.signal.aborted) return error('the review was stopped');
-    // An empty directory of its own as cwd, never a checkout: a vendor CLI loads project
-    // settings, hooks and instructions from its cwd (the Claude Agent SDK loads every settings
-    // source by default), and a checkout of the Worker's commit would hand it the Worker's.
+    // An empty directory of its own as cwd, never a checkout: a vendor CLI may load project
+    // settings, hooks and instructions from its cwd, and a checkout of the Worker's commit would
+    // hand it the Worker's. Defence in depth: since #181 the Claude SDK adapter loads no
+    // filesystem settings by default (capability matrix, "Project files loaded from the checkout").
     const cwd = await mkdtemp(join(this.#o.tmpDir ?? tmpdir(), 'tacet-review-'));
     try {
       return await this.#session(task, ctx, diff, cwd, base, error);
