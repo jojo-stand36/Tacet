@@ -407,8 +407,27 @@ for (const c of CASES) {
         const spec = claudeAcpWorkerSpec(c.agent(api.url));
         expect(spec.capabilities).toMatchObject({ resume: true, fork: 'native' });
         expect(spec.sessionMode).toBe('default');
-        // The same Worker options without the mode pin, and without any session options.
-        const { sessionMode: _mode, ...unpinned } = spec;
+        // Variants of it: without the mode pin, the ask rule (#214) or verbatim prompts, and
+        // without any session options at all.
+        const variant = (o: { pin?: boolean; ask?: boolean; verbatim?: boolean }): AcpAgentSpec => {
+          const { sessionMode, sessionMeta, ...rest } = spec;
+          const { settings, verbatimPrompts, ...options } = (
+            sessionMeta as { claudeCode: { options: Record<string, unknown> } }
+          ).claudeCode.options;
+          return {
+            ...rest,
+            ...(o.pin !== false ? { sessionMode } : {}),
+            sessionMeta: {
+              claudeCode: {
+                options: {
+                  ...options,
+                  ...(o.ask !== false ? { settings } : {}),
+                  ...(o.verbatim !== false ? { verbatimPrompts } : {}),
+                },
+              },
+            },
+          };
+        };
         const { sessionMeta: _meta, ...bare } = spec;
         // A checkout a Worker could have written: a hook, CLAUDE.md and .mcp.json (#181).
         const cwd = join(root, 'wt-224');
@@ -429,17 +448,25 @@ for (const c of CASES) {
             },
           }),
         );
+        // A file in the checkout, which `default` mode reads unasked and the ask rule asks
+        // about, and one outside it, which `default` mode asks about and `auto` reads unasked.
+        const inside = join(cwd, 'note.txt');
+        writeFileSync(inside, 'CONTENT-IN-224\n');
         const outside = join(root, 'outside-224.txt');
-        writeFileSync(outside, 'outside\n');
+        writeFileSync(outside, 'CONTENT-OUT-224\n');
         // A Worker MCP token, as the Mini-conductor mints one per session: never written to disk.
         const token = 'tacet-worker-token-224-0123456789abcdef';
         type Req = { text?: string; tools?: string[]; raw: string };
         const reqs = () => api.requests as unknown as Req[];
-        /** One session: a word to say, then a read outside the checkout, which must be asked. */
+        /**
+         * One session: a word to say, in a prompt that also mentions both files with `@` (as a
+         * verify command's output could), then a Read of each probe path, refused if asked.
+         */
         const session = async (
           agent: AcpAgentSpec,
           resume: { vendorSessionId: string; fork?: boolean } | undefined,
           word: string,
+          probes: string[],
         ) => {
           const a = new AcpAdapter({
             agent,
@@ -461,57 +488,76 @@ for (const c of CASES) {
             ],
           });
           const tap = new EventTap(a.events(h));
-          await a.send(h, { text: `SAY ${word}` });
+          await a.send(h, { text: `SAY ${word}\n\`\`\`\nsee @note.txt and @${outside}\n\`\`\`` });
           await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
-          const at = tap.events.length;
-          await a.send(h, { text: `READ_TOOL ${outside}` });
-          const asked = await tap.waitFor(
-            (e) => e.t === 'approval.request' || (e.t === 'status' && e.state === 'idle'),
-            60_000,
-            at + 1,
-          );
-          if (asked.event.t === 'approval.request') {
-            await a.respond(h, asked.event.id, { kind: 'reject', persist: false });
-            await tap.waitFor(
-              (e) => e.t === 'status' && e.state === 'idle',
+          const asked: (string | false)[] = [];
+          for (const probe of probes) {
+            const at = tap.events.length;
+            await a.send(h, { text: `READ_TOOL ${probe}` });
+            const next = await tap.waitFor(
+              (e) => e.t === 'approval.request' || (e.t === 'status' && e.state === 'idle'),
               60_000,
-              asked.index + 1,
+              at + 1,
             );
+            if (next.event.t === 'approval.request') {
+              asked.push(next.event.toolName ?? '?');
+              await a.respond(h, next.event.id, { kind: 'reject', persist: false });
+              await tap.waitFor(
+                (e) => e.t === 'status' && e.state === 'idle',
+                60_000,
+                next.index + 1,
+              );
+            } else asked.push(false);
           }
           await new Promise((r) => setTimeout(r, 500));
           await a.close(h);
           const mine = reqs().slice(from);
           // In this container a parent `.git` can prefix the prompt with a git status.
-          const said = mine.filter((r) => (r.text ?? '').endsWith(`SAY ${word}`)).at(-1);
+          const said = mine.filter((r) => (r.text ?? '').includes(`SAY ${word}\n`)).at(-1);
           const tools = (said?.tools ?? []).filter(
             (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
           );
+          const sent = (x: string) => mine.some((r) => r.raw.includes(x));
           return {
             id: h.vendorSessionId as string,
-            asked: asked.event.t === 'approval.request',
+            asked,
             tools: tools.sort(),
             raw: said?.raw ?? '',
             // Every request of the session, the title and suggestion calls included.
-            claudeMd: mine.some((r) => r.raw.includes('CLAUDEMD-MARKER-224')),
+            claudeMd: sent('CLAUDEMD-MARKER-224'),
+            leakedIn: sent('CONTENT-IN-224'),
+            leakedOut: sent('CONTENT-OUT-224'),
           };
         };
         const allow = [...CLAUDE_ACP_WORKER_OPTIONS.tools].sort();
+        const clean = { tools: allow, claudeMd: false, leakedIn: false, leakedOut: false };
 
-        // The source runs unpinned, so its transcript records the vendor's own mode (`auto`), in
-        // which the outside read runs unasked: a resume or fork that asked would then show that
-        // Tacet pinned the mode again, not that the vendor restored a pinned one.
-        const first = await session(unpinned, undefined, 'first224');
-        expect(first).toMatchObject({ asked: false, tools: allow, claudeMd: false });
+        // The source runs unpinned and without the ask rule, so its transcript records the
+        // vendor's own mode (`auto`), in which the outside read runs unasked.
+        const first = await session(variant({ pin: false, ask: false }), undefined, 'first224', [
+          outside,
+        ]);
+        expect(first).toMatchObject({ ...clean, asked: [false], leakedOut: true });
+        // That read put the outside file in the transcript; nothing below may send it again
+        // unless it resumes this transcript, so the leak checks below use the inside file.
 
         // Resumed without the pin, it stays in the recorded mode and reads unasked: the vendor does
         // not restore a safe mode by itself (claude-agent-acp 0.101.0 resumes in the mode its
         // transcript's last prompt records).
-        const stale = await session(unpinned, { vendorSessionId: first.id }, 'stale224');
-        expect(stale.asked).toBe(false);
+        const stale = await session(
+          variant({ pin: false, ask: false }),
+          { vendorSessionId: first.id },
+          'stale224',
+          [outside],
+        );
+        expect(stale.asked).toEqual([false]);
 
-        const resumed = await session(spec, { vendorSessionId: first.id }, 'resumed224');
+        // The production Worker, resumed and forked: an in-checkout read is asked about (the ask
+        // rule), an `@` mention reads nothing in, and no checkout file loads.
+        const resumed = await session(spec, { vendorSessionId: first.id }, 'resumed224', [inside]);
         expect(resumed.id).toBe(first.id);
-        expect(resumed).toMatchObject({ asked: true, tools: allow, claudeMd: false });
+        expect(resumed).toMatchObject({ tools: allow, claudeMd: false, asked: ['Read'] });
+        expect(resumed.leakedIn).toBe(false);
         // It continued the conversation: the earlier turn was sent again.
         expect(resumed.raw).toContain('SAY first224');
 
@@ -522,9 +568,12 @@ for (const c of CASES) {
           );
         const sourceBefore = transcripts();
         expect(Object.keys(sourceBefore)).toHaveLength(1);
-        const forked = await session(spec, { vendorSessionId: first.id, fork: true }, 'forked224');
+        const forked = await session(spec, { vendorSessionId: first.id, fork: true }, 'forked224', [
+          inside,
+        ]);
         expect(forked.id).not.toBe(first.id);
-        expect(forked).toMatchObject({ asked: true, tools: allow, claudeMd: false });
+        expect(forked).toMatchObject({ tools: allow, claudeMd: false, asked: ['Read'] });
+        expect(forked.leakedIn).toBe(false);
         expect(forked.raw).toContain('SAY first224');
         expect(forked.raw).toContain('SAY resumed224');
         expect(transcripts()).toEqual(sourceBefore);
@@ -537,16 +586,39 @@ for (const c of CASES) {
         );
         expect(leaked).toEqual([]);
 
-        // Controls: the same resume and fork without the session options offer a shell, read the
-        // checkout's CLAUDE.md, and run its hook and MCP server, so each check above would have
-        // caught a session that lost them.
-        const control = await session(bare, { vendorSessionId: first.id }, 'control224');
+        // Controls, each after the checks above, since they read the inside file into the source.
+        // Fork with the pin but without the ask rule or verbatim prompts: the outside read is asked
+        // (the mode pin holds on a fork), the inside one is not (so the asks above were the ask
+        // rule's), and the `@` mention reads the file in (so verbatim prompts kept it out).
+        const forkControl = await session(
+          variant({ ask: false, verbatim: false }),
+          { vendorSessionId: first.id, fork: true },
+          'forkcontrol224',
+          [outside, inside],
+        );
+        expect(forkControl.asked).toEqual(['Read', false]);
+        expect(forkControl.leakedIn).toBe(true);
+        // The same for a resume.
+        const resumeControl = await session(
+          variant({ ask: false, verbatim: false }),
+          { vendorSessionId: first.id },
+          'resumecontrol224',
+          [outside, inside],
+        );
+        expect(resumeControl.asked).toEqual(['Read', false]);
+        expect(resumeControl.leakedIn).toBe(true);
+
+        // The same resume and fork without the session options offer a shell, read the checkout's
+        // CLAUDE.md, and run its hook and MCP server, so each check above would have caught a
+        // session that lost them.
+        const control = await session(bare, { vendorSessionId: first.id }, 'control224', []);
         expect(control.tools).toContain('Bash');
         expect(control.claudeMd).toBe(true);
         const controlFork = await session(
           bare,
           { vendorSessionId: first.id, fork: true },
           'controlfork224',
+          [],
         );
         expect(controlFork.tools).toContain('Bash');
         expect(controlFork.claudeMd).toBe(true);
