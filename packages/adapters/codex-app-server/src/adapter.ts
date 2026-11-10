@@ -124,7 +124,7 @@ export interface CodexAdapterOptions {
 
 type Queued = { text: string; model?: string; effort?: string };
 
-/** The part of a `model/list` entry the effort check reads (schema checked by schema.test.ts). */
+/** The part of a `model/list` entry the effort check reads (fields checked by schema.test.ts). */
 interface CodexModel {
   id: string;
   model: string;
@@ -157,6 +157,8 @@ interface Session {
   planned: { model: string | undefined; effort: string | undefined };
   /** The `model/list` catalog, fetched once when an effort first needs checking. */
   models: Promise<CodexModel[]> | undefined;
+  /** Sends still waiting on an effort check; later sends queue behind them, in order. */
+  sending: Promise<void> | undefined;
   secrets: string[];
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
@@ -178,19 +180,63 @@ const TOOL_ITEMS = new Set([
 ]);
 const ALL_OPTIONS: ApprovalOption[] = ['allow_once', 'allow_always', 'reject', 'cancel'];
 
-/** The whole `model/list` catalog, hidden models included. */
+/** The effort in force after a send with `opts`. */
+const effortOf = (s: Session, opts?: SendOptions): string | undefined =>
+  opts?.effort ?? s.planned.effort;
+
+/** Effort stays in force across turns, so a model switch must keep it valid too. */
+function needsEffortCheck(s: Session, opts?: SendOptions): boolean {
+  const model = opts?.model ?? s.planned.model;
+  return (
+    effortOf(s, opts) !== undefined && (opts?.effort !== undefined || model !== s.planned.model)
+  );
+}
+
+/** At most this many `model/list` pages, so a server that repeats its cursor cannot loop. */
+const MODEL_LIST_MAX_PAGES = 50;
+
+/** The whole `model/list` catalog, hidden models included; malformed entries are skipped. */
 async function listModels(rpc: JsonRpcPeer): Promise<CodexModel[]> {
   const out: CodexModel[] = [];
+  const seen = new Set<string>();
   let cursor: string | undefined;
-  do {
-    const page = await rpc.request<Obj>('model/list', {
+  for (let page = 0; page < MODEL_LIST_MAX_PAGES; page++) {
+    const res = await rpc.request<Obj>('model/list', {
       includeHidden: true,
       ...(cursor ? { cursor } : {}),
     });
-    if (Array.isArray(page.data)) out.push(...(page.data as CodexModel[]));
-    cursor = str(page.nextCursor);
-  } while (cursor);
+    for (const m of Array.isArray(res.data) ? res.data : []) {
+      if (
+        isObj(m) &&
+        typeof m.id === 'string' &&
+        typeof m.model === 'string' &&
+        Array.isArray(m.supportedReasoningEfforts)
+      ) {
+        out.push({
+          id: m.id,
+          model: m.model,
+          isDefault: m.isDefault === true,
+          supportedReasoningEfforts: m.supportedReasoningEfforts.filter(
+            (e): e is { reasoningEffort: string } =>
+              isObj(e) && typeof e.reasoningEffort === 'string',
+          ),
+        });
+      }
+    }
+    cursor = str(res.nextCursor);
+    if (!cursor || seen.has(cursor)) break;
+    seen.add(cursor);
+  }
   return out;
+}
+
+/** The catalog, or a refusal the policy can fall back from when it cannot be read. */
+async function catalog(models: Promise<CodexModel[]>): Promise<CodexModel[]> {
+  try {
+    return await models;
+  } catch (err) {
+    throw new ProfileRefusedError('effort', `cannot read model/list: ${errorMessage(err)}`);
+  }
 }
 
 /**
@@ -363,9 +409,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
       await rpc.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null });
       rpc.notify('initialized');
       // Checked before the thread starts, since `thread/start` takes any level without a word.
+      // Without a model named, the thread's model (config may choose it) is checked below.
       if (opts.effort !== undefined) {
         models = listModels(rpc);
-        checkEffort(await models, opts.model, opts.effort);
+        if (opts.model !== undefined) checkEffort(await catalog(models), opts.model, opts.effort);
       }
       const threadParams = {
         cwd: opts.cwd,
@@ -403,6 +450,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
       const thread = isObj(result.thread) ? result.thread : {};
       const threadId = str(thread.id);
       if (!threadId) throw new Error('app-server returned no thread id');
+      const threadModel = str(result.model) ?? opts.model;
+      if (opts.effort !== undefined && opts.model === undefined && models) {
+        // No model call has been made yet, so refusing here is still before launch.
+        checkEffort(await catalog(models), threadModel, opts.effort);
+      }
       handle.vendorSessionId = threadId;
       s = {
         handle,
@@ -418,8 +470,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
         closing: false,
         ended: false,
         model: str(result.model) ?? opts.model,
-        planned: { model: str(result.model) ?? opts.model, effort: opts.effort },
+        // A resumed thread keeps the effort an earlier turn set (`reasoningEffort`, observed on
+        // 0.167.0, #110), so a later model switch is checked against it too.
+        planned: { model: threadModel, effort: opts.effort ?? str(result.reasoningEffort) },
         models,
+        sending: undefined,
         secrets,
         exited,
         get exit() {
@@ -455,14 +510,38 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async send(h: SessionHandle, input: UserInput, opts?: SendOptions): Promise<void> {
     const s = this.#live(h);
-    const model = opts?.model ?? s.planned.model;
-    const effort = opts?.effort ?? s.planned.effort;
-    // Effort stays in force across turns, so a model switch must keep it valid too.
-    if (effort !== undefined && (opts?.effort !== undefined || model !== s.planned.model)) {
-      s.models ??= listModels(s.rpc);
-      checkEffort(await s.models, model, effort);
-    }
-    s.planned = { model, effort };
+    // Without a pending check, input is queued at once, as before.
+    if (!s.sending && !needsEffortCheck(s, opts)) return this.#enqueue(s, input, opts);
+    // Otherwise behind earlier sends, so turns keep the order they were sent in.
+    const run = (s.sending ?? Promise.resolve()).then(async () => {
+      this.#live(h);
+      const effort = effortOf(s, opts);
+      if (effort !== undefined && needsEffortCheck(s, opts)) {
+        s.models ??= listModels(s.rpc);
+        const p = s.models;
+        // A failed read is not cached: the next send tries again.
+        const models = await catalog(p).catch((err: unknown) => {
+          if (s.models === p) s.models = undefined;
+          throw err;
+        });
+        checkEffort(models, opts?.model ?? s.planned.model, effort);
+      }
+      this.#enqueue(s, input, opts);
+    });
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    s.sending = tail;
+    void tail.then(() => {
+      if (s.sending === tail) s.sending = undefined;
+    });
+    return run;
+  }
+
+  /** Queue a turn and record the model and effort it leaves in force. */
+  #enqueue(s: Session, input: UserInput, opts?: SendOptions): void {
+    s.planned = { model: opts?.model ?? s.planned.model, effort: effortOf(s, opts) };
     s.queue.push({
       text: input.text,
       ...(opts?.model !== undefined ? { model: opts.model } : {}),

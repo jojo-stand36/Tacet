@@ -15,6 +15,7 @@ if (process.env.FAKE_ENV_LOG) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let turns = 0;
+let modelLists = 0;
 let active;
 
 if (mode === 'child') {
@@ -51,6 +52,31 @@ rl.on('line', async (line) => {
     }
     if (mode === 'exit-idle') setTimeout(() => process.exit(5), 100);
     return;
+  }
+  if (m.method === 'model/list') {
+    modelLists++;
+    if (mode === 'models-fail-once' && modelLists === 1) {
+      return send({ id: m.id, error: { code: -32603, message: 'catalog unavailable' } });
+    }
+    if (mode === 'models-slow') await sleep(200);
+    const levels = ['low', 'high'].map((reasoningEffort) => ({ reasoningEffort }));
+    return send({
+      id: m.id,
+      result: {
+        data: [
+          {
+            id: 'fake-model',
+            model: 'fake-model',
+            isDefault: true,
+            supportedReasoningEfforts: levels,
+          },
+          // Malformed: no supportedReasoningEfforts. Skipped by the adapter.
+          { id: 'broken', model: 'broken' },
+        ],
+        // A server that repeats its cursor must not make the adapter loop.
+        nextCursor: mode === 'models-loop' ? 'same' : null,
+      },
+    });
   }
   if (m.method === 'turn/interrupt') {
     send({ id: m.id, result: {} });

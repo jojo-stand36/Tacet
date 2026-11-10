@@ -9,7 +9,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionHandle } from '@tacet/core';
+import type { SendOptions, SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CodexAppServerAdapter } from './adapter.js';
@@ -55,9 +55,9 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  async function turn(h: SessionHandle, tap: EventTap, text: string, effort?: string) {
+  async function turn(h: SessionHandle, tap: EventTap, text: string, opts?: SendOptions) {
     const from = tap.events.length;
-    await adapter.send(h, { text }, effort ? { effort } : undefined);
+    await adapter.send(h, { text }, opts);
     const end = await tap.waitFor(
       (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'error'),
       60_000,
@@ -73,6 +73,7 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
   it('passes the P0 probes', { timeout: 300_000 }, async () => {
     const results = await runConformance(adapter, {
       // Models from Codex's bundled catalog, so effort levels can be checked against model/list.
+      // A Codex bump that changes the catalog can break these tests for that reason alone.
       session: { cwd: worktree, model: 'gpt-5.5' },
       replyPrompt: 'SAY hello',
       approvalPrompt: 'RUN_TOOL',
@@ -105,8 +106,8 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
   }, async () => {
     const h1 = await adapter.start({ cwd: worktree, model: 'gpt-5.5' });
     const tap1 = new EventTap(adapter.events(h1));
-    expect(await turn(h1, tap1, 'SAY first', 'low')).toBe('You said first.');
-    expect(await turn(h1, tap1, 'SAY second', 'high')).toBe('You said second.');
+    expect(await turn(h1, tap1, 'SAY first', { effort: 'low' })).toBe('You said first.');
+    expect(await turn(h1, tap1, 'SAY second', { effort: 'high' })).toBe('You said second.');
     expect(api.requests.findLast((r) => r.text === 'SAY first')?.effort).toBe('low');
     expect(api.requests.findLast((r) => r.text === 'SAY second')?.effort).toBe('high');
     await adapter.close(h1);
@@ -114,6 +115,11 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
 
     const h2 = await adapter.start({ cwd: worktree, resume: { vendorSessionId: id } });
     expect(h2.vendorSessionId).toBe(id);
+    // The resumed thread keeps `high`; a switch to a model whose levels cannot be confirmed is
+    // refused rather than sent with it.
+    await expect(
+      adapter.send(h2, { text: 'SAY x' }, { model: 'gpt-mock-2' }),
+    ).rejects.toMatchObject({ field: 'effort' });
     expect(await turn(h2, new EventTap(adapter.events(h2)), 'SAY third')).toBe('You said third.');
     await adapter.close(h2);
 
@@ -153,8 +159,7 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     await expect(adapter.send(h, { text: 'SAY x' }, { model: 'gpt-mock-2' })).rejects.toMatchObject(
       { field: 'effort' },
     );
-    await adapter.send(h, { text: 'SAY luna' }, { model: 'gpt-6-luna' });
-    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, tap.events.length);
+    expect(await turn(h, tap, 'SAY luna', { model: 'gpt-6-luna' })).toBe('You said luna.');
     const luna = api.requests.findLast((r) => r.text === 'SAY luna');
     expect(luna).toMatchObject({ model: 'gpt-6-luna', effort: 'xhigh' });
     await adapter.close(h);
