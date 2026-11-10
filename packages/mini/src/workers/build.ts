@@ -24,7 +24,10 @@ export class WorkerConfigError extends Error {
 }
 
 export interface BuildWorkerAdaptersOptions {
-  /** The repo the Workers work on: keys per-repo adapter state (Claude PTY sessions, #153; ACP agent homes, #150). */
+  /**
+   * The repo the Workers work on: keys per-repo adapter state (Claude PTY sessions, #153; ACP
+   * agent homes, #150; Codex's `CODEX_HOME`, #186). Codex Workers in a git checkout need it.
+   */
   repoRoot?: string;
   /**
    * The user's environment: what Workers get an allowlist of, and where `{ env }` secret
@@ -117,7 +120,14 @@ export function buildWorkerAdapters(
       return new ClaudeSdkAdapter({ ...opts.claude, ...common, authRoute: 'api_key' });
     }
     if (id === 'codex-app-server') {
-      return new CodexAppServerAdapter({ ...opts.codex, ...common, authRoute: 'api_key' });
+      return new CodexAppServerAdapter({
+        // An unattended Codex Worker in a git checkout needs it: its own CODEX_HOME is keyed by
+        // the repo, and its worktree is checked against it before git runs (#116, #186).
+        ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...opts.codex,
+        ...common,
+        authRoute: 'api_key',
+      });
     }
     const slug = ACP_ID.exec(id)?.[1];
     if (slug !== undefined) {
