@@ -1314,6 +1314,37 @@ describe('WorktreeManager', () => {
     expect(await manager.head()).toEqual({ commit });
   });
 
+  it('unpins only a ref that still holds the pinned commit (#247)', async () => {
+    const first = (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    await writeFile(path.join(repository, 'later.txt'), 'later\n');
+    await git(repository, ['add', 'later.txt']);
+    await git(repository, ['commit', '-qm', 'later']);
+    const second = (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    const refs = async () =>
+      (await git(repository, ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/tacet/']))
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+
+    await manager.pin('done', first);
+    await manager.pin('moved', second);
+    await manager.pin('other', first);
+    await manager.unpin([
+      { taskId: 'done', commit: first },
+      // Pinned again at another commit since: kept.
+      { taskId: 'moved', commit: first },
+      // Never pinned: nothing to do.
+      { taskId: 'never', commit: first },
+    ]);
+    expect(await refs()).toEqual([
+      `refs/tacet/moved/target ${second}`,
+      `refs/tacet/other/target ${first}`,
+    ]);
+    await expect(manager.unpin([{ taskId: 'other', commit: 'HEAD' }])).rejects.toThrow(
+      'expected a full commit id',
+    );
+  });
+
   it('holds a pinned target with a ref, so git gc never prunes it (#236)', async () => {
     const commitOnMain = async (file: string) => {
       await writeFile(path.join(repository, file), `${file}\n`);
