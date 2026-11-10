@@ -24,6 +24,12 @@ export interface Workspaces {
    * `base`, a commit in the repo (#134: its dependencies' work), or at the main branch.
    */
   create(workerId: string, base?: string): Promise<Workspace>;
+  /**
+   * The repo's checked-out branch (absent when its HEAD is detached) and commit right now: where a
+   * new task's sub-tasks start (#219). Without it, each sub-task starts at the main branch as it is
+   * when the sub-task starts.
+   */
+  head?(): Promise<{ branch?: string; commit: string }>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   /**

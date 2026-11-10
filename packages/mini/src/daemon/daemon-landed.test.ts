@@ -10,6 +10,7 @@ import { CommandVerifier } from '../verify/command-verifier.js';
 import { WorktreeManager } from '../worktree.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
+import type { Planner } from './ports.js';
 import { type Script, ScriptedAdapter } from './testing.js';
 
 /**
@@ -132,10 +133,17 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
   it('records the squash merge and removes the checkout when the setting is on', async () => {
     const { id, published } = await runTask(commitWork);
     expect(published.ref).toBe(`refs/heads/tacet/${id}/result`);
+    // The task's target was pinned when it started (#219).
+    expect(store.query({ taskId: id, typePrefix: 'task.target' })[0]?.envelope.data).toMatchObject({
+      branch: 'main',
+    });
+    // Started from the pinned commit, not a branch: the sweep's target can only come from it.
     const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as {
       baseBranch?: string;
+      baseCommit?: string;
     };
-    expect(started.baseBranch).toBe('main');
+    expect(started.baseBranch).toBeUndefined();
+    expect(started.baseCommit).toMatch(/^[0-9a-f]{40}$/);
     expect(await manager.list()).toHaveLength(1);
     squashIntoMain(published.commit);
     const squashed = git(repo, ['rev-parse', 'HEAD']);
@@ -259,6 +267,63 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       await vi.waitFor(() => expect(landedEvents(id)).toHaveLength(1), { timeout: 3_000 });
       await severalSweeps();
       expect(await manager.list()).toHaveLength(1);
+    });
+  });
+
+  it('starts every sub-task from the target pinned when the task started (#219)', async () => {
+    const mainTip = git(repo, ['rev-parse', 'HEAD']);
+    const startedAt: Record<string, string> = {};
+    const planner: Planner = {
+      async plan() {
+        return {
+          subtasks: [
+            { key: 'a', goal: 'a', acceptanceCriteria: ['ok'] },
+            { key: 'b', goal: 'b', acceptanceCriteria: ['ok'] },
+          ],
+          rationale: 'two independent sub-tasks',
+          planner: { adapter: 'test' },
+        };
+      },
+    };
+    const fake = new ScriptedAdapter('fake', (_input, s): Script => {
+      const cwd = s.opts.cwd;
+      startedAt[cwd] = workerGit(cwd, ['rev-parse', 'HEAD']);
+      if (Object.keys(startedAt).length === 1) {
+        // The user switches the main checkout to another branch while the task runs.
+        git(repo, ['checkout', '-q', '-b', 'elsewhere']);
+        writeFileSync(join(repo, 'elsewhere.txt'), 'x\n');
+        git(repo, ['add', 'elsewhere.txt']);
+        git(repo, ['commit', '-qm', 'elsewhere']);
+      }
+      return { do: 'reply', text: 'done' };
+    });
+    daemon = new MiniConductor({
+      store,
+      config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } }, workers: { max: 1 } },
+      adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+      workspaces: manager,
+      integrator: new GitIntegrator(repo, env),
+      planner,
+      mcp: {
+        workerConfig: () => ({
+          config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+          revoke: () => {},
+        }),
+      },
+      lockPath: join(root, 'mini.lock'),
+      pollMs: 20,
+    });
+    await daemon.start();
+    const id = daemon.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await daemon.settled();
+
+    expect(git(repo, ['symbolic-ref', '--short', 'HEAD'])).toBe('elsewhere');
+    const heads = Object.values(startedAt);
+    expect(heads).toHaveLength(2);
+    expect(new Set(heads)).toEqual(new Set([mainTip]));
+    expect(store.query({ taskId: id, typePrefix: 'task.target' })[0]?.envelope.data).toEqual({
+      branch: 'main',
+      commit: mainTip,
     });
   });
 });

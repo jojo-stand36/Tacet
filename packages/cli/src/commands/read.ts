@@ -1,3 +1,4 @@
+import { TaskTarget } from '@tacet/core';
 import type { EventStore, StoredEvent } from '@tacet/core/node';
 import type { Io } from '../io.js';
 import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
@@ -39,6 +40,13 @@ async function open(
 }
 
 /** `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live. */
+/** Where a task starts and lands, as recorded when it started (#219); undefined for older tasks. */
+function targetOf(store: EventStore, taskId: string): TaskTarget | undefined {
+  const data = store.query({ taskId, typePrefix: 'task.target' }).at(-1)?.envelope.data;
+  const parsed = TaskTarget.safeParse(data);
+  return parsed.success ? parsed.data : undefined;
+}
+
 export async function status(io: Io, o: Where & { json?: boolean }): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
   const paths = statePaths(repoRoot, o['user-dir'], io.home);
@@ -59,6 +67,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
         goal: t.task.goal,
         state: t.state,
         ...(t.result ? { outcome: t.result.outcome } : {}),
+        ...(targetOf(store, t.task.id) ? { target: targetOf(store, t.task.id) } : {}),
         usage: t.usage,
         subtasks: subtasksOf(state, t.task.id).map((s) => ({
           id: s.task.id,
@@ -74,7 +83,14 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
     }
     io.out(pid ? `Mini-conductor running (pid ${pid})` : 'Mini-conductor not running');
     if (roots.length === 0) io.out('no tasks');
-    for (const t of roots) io.out(formatTask(t, subtasksOf(state, t.task.id)));
+    for (const t of roots) {
+      io.out(formatTask(t, subtasksOf(state, t.task.id)));
+      const target = targetOf(store, t.task.id);
+      if (target) {
+        const where = target.branch ? terminalSafe(target.branch) : 'a detached HEAD';
+        io.out(`  targets ${where} (started at ${target.commit.slice(0, 12)})`);
+      }
+    }
     return 0;
   } finally {
     store.close();

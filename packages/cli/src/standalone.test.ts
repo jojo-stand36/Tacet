@@ -117,7 +117,13 @@ describe('tacet standalone (#21)', () => {
     expect(status.tasks).toMatchObject([
       { id, state: 'completed', subtasks: [{ id: `${id}/1`, state: 'completed' }] },
     ]);
-    expect((await tacet(['status', ...user()])).out).toContain('Mini-conductor not running');
+    // The branch the task targets, pinned when it started (#219).
+    const branch = git(repo, ['symbolic-ref', '--short', 'HEAD']);
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    expect((status.tasks[0] as { target?: unknown }).target).toEqual({ branch, commit: head });
+    const text = (await tacet(['status', ...user()])).out;
+    expect(text).toContain('Mini-conductor not running');
+    expect(text).toContain(`targets ${branch} (started at ${head.slice(0, 12)})`);
 
     const l = await tacet(['logs', ...user(), id]);
     expect(l.code).toBe(0);

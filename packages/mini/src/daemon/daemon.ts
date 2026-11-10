@@ -17,6 +17,7 @@ import {
   type TaskInput,
   TaskPlan,
   type TaskState,
+  TaskTarget,
   type TaskView,
   type TierConfig,
   tasksProjection,
@@ -498,6 +499,10 @@ export class MiniConductor {
     this.#track(
       (async () => {
         try {
+          if (this.#o.workspaces.head && !this.#target(task.id)) {
+            await this.#pinTarget(task.id);
+            if (dropped()) return;
+          }
           const proposal = await this.#o.planner.plan(task, {
             signal: AbortSignal.any([this.#abort.signal, abort.signal]),
           });
@@ -829,6 +834,43 @@ export class MiniConductor {
     }
   }
 
+  // ---- target (#219) --------------------------------------------------------------------
+
+  /**
+   * Record where a task starts and lands, once, before it is planned: the repo's checked-out branch
+   * and commit now. Sub-tasks without dependencies start from that commit, so the user switching
+   * branch mid-task moves none of them. Without `Workspaces.head`, or if it fails, nothing is
+   * recorded and sub-tasks start where the main checkout is when they start, as before.
+   */
+  async #pinTarget(taskId: string): Promise<void> {
+    if (this.#target(taskId) || !this.#o.workspaces.head) return;
+    let head: { branch?: string; commit: string };
+    try {
+      head = await this.#o.workspaces.head();
+    } catch (err) {
+      this.#errors.push(err);
+      return;
+    }
+    const target = TaskTarget.safeParse(head);
+    if (!target.success || this.#target(taskId)) return;
+    this.#o.store.append(this.#env(taskId, 'task.target', target.data));
+  }
+
+  #target(taskId: string): TaskTarget | undefined {
+    const last = this.#o.store.query({ taskId, typePrefix: 'task.target' }).at(-1)?.envelope.data;
+    const parsed = TaskTarget.safeParse(last);
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  #rootOf(taskId: string): string {
+    const tasks = this.#state().tasks;
+    let id = taskId;
+    for (let parent = tasks[id]?.task.parentId; parent; parent = tasks[id]?.task.parentId) {
+      id = parent;
+    }
+    return id;
+  }
+
   // ---- landed results (#210) ------------------------------------------------------------
 
   #sweep(): void {
@@ -880,12 +922,18 @@ export class MiniConductor {
       for (const id of workspaceIds) if (await this.#o.workspaces.get(id)) left.push(id);
       if (left.length === 0 || !this.#live(gen)) continue;
 
+      // The target recorded when the task started (#219); older tasks: the one branch their
+      // checkouts agree they started from.
+      const pinned = this.#target(root.task.id);
       const recorded = this.#o.store
         .query({ taskId: root.task.id, typePrefix: 'task.landed' })
         .some((e) => (e.envelope.data as { commit?: unknown }).commit === published.commit);
       if (!recorded) {
-        const branches = new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
-        // No target, or sub-tasks that started from different branches: nothing to compare.
+        const branches = pinned
+          ? new Set(pinned.branch ? [pinned.branch] : [])
+          : new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
+        // No target (a task started on a detached HEAD), or sub-tasks that started from different
+        // branches: nothing to compare.
         if (branches.size !== 1) continue;
         const target = `refs/heads/${[...branches][0]}`;
         let landed: Awaited<ReturnType<NonNullable<Integrator['landed']>>>;
@@ -1026,7 +1074,11 @@ export class MiniConductor {
     const deps = this.#dependencies(subtaskId)
       .map((id) => ({ id, commit: this.#resultCommit(id) }))
       .filter((d): d is { id: string; commit: string } => d.commit !== undefined);
-    if (!integrator || deps.length === 0) return { notes: [] };
+    if (!integrator || deps.length === 0) {
+      // Nothing to combine: the task's pinned target, wherever the main checkout is now (#219).
+      const target = this.#target(this.#rootOf(subtaskId));
+      return { ...(target ? { commit: target.commit } : {}), notes: [] };
+    }
     try {
       const commit = await integrator.combine(deps.map((d) => d.commit));
       this.#combineFailures.delete(subtaskId);
