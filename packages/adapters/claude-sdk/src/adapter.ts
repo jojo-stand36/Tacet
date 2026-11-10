@@ -79,7 +79,14 @@ export interface ClaudeSdkAdapterOptions {
    * this adapter started its first session (#108). Only the count: never names or contents.
    */
   onSweep?: (removedFiles: number) => void;
-  /** SDK options passed through unchanged, e.g. `settingSources` or `pathToClaudeCodeExecutable`. */
+  /**
+   * SDK options passed through unchanged, e.g. `pathToClaudeCodeExecutable`.
+   *
+   * `settingSources` defaults to `[]` (#181): no user, project or local settings and no CLAUDE.md,
+   * so a checkout a Worker wrote cannot add hooks, permissions, environment or instructions to a
+   * later session. Passing it here is the explicit opt-in, e.g. `['project']` for an interactive
+   * session in the user's own repo. Never opt in for a session in a Worker's checkout.
+   */
   sdkOptions?: Pick<
     Options,
     'settingSources' | 'pathToClaudeCodeExecutable' | 'permissionMode' | 'allowedTools'
@@ -252,6 +259,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         prompt: inbox,
         options: {
           ...this.#opts.sdkOptions,
+          // SDK isolation mode unless the caller opted in (#181); see `sdkOptions`.
+          settingSources: this.#opts.sdkOptions?.settingSources ?? [],
           ...sessionOpts,
           cwd: opts.cwd,
           env,
