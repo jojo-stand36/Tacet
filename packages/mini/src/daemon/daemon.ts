@@ -539,7 +539,7 @@ export class MiniConductor {
     if (!tier) throw new Error('config has no tiers.worker');
     return {
       adapter: tier.adapter,
-      model: tier.model,
+      ...(tier.model !== undefined ? { model: tier.model } : {}),
       ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
     };
   }

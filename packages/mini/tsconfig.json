@@ -15,6 +15,12 @@
     },
     {
       "path": "../adapters/codex-app-server"
+    },
+    {
+      "path": "../adapters/acp"
+    },
+    {
+      "path": "../adapters/pty"
     }
   ]
 }

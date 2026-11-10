@@ -177,7 +177,7 @@ export function workerEnv(
 
 /** The Worker environment policy an effective config asks for (`workers.env.pass`). */
 export function workerEnvPolicy(config: {
-  workers?: { env?: { pass?: readonly string[] } };
+  workers?: { env?: { pass?: readonly string[] | undefined } | undefined } | undefined;
 }): WorkerEnvPolicy {
   return { pass: [...(config.workers?.env?.pass ?? [])] };
 }

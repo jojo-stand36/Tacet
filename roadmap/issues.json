@@ -1211,6 +1211,18 @@
         "needs-human"
       ],
       "body": "Follow-up from #15 (#156). `AdapterCapabilities.modelSwitch` has no value for an adapter that cannot choose a model at all. Generic PTY presets (`pty:<slug>`) report `launch-only` as an interim: the preset's command fixes the model, and `start({ model })` is refused with `ProfileRefusedError`, never ignored. A router reading `launch-only` may still believe it can pick a model. Human decision: add `'none'` to core, or keep `launch-only` and document the refusal.\n\n### Tasks\n- [ ] Decision recorded on this issue\n- [ ] If `'none'`: add it to the core type and schema, set it for `PTY_CLI_CAPABILITIES`, and make routing skip model choice for such adapters\n- [ ] Conformance probe: an adapter with `modelSwitch: 'none'` refuses `start({ model })` with `ProfileRefusedError`\n\n### Acceptance criteria\n- If `'none'` is adopted: the probe passes for `pty:<slug>` and fails for an adapter that ignores the model\n- If `launch-only` stays: `PTY_CLI_CAPABILITIES` documents that `start({ model })` is refused\n\n_See packages/core/src/adapter/types.ts, packages/core/src/testing/conformance.ts and docs/ARCHITECTURE.md §3._"
+    },
+    {
+      "title": "Resolve keychain secret references in config",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #149. Config accepts `{ keychain: \"service/account\" }` secret references (`SecretRef`), but `resolveSecretRef` (`@tacet/core/node`) resolves only `{ env: NAME }`: a keychain reference used by a Worker's agent is a startup error naming its config path. Resolve them from the OS keychain without the value touching disk, argv of long-lived processes, logs or events.\n\n### Tasks\n- [ ] Verify the platform tools and their exact invocation and exit codes (`verify-vendor-facts`): macOS `security find-generic-password`, Linux Secret Service (`secret-tool lookup`, libsecret); decide what `service/account` maps to on each\n- [ ] Resolve keychain references in `resolveSecretRef`, returning a `Secret`; a missing item, a locked keychain or a missing tool is an error naming the config path, never a value\n- [ ] Keep `{ env }` behaviour unchanged; update ARCHITECTURE.md §4\n\n### Acceptance criteria\n- Unit tests with the platform tool replaced by a fake cover found, missing, locked and tool-not-installed\n- No resolved value appears in errors, logs or events (test)\n\n_See packages/core/src/node/config/secret-ref.ts, docs/ARCHITECTURE.md §4 and §6._"
     }
   ]
 }

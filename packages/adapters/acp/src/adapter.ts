@@ -83,6 +83,12 @@ export interface AcpAdapterOptions {
   killTimeoutMs?: number;
   /** Receives the agent's stderr (free-form logging; ACP keeps stdout for messages). Scrubbed. */
   stderr?: (text: string, h: SessionHandle) => void;
+  /**
+   * Values resolved from secret references for this agent (e.g. a key in `agent.env`, #149):
+   * scrubbed from every event and from stderr, as are the values of the agent's `apiKeyEnv`.
+   * Values shorter than four characters are not.
+   */
+  secrets?: string[];
 }
 
 interface PendingApproval {
@@ -168,7 +174,17 @@ export class AcpAdapter implements AgentAdapter {
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     });
-    const secrets = mcpHeaderSecrets(opts.mcpServers);
+    // Longest first, so a secret that starts another does not leave that one's end showing.
+    // MCP header values are always scrubbed; the others from four characters up.
+    const secrets = [
+      ...new Set([
+        ...mcpHeaderSecrets(opts.mcpServers),
+        ...[
+          ...(this.#opts.secrets ?? []),
+          ...spec.apiKeyEnv.flatMap((name) => env[name] ?? []),
+        ].filter((v) => v.length >= 4),
+      ]),
+    ].sort((a, b) => b.length - a.length);
     const handle: SessionHandle = { id: randomUUID() };
     let s: Session | undefined;
     const exitInfo: { value?: Session['exit'] } = {};
