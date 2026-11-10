@@ -13,6 +13,7 @@ import { type EventStore, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
+  cancelStopped,
   MiniConductor,
   type MiniConductorOptions,
   miniLockHolder,
@@ -1007,6 +1008,111 @@ describe('MiniConductor', () => {
     expect(tasks()[sub]?.state).toBe('completed');
     expect(fake.sessions[0]?.inputs.at(-1)).toBe(`Answer to your escalation ${escId}: Postgres`);
     expect(ofType('escalation.delivered', sub)).toHaveLength(1);
+  });
+
+  describe('cancel (#202)', () => {
+    const plan3 = () =>
+      new FixedPlanner([
+        { key: 'a', goal: 'a [hold]', acceptanceCriteria: ['ok'] },
+        { key: 'b', goal: 'b [hold]', acceptanceCriteria: ['ok'] },
+        { key: 'c', goal: 'c', acceptanceCriteria: ['ok'], dependsOn: ['a'] },
+      ]);
+    const endReasons = (id: string) =>
+      store
+        .query({ typePrefix: 'worker.ended' })
+        .filter((e) => e.envelope.taskId?.startsWith(`${id}/`))
+        .map((e) => (e.envelope.data as { reason: string }).reason);
+
+    it('ends the running Workers, cancels every unfinished sub-task, and starts nothing more', async () => {
+      const d = make({ planner: plan3() });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => fake.open, { timeout: 5000 }).toBe(2);
+      const vendors = fake.sessions.map((x) => x.handle.vendorSessionId);
+
+      expect(await d.cancel(id)).toEqual([`${id}/1`, `${id}/2`, `${id}/3`, id]);
+      await d.settled();
+      for (const t of [id, `${id}/1`, `${id}/2`, `${id}/3`])
+        expect(tasks()[t]?.state).toBe('canceled');
+      expect(fake.open).toBe(0);
+      expect(fake.sessions).toHaveLength(2);
+      expect(endReasons(id)).toEqual(['canceled', 'canceled']);
+      // A canceled session is never resumed, so its vendor state is let go.
+      expect(fake.discarded.map((x) => x.vendorSessionId).sort()).toEqual(vendors.sort());
+      expect(revoked).toHaveLength(2);
+
+      // A restart does not pick it up again.
+      await d.stop();
+      const again = make({ planner: plan3() });
+      await again.start();
+      await again.settled();
+      expect(fake.sessions).toHaveLength(2);
+      expect(tasks()[id]?.state).toBe('canceled');
+    });
+
+    it('stops a task being planned and drops its plan', async () => {
+      let aborted = false;
+      const planner: Planner = {
+        plan: (_task, opts) =>
+          new Promise((_resolve, reject) => {
+            opts?.signal?.addEventListener('abort', () => {
+              aborted = true;
+              reject(new Error('planner aborted'));
+            });
+          }),
+      };
+      const d = make({ planner });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      expect(await d.cancel(id)).toEqual([id]);
+      await d.settled();
+      expect(aborted).toBe(true);
+      expect(tasks()[id]?.state).toBe('canceled');
+      expect(types(id)).not.toContain('task.planned');
+      expect(ofType('task.status', id).map((e) => (e.data as { state: string }).state)).toEqual([
+        'canceled',
+      ]);
+    });
+
+    it('refuses an unknown task, a sub-task and a task that has ended', async () => {
+      const d = make();
+      await d.start();
+      await expect(d.cancel('nope')).rejects.toThrow('unknown task nope');
+      const id = d.submit({ goal: 'quick', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      await expect(d.cancel(`${id}/1`)).rejects.toThrow(`cancel its task ${id}`);
+      await expect(d.cancel(id)).rejects.toThrow('has already ended (completed)');
+    });
+
+    it('cancels with no Mini-conductor running, ending what a crash left open (cancelStopped)', async () => {
+      const d1 = make({ planner: plan3() });
+      await d1.start();
+      const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => fake.open, { timeout: 5000 }).toBe(2);
+      // While one runs, the lock refuses.
+      await expect(cancelStopped(id, { store, lockPath: join(dir, 'mini.lock') })).rejects.toThrow(
+        'already running',
+      );
+      d1.crashForTest();
+
+      const r = await cancelStopped(id, { store, lockPath: join(dir, 'mini.lock') });
+      expect(r.canceled).toEqual([`${id}/1`, `${id}/2`, `${id}/3`, id]);
+      expect(r.errors).toEqual([]);
+      expect(endReasons(id)).toEqual(['canceled', 'canceled']);
+      expect(tasks()[id]?.state).toBe('canceled');
+      expect(miniLockHolder(join(dir, 'mini.lock'))).toBeUndefined();
+      await expect(cancelStopped(id, { store, lockPath: join(dir, 'mini.lock') })).rejects.toThrow(
+        'has already ended (canceled)',
+      );
+
+      // The next start records no restart for those sessions and runs nothing of the task.
+      const before = fake.sessions.length;
+      const d2 = make({ planner: plan3() });
+      await d2.start();
+      await d2.settled();
+      expect(fake.sessions).toHaveLength(before);
+      expect(endReasons(id)).toEqual(['canceled', 'canceled']);
+    });
   });
 
   it('miniLockHolder names the running holder only (#21)', async () => {

@@ -135,7 +135,9 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
       for (;;) {
         if (io.signal?.aborted) {
           progress();
-          io.err('interrupted: open Worker sessions resume with `tacet run --resume`');
+          io.err(
+            'interrupted: open Worker sessions resume with `tacet run --resume`; `tacet cancel <task>` drops a task',
+          );
           return EXIT.interrupted;
         }
         try {

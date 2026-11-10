@@ -299,6 +299,60 @@ describe('tacet standalone (#21)', () => {
     expect(s.running).toBeNull();
   });
 
+  it('cancels an interrupted task, which --resume then leaves alone (#202)', async () => {
+    const abort = new AbortController();
+    let turns = 0;
+    script = () => {
+      turns += 1;
+      abort.abort();
+      return { do: 'hold' };
+    };
+    const r = await tacet(['run', ...user(), 'add work.txt'], { signal: abort.signal });
+    expect(r.code).toBe(130);
+    expect(r.err).toContain('tacet cancel <task>');
+    const id = /task (\S+) submitted/.exec(r.err)?.[1] as string;
+
+    // Refused while a run is live.
+    const paths = repoStatePaths(repo, state);
+    const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      writeFileSync(paths.lock, `${other.pid}\n`);
+      const live = await tacet(['cancel', ...user(), id]);
+      expect(live.code).toBe(1);
+      expect(live.err).toContain(`a run is live for this repo (pid ${other.pid})`);
+    } finally {
+      other.kill('SIGKILL');
+      rmSync(paths.lock, { force: true });
+    }
+
+    const c = await tacet(['cancel', ...user(), '--json', id]);
+    expect(c.code).toBe(0);
+    expect(JSON.parse(c.out)).toEqual({ canceled: [`${id}/1`, id] });
+    const s = JSON.parse((await tacet(['status', ...user(), '--json'])).out) as {
+      tasks: { id: string; state: string; subtasks: { state: string }[] }[];
+    };
+    expect(s.tasks).toEqual([
+      expect.objectContaining({
+        id,
+        state: 'canceled',
+        subtasks: [expect.objectContaining({ state: 'canceled' })],
+      }),
+    ]);
+
+    const resumed = await tacet(['run', ...user(), '--resume']);
+    expect(resumed.code).toBe(0);
+    expect(resumed.err).toContain('nothing to resume');
+    expect(turns).toBe(1);
+
+    const again = await tacet(['cancel', ...user(), id]);
+    expect(again.code).toBe(1);
+    expect(again.err).toContain('has already ended (canceled)');
+    expect((await tacet(['cancel', ...user(), `${id}/1`])).err).toContain(`cancel its task ${id}`);
+    expect((await tacet(['cancel', ...user()])).code).toBe(2);
+  });
+
   it('says so when the repo has no Tacet state, and refuses usage errors', async () => {
     expect((await tacet(['status', ...user()])).out).toContain('no Tacet state');
     expect((await tacet(['logs', ...user(), 'x'])).code).toBe(1);
