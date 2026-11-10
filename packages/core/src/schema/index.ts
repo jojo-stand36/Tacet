@@ -17,6 +17,7 @@ import {
   WorkerStarted,
   WorkerThrottled,
   WorkerVendorSession,
+  WorkerVerification,
 } from './worker.js';
 
 export * from './agent-event.js';
@@ -71,6 +72,10 @@ export const jsonSchemas = {
   'worker-profile': { schema: WorkerProfile, title: 'Tacet worker.profile payload' },
   'worker-integrated': { schema: WorkerIntegrated, title: 'Tacet worker.integrated payload' },
   'worker-throttled': { schema: WorkerThrottled, title: 'Tacet worker.throttled payload' },
+  'worker-verification': {
+    schema: WorkerVerification,
+    title: 'Tacet worker.verification payload',
+  },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;

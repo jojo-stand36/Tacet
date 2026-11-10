@@ -1259,6 +1259,18 @@
       "body": "Found in #110 slice 2 (spike `docs/adapters/spikes/110-codex-effort/`, Codex 0.167.0, mock Responses API): `thread/fork` sent without a `model` came back on the catalog's default model (`gpt-6.1-sol`) with `reasoningEffort: null`, not on the source thread's model. The Codex adapter adopts the reported model, so its own state is consistent, but a forked Worker silently changes model and loses its effort unless the adapter sends them.\n\n### Tasks\n- [ ] Verify on the pinned Codex whether `thread/fork` honours `model` (and the thread config's `model_reasoning_effort`) in its params (`verify-vendor-facts`).\n- [ ] When forking without `SessionOptions.model`, send the source thread's model (and its effort, checked against `model/list`) so the fork continues on what the source ran.\n- [ ] Record the behaviour in the capability matrix Codex Resume/fork row.\n\n### Acceptance criteria\n- Against the mock Responses API, a fork of a thread that ran on `gpt-5.5` at `low`, started without a model or effort, sends its first request with model `gpt-5.5` and effort `low`.\n- A fork with an explicit `model` or `effort` still uses those, and an effort the model does not list is refused (`ProfileRefusedError`).\n\n_See docs/adapters/capability-matrix.md (Codex) and #110._"
     },
     {
+      "title": "buildWorkerAdapters: pass repoRoot to the Codex adapter",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Found in the review of #181 (PR #185). `buildWorkerAdapters` (`packages/mini/src/workers/build.ts`) passes `opts.repoRoot` to the ACP and PTY adapters but not to `CodexAppServerAdapter`. An unattended Codex Worker in a git checkout needs it (`workerRepoRoot`, #116): it keys the Worker's own `CODEX_HOME`, checks the worktree against the repo root before any git command, and is where #181 marks the repo untrusted. Without it, every `codex-app-server` Worker built from config refuses to start in a git checkout (\"unattended Codex Workers in a git checkout need the repoRoot option\"). It fails closed, but Codex Workers cannot run.\n\n### Tasks\n- [ ] Pass `opts.repoRoot` to the Codex adapter in `buildWorkerAdapters`.\n- [ ] Test that a Codex Worker built from config starts in a git worktree of the repo.\n\n### Acceptance criteria\n- A `codex-app-server` Worker built by `buildWorkerAdapters` with `repoRoot` starts a session in a linked worktree of that repo (real Codex against the mock Responses API), and its `CODEX_HOME` is keyed by the repo root.\n\n_See packages/mini/src/workers/build.ts, docs/ARCHITECTURE.md §6 (Codex Worker isolation) and #116._"
+    },
+    {
       "title": "codex-acp Workers trust the checkout: refuse, accept or patch",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [

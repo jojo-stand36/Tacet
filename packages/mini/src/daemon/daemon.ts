@@ -36,6 +36,7 @@ import {
   MergeConflictError,
   type Planner,
   type Verifier,
+  type VerifyResult,
   type WorkerAdapter,
   type WorkerMcp,
   type Workspace,
@@ -144,7 +145,21 @@ interface Run {
   progressSeen?: number | undefined;
   /** The turn's end is being handled, so it is handled once. */
   settling: boolean;
+  /** Aborts a verification in progress when the session ends (#19). */
+  verifyAbort?: AbortController | undefined;
 }
+
+/**
+ * Whether `verify` commands run for Codex Workers (#19). Off until the owner decides: the
+ * commands run code the Worker wrote outside the Codex sandbox, which keeps the shared `.git`
+ * read-only for the Worker itself (ARCHITECTURE.md §6). Off, their sub-tasks are recorded as
+ * not verified, with this reason.
+ */
+export const VERIFY_CODEX_WORKERS = false;
+const CODEX_ADAPTERS: ReadonlySet<string> = new Set(['codex-app-server', 'acp:codex-acp']);
+const CODEX_NOT_VERIFIED = 'codex verify pending sandbox decision';
+/** The command name `worker.verification` records for a failure before any command ran. */
+const CHECKOUT_CHECK = '(verification failed before any command)';
 
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
@@ -1173,11 +1188,20 @@ export class MiniConductor {
         ended = true;
         return;
       }
-      const verification = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
-        view.task,
-        run.workspace,
-      );
+      let verification: VerifyResult;
+      try {
+        verification = await this.#verify(run, view.task);
+      } catch (err) {
+        if (!(err instanceof WorktreeRefusedError)) throw err;
+        ended = true;
+        await this.#refused(run);
+        return;
+      }
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      if (verification.status === 'failed' && (await this.#sendFix(run, verification))) {
+        // The same session fixes it: its next turn's end verifies again.
+        return;
+      }
       if (verification.status === 'failed') {
         this.#o.store.append(
           this.#env(run.subtaskId, 'task.result', this.#summary(run, 'failed', verification)),
@@ -1201,7 +1225,14 @@ export class MiniConductor {
     }
   }
 
-  #summary(run: Run, outcome: 'completed' | 'failed', verification: Verification): SummaryPacket {
+  #summary(run: Run, outcome: 'completed' | 'failed', result: VerifyResult): SummaryPacket {
+    // What goes up is the verification, never the feedback meant for the Worker (8 KB of output).
+    const verification: Verification = {
+      status: result.status,
+      commands: result.commands,
+      ...(result.notes !== undefined ? { notes: result.notes } : {}),
+      ...(result.results !== undefined ? { results: result.results } : {}),
+    };
     const text = (run.lastMessage ?? run.text).trim();
     return {
       v: 1,
@@ -1242,15 +1273,7 @@ export class MiniConductor {
     } catch (err) {
       this.#errors.push(err);
       if (err instanceof WorktreeRefusedError) {
-        // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
-        this.#raise(
-          run.subtaskId,
-          `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
-          { urgency: 'high' },
-        );
-        await this.#end(run, 'canceled', 'checkout failed its integrity checks', {
-          workspaceRefused: true,
-        });
+        await this.#refused(run);
         return false;
       }
       if (opts.bestEffort) return true;
@@ -1271,10 +1294,165 @@ export class MiniConductor {
     }
   }
 
+  /** The Worker's checkout failed its integrity checks: ask the user, end the run. */
+  async #refused(run: Run): Promise<void> {
+    // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
+    this.#raise(
+      run.subtaskId,
+      `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
+      { urgency: 'high' },
+    );
+    await this.#end(run, 'canceled', 'checkout failed its integrity checks', {
+      workspaceRefused: true,
+    });
+  }
+
+  /**
+   * Verify a finished turn (#19): with the process marker recorded first (a crash mid-run ends
+   * what the commands started at the next start) and aborted if the session ends meanwhile.
+   * Each command's result becomes a `worker.verification` event; the output never does.
+   */
+  async #verify(run: Run, task: Task): Promise<VerifyResult> {
+    const commands = this.#o.config.verify ?? [];
+    if (CODEX_ADAPTERS.has(run.adapterId) && !VERIFY_CODEX_WORKERS && commands.length > 0) {
+      return { status: 'not_run', commands, notes: CODEX_NOT_VERIFIED };
+    }
+    const round = this.#verifyRounds(run);
+    const abort = new AbortController();
+    run.verifyAbort = abort;
+    const marker = newWorkerMarker();
+    const key = `verify:${run.sessionId}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    let ranCommand = false;
+    try {
+      const result = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
+        task,
+        run.workspace,
+        {
+          ...(run.commit !== undefined ? { commit: run.commit } : {}),
+          signal: AbortSignal.any([abort.signal, this.#abort.signal]),
+          marker,
+          onCommand: (r) => {
+            ranCommand = true;
+            this.#o.store.append(
+              this.#env(
+                run.subtaskId,
+                'worker.verification',
+                {
+                  sessionId: run.sessionId,
+                  round,
+                  command: redactSecrets(r.command),
+                  status: r.status,
+                  ...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
+                  ...(r.signal !== undefined ? { signal: r.signal } : {}),
+                  durationMs: r.durationMs ?? 0,
+                  ...(run.commit !== undefined ? { commit: run.commit } : {}),
+                },
+                run.sessionId,
+              ),
+            );
+          },
+        },
+      );
+      if (result.status === 'failed' && !ranCommand) {
+        // Failed before any command (the checkout was not clean): still a round, so the fix
+        // loop ends.
+        this.#o.store.append(
+          this.#env(
+            run.subtaskId,
+            'worker.verification',
+            {
+              sessionId: run.sessionId,
+              round,
+              command: CHECKOUT_CHECK,
+              status: 'failed',
+              durationMs: 0,
+              ...(run.commit !== undefined ? { commit: run.commit } : {}),
+            },
+            run.sessionId,
+          ),
+        );
+      }
+      return result;
+    } catch (err) {
+      this.#errors.push(err);
+      // The checkout failed its integrity checks: the caller handles it as integration does.
+      if (err instanceof WorktreeRefusedError) throw err;
+      // No message: it can name paths, which stay out of what goes up.
+      return {
+        status: 'failed',
+        commands,
+        notes: 'Verification could not run (see the Mini-conductor log).',
+      };
+    } finally {
+      if (run.verifyAbort === abort) run.verifyAbort = undefined;
+      if (this.#markers.get(key) === marker) {
+        this.#markers.delete(key);
+        this.#saveMarkers();
+      }
+    }
+  }
+
+  /**
+   * Verification rounds this attempt already had (each recorded its commands under one round):
+   * those of every session started under the same attempt number, so a restart (which resumes
+   * without counting as a failed attempt) does not buy fix rounds, while a retry after a failed
+   * attempt starts afresh even in the same checkout.
+   * A round a restart cut short (its commands `aborted`) counts too: the restart re-checks.
+   */
+  #verifyRounds(run: Run): number {
+    const started = this.#o.store
+      .query({ taskId: run.subtaskId, typePrefix: 'worker.started' })
+      .map((e) => e.envelope.data as { sessionId?: string; attempt?: number });
+    const attempt = started.find((d) => d.sessionId === run.sessionId)?.attempt;
+    const sessions = new Set([run.sessionId]);
+    for (const d of started) {
+      if (d.sessionId && attempt !== undefined && d.attempt === attempt) sessions.add(d.sessionId);
+    }
+    const rounds = new Set<string>();
+    for (const e of this.#o.store.query({
+      taskId: run.subtaskId,
+      typePrefix: 'worker.verification',
+    })) {
+      const d = e.envelope.data as { sessionId?: string; round?: number };
+      if (d.sessionId && sessions.has(d.sessionId) && typeof d.round === 'number') {
+        rounds.add(`${d.sessionId}:${d.round}`);
+      }
+    }
+    return rounds.size;
+  }
+
+  /**
+   * A failed verification goes back to the same session to fix, while fix rounds are left
+   * (`workers.verify_fix_attempts`). False when it should fail the attempt instead.
+   */
+  async #sendFix(run: Run, verification: VerifyResult): Promise<boolean> {
+    const allowed = this.#o.config.workers?.verify_fix_attempts ?? 2;
+    // The round that just failed is recorded: rounds so far = fix rounds used + 1.
+    if (!verification.feedback || this.#verifyRounds(run) > allowed) return false;
+    const worker = this.#o.adapters[run.adapterId];
+    if (!worker) return false;
+    run.turnActive = true;
+    run.settling = false;
+    run.lastActivity = this.#now().getTime();
+    run.nudgedAt = undefined;
+    try {
+      await worker.adapter.send(run.handle, { text: safePrompt([verification.feedback]) });
+      return true;
+    } catch (err) {
+      run.turnActive = false;
+      run.settling = true;
+      this.#errors.push(err);
+      return false;
+    }
+  }
+
   #defaultVerifier(): Verifier {
     const commands = this.#o.config.verify ?? [];
     return {
       // #19 runs the commands and a reviewer; until then nothing is claimed as verified.
+      // Without a verifier (the entry point passes a `CommandVerifier`), nothing is claimed.
       verify: async () => ({ status: commands.length > 0 ? 'not_run' : 'passed', commands }),
     };
   }
@@ -1285,7 +1463,12 @@ export class MiniConductor {
       .query({ taskId: subtaskId, typePrefix: 'task.result' })
       .map((e) => e.envelope.data as SummaryPacket)
       .at(-1);
-    return last && last.outcome !== 'completed' ? last.summary.slice(0, 1000) : undefined;
+    if (!last || last.outcome === 'completed') return undefined;
+    const notes = last.verification.status === 'failed' ? last.verification.notes : undefined;
+    // Why the last attempt failed verification, so a fresh session does not repeat it (#19).
+    return notes
+      ? `${last.summary.slice(0, 1000)}\n\nVerification of that attempt: ${notes.slice(0, 2000)}`
+      : last.summary.slice(0, 1000);
   }
 
   /** After a failed run: retry (a restart does not count) or fail the sub-task for good. */
@@ -1312,6 +1495,8 @@ export class MiniConductor {
     extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
     if (this.#runs.get(run.subtaskId) !== run) return;
+    // A verification still running for it stops (its result is not used).
+    run.verifyAbort?.abort();
     this.#runs.delete(run.subtaskId);
     run.revoke();
     this.#o.store.append(

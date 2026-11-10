@@ -22,10 +22,29 @@ export type CommandRun = z.infer<typeof CommandRun>;
 export const VerificationStatus = openEnum(['passed', 'failed', 'partial', 'not_run'], 'not_run');
 export type VerificationStatus = z.infer<typeof VerificationStatus>;
 
+/** How one `verify` command ended (#19). Unknown values fall back to `failed`. */
+export const VerifyCommandStatus = openEnum(
+  ['passed', 'failed', 'timed_out', 'aborted', 'not_run'],
+  'failed',
+);
+export type VerifyCommandStatus = z.infer<typeof VerifyCommandStatus>;
+
+/** One `verify` command's result (#19): no output. */
+export const VerifyCommandResult = z.object({
+  command: z.string().min(1),
+  status: VerifyCommandStatus,
+  exitCode: z.number().int().optional(),
+  signal: z.string().min(1).optional(),
+  durationMs: z.number().int().nonnegative().optional(),
+});
+export type VerifyCommandResult = z.infer<typeof VerifyCommandResult>;
+
 export const Verification = z.object({
   status: VerificationStatus,
   commands: z.array(z.string().min(1)).default([]).describe('Commands that verify the work'),
   notes: z.string().optional(),
+  /** Per command, as last run (#19). Optional: older producers and handoffs omit it. */
+  results: z.array(VerifyCommandResult).optional(),
 });
 export type Verification = z.infer<typeof Verification>;
 
