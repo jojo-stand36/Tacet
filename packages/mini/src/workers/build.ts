@@ -59,8 +59,9 @@ export interface BuildWorkerAdaptersOptions {
 }
 
 /**
- * The ACP agent spec a Worker runs on: a Claude Worker over ACP gets the file tools only and no
- * shell, as the SDK adapter's `fileToolsOnly` does (#206, `claudeAcpWorkerSpec`).
+ * The ACP agent spec a Worker runs on: a Claude Worker over ACP gets the file tools only, no
+ * shell, every read and search asked about, and verbatim prompts, as the SDK adapter's
+ * `fileToolsOnly` does (#206, #214, `claudeAcpWorkerSpec`).
  */
 function workerSpec(spec: AcpAgentSpec): AcpAgentSpec {
   return spec.id === 'claude-acp' ? claudeAcpWorkerSpec(spec) : spec;
@@ -281,6 +282,16 @@ export function buildWorkerAdapters(
     if (refused) {
       throw new WorkerConfigError(`${where}: acp:${slug} is refused for Workers: ${refused}`);
     }
+    // A custom preset running claude-agent-acp would get none of the built-in's Worker hardening
+    // (no settings isolation, no pinned mode, a shell, unasked reads; #214): use the built-in.
+    if (
+      preset?.kind === 'acp' &&
+      preset.command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).some(runsClaudeAcp)
+    ) {
+      throw new WorkerConfigError(
+        `${where}: agents.${slug} runs claude-agent-acp; use acp:claude-acp for Workers, which runs it with the Worker hardening (#214)`,
+      );
+    }
   }
 
   /** Throws unless `id` names an adapter this function can build. */
@@ -306,6 +317,23 @@ export function buildWorkerAdapters(
       `${where}: no Worker adapter "${id}" yet (available: claude-sdk, codex-app-server, acp:<agent>, pty:<preset>)`,
     );
   }
+}
+
+/**
+ * Whether a command word runs claude-agent-acp: its bin, its npm package (current, or the old
+ * `@zed-industries/claude-code-acp`, renamed to it), or a path into its package directory
+ * (`node .../claude-agent-acp/dist/index.js`). A wrapper script that hides it is not caught.
+ */
+function runsClaudeAcp(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return (
+    ['claude-agent-acp', 'claude-code-acp'].includes(base) ||
+    /(^|\/)(claude-agent-acp|claude-code-acp)(\/|@|$)/.test(word)
+  );
 }
 
 /** Whether one word of a command runs `bin` (by name, path or npm package). */

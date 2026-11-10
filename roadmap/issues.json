@@ -958,6 +958,17 @@
       "body": "Owner decision, 2026-11-10: Tacet targets Windows, WSL2 first. Tacet runs inside a WSL2 Linux distro (Ubuntu) as on Linux: Node, git, the vendor CLIs and the repos all live in the distro. Native Windows comes later, through an ADR (#194, then #195).\n\n### Tasks\n- [ ] Docs: install steps inside WSL2 (distro, Node 24+, pnpm, git, the vendor CLIs), and the caveats:\n  - repos on `/mnt/c` and other Windows drives (check: performance, permission/metadata, symlink and case-sensitivity behaviour of drvfs/9p mounts),\n  - Windows-side git, editors and indexers touching the same checkout as Tacet's Workers,\n  - check which vendor CLIs need bubblewrap or other helpers (e.g. socat) inside WSL2 for their sandboxes, and whether they work there.\n  Verify each WSL fact from Microsoft's or the tool's own docs (`verify-vendor-facts`) and cite it.\n- [ ] A startup check that warns, with the reason and the fix, when the repo or the state dir is on a Windows drive (`/mnt/<letter>/...` or another drvfs/9p mount) inside WSL.\n- [ ] CI: find out from primary sources whether GitHub-hosted Windows runners can run the test suite inside WSL2 (not WSL1), and how (e.g. a setup action, nested virtualisation). Record the method and its limits. Add the job if it is feasible, or record why not and what would make it so.\n- [ ] Once this lands, ARCHITECTURE and AGENTS.md link the WSL2 setup docs and say whether CI covers WSL2.\n\n### Acceptance criteria\n- The docs describe a working WSL2 setup, with every WSL-specific claim sourced.\n- Starting Tacet on a repo under `/mnt/*` inside WSL prints the warning; a repo in the distro's own filesystem does not. A test covers both, using a fake mount table.\n- Either a CI job runs the suite inside WSL2 on a Windows runner, or the issue records, with sources, why that is not possible on GitHub-hosted runners and what the alternative is.\n\n_See docs/adr/002-language-runtime.md (platforms, with the 2026-11-10 addendum), docs/ARCHITECTURE.md and docs/RESEARCH.md._"
     },
     {
+      "title": "Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "The #200 policy refuses Worker writes to agent, hook and tool config, such as `.claude/`, `.husky/` and `.mcp.json`. Those take effect when the user opens or merges the branch. `.tacet/` is not on that list, yet Tacet loads `.tacet/tacet.yaml` from the repo root (`packages/core/src/node/config/load.ts`). A Worker can therefore commit changes to:\n- `verify` commands, which Tacet runs;\n- `agents.<slug>` commands, which Tacet launches;\n- tiers.\n\nOnce the user merges the branch, the next `tacet run` uses them. This is the same class as the list the owner decided on #200. Found by the #214 review.\n\n### Tasks\n- [ ] Add `.tacet/` (every file in it) to the protected list in `packages/mini/src/daemon/tool-policy.ts`, matched the same way as the rest: any depth, names folded.\n- [ ] Tests, and an ARCHITECTURE update.\n\n### Acceptance criteria\n- A Worker's `Write`/`Edit` to `.tacet/tacet.yaml`, `.tacet/local.yaml` or anything under `.tacet/` is refused, and the reason says to escalate.\n\n_See #200 and docs/ARCHITECTURE.md §2._"
+    },
+    {
       "title": "Worktree manager",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1026,6 +1037,17 @@
         "needs-human"
       ],
       "body": "Found in #181 (verified live on codex-acp 2.6.0 with Codex 0.166.0, mock Responses API): `createSessionConfig` sets `trust_level: \"trusted\"` for every session root after merging any config Tacet can pass (`CODEX_CONFIG`, its own `CODEX_HOME/config.toml`). So a checkout's `.codex/config.toml` (an `[mcp_servers]` command ran, `developer_instructions` reached the model) and `AGENTS.md` apply to an `acp:codex-acp` Worker: files any Worker can write. Native `codex-app-server` Workers are fixed in #181 (an explicit `untrusted` entry); codex-acp overrides that.\n\nAlso noted: the `CODEX_` prefix allowlist passes the user's own `CODEX_CONFIG` and `CODEX_PATH` into codex-acp; set or deny them in the spec.\n\n### Tasks\n- [ ] Owner decision: refuse `acp:codex-acp` for unattended Workers, drop it from the built-in agents, accept the risk, or patch or ask upstream for a way to keep a session root untrusted.\n- [ ] Implement the decision (e.g. `buildWorkerAdapters` refuses it in a Worker tier) and update ARCHITECTURE §6 and the capability matrix.\n- [ ] Set or deny `CODEX_CONFIG` and `CODEX_PATH` in the codex-acp spec.\n\n### Acceptance criteria\n- Either an unattended Worker cannot run on `acp:codex-acp`, or a test against the real agent with a hostile checkout shows its `.codex/config.toml` and `AGENTS.md` do not load.\n- The user's `CODEX_CONFIG` and `CODEX_PATH` never reach codex-acp unless the spec sets them.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (codex-acp, #181)._"
+    },
+    {
+      "title": "pty:claude Workers: an @path in a prompt may read files unasked",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Over the Claude Agent SDK and claude-agent-acp, an `@path` mention in a prompt is read into the prompt with no permission request, outside the checkout too. #214 closes that with `verbatimPrompts`, verified live. A Worker's next prompt can carry text the Worker wrote, such as a `verify` command's output or review findings.\n\n`pty:claude` (interactive Claude Code in a PTY) gets the same text. Its `promptText` (`packages/adapters/pty/src/adapter.ts`) refuses only a leading `/` or `!`. Interactive Claude Code probably expands `@path` too, and its `PreToolUse` hook does not see attachments. This is not verified: `node-pty` cannot build in the sessions that found it.\n\n### Tasks\n- [ ] Verify live, with the PTY conformance setup and the mock Messages API: does an `@<outside path>` pasted in a prompt reach the model? Check inside a ``` fence too.\n- [ ] If it does, refuse or neutralise `@` followed by a path character in Worker prompts. Alternatively, use an interactive-mode equivalent of verbatim prompts, if Claude Code has one: check the CLI reference (`verify-vendor-facts`).\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- A `pty:claude` Worker's prompt containing `@<path outside the checkout>` reads nothing into the prompt, shown live.\n\n_See #214, #200, #206 and docs/ARCHITECTURE.md §2._"
     },
     {
       "title": "tacet cancel <task> in standalone mode",
