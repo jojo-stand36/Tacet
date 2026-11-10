@@ -126,8 +126,8 @@ export const TacetConfig = z.strictObject({
         z
           .string()
           .regex(
-            /^(claude-sdk|codex-app-server|opencode|acp|pty|acp:[a-z0-9][a-z0-9-]*)$/,
-            'expected an adapter id: claude-sdk, codex-app-server, opencode, acp, pty or acp:<agent>',
+            /^(claude-sdk|codex-app-server|opencode|acp|pty|(acp|pty):[a-z0-9][a-z0-9-]*)$/,
+            'expected an adapter id: claude-sdk, codex-app-server, opencode, acp, pty, acp:<agent> or pty:<agent>',
           ),
         z.number().int().positive(),
       ),
