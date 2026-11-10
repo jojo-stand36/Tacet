@@ -36,6 +36,12 @@ export const BASE_ENV_NAMES: readonly string[] = [
   'https_proxy',
   'no_proxy',
   'all_proxy',
+  // Commit identity, for users who set it in the environment rather than in ~/.gitconfig.
+  'GIT_AUTHOR_NAME',
+  'GIT_AUTHOR_EMAIL',
+  'GIT_COMMITTER_NAME',
+  'GIT_COMMITTER_EMAIL',
+  'DO_NOT_TRACK',
   // Trust stores for corporate proxies.
   'NODE_EXTRA_CA_CERTS',
   'SSL_CERT_FILE',

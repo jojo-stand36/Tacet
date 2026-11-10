@@ -33,6 +33,8 @@ import {
   scrubbedEvents,
   scrubLiterals,
   type UserInput,
+  type WorkerEnvPolicy,
+  workerEnv,
 } from '@tacet/core';
 import type { AcpAgentSpec } from './agents.js';
 import {
@@ -68,8 +70,15 @@ export interface AcpAdapterOptions {
    * to run a pinned package's entry point with this Node: `[process.execPath, '<path>/gemini.js']`.
    */
   executable?: string[];
-  /** The user's environment the Worker inherits. Default `process.env`. */
+  /** The user's environment, which the Worker gets an allowlist of. Default `process.env`. */
   baseEnv?: Record<string, string | undefined>;
+  /**
+   * Which of `baseEnv` the Worker gets (#147). Default: the allowlist (`workerEnv`) with the
+   * agent's own variables. Interactive sessions may pass `{ inherit: 'all' }`.
+   */
+  envPolicy?: WorkerEnvPolicy;
+  /** Told the names (never values) of the variables left out of each session's environment. */
+  onEnvDropped?: (names: string[]) => void;
   /** Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL. Default 5000. */
   killTimeoutMs?: number;
   /** Receives the agent's stderr (free-form logging; ACP keeps stdout for messages). Scrubbed. */
@@ -349,15 +358,22 @@ export class AcpAdapter implements AgentAdapter {
 
   // ---- internals -------------------------------------------------------------------------
 
-  /** The agent's environment: the user's, the agent's fixed additions, the session's. */
+  /**
+   * The agent's environment: the allowlist of the user's (#147), then the agent's fixed additions
+   * and the session's own variables, unfiltered.
+   */
   #env(opts: SessionOptions): Record<string, string> {
     const spec = this.#opts.agent;
+    const filtered = workerEnv(
+      this.#opts.baseEnv ?? process.env,
+      {
+        prefixes: spec.envAllow?.prefixes ?? [],
+        names: [...(spec.envAllow?.names ?? []), ...spec.apiKeyEnv],
+      },
+      this.#opts.envPolicy,
+    );
     const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries({
-      ...(this.#opts.baseEnv ?? process.env),
-      ...spec.env,
-      ...opts.env,
-    })) {
+    for (const [k, v] of Object.entries({ ...filtered.env, ...spec.env, ...opts.env })) {
       if (v !== undefined) env[k] = v;
     }
     if (spec.apiKeyEnv.length > 0 && !spec.apiKeyEnv.some((k) => env[k])) {
@@ -365,6 +381,7 @@ export class AcpAdapter implements AgentAdapter {
         `${spec.id}: Workers use an API key only; set ${spec.apiKeyEnv.join(' or ')}`,
       );
     }
+    this.#opts.onEnvDropped?.(filtered.dropped);
     return env;
   }
 

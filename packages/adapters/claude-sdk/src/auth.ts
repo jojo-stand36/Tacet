@@ -1,3 +1,5 @@
+import type { EnvAllow } from '@tacet/core';
+
 /**
  * Auth routing for Claude Workers (owner policy, 2026-11-09; docs/RESEARCH.md §7):
  * - `api_key`: parallel or unattended Workers use the user's own API key (or cloud provider
@@ -60,4 +62,32 @@ export function authEnv(
   }
   for (const k of API_KEY_VARS) delete out[k];
   return out;
+}
+
+/**
+ * The variables a Claude Code Worker needs beyond the common base set (#147), verified on Claude
+ * Code 2.1.319 (capability matrix §1, "Worker environment"): `ANTHROPIC_*` and `CLAUDE_*` cover
+ * the key, base URL, model overrides, mTLS and config dir. A cloud provider route the user chose
+ * adds its own credential chain: Bedrock `AWS_*`; Vertex `CLOUD_ML_*`, `VERTEX_*`, `GOOGLE_*`,
+ * `GCLOUD_*`, `CLOUDSDK_*`; Foundry `AZURE_*` (the exact Azure set is unverified).
+ */
+export function claudeEnvAllow(base: Record<string, string | undefined>): EnvAllow {
+  const on = (k: string) => base[k] !== undefined && base[k] !== '' && base[k] !== '0';
+  const prefixes = ['ANTHROPIC_', 'CLAUDE_'];
+  if (on('CLAUDE_CODE_USE_BEDROCK')) prefixes.push('AWS_');
+  if (on('CLAUDE_CODE_USE_VERTEX')) {
+    prefixes.push('CLOUD_ML_', 'VERTEX_', 'GOOGLE_', 'GCLOUD_', 'CLOUDSDK_');
+  }
+  if (on('CLAUDE_CODE_USE_FOUNDRY')) prefixes.push('AZURE_');
+  return {
+    prefixes,
+    // The user's opt-outs and timeouts, documented in Claude Code's environment reference.
+    names: [
+      'DISABLE_TELEMETRY',
+      'DISABLE_ERROR_REPORTING',
+      'DISABLE_AUTOUPDATER',
+      'DO_NOT_TRACK',
+      'API_TIMEOUT_MS',
+    ],
+  };
 }

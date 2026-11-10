@@ -201,6 +201,8 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
   const make = (mode: string, extra: object = {}) =>
     new CodexAppServerAdapter({
       codexPath: FAKE,
+      // The fake app-server is steered by FAKE_* variables (#147: passed through on purpose).
+      envPolicy: { pass: ['FAKE_*'] },
       killTimeoutMs: 1000,
       baseEnv: {
         PATH: process.env.PATH,
@@ -216,6 +218,48 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
+
+  it('gives unattended Workers an allowlist of the environment, interactive ones all of it', async () => {
+    const envLog = join(root, 'env.json');
+    const user = {
+      PATH: process.env.PATH,
+      HOME: root,
+      OPENAI_API_KEY: FAKE_KEY,
+      OPENAI_ORGANIZATION: 'org-1',
+      ANTHROPIC_API_KEY: 'sk-ant-other-vendor',
+      GITHUB_TOKEN: 'ghp_x',
+      RUST_LOG: 'trace',
+      FAKE_ENV_LOG: envLog,
+    };
+    const dropped: string[][] = [];
+    const run = async (extra: object) => {
+      rmSync(envLog, { force: true });
+      const adapter = make('normal', { baseEnv: user, ...extra });
+      const h = await adapter.start({ cwd: root, env: { TACET_WORKER_MARKER: 'm-1' } });
+      await adapter.close(h);
+      return JSON.parse(readFileSync(envLog, 'utf8')) as string[];
+    };
+    const names = await run({ onEnvDropped: (n: string[]) => dropped.push(n) });
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'OPENAI_API_KEY',
+        'OPENAI_ORGANIZATION',
+        'CODEX_HOME',
+        'TACET_WORKER_MARKER',
+      ]),
+    );
+    for (const n of ['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'RUST_LOG'])
+      expect(names).not.toContain(n);
+    expect(dropped).toEqual([['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'RUST_LOG']]);
+    const interactive = await run({
+      mode: 'interactive',
+      authRoute: 'subscription',
+      envPolicy: undefined,
+    });
+    expect(interactive).toContain('GITHUB_TOKEN');
+    // The key never reaches an interactive session on the login route, filter or not.
+    expect(interactive).not.toContain('OPENAI_API_KEY');
+  });
 
   it('reports a crash during a turn as error and refuses further input', async () => {
     const adapter = make('crash');
@@ -233,6 +277,8 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     const token = 'w0rkerT0ken-abcdef123456';
     const adapter = new CodexAppServerAdapter({
       codexPath: FAKE,
+      // The fake app-server is steered by FAKE_* variables (#147: passed through on purpose).
+      envPolicy: { pass: ['FAKE_*'] },
       killTimeoutMs: 1000,
       baseEnv: {
         PATH: process.env.PATH,

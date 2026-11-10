@@ -23,6 +23,8 @@ import {
   scrubbedEvents,
   scrubLiterals,
   type UserInput,
+  type WorkerEnvPolicy,
+  workerEnv,
 } from '@tacet/core';
 import {
   defaultStateDir,
@@ -33,7 +35,7 @@ import {
   workerGitEnv,
   workerWorktree,
 } from '@tacet/core/node';
-import { AuthRoutingError, type CodexAuthRoute, codexLaunch } from './auth.js';
+import { AuthRoutingError, CODEX_ENV_ALLOW, type CodexAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, METHOD_NOT_FOUND, RpcError } from './jsonrpc.js';
 
 /** The Codex CLI version this adapter is pinned to and conformance-tested against. */
@@ -60,8 +62,15 @@ export const CODEX_CAPABILITIES: AdapterCapabilities = {
 export interface CodexAdapterOptions {
   /** Default `api_key`, the owner's policy for parallel or unattended Workers. */
   authRoute?: CodexAuthRoute;
-  /** The user's environment the Worker inherits. Default `process.env`. */
+  /** The user's environment, which the Worker gets an allowlist of. Default `process.env`. */
   baseEnv?: Record<string, string | undefined>;
+  /**
+   * Which of `baseEnv` the Worker gets (#147). Default: the allowlist (`workerEnv`) for
+   * unattended Workers, the whole environment for interactive sessions.
+   */
+  envPolicy?: WorkerEnvPolicy;
+  /** Told the names (never values) of the variables left out of each session's environment. */
+  onEnvDropped?: (names: string[]) => void;
   /** Responses API base URL for the `api_key` route. Default OpenAI's; tests use a local mock. */
   apiBaseUrl?: string;
   /**
@@ -178,9 +187,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
     if (unattended && route !== 'api_key') {
       throw new AuthRoutingError('unattended Codex Workers must use the api_key route (#65)');
     }
+    const filtered = workerEnv(
+      this.#opts.baseEnv ?? process.env,
+      CODEX_ENV_ALLOW,
+      this.#opts.envPolicy ?? (unattended ? {} : { inherit: 'all' }),
+    );
+    this.#opts.onEnvDropped?.(filtered.dropped);
     const launch = codexLaunch(
       route,
-      { ...(this.#opts.baseEnv ?? process.env), ...opts.env },
+      { ...filtered.env, ...opts.env },
       this.#opts.apiBaseUrl !== undefined ? { baseUrl: this.#opts.apiBaseUrl } : {},
     );
     const home = launch.env.HOME ?? homedir();

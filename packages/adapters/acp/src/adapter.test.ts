@@ -54,6 +54,8 @@ describe('AcpAdapter (fake ACP agent)', () => {
       executable: [process.execPath, FAKE],
       killTimeoutMs: 1000,
       baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...env },
+      // The fake agent is steered by FAKE_* variables (#147: passed through on purpose).
+      envPolicy: { pass: ['FAKE_*'] },
       ...extra,
     });
   const received = () =>
@@ -79,7 +81,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
     ];
     const adapter = make(GEMINI_AGENT, {
       GEMINI_API_KEY: 'placeholder',
-      FAKE_AUTH_METHODS: JSON.stringify(offered),
+      FAKE_LOGIN_METHODS: JSON.stringify(offered),
     });
     const h = await adapter.start({ cwd: join(root, 'wt') });
     await adapter.close(h);
@@ -95,13 +97,46 @@ describe('AcpAdapter (fake ACP agent)', () => {
     ];
     const adapter = make(CLAUDE_ACP_AGENT, {
       ANTHROPIC_API_KEY: 'placeholder',
-      FAKE_AUTH_METHODS: JSON.stringify(logins),
+      FAKE_LOGIN_METHODS: JSON.stringify(logins),
     });
     const h = await adapter.start({ cwd: join(root, 'wt') });
     await adapter.close(h);
     expect(methods().some((m) => m.method === 'authenticate')).toBe(false);
     // Launched with the subscription login hidden.
     expect(received()[0]?.argv).toContain('--hide-claude-auth');
+  });
+
+  it('gives the agent an allowlist of the environment, not other vendors keys (#147)', async () => {
+    const dropped: string[][] = [];
+    const adapter = make(
+      GEMINI_AGENT,
+      {
+        GEMINI_API_KEY: 'placeholder',
+        GOOGLE_GEMINI_BASE_URL: 'http://127.0.0.1:9',
+        GOOGLE_APPLICATION_CREDENTIALS: '/tmp/adc.json',
+        ANTHROPIC_API_KEY: 'sk-ant-other-vendor',
+        OPENAI_API_KEY: 'sk-other-vendor',
+        GITHUB_SHA: 'abc',
+      },
+      { onEnvDropped: (n: string[]) => dropped.push(n) },
+    );
+    const h = await adapter.start({ cwd: join(root, 'wt'), env: { TACET_WORKER_MARKER: 'm-1' } });
+    await adapter.close(h);
+    const names = (received()[0] as { envNames?: string[] }).envNames ?? [];
+    expect(names).toEqual(
+      expect.arrayContaining(['GEMINI_API_KEY', 'GOOGLE_GEMINI_BASE_URL', 'TACET_WORKER_MARKER']),
+    );
+    for (const n of [
+      'ANTHROPIC_API_KEY',
+      'OPENAI_API_KEY',
+      'GOOGLE_APPLICATION_CREDENTIALS',
+      'GITHUB_SHA',
+    ]) {
+      expect(names).not.toContain(n);
+    }
+    expect(dropped).toEqual([
+      ['ANTHROPIC_API_KEY', 'GITHUB_SHA', 'GOOGLE_APPLICATION_CREDENTIALS', 'OPENAI_API_KEY'],
+    ]);
   });
 
   it('refuses to start without an API key, and when the agent wants a login', async () => {
@@ -111,8 +146,8 @@ describe('AcpAdapter (fake ACP agent)', () => {
     expect(existsSync(logFile)).toBe(false);
     const wantsLogin = make(GEMINI_AGENT, {
       GEMINI_API_KEY: 'placeholder',
-      FAKE_REQUIRE_AUTH: '1',
-      FAKE_AUTH_METHODS: JSON.stringify([{ id: 'oauth-personal', name: 'Log in with Google' }]),
+      FAKE_NEEDS_LOGIN: '1',
+      FAKE_LOGIN_METHODS: JSON.stringify([{ id: 'oauth-personal', name: 'Log in with Google' }]),
     });
     await expect(wantsLogin.start({ cwd: join(root, 'wt') })).rejects.toThrow(AuthRoutingError);
     expect(methods().some((m) => m.method === 'authenticate')).toBe(false);
