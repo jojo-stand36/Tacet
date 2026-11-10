@@ -23,6 +23,13 @@ export const WorkerStarted = z.object({
   previousSessionId: Id.optional().describe(
     'The session this one replaces (restart, handoff or retry), like AG-UI parentRunId',
   ),
+  baseCommit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/)
+    .optional()
+    .describe(
+      "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
+    ),
 });
 export type WorkerStarted = z.infer<typeof WorkerStarted>;
 
