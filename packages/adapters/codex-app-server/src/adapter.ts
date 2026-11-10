@@ -39,6 +39,8 @@ import {
 } from '@tacet/core';
 import {
   defaultStateDir,
+  processGroupAlive,
+  processGroupGone,
   repoStateDir,
   SAFE_GIT_ARGS,
   trustedGitEnv,
@@ -104,7 +106,11 @@ export interface CodexAdapterOptions {
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */
   codexPath?: string;
-  /** Milliseconds to wait for the process to exit after SIGTERM before SIGKILL. */
+  /**
+   * Milliseconds to wait for the process to exit after SIGTERM before SIGKILL, and again for the
+   * rest of its process group (#191). Default 5000. Worst-case `close()` is about
+   * 0.5 s + 2 × this + 1 s.
+   */
   killTimeoutMs?: number;
   /**
    * Extra non-secret `-c key=value` overrides for `codex app-server`, e.g.
@@ -173,7 +179,10 @@ interface Session {
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
   exited: Promise<void>;
-  /** Set synchronously on exit; after that the process group must never be signalled. */
+  /**
+   * Set synchronously on exit; after that the process group is signalled only right after a
+   * running member was seen (`#terminate`), never blindly: its id could be reused once empty.
+   */
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 }
 
@@ -399,7 +408,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
         // Codex's children (e.g. its plugin `git` sync) keep the group alive, so signalling it
-        // here, synchronously on exit, cannot reach a reused group id. Later code never does.
+        // here, synchronously on exit, cannot reach a reused group id. Later code signals it only
+        // right after seeing a running member (#terminate).
         signalGroup(proc, 'SIGTERM');
         resolve();
       }),
@@ -646,11 +656,22 @@ export class CodexAppServerAdapter implements AgentAdapter {
         new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
       ]);
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (await within(Math.min(500, timeout))) return;
-    if (!hasExited()) signalGroup(proc, 'SIGTERM');
-    if (await within(timeout)) return;
-    if (!hasExited()) signalGroup(proc, 'SIGKILL');
-    await exited;
+    if (!(await within(Math.min(500, timeout)))) {
+      if (!hasExited()) signalGroup(proc, 'SIGTERM');
+      if (!(await within(timeout))) {
+        if (!hasExited()) signalGroup(proc, 'SIGKILL');
+        await exited;
+      }
+    }
+    // Codex's own children (tool commands, MCP servers, its plugin sync) got SIGTERM when it
+    // exited, but may still be shutting down and writing into the Worker's CODEX_HOME or
+    // checkout: wait for the whole group, so nothing of a closed session is left running (#191).
+    // SIGKILL only right after seeing a running member, synchronously: a pid is not reused while
+    // it is the id of a group with members, so this cannot reach a reused group id.
+    if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
+      if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
+      await processGroupGone(proc.pid, 1000);
+    }
   }
 
   #session(h: SessionHandle): Session {
