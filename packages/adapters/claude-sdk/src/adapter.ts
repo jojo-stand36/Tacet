@@ -338,6 +338,10 @@ export class ClaudeSdkAdapter implements AgentAdapter {
                 disallowedTools: [...SHELL_TOOLS],
                 // Never auto-approve: an `allowedTools` entry would skip `canUseTool`.
                 allowedTools: [],
+                // No `@path` expansion or slash commands in prompts: Worker-written text (a verify
+                // command's output) reaches the next prompt, and an `@path` there would be read
+                // in without asking (#214 review; SDK 0.3.319 `verbatimPrompts`).
+                verbatimPrompts: true,
                 permissionMode: 'default' as const,
                 hooks: {
                   PreToolUse: [
