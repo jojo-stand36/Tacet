@@ -123,6 +123,15 @@ function identities(pids: readonly number[]): Map<number, ProcessIdentity> {
   return out;
 }
 
+/**
+ * When `pid` started, as an opaque string to compare (it tells a process apart from a later one
+ * with the same pid), or undefined when there is no such process or its start time cannot be
+ * read.
+ */
+export function processStartTime(pid: number): string | undefined {
+  return identities([pid]).get(pid)?.start;
+}
+
 /** Whether `pid` is running: it exists and is not a zombie waiting to be reaped. */
 export function isProcessRunning(pid: number): boolean {
   const id = identities([pid]).get(pid);
