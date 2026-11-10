@@ -156,6 +156,11 @@ export class MergeConflictError extends Error {
 export interface VerifyContext {
   /** The integrated commit the checkout must be at, when the Worker's work was integrated. */
   commit?: string;
+  /**
+   * Untracked paths the Mini-conductor vouches for, which do not make the checkout unclean: the
+   * empty placeholders of Claude Code's sandbox, which no commit has (#260, #263).
+   */
+  ignoreUntracked?: (path: string) => boolean;
   /** Aborted when the session ends or the Mini-conductor stops: the run ends as `not_run`. */
   signal: AbortSignal;
   /**

@@ -21,6 +21,7 @@ import { inflateSync, constants as zlibConstants } from 'node:zlib';
 import {
   readWorkerFile,
   SAFE_GIT_ARGS,
+  trustedGitEnv,
   type WorkerWorktree,
   workerWorktree,
 } from '@tacet/core/node';
@@ -598,7 +599,8 @@ export interface CommitWorktreeOptions {
  * `git add` of exactly the changed paths (their contents read as data; a symlink is stored as a
  * link, never followed), `write-tree`, and `commit-tree` with the parent, unsigned, by
  * `TACET_WORKER_IDENTITY`; the objects go to the shared store and the Worker's own store is never
- * read. Then `ref` points at the commit. Refuses, committing nothing, when a changed path is
+ * read. Then `ref` points at the commit, and the Worker's HEAD (detached) and index at it too, so
+ * the checkout is clean at the commit, as after a commit of its own. Refuses, committing nothing, when a changed path is
  * protected config or the change is too big. Undefined when there is nothing to commit or no
  * parent the repo has.
  */
@@ -617,7 +619,12 @@ export async function commitWorktree(
     ...(opts.env ? { env: opts.env } : {}),
     maxPaths: (opts.maxFiles ?? 5000) + 1,
   });
-  const wt = workerWorktree(opts.cwd, opts.repoRoot);
+  let wt: WorkerWorktree | undefined;
+  try {
+    wt = workerWorktree(opts.cwd, opts.repoRoot);
+  } catch (err) {
+    throw new WorktreeRefusedError((err as Error).message);
+  }
   if (!changes || !wt) return undefined;
   // A nested repository (`dir/`) is not committed: it stays in the checkout, and is reported as
   // left out (#261).
@@ -667,8 +674,8 @@ export async function commitWorktree(
         ],
         { cwd: opts.repoRoot, env: gitEnv, timeoutMs: opts.timeoutMs ?? 120_000, input },
       );
-    const parent =
-      opts.parent ?? (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    const head = (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    const parent = opts.parent ?? head;
     if (parent === undefined || !COMMIT_ID.test(parent)) return undefined;
     // As in `uncommittedChanges`: attributes from the parent, so no Worker-named filter runs.
     // Paths are literal: a name with `*` or `:(` is that file, never a pattern or magic.
@@ -691,6 +698,34 @@ export async function commitWorktree(
     ]);
     if (!COMMIT_ID.test(commit)) throw new Error('commit-tree gave no commit id');
     await setTaskBranch(opts.ref, commit, { repoRoot: opts.repoRoot, env });
+    // Then the checkout is at the commit, as a Worker's own commit would leave it: its HEAD and
+    // index, in its git dir, which Tacet writes from outside (a Worker with no shell cannot
+    // reach it). The branch comes first: if this fails, the checkout still shows the changes.
+    const wenv = {
+      ...trustedGitEnv(realpathSync.native(opts.cwd), wt, env),
+      GIT_ATTR_NOSYSTEM: '1',
+    };
+    const inWorker = (args: string[]) =>
+      run(
+        [
+          'git',
+          `--attr-source=${parent}`,
+          ...SAFE_GIT_ARGS,
+          '-c',
+          'core.attributesFile=/dev/null',
+          ...args,
+        ],
+        { cwd: opts.repoRoot, env: wenv, timeoutMs: opts.timeoutMs ?? 120_000 },
+      );
+    await inWorker([
+      'update-ref',
+      '--no-deref',
+      'HEAD',
+      commit,
+      ...(head !== undefined ? [head] : []),
+    ]);
+    // No refresh: it would hash files with the commit's attributes, which may be the Worker's.
+    await inWorker(['read-tree', commit]);
     return { commit, ref: opts.ref, paths };
   } finally {
     rmSync(tmp, { recursive: true, force: true });

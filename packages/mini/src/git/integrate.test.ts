@@ -216,7 +216,7 @@ describe('integrateWorktree', () => {
         ...extra,
       });
 
-    it("commits changed, deleted and new files as Tacet's own Worker, unsigned, and leaves the checkout alone", async () => {
+    it("commits changed, deleted and new files as Tacet's own Worker, unsigned, and moves the checkout to it", async () => {
       // Signing would fail: the commit must not try.
       git(repo, ['config', '--global', 'commit.gpgSign', 'true']);
       git(repo, ['config', '--global', 'gpg.program', 'false']);
@@ -230,7 +230,6 @@ describe('integrateWorktree', () => {
       writeFileSync(join(w.dir, 'README'), 'changed\n');
       rmSync(join(w.dir, 'gone.txt'));
       writeFileSync(join(w.dir, 'new.txt'), 'new\n');
-      const workerHeadBefore = git(w.dir, ['rev-parse', 'HEAD'], w.wenv);
       const r = await commitFor(w, 'c1');
       if (!r || !('commit' in r)) throw new Error(`no commit: ${JSON.stringify(r)}`);
       expect(r.paths.sort()).toEqual(['README', 'gone.txt', 'new.txt']);
@@ -245,8 +244,10 @@ describe('integrateWorktree', () => {
       );
       expect(git(repo, ['show', `${r.commit}:new.txt`])).toBe('new');
       expect(() => git(repo, ['cat-file', '-e', `${r.commit}:gone.txt`])).toThrow();
-      // The Worker's HEAD does not move; its checkout now has nothing beyond the commit.
-      expect(git(w.dir, ['rev-parse', 'HEAD'], w.wenv)).toBe(workerHeadBefore);
+      // The checkout is at the commit, detached, and clean by its own index too.
+      expect(git(w.dir, ['rev-parse', 'HEAD'], w.wenv)).toBe(r.commit);
+      expect(() => git(w.dir, ['symbolic-ref', '-q', 'HEAD'], w.wenv)).toThrow();
+      expect(git(w.dir, ['status', '--porcelain'], w.wenv)).toBe('');
       expect(
         await uncommittedChanges({ cwd: w.dir, repoRoot: repo, commit: r.commit, env }),
       ).toEqual([]);

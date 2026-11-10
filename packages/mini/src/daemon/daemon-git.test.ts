@@ -400,13 +400,32 @@ describe('MiniConductor with git worktrees', () => {
     expect(() => git(repo, ['rev-parse', '--verify', '-q', resultBranch(id)])).toThrow();
   });
 
-  it('fails, without retrying, a sub-task whose changes were never committed (#261)', async () => {
-    // Tacet's own commit for the Worker (#260) fails: the work never leaves the checkout.
+  it('fails, retrying, a sub-task whose Tacet commit failed (#260)', async () => {
     const failing = new (class extends GitIntegrator {
       override commitFor = async (): Promise<never> => {
         throw new Error('disk full');
       };
     })(repo, env);
+    const d = start((cwd) => writeFileSync(join(cwd, 'work.txt'), 'work\n'), undefined, undefined, {
+      adapterId: 'claude-sdk',
+      integrator: failing,
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const sub = `${id}/1`;
+    expect(tasks()[sub]?.state).toBe('failed');
+    const notes = data<{ verification: { notes?: string } }>(sub, 'task.result').at(-1)
+      ?.verification.notes;
+    expect(notes).toBe("Tacet's commit of the Worker's changes failed: disk full");
+    // A git failure may pass: the attempt is retried, in the same checkout.
+    expect(data(sub, 'worker.started').length).toBeGreaterThan(1);
+  });
+
+  it('fails, without retrying, a sub-task whose changes were never committed (#261)', async () => {
+    // An integrator that does not commit for the Worker (#260): the work never leaves the checkout.
+    const failing = new GitIntegrator(repo, env);
+    Object.defineProperty(failing, 'commitFor', { value: undefined });
     const d = start(
       (cwd) => {
         writeFileSync(join(cwd, 'work.txt'), 'work\n');
@@ -424,9 +443,7 @@ describe('MiniConductor with git worktrees', () => {
     expect(tasks()[sub]?.state).toBe('failed');
     const message = data<{ message?: string }>(sub, 'task.status').at(-1)?.message ?? '';
     expect(message).toMatch(/^nothing was integrated: the Worker changed 1 file \("work\.txt"\)/);
-    expect(message).toContain(
-      "claude-sdk Workers cannot run git, and Tacet's commit for it failed",
-    );
+    expect(message).toContain('claude-sdk Workers cannot run git, and Tacet did not commit for it');
     expect(message).not.toContain('package.json');
     expect(data<{ outcome: string }>(sub, 'task.result').at(-1)?.outcome).toBe('failed');
     // One attempt: retrying a Worker that cannot commit would only fail again.
@@ -447,7 +464,8 @@ describe('MiniConductor with git worktrees', () => {
         writeFileSync(join(cwd, 'package.json'), '');
       },
       undefined,
-      undefined,
+      // Verified at the commit: the checkout is at it, clean (#260 review).
+      ['true'],
       { adapterId: 'claude-sdk' },
     );
     await d.start();
@@ -469,6 +487,16 @@ describe('MiniConductor with git worktrees', () => {
     expect(() => git(repo, ['cat-file', '-e', `${commit}:package.json`])).toThrow();
     expect(data<{ commits: string[] }>(sub, 'task.result').at(-1)?.commits).toEqual([commit]);
     expect(data<{ message?: string }>(sub, 'task.status').at(-1)?.message).toBeUndefined();
+    expect(
+      data<{ verification: { status: string } }>(sub, 'task.result').at(-1)?.verification.status,
+    ).toBe('passed');
+    // The checkout is at the commit and clean, so it can be removed once the work lands.
+    const wsId = data<{ workspaceId: string }>(sub, 'worker.started')[0]?.workspaceId ?? '';
+    const cwd = join(root, 'worktrees', wsId);
+    const wt = workerWorktree(cwd, repo);
+    if (!wt) throw new Error('not a worktree');
+    expect(git(cwd, ['rev-parse', 'HEAD'], workerGitEnv(wt))).toBe(commit);
+    expect(git(cwd, ['status', '--porcelain', '--untracked-files=no'], workerGitEnv(wt))).toBe('');
   });
 
   it('asks the user, committing nothing, when a claude-sdk Worker changed protected config (#260)', async () => {
@@ -476,10 +504,7 @@ describe('MiniConductor with git worktrees', () => {
     const d = start(
       (cwd, input) => {
         inputs.push(input);
-        if (input.includes('undo the config')) {
-          rmSync(join(cwd, '.claude'), { recursive: true, force: true });
-          return undefined;
-        }
+        if (input.includes('reverted')) return undefined;
         mkdirSync(join(cwd, '.claude'), { recursive: true });
         writeFileSync(join(cwd, '.claude', 'settings.json'), '{}\n');
         writeFileSync(join(cwd, 'work.txt'), 'work\n');
@@ -498,6 +523,12 @@ describe('MiniConductor with git worktrees', () => {
       sub,
       'escalation.raised',
     );
+    const wsId = data<{ workspaceId: string }>(sub, 'worker.started')[0]?.workspaceId ?? '';
+    expect(raised[0]?.question).toContain(
+      `The Worker cannot change those paths itself: revert them in checkout ${wsId}`,
+    );
+    // The user reverts it, as the Worker cannot.
+    rmSync(join(root, 'worktrees', wsId, '.claude'), { recursive: true, force: true });
     expect(raised).toHaveLength(1);
     expect(raised[0]?.question).toContain('".claude/settings.json"');
     expect(raised[0]?.question).not.toContain(root);
@@ -511,12 +542,12 @@ describe('MiniConductor with git worktrees', () => {
       source: { kind: 'conductor', id: 'test' },
       taskId: sub,
       type: 'escalation.resolved',
-      data: { escalationId: raised[0]?.id, answer: 'undo the config' },
+      data: { escalationId: raised[0]?.id, answer: 'reverted' },
     });
     await d.settled();
-    // The same session got the answer, undid the config, and its work was committed.
+    // The same session got the answer, and its work was committed, without the config.
     expect(data(sub, 'worker.started')).toHaveLength(1);
-    expect(inputs.at(-1)).toContain('undo the config');
+    expect(inputs.at(-1)).toContain('reverted');
     expect(tasks()[sub]?.state).toBe('completed');
     const commit = data<{ commit: string }>(sub, 'worker.integrated').at(-1)?.commit ?? '';
     expect(git(repo, ['ls-tree', '-r', '--name-only', commit]).split('\n').sort()).toEqual([

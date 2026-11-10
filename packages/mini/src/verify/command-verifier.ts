@@ -90,7 +90,7 @@ export class CommandVerifier implements Verifier {
         `refusing to verify in ${workspace.id}: it is not a linked worktree of the repo`,
       );
     }
-    const dirty = await this.#dirty(workspace.path, wt, ctx.commit);
+    const dirty = await this.#dirty(workspace.path, wt, ctx.commit, ctx.ignoreUntracked);
     if (dirty) {
       return {
         status: 'failed',
@@ -126,7 +126,7 @@ export class CommandVerifier implements Verifier {
     if (ctx.signal.aborted || results.length < commands.length) {
       return { status: 'not_run', commands, results, notes: 'Verification was stopped.' };
     }
-    const after = await this.#dirty(workspace.path, wt, ctx.commit);
+    const after = await this.#dirty(workspace.path, wt, ctx.commit, ctx.ignoreUntracked);
     if (after) {
       return {
         status: 'failed',
@@ -140,7 +140,12 @@ export class CommandVerifier implements Verifier {
   }
 
   /** Why the checkout is not exactly the integrated commit, or undefined when it is. */
-  async #dirty(cwd: string, wt: WorkerWorktree, commit?: string): Promise<string | undefined> {
+  async #dirty(
+    cwd: string,
+    wt: WorkerWorktree,
+    commit?: string,
+    ignoreUntracked?: (path: string) => boolean,
+  ): Promise<string | undefined> {
     // Only PATH and HOME, and the worktree's git dirs as checked (no Worker object store: the
     // integrated commit is in the shared one, and a worktree without its own store is refused
     // with it).
@@ -179,7 +184,11 @@ export class CommandVerifier implements Verifier {
       '--ignore-submodules=all',
     ]);
     if (status.code !== 0) return 'git could not read the checkout';
-    const lines = status.out.split('\n').filter(Boolean);
+    // A vouched-for untracked path is skipped; a quoted (unusual) name never matches one.
+    const lines = status.out
+      .split('\n')
+      .filter(Boolean)
+      .filter((l) => !(l.startsWith('?? ') && ignoreUntracked?.(l.slice(3))));
     // Entries the index marks to be skipped are invisible to status: a Worker could hide changes.
     const listed = await git(['ls-files', '-v']);
     if (listed.code !== 0) return 'git could not read the checkout';
