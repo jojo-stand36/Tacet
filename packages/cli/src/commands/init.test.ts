@@ -362,7 +362,7 @@ describe('tacet uninstall (#20)', () => {
     expect(existsSync(join(repo, '.claude', 'settings.json'))).toBe(true);
   });
 
-  it('keeps the backup and says where when removal fails, and refuses a symlinked .tacet', async () => {
+  it('backs up symbolic links as links, and refuses a symlinked .tacet', async () => {
     await tacet(['init', '--model', 'm']);
     const outside = join(dir, 'outside.txt');
     writeFileSync(outside, 'keep me');
@@ -380,6 +380,35 @@ describe('tacet uninstall (#20)', () => {
     expect(refused.code).toBe(1);
     expect(refused.err).toContain('.tacet must be a directory');
     expect(readdirSync(elsewhere)).toEqual(['tacet.yaml']);
+  });
+
+  it('leaves .tacet/ and claims no backup when the backup cannot be made', async () => {
+    await tacet(['init', '--model', 'm']);
+    mkdirSync(join(home, '.tacet'));
+    writeFileSync(join(home, '.tacet', 'backups'), 'a file, not a directory');
+    const before = snapshot(join(repo, '.tacet'));
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.code).toBe(1);
+    expect(r.err).not.toContain('the backup is at');
+    expect(snapshot(join(repo, '.tacet'))).toEqual(before);
+  });
+
+  it('names the backup when removing .tacet/ fails after it', async () => {
+    await tacet(['init', '--model', 'm']);
+    const sub = join(repo, '.tacet', 'sub');
+    mkdirSync(sub);
+    writeFileSync(join(sub, 'f'), 'x');
+    chmodSync(sub, 0o500);
+    try {
+      const r = await tacet(['uninstall', '--purge', '--apply']);
+      // As root, removal succeeds anyway; the message is only checked where it fails.
+      if (r.code === 1) {
+        const at = /the backup is at (.+)$/m.exec(r.err)?.[1];
+        expect(at && existsSync(join(at, '.tacet', 'sub', 'f'))).toBe(true);
+      }
+    } finally {
+      if (existsSync(sub)) chmodSync(sub, 0o700);
+    }
   });
 
   it('refuses outside a git repo', async () => {

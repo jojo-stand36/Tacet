@@ -199,6 +199,7 @@ export async function init(io: Io, o: InitOptions): Promise<number> {
  */
 export function uninstall(io: Io, o: UninstallOptions): number {
   let backup: string | undefined;
+  let backedUp = false;
   try {
     const root = repoFor(io, o);
     const tacetDir = join(root, '.tacet');
@@ -237,9 +238,9 @@ export function uninstall(io: Io, o: UninstallOptions): number {
           });
         } catch (err) {
           rmSync(backup, { recursive: true, force: true });
-          backup = undefined;
           throw err;
         }
+        backedUp = true;
         rmSync(tacetDir, { recursive: true });
       } else {
         for (const path of removals) {
@@ -272,7 +273,7 @@ export function uninstall(io: Io, o: UninstallOptions): number {
     return 0;
   } catch (err) {
     const code = failed(io, err);
-    if (backup !== undefined && o.apply) io.err(`the backup is at ${terminalSafe(backup)}`);
+    if (backedUp && backup !== undefined) io.err(`the backup is at ${terminalSafe(backup)}`);
     return code;
   }
 }
