@@ -37,6 +37,8 @@ export interface MockResponsesApi {
     inputs: number;
     /** `call_id`s of the function calls in the input, so a resumed thread can be recognised. */
     callIds: string[];
+    /** The request body as sent, to check that some text never reached the model (#181). */
+    raw: string;
   }[];
   close(): Promise<void>;
 }
@@ -106,6 +108,7 @@ async function handle(
   } catch {}
   const last = lastUser(body);
   log.push({
+    raw,
     model: body.model,
     effort: body.reasoning?.effort,
     text: last.text,

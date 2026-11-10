@@ -22,6 +22,8 @@ export interface MockGeminiRequest {
   stream: boolean;
   text: string;
   toolResult: boolean;
+  /** The request body as sent, to check that some text never reached the model (#181). */
+  raw: string;
 }
 
 export interface MockGeminiApi {
@@ -131,7 +133,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, log: MockGemini
   };
   if (url.includes(':countTokens')) return json(200, { totalTokens: 120 });
   if (url.includes(':streamGenerateContent')) {
-    log.push({ model, stream: true, ...lastUser(body) });
+    log.push({ model, stream: true, raw, ...lastUser(body) });
     const { chunks, delayMs } = script(model, body);
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     for (const [i, parts] of chunks.entries()) {
@@ -143,7 +145,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, log: MockGemini
     return;
   }
   if (url.includes(':generateContent')) {
-    log.push({ model, stream: false, ...lastUser(body) });
+    log.push({ model, stream: false, raw, ...lastUser(body) });
     // The CLI's model router asks for a JSON choice; any reasonable one will do.
     return json(200, chunk([{ text: '{"reasoning":"mock","model_choice":"flash"}' }], true));
   }

@@ -1,6 +1,16 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -328,6 +338,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
       );
       privateDir(codexHome);
       launch.env.CODEX_HOME = codexHome;
+      // Codex trusts a repo by itself at the first thread that can write it, and a trusted
+      // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
+      // hooks) and AGENTS.md then apply: all of them files a Worker can write (#181, verified on
+      // 0.167.0). An explicit `untrusted` is respected and never overwritten.
+      untrustProjects(join(codexHome, 'config.toml'), [
+        workerRepoRoot(opts.cwd, this.#opts.repoRoot),
+        opts.cwd,
+      ]);
     } else {
       codexHome = launch.env.CODEX_HOME ?? join(home, '.codex');
       // Codex refuses to start when CODEX_HOME does not exist.
@@ -979,6 +997,49 @@ export function configArgs(
     '-c',
     `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
   ]);
+}
+
+/**
+ * Mark `paths` (and their real paths) `untrusted` in a Codex `config.toml` Tacet owns, replacing
+ * any entry Codex wrote for them. Other content is kept. Written with a rename, mode 0600.
+ * The editor is line-based: it recognises the `[projects."<path>"]` tables Codex writes, not
+ * other TOML spellings of them (a duplicate table would make Codex refuse the file: fails closed).
+ */
+export function untrustProjects(file: string, paths: readonly string[]): void {
+  const keys = new Set<string>();
+  for (const p of paths) {
+    keys.add(p);
+    try {
+      keys.add(realpathSync(p));
+    } catch {}
+  }
+  const headers = new Set([...keys].map((k) => `[projects.${JSON.stringify(k)}]`));
+  let text = '';
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    // Only a missing file starts empty: any other read error must not drop its content.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  // Drop each table for these paths: its header line up to the next table header.
+  const kept: string[] = [];
+  let dropping = false;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('[')) dropping = headers.has(t);
+    if (!dropping) kept.push(line);
+  }
+  const body = kept.join('\n').replace(/\n*$/, '');
+  const tables = [...headers].map((h) => `${h}\ntrust_level = "untrusted"\n`).join('\n');
+  // A fresh name, created exclusively: never a planted file or symlink at a guessable path.
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, `${body ? `${body}\n\n` : ''}${tables}`, { mode: 0o600, flag: 'wx' });
+  try {
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Append `-c`-style settings through `GIT_CONFIG_COUNT`, keeping any the caller already set. */
