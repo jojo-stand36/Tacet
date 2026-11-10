@@ -17,6 +17,10 @@ export type {
   Integrator,
   Planner,
   ProposedSubtask,
+  ReviewContext,
+  Reviewer,
+  ReviewFinding,
+  ReviewResult,
   Verifier,
   VerifyContext,
   VerifyResult,
@@ -32,6 +36,7 @@ export {
   pickReady,
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
+export { type ReviewDiff, type ReviewDiffOptions, reviewDiff } from './git/diff.js';
 export {
   GitIntegrator,
   type Integration,
@@ -59,6 +64,15 @@ export {
   type ToolOutput,
   ToolSchemas,
 } from './mcp/tools.js';
+export {
+  AdapterReviewer,
+  type AdapterReviewerOptions,
+  parseReview,
+  REVIEWER_SYSTEM_PROMPT,
+  reviewerPrompt,
+  reviewFeedback,
+} from './review/adapter-reviewer.js';
+export { REVIEW_WITH_CODEX, reviewConfigProblem } from './review/config.js';
 export {
   CommandVerifier,
   type CommandVerifierOptions,

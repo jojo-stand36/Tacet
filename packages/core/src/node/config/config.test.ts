@@ -246,6 +246,48 @@ describe('loadConfig', () => {
     ).toThrow(/workers\.verify_timeout_s: the task layer .* may only lower it/);
   });
 
+  it('lets a task turn review on but never off (#19)', () => {
+    expect(loadConfig({ userDir, repoRoot }).config.review).toBeUndefined();
+    expect(
+      loadConfig({ userDir, repoRoot, task: { review: { enabled: true } } }).config.review,
+    ).toEqual({ enabled: true });
+    expect(() => loadConfig({ userDir, repoRoot, task: { review: { enabled: false } } })).toThrow(
+      /review\.enabled: the task layer .* may not turn review off/,
+    );
+    // Nor weaken it through the tiers (review re-review S6).
+    expect(() =>
+      loadConfig({
+        userDir,
+        repoRoot,
+        task: { tiers: { review: { adapter: 'claude-sdk', cross_vendor: false } } },
+      }),
+    ).toThrow(/tiers\.review: the task layer .* may not change the reviewer/);
+    expect(() =>
+      loadConfig({
+        userDir,
+        repoRoot,
+        task: { tiers: { worker: { adapter: 'opencode', vendor: 'google' } } },
+      }),
+    ).toThrow(/tiers\.worker\.vendor: the task layer .* may not declare a vendor/);
+    // The user's own local layer may.
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'review: { enabled: true }\n');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'review: { enabled: false }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.review).toEqual({ enabled: false });
+  });
+
+  it('takes a vendor on a tier, and refuses an unknown one (#19)', () => {
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'tiers: { review: { adapter: opencode, vendor: google } }\n',
+    );
+    expect(loadConfig({ userDir, repoRoot }).config.tiers?.review?.vendor).toBe('google');
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'tiers: { review: { adapter: opencode, vendor: acme } }\n',
+    );
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/tiers\.review\.vendor/);
+  });
+
   it('reports every problem with file, line and column', () => {
     write(
       join(repoRoot, '.tacet', 'tacet.yaml'),

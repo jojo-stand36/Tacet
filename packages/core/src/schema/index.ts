@@ -14,6 +14,7 @@ import {
   WorkerIntegrated,
   WorkerNudged,
   WorkerProfile,
+  WorkerReview,
   WorkerStarted,
   WorkerThrottled,
   WorkerVendorSession,
@@ -76,6 +77,7 @@ export const jsonSchemas = {
     schema: WorkerVerification,
     title: 'Tacet worker.verification payload',
   },
+  'worker-review': { schema: WorkerReview, title: 'Tacet worker.review payload' },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;
