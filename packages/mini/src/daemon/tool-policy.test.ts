@@ -350,6 +350,136 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Write', { file_path: 'cfg/settings.json', content: '' }).allow).toBe(false);
   });
 
+  it("refuses writes to Tacet's own config, .tacet/, at any depth (#227)", () => {
+    for (const p of [
+      '.tacet/tacet.yaml',
+      '.tacet/local.yaml',
+      '.tacet',
+      'pkg/.tacet/x.yaml',
+      '.TACET/tacet.yaml',
+    ]) {
+      const r = ask('Write', { file_path: p, content: '' });
+      expect({ p, allow: r.allow }).toEqual({ p, allow: false });
+      expect(r.reason).toMatch(/escalate/);
+    }
+    expect(
+      ask('Edit', { file_path: '.tacet/tacet.yaml', old_string: 'a', new_string: 'b' }).allow,
+    ).toBe(false);
+    expect(ask('NotebookEdit', { notebook_path: '.tacet/n.ipynb', new_source: '' }).allow).toBe(
+      false,
+    );
+    // Folded names, and the file that keeps local.yaml out of git.
+    for (const p of ['.ta\u200dcet/tacet.yaml', '\uff0etacet/tacet.yaml', '.tacet/.gitignore']) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
+    // A committed `.tacet` symlink to elsewhere in the checkout is still Tacet's config.
+    mkdirSync(join(wt, 'config', 'tacet'), { recursive: true });
+    symlinkSync(join(wt, 'config', 'tacet'), join(wt, '.tacet'));
+    expect(ask('Write', { file_path: '.tacet/tacet.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: join(wt, '.tacet', 'tacet.yaml'), content: '' }).allow).toBe(
+      false,
+    );
+    // So is the file it points at, written by its real path: Tacet reads it through the link.
+    expect(ask('Write', { file_path: 'config/tacet/tacet.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'config/other.yaml', content: '' }).allow).toBe(true);
+    // Likewise a root `.mcp.json` that links to another file.
+    writeFileSync(join(wt, 'servers.json'), '{}');
+    symlinkSync(join(wt, 'servers.json'), join(wt, '.mcp.json'));
+    expect(ask('Edit', { file_path: 'servers.json', old_string: '{', new_string: '[' }).allow).toBe(
+      false,
+    );
+    // Reading it is fine, and similar names are not it.
+    expect(ask('Read', { file_path: '.tacet/tacet.yaml' }).allow).toBe(true);
+    expect(ask('Write', { file_path: 'docs/tacet.md', content: '' }).allow).toBe(true);
+  });
+
+  it('follows symlinks in protected config the way a committed link resolves (#227 review)', () => {
+    const w = (p: string) => ask('Write', { file_path: p, content: '' });
+    // A dangling `.tacet` link: a write would create the config it points at.
+    symlinkSync('config/tacet', join(wt, '.tacet'));
+    expect(w('config/tacet/tacet.yaml')).toMatchObject({ allow: false, reason: /escalate/ });
+    expect(w('config/other.yaml').allow).toBe(true);
+    // Once it resolves, still only what it points at is protected.
+    mkdirSync(join(wt, 'config', 'tacet'), { recursive: true });
+    expect(w('config/tacet/tacet.yaml').allow).toBe(false);
+    expect(w('config/tacetx').allow).toBe(true);
+    expect(w('config/other/x.yaml').allow).toBe(true);
+    expect(w('src/a.ts').allow).toBe(true);
+    // A link on a parent of a two-segment name, and a parent of a PROTECTED_IN file.
+    mkdirSync(join(wt, 'ci', 'github', 'workflows'), { recursive: true });
+    symlinkSync('ci/github', join(wt, '.github'));
+    expect(w('ci/github/workflows/x.yml').allow).toBe(false);
+    expect(w('ci/github/CODEOWNERS').allow).toBe(true);
+    mkdirSync(join(wt, 'shared'));
+    symlinkSync('shared', join(wt, '.vscode'));
+    expect(w('shared/tasks.json').allow).toBe(false);
+    expect(w('shared/extensions.json').allow).toBe(true);
+    // Targets compare folded, as a case-insensitive file system resolves them.
+    expect(w('CONFIG/tacet/tacet.yaml').allow).toBe(false);
+  });
+
+  it('protects what a symlink inside a protected directory points at (#227 review)', () => {
+    mkdirSync(join(wt, '.tacet'));
+    writeFileSync(join(wt, 'cfg.yaml'), '');
+    symlinkSync('../cfg.yaml', join(wt, '.tacet', 'tacet.yaml'));
+    expect(ask('Write', { file_path: 'cfg.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'other.yaml', content: '' }).allow).toBe(true);
+    // A dangling one inside protects the file it would create.
+    symlinkSync('../later.yaml', join(wt, '.tacet', 'local.yaml'));
+    expect(ask('Write', { file_path: 'later.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'other.yaml', content: '' }).allow).toBe(true);
+    // Links inside a linked directory are followed too.
+    mkdirSync(join(wt, '.claude'));
+    mkdirSync(join(wt, 'shared'));
+    symlinkSync('../shared', join(wt, '.claude', 'agents'));
+    writeFileSync(join(wt, 'x.md'), '');
+    symlinkSync('../x.md', join(wt, 'shared', 'a.md'));
+    expect(ask('Write', { file_path: 'x.md', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'shared/new.md', content: '' }).allow).toBe(false);
+    // Personal links out of the checkout, dangling in a fresh worktree, change nothing, and a
+    // loop of directory links ends.
+    symlinkSync('/nonexistent/abs/notes.md', join(wt, '.claude', 'CLAUDE.local.md'));
+    symlinkSync('../.local/notes.md', join(wt, '.claude', 'notes.md'));
+    symlinkSync('.', join(wt, '.claude', 'self'));
+    expect(ask('Write', { file_path: 'src/a.ts', content: '' }).allow).toBe(true);
+    expect(ask('Write', { file_path: '.local/notes.md', content: '' }).allow).toBe(false);
+  });
+
+  it('resolves `..` in a dangling link after its symlinks, as the kernel does (#227 review)', () => {
+    const w = (p: string) => ask('Write', { file_path: p, content: '' }).allow;
+    mkdirSync(join(wt, 'deep', 'dir'), { recursive: true });
+    symlinkSync('deep/dir', join(wt, 'lnk'));
+    mkdirSync(join(wt, '.tacet'));
+    symlinkSync('../lnk/../cfg.yaml', join(wt, '.tacet', 'tacet.yaml'));
+    expect(w('deep/cfg.yaml')).toBe(false);
+    expect(w('cfg.yaml')).toBe(true);
+    mkdirSync(join(wt, 'a', 'b'), { recursive: true });
+    symlinkSync('a/b', join(wt, 'l2'));
+    symlinkSync('l2/../t', join(wt, '.claude'));
+    expect(w('a/t/settings.json')).toBe(false);
+    expect(w('t/settings.json')).toBe(true);
+  });
+
+  it('fails closed on a symlink loop in protected config (#227 review)', () => {
+    symlinkSync('b', join(wt, '.tacet'));
+    symlinkSync('.tacet', join(wt, 'b'));
+    expect(ask('Write', { file_path: 'src/a.ts', content: '' })).toMatchObject({
+      allow: false,
+      reason: /escalate/,
+    });
+  });
+
+  it('fails closed on a protected name linked to the checkout root (#227 review)', () => {
+    symlinkSync('.', join(wt, '.tacet'));
+    expect(ask('Write', { file_path: 'tacet.yaml', content: '' }).allow).toBe(false);
+    expect(ask('Write', { file_path: 'src/a.ts', content: '' }).allow).toBe(false);
+    // Reads are not affected.
+    expect(ask('Read', { file_path: 'tacet.yaml' }).allow).toBe(true);
+  });
+
   it('protects every lefthook config name (lefthook docs, checked 2026-11-10)', () => {
     for (const p of [
       'lefthook.yaml',
