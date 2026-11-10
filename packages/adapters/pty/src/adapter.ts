@@ -3,7 +3,14 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { authEnv, claudeEnvAllow, writeMcpConfig } from '@tacet/adapter-claude-sdk/launch';
+import {
+  authEnv,
+  claudeEnvAllow,
+  removeClaudeConfigDir,
+  repoOf,
+  sweepClaudeConfigDirs,
+  writeMcpConfig,
+} from '@tacet/adapter-claude-sdk/launch';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -42,7 +49,6 @@ import {
   prepareClaudeConfigDir,
   preToolUseDecision,
 } from './claude.js';
-import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
