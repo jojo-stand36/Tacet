@@ -1,4 +1,4 @@
-import { planIssues, type SessionHandle, type Task } from '@tacet/core';
+import { assertSafePrompt, planIssues, type SessionHandle, type Task } from '@tacet/core';
 import { z } from 'zod';
 import type { Planner, PlanResult, ProposedSubtask, WorkerAdapter } from './ports.js';
 import { PLANNER_SYSTEM_PROMPT, plannerPrompt } from './prompts.js';
@@ -138,7 +138,7 @@ export class AdapterPlanner implements Planner {
     const { adapter } = this.#o.worker;
     const iterator = adapter.events(h)[Symbol.asyncIterator]();
     return async (text) => {
-      await adapter.send(h, { text });
+      await adapter.send(h, { text: assertSafePrompt(text) });
       let reply = '';
       let started = false;
       const deadline = Date.now() + (this.#o.timeoutMs ?? 600_000);
