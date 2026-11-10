@@ -149,6 +149,16 @@ describe('integrateWorktree', () => {
     writeFileSync(join(v.dir, 'hidden.txt'), 'x\n');
     const hidden = await uncommittedChanges({ cwd: v.dir, repoRoot: repo, commit: main, env });
     expect(hidden?.map((c) => c.path).sort()).toEqual(['.gitignore', 'sub/.gitignore']);
+    // The compared commit's attributes are the ones used: a filter it names does run.
+    const x = worker('attr2');
+    writeFileSync(join(x.dir, '.gitattributes'), '* filter=evil\n');
+    git(x.dir, ['add', '.gitattributes'], x.wenv);
+    git(x.dir, ['commit', '-qm', 'attrs'], x.wenv);
+    await integrateWorktree({ cwd: x.dir, repoRoot: repo, ref: taskBranch('attr2'), env });
+    const own = git(repo, ['rev-parse', taskBranch('attr2')]);
+    writeFileSync(join(x.dir, 'README'), 'changed\n');
+    await uncommittedChanges({ cwd: x.dir, repoRoot: repo, commit: own, env });
+    expect(existsSync(ran)).toBe(true);
   });
 
   it('honours a committed .gitignore, stops at maxPaths, and reads FIFOs and symlinks as data (#261)', async () => {
