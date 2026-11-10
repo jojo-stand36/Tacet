@@ -56,7 +56,6 @@ export {
   integrateWorktree,
   taskBranch,
 } from './git/integrate.js';
-export { GitWorktrees, type GitWorktreesOptions } from './git/worktrees.js';
 export {
   type EscalationGate,
   EventLogBackend,

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -765,6 +765,92 @@ describe('WorktreeManager', () => {
     expect(await failing.list()).toEqual([]);
   });
 
+  it('keeps a worktree whose private objects it cannot fully read', async () => {
+    const worktree = await manager.create('unreadable-objects-worker');
+    await writeFile(path.join(worktree.path, 'hidden.txt'), 'hidden\n');
+    await workerGit(worktree.path, ['add', 'hidden.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'hidden']);
+    const head = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    const gitDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    const fanout = path.join(gitDirectory, 'objects', head.slice(0, 2));
+    const moved = path.join(temporaryDirectory, 'moved-fanout');
+    await rename(fanout, moved);
+    await symlink(moved, fanout);
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow('unable to verify Worker commits');
+    expect((await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).removed).toEqual([]);
+
+    // Nothing else names the commit: only reading the whole private store finds it.
+    await rm(fanout);
+    await rename(moved, fanout);
+    await workerGit(worktree.path, ['checkout', '--detach', 'refs/heads/main']);
+    await rm(path.join(gitDirectory, 'logs'), { recursive: true, force: true });
+    await rename(fanout, moved);
+    await symlink(moved, fanout);
+    await expect(manager.remove(worktree.id)).rejects.toThrow('unable to verify Worker commits');
+  });
+
+  it('refuses a private store with a pack whose name starts with a dot', async () => {
+    const worktree = await manager.create('dot-pack-worker');
+    const gitDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    await mkdir(path.join(gitDirectory, 'objects', 'pack'), { recursive: true });
+    await writeFile(path.join(gitDirectory, 'objects', 'pack', '.h.pack'), 'PACK');
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow('unable to verify Worker commits');
+  });
+
+  it('checks a checkout deleted by hand before dropping its admin directory, and prunes nothing else', async () => {
+    const worktree = await manager.create('deleted-with-work');
+    await writeFile(path.join(worktree.path, 'work.txt'), 'work\n');
+    await workerGit(worktree.path, ['add', 'work.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'work']);
+    const userWorktree = path.join(temporaryDirectory, 'user-worktree');
+    await git(repository, ['worktree', 'add', '--detach', userWorktree]);
+    await rm(userWorktree, { recursive: true, force: true });
+    await rm(worktree.path, { recursive: true, force: true });
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow(
+      'Worker has unintegrated private commits',
+    );
+    await manager.remove(worktree.id, { force: true });
+
+    const registered = await git(repository, ['worktree', 'list', '--porcelain']);
+    expect(registered).not.toContain(worktree.id);
+    expect(registered).toContain(userWorktree);
+    await manager.remove(worktree.id);
+  });
+
+  it('honours a live removal lock and recovers from an empty one', async () => {
+    const worktree = await manager.create('locked-worker');
+    const locks = path.join(temporaryDirectory, 'worktrees', '.tacet-locks');
+    await mkdir(locks, { recursive: true });
+    const lock = path.join(locks, `${worktree.id}.removing`);
+    await writeFile(lock, `${process.pid} 0123abcd-0000\n`);
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow('already being removed');
+    await expect(manager.merge(worktree.id, 'pr', 'main')).rejects.toThrow('being removed');
+    expect(await readFile(lock, 'utf8')).toBe(`${process.pid} 0123abcd-0000\n`);
+
+    await writeFile(lock, '');
+    expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
+    await manager.remove(worktree.id);
+    expect(await manager.get(worktree.id)).toBeUndefined();
+  });
+
   it('ignores busy markers left by a manager that died', async () => {
     const worktree = await manager.create('orphaned-marker-worker');
     const child = execFile(process.execPath, ['-e', '']);
@@ -774,7 +860,7 @@ describe('WorktreeManager', () => {
     const locks = path.join(temporaryDirectory, 'worktrees', '.tacet-locks');
     await mkdir(locks, { recursive: true });
     await writeFile(path.join(locks, `${worktree.id}.busy.${deadPid}.stale`), '');
-    await writeFile(path.join(locks, `${worktree.id}.removing`), `${deadPid}\n`);
+    await writeFile(path.join(locks, `${worktree.id}.removing`), `${deadPid} 0123abcd-0001\n`);
 
     expect((await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).removed).toEqual([
       worktree.id,

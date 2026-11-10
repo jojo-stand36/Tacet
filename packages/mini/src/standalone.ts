@@ -13,12 +13,12 @@ import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
 import { GitIntegrator } from './git/integrate.js';
-import { GitWorktrees } from './git/worktrees.js';
 import { EventLogBackend } from './mcp/backend.js';
 import { MiniMcpServer } from './mcp/server.js';
 import { AdapterReviewer } from './review/adapter-reviewer.js';
 import { commandVerifierFromConfig } from './verify/command-verifier.js';
 import { type BuildWorkerAdaptersOptions, buildWorkerAdapters } from './workers/build.js';
+import { WorktreeManager } from './worktree.js';
 
 export interface StandaloneOptions {
   /** The repo's main checkout. */
@@ -59,7 +59,7 @@ export interface Standalone {
  * process that calls this (`tacet run`). Wires the existing pieces from the effective config:
  * Worker adapters (`buildWorkerAdapters`), the planner (`AdapterPlanner` on `tiers.mini`, else
  * one sub-task per task), `verify` commands, the reviewer when `review.enabled`, git integration,
- * interim git worktrees (until #16), and the Mini-conductor MCP server on loopback. Everything
+ * Worker worktrees (`WorktreeManager`, #16), and the Mini-conductor MCP server on loopback. Everything
  * lives in the repo's state directory, outside the repo. Throws `ConfigError`, `WorkerConfigError`
  * or the lock error before anything is left running.
  */
@@ -81,11 +81,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       acp: { ...o.workers?.acp, stateDir },
     });
   const tiers = config.tiers ?? {};
-  const workspaces = new GitWorktrees({
-    repoRoot: o.repoRoot,
-    root: paths.worktrees,
-    env: baseEnv,
-  });
+  const workspaces = new WorktreeManager(o.repoRoot, paths.worktrees);
   let planner: Planner = new SingleStepPlanner();
   const mini = tiers.mini;
   if (!o.singleStep && mini) {
@@ -185,7 +181,8 @@ export class CheckoutPlanner implements Planner {
     try {
       return await this.make(ws.path).plan(task, opts);
     } finally {
-      await this.workspaces.remove(ws.id).catch(() => {});
+      // A planner may have written to it; nothing in it is kept.
+      await this.workspaces.remove(ws.id, { force: true }).catch(() => {});
     }
   }
 }

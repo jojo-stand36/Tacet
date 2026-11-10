@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { link, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readWorkerFile, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
 import { MergeConflictError, type Workspaces } from './daemon/ports.js';
@@ -92,7 +92,8 @@ interface ManagerPaths {
 }
 
 const commandTimeoutMs = 120_000;
-const maxBuffer = 1024 * 1024;
+/** Large enough for `status` listing an ignored dependency tree, or a big `rev-list`. */
+const maxBuffer = 64 * 1024 * 1024;
 const maxReflogBytes = 4 * 1024 * 1024;
 const worktreeIdPattern = /^[a-z0-9-]+$/;
 const commitIdPattern = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
@@ -242,6 +243,8 @@ function errorCode(error: unknown): string | undefined {
  */
 export class WorktreeManager implements Workspaces {
   private pathsPromise: Promise<ManagerPaths> | undefined;
+  /** `git worktree add/remove/prune` lock the repository's worktree list: one at a time. */
+  private worktreeQueue: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly repositoryPath: string,
@@ -251,7 +254,8 @@ export class WorktreeManager implements Workspaces {
 
   /**
    * A fresh detached checkout for `workerId`, at `base`: a full commit id, or a local branch
-   * name. Without `base`, it starts at the repository's current branch.
+   * name. Without `base`, it starts at the repository's current branch, or its HEAD commit
+   * when that is detached.
    */
   async create(
     workerId: string,
@@ -297,25 +301,16 @@ export class WorktreeManager implements Workspaces {
   /**
    * Remove a checkout and its `tacet/<id>` branch. Throws `WorktreeKeptError` instead when that
    * would lose work (see the class comment) or a merge is using it, unless `force` is given. An
-   * id with no checkout is a no-op; a checkout deleted by hand is unregistered, and its branch is
-   * kept.
+   * id with no checkout is a no-op. For a checkout deleted by hand, the same checks run on what
+   * is left (its Git admin directory and branch), then only that admin directory is deleted.
    */
   async remove(worktreeId: string, options: RemoveWorktreeOptions = {}): Promise<void> {
     if (!worktreeIdPattern.test(worktreeId)) throw new Error('invalid worktree id');
     const { root } = await this.paths();
     const info = await this.readInfo(root, worktreeId);
     if (!info || info.path !== path.join(root, worktreeId)) return;
-    if ((await realpath(info.path).catch(() => undefined)) !== info.path) {
-      const release = await this.lockRemoval(worktreeId);
-      try {
-        await this.git(['worktree', 'prune']);
-        await rm(this.infoPath(root, worktreeId), { force: true });
-      } finally {
-        await release();
-      }
-      return;
-    }
-    await this.removeWorktree(info, options.force === true);
+    const missing = (await realpath(info.path).catch(() => undefined)) !== info.path;
+    await this.removeWorktree(info, options.force === true, missing);
   }
 
   async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
@@ -350,10 +345,11 @@ export class WorktreeManager implements Workspaces {
   }
 
   async checkConflicts(worktreeId: string, targetBranch: string): Promise<string[]> {
-    const info = await this.requireWorktree(worktreeId);
+    await this.requireWorktree(worktreeId);
     await this.requireLocalBranch(targetBranch);
-    const release = await this.hold([info.id]);
+    const release = await this.hold([worktreeId]);
     try {
+      const info = await this.requireWorktree(worktreeId);
       const workerCommit = await this.integrate(info);
       if (!workerCommit) return [];
       try {
@@ -480,6 +476,7 @@ export class WorktreeManager implements Workspaces {
         resultWorktreePath: staging.path,
       };
     } catch (error) {
+      // Released first, or the forced remove would refuse it as busy.
       await releaseStaging();
       if (staging) await this.remove(staging.id, { force: true }).catch(() => {});
       throw error;
@@ -512,7 +509,7 @@ export class WorktreeManager implements Workspaces {
 
     const branchName = taskBranch(id).slice('refs/heads/'.length);
     const worktreePath = path.join(root, id);
-    await this.git(['worktree', 'add', '--detach', worktreePath, baseCommit]);
+    await this.worktreeGit(['worktree', 'add', '--detach', worktreePath, baseCommit]);
 
     const timestamp = Date.now();
     const info: WorktreeInfo = {
@@ -535,7 +532,7 @@ export class WorktreeManager implements Workspaces {
       await this.writeInfo(root, info);
     } catch (error) {
       try {
-        await this.git(['worktree', 'remove', '--force', worktreePath]);
+        await this.worktreeGit(['worktree', 'remove', '--force', worktreePath]);
       } catch {
         // Keep the original metadata error; Git may still need manual cleanup.
       }
@@ -589,6 +586,12 @@ export class WorktreeManager implements Workspaces {
       return { baseCommit: commit };
     }
     const baseBranch = base ?? (await this.currentBranch());
+    if (baseBranch === undefined) {
+      // A detached repository HEAD: start where it is.
+      const head = await this.refTip('HEAD');
+      if (!head) throw new Error('the repository HEAD is not a commit');
+      return { baseCommit: head };
+    }
     await this.requireLocalBranch(baseBranch);
     const baseCommit = (
       await this.git(['rev-parse', '--verify', `refs/heads/${baseBranch}^{commit}`])
@@ -596,7 +599,7 @@ export class WorktreeManager implements Workspaces {
     return { baseBranch, baseCommit };
   }
 
-  private async removeWorktree(info: WorktreeInfo, force: boolean): Promise<void> {
+  private async removeWorktree(info: WorktreeInfo, force: boolean, missing = false): Promise<void> {
     const { root } = await this.paths();
     const release = await this.lockRemoval(info.id);
     try {
@@ -605,7 +608,13 @@ export class WorktreeManager implements Workspaces {
       }
       const branchRef = taskBranch(info.id);
       const branchTip = await this.refTip(branchRef);
-      if (!force) {
+      // The admin directory holds the Worker's HEAD, reflog and private objects, even when the
+      // checkout itself was deleted by hand.
+      const gitDirectory = await this.managerWorktreeGitDirectory(info).catch((error: unknown) => {
+        if (missing && errorCode(error) === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (!force && !missing) {
         let status: string;
         try {
           status = await this.runWorktreeGit(info, [
@@ -626,9 +635,25 @@ export class WorktreeManager implements Workspaces {
             'worktree contains local or ignored files; pass { force: true } to remove it',
           );
         }
-        await this.ensureWorkIsKept(info, branchTip);
       }
-      const gitDirectory = await this.managerWorktreeGitDirectory(info);
+      if (!force) await this.ensureWorkIsKept(info, gitDirectory, branchTip);
+      if (missing) {
+        // Only this worktree's registration: `git worktree prune` would also prune the user's own.
+        if (gitDirectory) await rm(gitDirectory, { recursive: true, force: true });
+      } else {
+        if (!gitDirectory) throw new Error('worktree Git directory is missing');
+        await this.removeCheckout(info, gitDirectory);
+      }
+      // Only the tip that was checked: a branch moved since then is left alone.
+      if (branchTip) await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
+      await rm(this.infoPath(root, info.id), { force: true });
+    } finally {
+      await release();
+    }
+  }
+
+  private async removeCheckout(info: WorktreeInfo, gitDirectory: string): Promise<void> {
+    {
       await this.restoreAdminGitdir(info, gitDirectory);
       const gitFile = path.join(info.path, '.git');
       const temporaryGitFile = path.join(info.path, `.git.${randomUUID()}.tmp`);
@@ -643,95 +668,111 @@ export class WorktreeManager implements Workspaces {
         await rm(temporaryGitFile, { force: true });
         throw error;
       }
-      await this.git(['worktree', 'remove', '--force', info.path]);
-      // Only the tip that was checked: a branch moved since then is left alone.
-      if (branchTip) await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
-      await rm(this.infoPath(root, info.id), { force: true });
-    } finally {
-      await release();
+      await this.worktreeGit(['worktree', 'remove', '--force', info.path]);
     }
   }
 
   /**
    * Throws `WorktreeKeptError` unless every commit the checkout could hold is somewhere that
-   * survives its removal: its HEAD, every commit in its HEAD reflog (a Worker that writes the
-   * shared store and then moves HEAD), its `tacet/<id>` branch, and its private loose commits.
-   * "Survives" means contained in a branch, tag or remote-tracking ref other than `tacet/<id>`.
+   * survives its removal: its `tacet/<id>` branch, its HEAD, every commit in its HEAD reflog (best
+   * effort for a Worker that writes the shared store and then moves HEAD: it relies on git having
+   * written that reflog), and its private loose commits. "Survives" means contained in a branch,
+   * tag or remote-tracking ref other than `tacet/<id>`. A commit it cannot find anywhere, or a
+   * private store it cannot fully read, keeps the worktree. `gitDirectory` is undefined only when
+   * the Worker's Git admin directory is already gone; then only the branch is checked.
    */
-  private async ensureWorkIsKept(info: WorktreeInfo, branchTip: string | undefined): Promise<void> {
+  private async ensureWorkIsKept(
+    info: WorktreeInfo,
+    gitDirectory: string | undefined,
+    branchTip: string | undefined,
+  ): Promise<void> {
     const unverifiable = (reason: string) =>
       new WorktreeKeptError(
         'unable to verify Worker commits',
         `unable to verify Worker commits: ${reason}`,
       );
-    const gitDirectory = await this.managerWorktreeGitDirectory(info);
     const candidates = new Set<string>();
     if (branchTip) candidates.add(branchTip);
+    let privateCommits: string[] = [];
 
-    let head: string;
-    try {
-      head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
-    } catch {
-      throw unverifiable('the Worker HEAD cannot be read');
-    }
-    if (commitIdPattern.test(head)) {
-      candidates.add(head);
-    } else {
-      const ref = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
-      if (!ref) throw unverifiable('the Worker HEAD is neither a commit nor a branch');
-      const tip = await this.refTip(ref);
-      // An unborn branch has nothing to lose.
-      if (tip) candidates.add(tip);
+    if (gitDirectory) {
+      let head: string;
+      try {
+        head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
+      } catch {
+        throw unverifiable('the Worker HEAD cannot be read');
+      }
+      if (commitIdPattern.test(head)) {
+        candidates.add(head);
+      } else {
+        const ref = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
+        if (!ref) throw unverifiable('the Worker HEAD is neither a commit nor a branch');
+        const tip = await this.refTip(ref);
+        // An unborn branch has nothing to lose.
+        if (tip) candidates.add(tip);
+      }
+
+      let reflog = '';
+      try {
+        reflog = readWorkerFile(path.join(gitDirectory, 'logs', 'HEAD'), maxReflogBytes);
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') throw unverifiable('the Worker reflog cannot be read');
+      }
+      for (const line of reflog.split('\n')) {
+        const commit = /^[0-9a-f]+ ([0-9a-f]{40}(?:[0-9a-f]{24})?) /.exec(line)?.[1];
+        if (commit && !/^0+$/.test(commit)) candidates.add(commit);
+      }
+
+      try {
+        privateCommits = await looseCommits(
+          path.join(gitDirectory, 'objects'),
+          Date.now() + commandTimeoutMs,
+        );
+      } catch (error) {
+        throw unverifiable(
+          error instanceof Error ? error.message : 'the object store is unreadable',
+        );
+      }
     }
 
-    let reflog = '';
-    try {
-      reflog = readWorkerFile(path.join(gitDirectory, 'logs', 'HEAD'), maxReflogBytes);
-    } catch (error) {
-      if (errorCode(error) !== 'ENOENT') throw unverifiable('the Worker reflog cannot be read');
-    }
-    for (const line of reflog.split('\n')) {
-      const commit = /^[0-9a-f]+ ([0-9a-f]{40}(?:[0-9a-f]{24})?) /.exec(line)?.[1];
-      if (commit && !/^0+$/.test(commit)) candidates.add(commit);
-    }
-
-    let privateCommits: string[];
-    try {
-      privateCommits = await looseCommits(
-        path.join(gitDirectory, 'objects'),
-        Date.now() + commandTimeoutMs,
-      );
-    } catch (error) {
-      throw unverifiable(error instanceof Error ? error.message : 'the object store is unreadable');
-    }
     const shared = await this.commitsInSharedStore([...candidates, ...privateCommits]);
     if (privateCommits.some((commit) => !shared.has(commit))) {
+      // Integration copies only what HEAD reaches: commits left behind by an amend or a reset
+      // can never be integrated, so say how to let them go.
       throw new WorktreeKeptError(
         'Worker has unintegrated private commits',
-        'Worker has unintegrated private commits; integrate them or pass { force: true }',
+        'Worker has unintegrated private commits; integrate and merge them, or discard them with { force: true }',
       );
     }
+    if ([...candidates].some((commit) => !shared.has(commit))) {
+      throw unverifiable('a commit the Worker HEAD, reflog or branch names was not found');
+    }
     for (const commit of privateCommits) candidates.add(commit);
-    // A HEAD or reflog commit the shared store lacks is a private commit, checked just above,
-    // or one that no longer exists anywhere: there is nothing left to keep.
-    const kept = [...candidates].filter((commit) => shared.has(commit));
-    if (kept.length === 0) return;
-    const unique = (
+    if (candidates.size === 0) return;
+    // On stdin, not argv: a long reflog can name tens of thousands of commits.
+    const others = (
       await this.git([
-        'rev-list',
-        '--max-count=1',
-        ...kept,
-        '--not',
-        `--exclude=${info.branchName}`,
-        '--branches',
-        '--tags',
-        '--remotes',
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/heads',
+        'refs/tags',
+        'refs/remotes',
       ])
+    )
+      .split('\n')
+      .map((line) => line.split(' '))
+      .filter(([tip, ref]) => tip && commitIdPattern.test(tip) && ref !== taskBranch(info.id))
+      .map(([tip]) => tip as string);
+    const unique = (
+      await this.git(
+        ['rev-list', '--max-count=1', '--stdin'],
+        `${[...candidates, ...others.map((tip) => `^${tip}`)].join('\n')}\n`,
+      )
     ).trim();
     if (unique) {
       throw new WorktreeKeptError(
         'Worker has commits no other ref contains',
-        'Worker has commits no other ref contains; merge them or pass { force: true }',
+        'Worker has commits no other ref contains; merge them, or discard them with { force: true }',
       );
     }
   }
@@ -752,6 +793,10 @@ export class WorktreeManager implements Workspaces {
     return found;
   }
 
+  /**
+   * The commit `ref` names, or undefined. Any failure reads as "no ref": safe because a branch is
+   * only ever deleted by compare-and-swap against a tip read here.
+   */
   private async refTip(ref: string): Promise<string | undefined> {
     const out = await this.git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).catch(
       () => '',
@@ -810,31 +855,66 @@ export class WorktreeManager implements Workspaces {
     return false;
   }
 
-  private async removalLocked(directory: string, id: string): Promise<boolean> {
-    const lock = path.join(directory, `${id}.removing`);
-    let owner: number;
+  /**
+   * The removal lock's contents, `<pid> <token>`, or undefined when there is none. A lock is only
+   * ever made by linking a complete file into place, so it is never seen empty; one that does not
+   * parse anyway counts as stale.
+   */
+  private async readRemovalLock(lock: string): Promise<string | undefined> {
     try {
-      owner = Number((await readFile(lock, 'utf8')).trim());
+      return await readFile(lock, 'utf8');
     } catch (error) {
-      if (errorCode(error) === 'ENOENT') return false;
+      if (errorCode(error) === 'ENOENT') return undefined;
       throw error;
     }
-    return !(Number.isSafeInteger(owner) && owner > 0) || processAlive(owner);
+  }
+
+  private lockIsLive(contents: string): boolean {
+    const pid = Number(/^(\d+) [0-9a-f-]+\n$/.exec(contents)?.[1]);
+    return Number.isSafeInteger(pid) && pid > 0 && processAlive(pid);
+  }
+
+  private async removalLocked(directory: string, id: string): Promise<boolean> {
+    const contents = await this.readRemovalLock(path.join(directory, `${id}.removing`));
+    return contents !== undefined && this.lockIsLive(contents);
   }
 
   private async lockRemoval(id: string): Promise<() => Promise<void>> {
     const directory = await this.locksDirectory();
     const lock = path.join(directory, `${id}.removing`);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        await writeFile(lock, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-        return () => rm(lock, { force: true });
-      } catch (error) {
-        if (errorCode(error) !== 'EEXIST') throw error;
-        if (await this.removalLocked(directory, id)) break;
-        // Left by a manager that died mid-removal.
-        await rm(lock, { force: true });
+    const mine = `${process.pid} ${randomUUID()}\n`;
+    const draft = path.join(directory, `${id}.draft.${randomUUID()}`);
+    await writeFile(draft, mine, { flag: 'wx', mode: 0o600 });
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await link(draft, lock);
+          // Deletes the lock only while it is still this one.
+          return async () => {
+            if ((await this.readRemovalLock(lock)) === mine) await rm(lock, { force: true });
+          };
+        } catch (error) {
+          if (errorCode(error) !== 'EEXIST') throw error;
+        }
+        const seen = await this.readRemovalLock(lock);
+        if (seen === undefined) continue;
+        if (this.lockIsLive(seen)) break;
+        // Left by a process that died: move it aside, and put it back if another manager
+        // replaced it with a live lock in the meantime.
+        const aside = path.join(directory, `${id}.stale.${randomUUID()}`);
+        try {
+          await rename(lock, aside);
+        } catch (error) {
+          if (errorCode(error) === 'ENOENT') continue;
+          throw error;
+        }
+        if ((await this.readRemovalLock(aside)) !== seen) {
+          await link(aside, lock).catch(() => {});
+        }
+        await rm(aside, { force: true });
       }
+    } finally {
+      await rm(draft, { force: true });
     }
     throw new WorktreeKeptError('being removed', 'worktree is already being removed');
   }
@@ -871,6 +951,12 @@ export class WorktreeManager implements Workspaces {
       throw error;
     });
     return this.pathsPromise;
+  }
+
+  private worktreeGit(args: readonly string[]): Promise<string> {
+    const next = this.worktreeQueue.then(() => this.git(args));
+    this.worktreeQueue = next.catch(() => {});
+    return next;
   }
 
   private async git(args: readonly string[], input?: string): Promise<string> {
@@ -993,10 +1079,12 @@ export class WorktreeManager implements Workspaces {
     return (await this.paths()).commonDirectory;
   }
 
-  private async currentBranch(): Promise<string> {
-    const branch = (await this.git(['symbolic-ref', '--quiet', '--short', 'HEAD'])).trim();
-    if (!branch) throw new Error('baseBranch is required when the repository has a detached HEAD');
-    return branch;
+  /** The checked-out branch, or undefined when the repository HEAD is detached. */
+  private async currentBranch(): Promise<string | undefined> {
+    const branch = (
+      await this.git(['symbolic-ref', '--quiet', '--short', 'HEAD']).catch(() => '')
+    ).trim();
+    return branch || undefined;
   }
 
   private async requireLocalBranch(branch: string): Promise<void> {

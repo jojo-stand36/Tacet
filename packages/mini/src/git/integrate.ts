@@ -266,12 +266,14 @@ function openIn(parent: OpenDir | undefined, name: string, flags: number): numbe
   return fd;
 }
 
-function openDir(parent: OpenDir | undefined, name: string): OpenDir | undefined {
+function openDir(parent: OpenDir | undefined, name: string, strict = false): OpenDir | undefined {
   let fd: number;
   try {
     fd = openIn(parent, name, constants.O_RDONLY | constants.O_DIRECTORY);
   } catch (err) {
     if ((err as Error).message.includes('changed while')) throw err;
+    // Strict callers vouch for what they did not see: only a missing directory is empty.
+    if (strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return undefined;
   }
   const st = fstatSync(fd);
@@ -350,17 +352,18 @@ async function snapshotLooseObjects(
  * (it cannot be checked without git) or cannot be read safely.
  */
 export async function looseCommits(objectsDir: string, deadline: number): Promise<string[]> {
-  const root = openDir(undefined, objectsDir);
+  const root = openDir(undefined, objectsDir, true);
   if (!root) return [];
   const commits: string[] = [];
   let files = 0;
   try {
     for (const d of listDir(root)) {
       if (d === 'pack') {
-        const pack = openDir(root, d);
+        const pack = openDir(root, d, true);
         if (pack) {
           try {
-            if (listDir(pack).some((f) => !f.startsWith('.'))) {
+            // Any entry: git also loads packs whose names start with a dot.
+            if (listDir(pack).length > 0) {
               throw new Error("the Worker's object store has packs, which are not supported");
             }
           } finally {
@@ -370,7 +373,7 @@ export async function looseCommits(objectsDir: string, deadline: number): Promis
         continue;
       }
       if (!LOOSE_DIR.test(d)) continue;
-      const sub = openDir(root, d);
+      const sub = openDir(root, d, true);
       if (!sub) continue;
       try {
         for (const f of listDir(sub)) {
