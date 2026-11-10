@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 import { formatExplain } from '@tacet/core';
 import { ConfigError, loadConfig, StateDirError } from '@tacet/core/node';
+import { init, uninstall } from './commands/init.js';
 import { attach, logs, status } from './commands/read.js';
 import { run } from './commands/run.js';
 import type { Io } from './io.js';
@@ -8,6 +9,11 @@ import type { Io } from './io.js';
 export type { Io };
 
 const USAGE = `usage:
+  tacet init [--worker ADAPTER] [--model MODEL] [--json]
+                                 set up .tacet/ in this repo (never overwrites a file)
+  tacet uninstall [--apply] [--purge] [--json]
+                                 preview, then remove what init wrote (--purge: all of .tacet/,
+                                 after a backup to ~/.tacet/backups)
   tacet run [--accept TEXT]... [--single] [--json] "<task>"
                                  run a task in this repo until it is done (standalone)
   tacet run --resume [--answer ID=TEXT]...
@@ -29,6 +35,8 @@ const COMMON = {
 } as const;
 
 const OPTIONS = {
+  init: { ...COMMON, worker: { type: 'string' }, model: { type: 'string' } },
+  uninstall: { ...COMMON, apply: { type: 'boolean' }, purge: { type: 'boolean' } },
   run: {
     ...COMMON,
     accept: { type: 'string', multiple: true },
@@ -71,6 +79,12 @@ export async function main(argv: string[], io: Io): Promise<number> {
   const v = values as never;
   try {
     switch (command) {
+      case 'init':
+        if (positionals.length > 0) return usage(io);
+        return await init(io, v);
+      case 'uninstall':
+        if (positionals.length > 0) return usage(io);
+        return uninstall(io, v);
       case 'run':
         if (positionals.length > 0 && values.resume) {
           io.err('give a task or --resume, not both');
