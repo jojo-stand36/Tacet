@@ -263,7 +263,6 @@ export class MiniConductor {
   #sweepTimer: NodeJS.Timeout | undefined;
   /** The generation whose landed sweep is in flight, so a slow one is never started twice. */
   #sweepingGen: number | undefined;
-  /** Landed-sweep problems already reported, so a slow timer does not grow `errors` forever. */
   /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
   readonly #closing = new Set<string>();
   /** Maintenance problems recorded by this process (#254), by op, task, workspace and text. */
@@ -973,7 +972,7 @@ export class MiniConductor {
         try {
           landed = await integrator.landed(published.commit, target);
         } catch (err) {
-          this.#problem('landed', err, { taskId: root.task.id });
+          this.#problem('landed', err, { taskId: root.task.id, gen });
           continue;
         }
         if (!landed || !this.#live(gen)) continue;
@@ -997,7 +996,7 @@ export class MiniConductor {
           .catch((err: unknown) => {
             // Kept for its work is the rule working; anything else is a problem (#254).
             if ((err as Error)?.name !== 'WorktreeKeptError') {
-              this.#problem('landed', err, { taskId: root.task.id, workspaceId: id });
+              this.#problem('landed', err, { taskId: root.task.id, workspaceId: id, gen });
             }
           });
       }
@@ -1039,11 +1038,11 @@ export class MiniConductor {
         lastActivity,
       });
     } catch (err) {
-      this.#problem('gc', err);
+      this.#problem('gc', err, { gen });
       return;
     }
     for (const f of result.failed ?? []) {
-      this.#problem('gc', new Error(f.message), { workspaceId: f.id });
+      this.#problem('gc', new Error(f.message), { workspaceId: f.id, gen });
     }
   }
 
@@ -2185,15 +2184,25 @@ export class MiniConductor {
   #problem(
     op: MaintenanceOp,
     err: unknown,
-    about: { taskId?: string; workspaceId?: string } = {},
+    about: { taskId?: string; workspaceId?: string; gen?: number } = {},
   ): void {
+    // A sweep the stop cut short: what failed is the stop's doing, not a problem.
+    if (about.gen !== undefined && !this.#live(about.gen)) return;
     let message = err instanceof Error ? err.message : String(err);
     for (const [dir, label] of this.#o.redactPaths ?? []) {
-      if (dir) message = message.split(dir).join(label);
+      // Never `/` (a service account's home): every path would be rewritten.
+      if (dir.length > 1) message = message.split(dir).join(label);
     }
     message = redactSecrets(message).trim().slice(0, 2000) || 'unknown error';
-    const key = JSON.stringify([op, about.taskId, about.workspaceId, message]);
+    // Random names (a lock file's UUID) would make each attempt look new: not for the key.
+    const same = message.replace(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi,
+      '<id>',
+    );
+    const key = JSON.stringify([op, about.taskId, about.workspaceId, same]);
     if (this.#problems.has(key)) return;
+    // Bounded: past it, a problem may be recorded again, never lost.
+    if (this.#problems.size >= 500) this.#problems.clear();
     this.#problems.add(key);
     this.#errors.push(err);
     const now = this.#now();

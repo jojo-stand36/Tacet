@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,7 +75,12 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     script: (cwd: string, input: string) => void,
     worktrees?: TacetConfig['worktrees'],
     verify?: string[],
-    more: { workspaces?: Workspaces; planner?: Planner; workersMax?: number } = {},
+    more: {
+      workspaces?: Workspaces;
+      planner?: Planner;
+      workersMax?: number;
+      integrator?: GitIntegrator;
+    } = {},
   ): Promise<{ id: string; published: { ref: string; commit: string } }> {
     const fake = new ScriptedAdapter('fake', (input, s): Script => {
       script(s.opts.cwd, input);
@@ -107,7 +113,7 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
         : {}),
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
       workspaces: more.workspaces ?? manager,
-      integrator: new GitIntegrator(repo, env),
+      integrator: more.integrator ?? new GitIntegrator(repo, env),
       planner: more.planner ?? new SingleStepPlanner(),
       mcp: {
         workerConfig: () => ({
@@ -724,7 +730,13 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
           gcs += 1;
           return {
             removed: [],
-            failed: [{ id: 'w-1', message: `rm ${where}: token sk-ant-api03-${'a'.repeat(40)}` }],
+            failed: [
+              {
+                id: 'w-1',
+                // A fresh lock-file name each time: still the same problem.
+                message: `rm ${where}/.tacet-locks/w-1.draft.${randomUUID()}: token sk-ant-api03-${'a'.repeat(40)}`,
+              },
+            ],
           };
         },
       };
@@ -765,6 +777,58 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(text).not.toContain(root);
       expect(text).not.toContain('sk-ant-api03');
       expect(daemon.errors).toHaveLength(2);
+    });
+
+    it('records a landed sweep failure, and nothing for a checkout kept for its work (#254)', async () => {
+      const problems = () =>
+        store.query({ typePrefix: 'maintenance' }).map((e) => ({
+          ...(e.envelope.data as { op: string; workspaceId?: string }),
+          taskId: e.envelope.taskId,
+        }));
+      let fail: Error = Object.assign(new Error('kept'), { name: 'WorktreeKeptError' });
+      let removes = 0;
+      const refusing: Workspaces = {
+        create: (workerId, base, o) => manager.create(workerId, base, o),
+        get: (id) => manager.get(id),
+        head: () => manager.head(),
+        remove: async () => {
+          removes += 1;
+          throw fail;
+        },
+      };
+      const { id, published } = await runTask(commitWork, undefined, undefined, {
+        workspaces: refusing,
+      });
+      squashIntoMain(published.commit);
+      await vi.waitFor(() => expect(removes).toBeGreaterThan(1), { timeout: 3_000 });
+      expect(problems()).toEqual([]);
+      fail = new Error('git worktree remove failed');
+      const before = removes;
+      await vi.waitFor(() => expect(removes).toBeGreaterThan(before + 1), { timeout: 3_000 });
+      const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as
+        | { workspaceId: string }
+        | undefined;
+      const workspaceId = started?.workspaceId;
+      expect(problems()).toEqual([
+        { op: 'landed', workspaceId, taskId: id, message: 'git worktree remove failed' },
+      ]);
+    });
+
+    it('records a failed landed check once, about its task (#254)', async () => {
+      class Broken extends GitIntegrator {
+        override async landed(): Promise<never> {
+          throw new Error('cannot read the target');
+        }
+      }
+      const { id } = await runTask(commitWork, undefined, undefined, {
+        integrator: new Broken(repo, env),
+      });
+      await severalSweeps();
+      const problems = store.query({ typePrefix: 'maintenance' }).map((e) => ({
+        ...(e.envelope.data as object),
+        taskId: e.envelope.taskId,
+      }));
+      expect(problems).toEqual([{ op: 'landed', message: 'cannot read the target', taskId: id }]);
     });
 
     it('runs no gc with idle_days 0', async () => {

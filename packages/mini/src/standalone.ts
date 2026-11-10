@@ -219,7 +219,7 @@ export function redactPathsFor(
 ): Array<readonly [string, string]> {
   const all = new Map<string, string>();
   for (const [dir, label] of dirs) {
-    if (!dir) continue;
+    if (dir.length <= 1) continue;
     if (!all.has(dir)) all.set(dir, label);
     try {
       const real = realpathSync(dir);

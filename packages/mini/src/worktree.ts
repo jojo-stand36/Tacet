@@ -113,6 +113,12 @@ export interface WorktreeGcResult {
 
 /** How long gc trusts its last "kept" verdict on an unchanged checkout (#254). */
 const keptRecheckMs = 86_400_000;
+/** Verdicts about the checkout's own work or files (#254): not passing states such as a merge. */
+const cachedKeptReasons = new Set([
+  'worktree contains local or ignored files',
+  'Worker has unintegrated private commits',
+  'Worker has commits no other ref contains',
+]);
 
 /**
  * Where the worktree registry lives (#126): the Mini-conductor's event log, as `workspace.*`
@@ -592,7 +598,8 @@ export class WorktreeManager implements Workspaces {
     // own tacet/<id> branch (an integration) included.
     const refs = await this.refsDigest().catch(() => undefined);
 
-    for (const info of await this.list()) {
+    const listed = await this.list();
+    for (const info of listed) {
       if (active.has(info.id)) {
         result.skipped.push({ id: info.id, reason: 'active' });
         continue;
@@ -630,17 +637,23 @@ export class WorktreeManager implements Workspaces {
         result.removed.push(info.id);
       } catch (error) {
         if (error instanceof WorktreeKeptError) {
-          if (refs !== undefined) {
+          if (refs !== undefined && cachedKeptReasons.has(error.reason)) {
             this.#kept.set(info.id, { used, refs, at: now, reason: error.reason });
           }
           result.skipped.push({ id: info.id, reason: error.reason });
         } else {
           this.#kept.delete(info.id);
           result.skipped.push({ id: info.id, reason: 'Git refused to remove the worktree' });
-          result.failed.push({ id: info.id, message: (error as Error).message ?? String(error) });
+          result.failed.push({
+            id: info.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
         }
       }
     }
+    // Verdicts on checkouts gone since (removed elsewhere) are no longer needed.
+    const live = new Set(listed.map(({ id }) => id));
+    for (const id of this.#kept.keys()) if (!live.has(id)) this.#kept.delete(id);
     return result;
   }
 
