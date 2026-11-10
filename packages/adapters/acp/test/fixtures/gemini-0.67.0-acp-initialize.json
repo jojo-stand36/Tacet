@@ -1,0 +1,9 @@
+{
+  "protocolVersion": 1,
+  "agentInfo": { "name": "gemini-cli", "title": "Gemini CLI", "version": "0.67.0" },
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": { "image": true, "audio": true, "embeddedContext": true },
+    "mcpCapabilities": { "http": true, "sse": true }
+  }
+}

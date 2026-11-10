@@ -61,6 +61,9 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Resume in-flight handoffs after a Mini-conductor restart** — `feature` `P2` `either`
+- [ ] **ACP: verify API-key-only auth for claude-agent-acp and codex-acp, then register them** — `feature` `P2` `claude`
+- [ ] **ACP: offer fork when the agent advertises sessionCapabilities.fork** — `feature` `P2` `claude`
+- [ ] **Adapters: launch Workers with an environment allowlist** — `feature` `P2` `either`
 
 ## M2 · Conductor & escalation
 
