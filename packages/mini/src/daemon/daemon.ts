@@ -847,6 +847,12 @@ export class MiniConductor {
       worker.adapter.capabilities().resume
         ? { vendorSessionId: last.vendorSessionId }
         : undefined;
+    // A session stopped for a restart that is not resumed after all (another adapter or
+    // checkout now) never will be: its adapter may drop what it kept for that (#153).
+    if (!resume && last?.ended === 'restart' && last.vendorSessionId && last.adapter) {
+      await this.#discard(last.adapter, last.vendorSessionId, existing?.path ?? workspace.path);
+      if (!this.#live(gen)) return;
+    }
     // Intent first: a crash after this leaves a record of the session and its checkout.
     this.#o.store.append([
       this.#env(
@@ -1246,6 +1252,19 @@ export class MiniConductor {
       .catch((err: unknown) => this.#errors.push(err));
     // Closed by its adapter: nothing of it is left to end after a crash.
     if (this.#markers.delete(run.sessionId)) this.#saveMarkers();
+    // Only a session stopped for a restart is ever resumed (#153).
+    const vendor =
+      run.handle.vendorSessionId ?? this.#state().sessions.get(run.sessionId)?.vendorSessionId;
+    if (reason !== 'restart' && vendor) {
+      await this.#discard(run.adapterId, vendor, run.workspace.path);
+    }
+  }
+
+  /** Let the adapter drop what it keeps to resume a session that never will be. Best effort. */
+  async #discard(adapterId: string, vendorSessionId: string, cwd: string): Promise<void> {
+    const adapter = this.#o.adapters[adapterId]?.adapter;
+    if (!adapter?.discard) return;
+    await adapter.discard(vendorSessionId, cwd).catch((err: unknown) => this.#errors.push(err));
   }
 
   // ---- Worker processes (#127) -----------------------------------------------------------

@@ -121,6 +121,13 @@ export class ScriptedAdapter implements AgentAdapter {
     return this.#get(h).events;
   }
 
+  /** Sessions the Mini-conductor said will never be resumed (#153). */
+  readonly discarded: { vendorSessionId: string; cwd: string }[] = [];
+
+  async discard(vendorSessionId: string, cwd: string): Promise<void> {
+    this.discarded.push({ vendorSessionId, cwd });
+  }
+
   status(h: SessionHandle): SessionState {
     return this.sessions.find((x) => x.handle.id === h.id)?.state ?? 'done';
   }

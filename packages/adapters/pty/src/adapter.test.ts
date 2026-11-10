@@ -158,6 +158,15 @@ describe('PtyAdapter (fake claude)', () => {
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+  /** The session directories under the test's state dir (any repo). */
+  const configDirs = (): string[] => {
+    const state = join(root, 'state');
+    if (!existsSync(state)) return [];
+    return readdirSync(state).flatMap((repo) => {
+      const dir = join(state, repo, 'claude-pty');
+      return existsSync(dir) ? readdirSync(dir) : [];
+    });
+  };
   const make = (env: Record<string, string> = {}, extra: object = {}) =>
     new PtyAdapter({
       command: ['claude'],
@@ -522,6 +531,24 @@ describe('PtyAdapter (fake claude)', () => {
         )
       : [];
     expect(left).toEqual([]);
+    // Nor a Claude config directory (#153).
+    expect(configDirs()).toEqual([]);
+  });
+
+  it('discards a closed session it will never resume, and never an open one', async () => {
+    const adapter = make();
+    const cwd = join(root, 'wt');
+    const h = await adapter.start({ cwd });
+    const vendor = h.vendorSessionId as string;
+    expect(configDirs()).toEqual([vendor]);
+    await expect(adapter.discard(vendor, cwd)).rejects.toThrow(/still open/);
+    await adapter.close(h);
+    await adapter.discard(vendor, cwd);
+    expect(configDirs()).toEqual([]);
+    await expect(adapter.start({ cwd, resume: { vendorSessionId: vendor } })).rejects.toThrow(
+      /no PTY session/,
+    );
+    await expect(adapter.discard('../escape', cwd)).rejects.toThrow(/UUID/);
   });
 
   it('reports a crash as an error, once', async () => {
