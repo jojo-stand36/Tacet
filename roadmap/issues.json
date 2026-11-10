@@ -1223,6 +1223,18 @@
         "agent:claude"
       ],
       "body": "Follow-up from #149. Config accepts `{ keychain: \"service/account\" }` secret references (`SecretRef`), but `resolveSecretRef` (`@tacet/core/node`) resolves only `{ env: NAME }`: a keychain reference used by a Worker's agent is a startup error naming its config path. Resolve them from the OS keychain without the value touching disk, argv of long-lived processes, logs or events.\n\n### Tasks\n- [ ] Verify the platform tools and their exact invocation and exit codes (`verify-vendor-facts`): macOS `security find-generic-password`, Linux Secret Service (`secret-tool lookup`, libsecret); decide what `service/account` maps to on each\n- [ ] Resolve keychain references in `resolveSecretRef`, returning a `Secret`; a missing item, a locked keychain or a missing tool is an error naming the config path, never a value\n- [ ] Keep `{ env }` behaviour unchanged; update ARCHITECTURE.md §4\n\n### Acceptance criteria\n- Unit tests with the platform tool replaced by a fake cover found, missing, locked and tool-not-installed\n- No resolved value appears in errors, logs or events (test)\n\n_See packages/core/src/node/config/secret-ref.ts, docs/ARCHITECTURE.md §4 and §6._"
+    },
+    {
+      "title": "Verify live how Codex and Gemini CLI scope resume to a worktree",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #157. A `pty:<slug>` preset's `resume_flag` continues the CLI's last session in the Worker's checkout. That is only safe if the CLI's resume picks among the sessions of its working directory: a wider scope (a project root shared by sibling worktrees) would let a Worker continue another Worker's session. From help text only: codex-cli 0.167.0 `resume --last` is cwd-filtered (`--all` disables it); Gemini CLI 0.67.0 `--resume latest` is per \"project\", and whether a git worktree is its own project is unknown. Gemini is therefore not given as a `resume_flag` example.\n\n### Tasks\n- [ ] Live, against the local mock APIs: two sibling git worktrees of one repo, a session in each, then resume in one with `codex resume --last` and with `gemini --resume latest`; record which session each continues\n- [ ] Record what each CLI does when asked to resume with no saved session in that directory (exit code, message, or a fresh session)\n- [ ] Update capability matrix §1 (\"Generic PTY presets: resume\") and, if Gemini scopes to the worktree, add it back as an example\n\n### Acceptance criteria\n- Both behaviours recorded with versions and the commands used; each UNVERIFIED mark in that row is resolved or kept with a reason\n- If a CLI scopes wider than the worktree, the docs say not to set `resume_flag` for it\n\n_See packages/adapters/pty/src/cli-adapter.ts (`resumeArgs`) and docs/adapters/capability-matrix.md._"
     }
   ]
 }

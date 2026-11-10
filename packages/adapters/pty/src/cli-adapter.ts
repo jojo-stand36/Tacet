@@ -65,9 +65,10 @@ export interface PtyPreset {
   /**
    * Arguments appended after `command` to continue the CLI's most recent session in the working
    * directory (#157), e.g. `['resume', '--last']` for Codex, whose `--last` picks among the
-   * sessions of the current directory (codex-cli 0.167.0 `resume --help`), or `['--resume',
-   * 'latest']` for Gemini CLI, whose sessions are per project (0.67.0 `--help`; whether a git
-   * worktree is its own project is unverified). Tacet resumes a Worker only in the checkout it
+   * sessions of the current directory (codex-cli 0.167.0 `resume --help`). Only for a CLI whose
+   * resume is scoped to its working directory: one that picks the latest session of a wider
+   * scope could continue another Worker's session. Not Gemini CLI's `--resume latest` until its
+   * per-project scope is shown to be per worktree (#168). Tacet resumes a Worker only in the checkout it
    * ran in, so "the last session here" is that checkout's, which can be an earlier attempt's. A
    * generic CLI has no session id Tacet can read, so `vendorSessionId` is a marker, set at start:
    * a CLI resumed before it saved anything gets the arguments with nothing to continue.
