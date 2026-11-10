@@ -268,6 +268,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(opts.disallowedTools).toEqual(['Bash', 'PowerShell', 'Monitor']);
     expect(opts.allowedTools).toEqual([]);
     expect(opts.permissionMode).toBe('default');
+    expect(opts.verbatimPrompts).toBe(true);
     const matcher = opts.hooks?.PreToolUse?.[0];
     expect(matcher).toMatchObject({ matcher: 'Read|Glob|Grep', onFailure: 'block' });
     const hook = matcher?.hooks[0] as NonNullable<typeof matcher>['hooks'][number];
