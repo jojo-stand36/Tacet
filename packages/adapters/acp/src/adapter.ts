@@ -53,6 +53,7 @@ import {
   repoStateDir,
 } from '@tacet/core/node';
 import type { AcpAgentSpec } from './agents.js';
+import { assertSessionId, removeSessionFiles, sweepSessionFiles } from './session-files.js';
 import {
   approvalChoices,
   newTurnState,
@@ -107,6 +108,12 @@ export interface AcpAdapterOptions {
   repoRoot?: string;
   /** Tacet's state directory, where the agent's own home lives. Default `~/.tacet/state`. */
   stateDir?: string;
+  /**
+   * Days after its last write that a session's files in the agent's home (`agent.sessionFiles`)
+   * are removed, if no Mini-conductor discarded them before (#232). Swept when the adapter first
+   * prepares that home. Default 30, as `events.retention.transcript_days`.
+   */
+  retentionDays?: number;
   /** Receives the agent's stderr (free-form logging; ACP keeps stdout for messages). Scrubbed. */
   stderr?: (text: string, h: SessionHandle) => void;
   /**
@@ -177,6 +184,10 @@ export class AcpAdapter implements AgentAdapter {
   readonly id: string;
   readonly #opts: AcpAdapterOptions;
   readonly #sessions = new Map<string, Session>();
+  /** Vendor session ids being resumed by a `start()` still in progress: never swept (#232). */
+  readonly #starting = new Map<string, number>();
+  /** Agent homes already swept by this adapter (#232). */
+  readonly #swept = new Set<string>();
 
   /** Why unattended Workers may not run on this agent (`AcpAgentSpec.workerRefused`), if so. */
   get workerRefused(): string | undefined {
@@ -214,6 +225,21 @@ export class AcpAdapter implements AgentAdapter {
       throw new Error(`${spec.id} does not fork sessions over ACP`);
     }
 
+    const claimed = opts.resume?.vendorSessionId;
+    if (claimed !== undefined) this.#starting.set(claimed, (this.#starting.get(claimed) ?? 0) + 1);
+    try {
+      return await this.#start(opts);
+    } finally {
+      if (claimed !== undefined) {
+        const n = (this.#starting.get(claimed) ?? 1) - 1;
+        if (n > 0) this.#starting.set(claimed, n);
+        else this.#starting.delete(claimed);
+      }
+    }
+  }
+
+  async #start(opts: SessionOptions): Promise<SessionHandle> {
+    const spec = this.#opts.agent;
     const env = this.#env(opts);
     const command = [
       ...(this.#opts.executable ?? spec.command.slice(0, 1)),
@@ -449,6 +475,24 @@ export class AcpAdapter implements AgentAdapter {
     this.#sessions.delete(s.handle.id);
   }
 
+  /**
+   * The closed session `vendorSessionId` will never be resumed (#153, #232): remove its files from
+   * the agent's own home (`agent.sessionFiles`), its transcript included. Never the user's own
+   * stores, the worktree or the event log. Refused while a session by that id is open or starting.
+   */
+  async discard(vendorSessionId: string, cwd: string): Promise<void> {
+    const spec = this.#opts.agent;
+    assertSessionId(vendorSessionId);
+    if (!spec.home || !spec.sessionFiles?.length) return;
+    if (this.#liveIds().has(vendorSessionId)) {
+      throw new Error(`${spec.id} session ${vendorSessionId} is still open`);
+    }
+    const dir = this.#homeDir(spec, cwd);
+    // Never made here: a home that does not exist holds nothing to remove.
+    if (!isPrivateDir(dir)) return;
+    removeSessionFiles(dir, spec.sessionFiles, vendorSessionId);
+  }
+
   events(h: SessionHandle): AsyncIterable<AgentEvent> {
     const s = this.#sessions.get(h.id);
     if (!s) throw new Error(`unknown session ${h.id}`);
@@ -496,17 +540,23 @@ export class AcpAdapter implements AgentAdapter {
    * written afresh (0600) for every session, so the agent never runs on settings it changed.
    */
   #prepareHome(spec: AcpAgentSpec, cwd: string): string {
-    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
-    const dir = join(
-      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
-      `acp-${spec.id.replace(/^acp:/, '')}`,
-    );
+    const dir = this.#homeDir(spec, cwd);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const st = lstatSync(dir);
-    if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) {
-      throw new Error(`${spec.id}: ${dir} is not a private directory`);
-    }
+    if (!isPrivateDir(dir)) throw new Error(`${spec.id}: ${dir} is not a private directory`);
     chmodSync(dir, 0o700);
+    if (spec.sessionFiles?.length && !this.#swept.has(dir)) {
+      this.#swept.add(dir);
+      try {
+        sweepSessionFiles(
+          dir,
+          spec.sessionFiles,
+          (this.#opts.retentionDays ?? 30) * 24 * 60 * 60 * 1000,
+          this.#liveIds(),
+        );
+      } catch {
+        // Tried again by the next adapter that prepares it; the files are only kept longer.
+      }
+    }
     for (const [rel, content] of Object.entries(spec.home?.files ?? {})) {
       const path = join(dir, rel);
       if (!path.startsWith(`${dir}/`))
@@ -521,6 +571,24 @@ export class AcpAdapter implements AgentAdapter {
       renameSync(tmp, path);
     }
     return dir;
+  }
+
+  /** `<repo state dir>/acp-<agent>`: the agent's own home, keyed by the user's HOME, never a session's. */
+  #homeDir(spec: AcpAgentSpec, cwd: string): string {
+    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
+    return join(
+      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
+      `acp-${spec.id.replace(/^acp:/, '')}`,
+    );
+  }
+
+  /** Vendor ids of the sessions open or being resumed in this adapter. */
+  #liveIds(): Set<string> {
+    const ids = new Set(this.#starting.keys());
+    for (const s of this.#sessions.values()) {
+      if (s.handle.vendorSessionId !== undefined) ids.add(s.handle.vendorSessionId);
+    }
+    return ids;
   }
 
   #mcpServers(init: InitializeResponse, servers: McpServerConfig[] | undefined): McpServer[] {
@@ -904,5 +972,15 @@ function signalGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
     else proc.kill(signal);
   } catch {
     // ESRCH: nothing left to signal.
+  }
+}
+
+/** A real directory (not a symlink) of the current user. */
+function isPrivateDir(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    return st.isDirectory() && (!process.getuid || st.uid === process.getuid());
+  } catch {
+    return false;
   }
 }
