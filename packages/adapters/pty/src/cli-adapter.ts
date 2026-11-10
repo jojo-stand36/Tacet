@@ -107,8 +107,10 @@ interface Session {
   outputs: number;
   /** A turn is in progress (`running`, or `waiting_input` after a stall). */
   inTurn: boolean;
-  /** The turn went quiet without the prompt: when that was reported. */
-  stalledAt: number;
+  /** The turn went quiet without the prompt and was reported waiting. */
+  stalled: boolean;
+  /** `outputs` when the stall was reported. */
+  stalledOutputs: number;
   /** After an interrupt, until the CLI shows its prompt again: input sent meanwhile is queued. */
   cancelledAt: number;
   /** `outputs` when the interrupt was sent. */
@@ -216,7 +218,8 @@ export class PtyCliAdapter implements AgentAdapter {
       lastOutputAt: 0,
       outputs: 0,
       inTurn: false,
-      stalledAt: 0,
+      stalled: false,
+      stalledOutputs: 0,
       cancelledAt: 0,
       cancelledOutputs: 0,
       secrets,
@@ -381,7 +384,7 @@ export class PtyCliAdapter implements AgentAdapter {
     s.typed = s.pasteMode ? text : line;
     s.turnOutput = '';
     s.inTurn = true;
-    s.stalledAt = 0;
+    s.stalled = false;
     this.#setState(s, 'running');
     const typedAt = Date.now();
     const typedOutputs = s.outputs;
@@ -395,14 +398,15 @@ export class PtyCliAdapter implements AgentAdapter {
         this.#endTurn(s);
         return;
       }
-      if (s.stalledAt !== 0) {
+      if (s.stalled) {
         // Output again after a stall: the turn goes on.
-        if (s.lastOutputAt > s.stalledAt) {
-          s.stalledAt = 0;
+        if (s.outputs > s.stalledOutputs) {
+          s.stalled = false;
           this.#setState(s, 'running');
         }
       } else if (Date.now() - Math.max(s.lastOutputAt, typedAt) >= stallMs) {
-        s.stalledAt = Date.now();
+        s.stalled = true;
+        s.stalledOutputs = s.outputs;
         this.#setState(
           s,
           'waiting_input',
@@ -415,7 +419,7 @@ export class PtyCliAdapter implements AgentAdapter {
 
   #endTurn(s: Session): void {
     s.inTurn = false;
-    s.stalledAt = 0;
+    s.stalled = false;
     // Leave out the echo of what was typed, and the prompt the CLI showed again.
     let reply = stripEcho(plainText(s.turnOutput), s.typed).trimEnd();
     const prompt = this.#opts.preset.readyPrompt?.trim();
