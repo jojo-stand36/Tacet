@@ -1187,6 +1187,18 @@
         "agent:either"
       ],
       "body": "The PTY adapter (#15) gives every Claude Code session its own `CLAUDE_CONFIG_DIR` under `~/.tacet/state/<repo-hash>/claude-pty/<session id>`, which holds the session's transcript (needed to resume it) and Claude Code's `.claude.json`. Nothing removes these directories, also when `start()` fails.\n\n### Tasks\n- [ ] Remove a session's directory when its sub-task is finished and it can no longer be resumed (Mini-conductor decides), and when `start()` fails before the session existed\n- [ ] Sweep directories older than the event log's transcript retention (`events.retention.transcript_days`)\n- [ ] Tests for both\n\n### Acceptance criteria\n- After a failed start or a finished sub-task, no `claude-pty/<id>` directory remains; resume of a live session still works\n\n_See docs/ARCHITECTURE.md §6 (PTY hook tokens) and #15._"
+    },
+    {
+      "title": "Resolve keychain secret references in config",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #149. Config accepts `{ keychain: \"service/account\" }` secret references (`SecretRef`), but `resolveSecretRef` (`@tacet/core/node`) resolves only `{ env: NAME }`: a keychain reference used by a Worker's agent is a startup error naming its config path. Resolve them from the OS keychain without the value touching disk, argv of long-lived processes, logs or events.\n\n### Tasks\n- [ ] Verify the platform tools and their exact invocation and exit codes (`verify-vendor-facts`): macOS `security find-generic-password`, Linux Secret Service (`secret-tool lookup`, libsecret); decide what `service/account` maps to on each\n- [ ] Resolve keychain references in `resolveSecretRef`, returning a `Secret`; a missing item, a locked keychain or a missing tool is an error naming the config path, never a value\n- [ ] Keep `{ env }` behaviour unchanged; update ARCHITECTURE.md §4\n\n### Acceptance criteria\n- Unit tests with the platform tool replaced by a fake cover found, missing, locked and tool-not-installed\n- No resolved value appears in errors, logs or events (test)\n\n_See packages/core/src/node/config/secret-ref.ts, docs/ARCHITECTURE.md §4 and §6._"
     }
   ]
 }

@@ -10,7 +10,11 @@ export interface AcpAgentSpec {
   id: string;
   /** The command and arguments that start the agent speaking ACP on stdio. */
   command: string[];
-  /** Fixed environment additions, e.g. to hide a subscription login. Never credentials. */
+  /**
+   * Fixed environment additions, e.g. to hide a subscription login. A credential here only comes
+   * from a secret reference resolved at startup (#149), and its value is then also passed as
+   * `AcpAdapterOptions.secrets` so it is scrubbed; never write one into code or config.
+   */
   env?: Record<string, string>;
   /**
    * The user's variables this agent needs beyond the common base set (#147). `apiKeyEnv` is

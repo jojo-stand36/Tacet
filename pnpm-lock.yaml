@@ -284,6 +284,15 @@ importers:
       '@modelcontextprotocol/server':
         specifier: 2.4.0
         version: 2.4.0
+      '@tacet/adapter-acp':
+        specifier: workspace:*
+        version: link:../adapters/acp
+      '@tacet/adapter-claude-sdk':
+        specifier: workspace:*
+        version: link:../adapters/claude-sdk
+      '@tacet/adapter-codex-app-server':
+        specifier: workspace:*
+        version: link:../adapters/codex-app-server
       '@tacet/core':
         specifier: workspace:*
         version: link:../core
@@ -297,12 +306,6 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: 1.32.2
         version: 1.32.2(zod@4.6.7)
-      '@tacet/adapter-claude-sdk':
-        specifier: workspace:*
-        version: link:../adapters/claude-sdk
-      '@tacet/adapter-codex-app-server':
-        specifier: workspace:*
-        version: link:../adapters/codex-app-server
 
   packages/tui:
     dependencies:

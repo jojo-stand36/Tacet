@@ -13,6 +13,11 @@
       "@tacet/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./workers": {
+      "@tacet/source": "./src/workers/index.ts",
+      "types": "./dist/workers/index.d.ts",
+      "default": "./dist/workers/index.js"
     }
   },
   "files": [
@@ -24,13 +29,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.4.0",
+    "@tacet/adapter-acp": "workspace:*",
+    "@tacet/adapter-claude-sdk": "workspace:*",
+    "@tacet/adapter-codex-app-server": "workspace:*",
     "@tacet/core": "workspace:*",
     "zod": "catalog:"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.4.0",
-    "@modelcontextprotocol/sdk": "1.32.2",
-    "@tacet/adapter-claude-sdk": "workspace:*",
-    "@tacet/adapter-codex-app-server": "workspace:*"
+    "@modelcontextprotocol/sdk": "1.32.2"
   }
 }
