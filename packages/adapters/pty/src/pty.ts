@@ -67,7 +67,13 @@ function fixSpawnHelper(): void {
 export function loadPty(): Promise<SpawnPty> {
   loaded ??= import('node-pty').then(
     (m) => {
-      fixSpawnHelper();
+      try {
+        fixSpawnHelper();
+      } catch (err) {
+        // Not cached: once the user fixes the install, the next session loads it.
+        loaded = undefined;
+        throw err;
+      }
       // CommonJS module: the namespace or its default export carries `spawn`.
       const mod = (m as { spawn?: unknown; default?: { spawn?: unknown } }).spawn
         ? m

@@ -71,10 +71,17 @@ export class HookServer {
       createServer((req, res) => {
         this.#handle(req, res);
       }),
-    ).then((l) => {
-      this.#listener = l;
-      return l;
-    });
+    ).then(
+      (l) => {
+        this.#listener = l;
+        return l;
+      },
+      (err: unknown) => {
+        // Not cached: the next session tries again.
+        this.#starting = undefined;
+        throw err;
+      },
+    );
     return this.#starting;
   }
 

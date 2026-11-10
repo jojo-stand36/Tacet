@@ -78,10 +78,8 @@ class FakeClaude implements Pty {
     this.writes.push(data);
     // Esc is a key: it ends the turn, it is not typed.
     if (data === '\x1b') return;
-    if (data !== '\r') {
-      this.typed += unpaste(data);
-      return;
-    }
+    this.typed += unpaste(data.replace(/\r$/, ''));
+    if (!data.endsWith('\r')) return;
     const text = this.typed;
     this.typed = '';
     if (this.opts.env.FAKE_MODE === 'NO_ACK') return;
@@ -109,7 +107,19 @@ describe('promptText', () => {
     expect(promptText('a\x1b[201~b\x03c\x04d\x7fe\r\nf')).toBe('a[201~bcde\nf');
   });
   it('refuses prompts Claude Code would run as a command', () => {
-    for (const t of ['/login', '!rm -rf .', '  !x', '​/status', '\n\n/x', '', ' \n ']) {
+    for (const t of [
+      '/login',
+      '!rm -rf .',
+      '  !x',
+      '\u200b/status',
+      '\n\n/x',
+      '\u3164/x',
+      '\ufe0f/x',
+      '\u034f!x',
+      '\u2800/x',
+      '',
+      ' \n ',
+    ]) {
       expect(() => promptText(t), JSON.stringify(t)).toThrow();
     }
     expect(promptText('# notes')).toBe('# notes');
@@ -242,8 +252,9 @@ describe('PtyAdapter (fake claude)', () => {
     await adapter.send(h, { text: 'two\nlines' });
     await tap.waitFor((e) => e.t === 'message.delta' && e.text.includes('two'), 5000);
     expect(texts(tap)).toEqual(['reply: one', 'reply: two\nlines']);
-    expect(fake().writes).toContain('\x1b[200~one\x1b[201~');
-    expect(fake().writes).toContain('\x1b[200~two\nlines\x1b[201~');
+    // Paste and Enter in one write.
+    expect(fake().writes).toContain('\x1b[200~one\x1b[201~\r');
+    expect(fake().writes).toContain('\x1b[200~two\nlines\x1b[201~\r');
     await adapter.close(h);
   });
 
@@ -291,6 +302,80 @@ describe('PtyAdapter (fake claude)', () => {
       'running',
       'idle',
     ]);
+    await adapter.close(h);
+  });
+
+  it("drops a cancelled turn's hooks before the next turn is acknowledged too", async () => {
+    const adapter = make();
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    await adapter.send(h, { text: 'HANG' });
+    await expect.poll(() => f.promptId).toBeDefined();
+    const hung = f.promptId;
+    // A tool of the cancelled turn is still open when Esc is sent.
+    const ls = { tool_name: 'Bash', tool_input: { command: 'ls' } };
+    await f.hook('PreToolUse', { ...ls, tool_use_id: 'old' });
+    await adapter.interrupt(h);
+    const next = adapter.send(h, { text: 'HANG' });
+    await adapter.send(h, { text: 'queued' });
+    // In the wait after Esc, before the new prompt is even typed: the old turn's late hooks.
+    await f.hook('Stop', { prompt_id: hung, last_assistant_message: 'stale' });
+    const late = await f.json('PermissionRequest', { ...ls, prompt_id: hung });
+    expect(late).toMatchObject({ hookSpecificOutput: { decision: { interrupt: true } } });
+    await next;
+    await expect.poll(() => f.promptId).not.toBe(hung);
+    expect(texts(tap)).toEqual([]);
+    // One prompt typed after the Esc; the queued one waits for that turn to end.
+    const afterEsc = f.writes.slice(f.writes.indexOf('\x1b') + 1);
+    expect(afterEsc).toEqual(['\x1b[200~HANG\x1b[201~\r']);
+    // The old tool call ended with the cancel; a new one with the same input is its own.
+    const results = () =>
+      tap.events.flatMap((e) => (e.t === 'tool.result' ? [`${e.id}:${e.ok}`] : []));
+    expect(results()).toEqual(['old:false']);
+    await f.hook('PreToolUse', { ...ls, tool_use_id: 'new' });
+    const perm = f.json('PermissionRequest', ls);
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+    if (req.event.t !== 'approval.request') throw new Error('no request');
+    await adapter.respond(h, req.event.id, { kind: 'reject', persist: false });
+    await perm;
+    expect(results()).toEqual(['old:false', 'new:false']);
+    await adapter.close(h);
+  });
+
+  it('does not submit a prompt interrupted while it waits to be typed', async () => {
+    const adapter = make();
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const f = fake();
+    await adapter.send(h, { text: 'HANG' });
+    await expect.poll(() => f.promptId).toBeDefined();
+    await adapter.interrupt(h);
+    // Typed only after the wait that follows an Esc: interrupted within it.
+    const typing = adapter.send(h, { text: 'never' });
+    await new Promise((r) => setTimeout(r, 30));
+    await adapter.interrupt(h);
+    await typing;
+    expect(f.writes.filter((w) => w.includes('never'))).toEqual([]);
+    expect(adapter.status(h)).toBe('cancelled');
+    await adapter.close(h);
+  });
+
+  it('keeps waiting while another approval is still open', async () => {
+    const adapter = make();
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    await adapter.send(h, { text: 'HANG' });
+    await expect.poll(() => f.promptId).toBeDefined();
+    const p1 = f.json('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'a' } });
+    const p2 = f.json('PermissionRequest', { tool_name: 'Bash', tool_input: { command: 'b' } });
+    await expect.poll(() => tap.events.filter((e) => e.t === 'approval.request').length).toBe(2);
+    const ids = tap.events.flatMap((e) => (e.t === 'approval.request' ? [e.id] : []));
+    await adapter.respond(h, ids[0] as string, { kind: 'allow_once', persist: false });
+    expect(adapter.status(h)).toBe('waiting_input');
+    await adapter.respond(h, ids[1] as string, { kind: 'reject', persist: false });
+    expect(adapter.status(h)).toBe('running');
+    await Promise.all([p1, p2]);
     await adapter.close(h);
   });
 

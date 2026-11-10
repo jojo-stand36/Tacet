@@ -125,6 +125,10 @@ interface Session {
   promptId: string | undefined;
   /** A prompt is being typed: input sent meanwhile is queued. */
   typing: boolean;
+  /** The `prompt_id` of the last cancelled turn: its hooks are stale whenever they arrive. */
+  cancelledPromptId: string | undefined;
+  /** Bumped by a cancel or close, so a prompt being typed stops typing. */
+  epoch: number;
   /** Fires when a typed prompt was not acknowledged in time. */
   ackTimer: NodeJS.Timeout | undefined;
   /** Tool calls whose result was reported. */
@@ -307,6 +311,8 @@ export class PtyAdapter implements AgentAdapter {
         openTools: [],
         promptId: undefined,
         typing: false,
+        cancelledPromptId: undefined,
+        epoch: 0,
         ackTimer: undefined,
         finished: new Set(),
         queue: [],
@@ -386,7 +392,7 @@ export class PtyAdapter implements AgentAdapter {
     s.approvals.delete(requestId);
     if (decision.kind === 'allow_once' || decision.kind === 'allow_always') {
       p.reply(allowPermission());
-      this.#setState(s, 'running');
+      this.#setState(s, s.approvals.size > 0 ? 'waiting_input' : 'running');
       return;
     }
     if (p.toolUseId) this.#toolResult(s, p.toolUseId, false);
@@ -397,13 +403,14 @@ export class PtyAdapter implements AgentAdapter {
       return;
     }
     p.reply(denyPermission('denied by Tacet'));
-    this.#setState(s, 'running');
+    this.#setState(s, s.approvals.size > 0 ? 'waiting_input' : 'running');
   }
 
   async close(h: SessionHandle): Promise<void> {
     const s = this.#sessions.get(h.id);
     if (!s || s.closing) return;
     s.closing = true;
+    s.epoch++;
     s.queue.length = 0;
     clearTimeout(s.ackTimer);
     this.#releaseApprovals(s);
@@ -433,17 +440,19 @@ export class PtyAdapter implements AgentAdapter {
    */
   async #type(s: Session, text: string): Promise<void> {
     s.typing = true;
+    const epoch = s.epoch;
+    // Cancelled or closed meanwhile: the prompt is not typed, or not submitted.
+    const gone = () => s.epoch !== epoch || s.ended || s.closing;
     this.#setState(s, 'running');
     try {
       // A key right after Esc reads as Alt+key.
       const since = Date.now() - s.escAt;
       if (since < 500) await sleep(500 - since);
-      if (s.ended || s.closing) return;
+      if (gone()) return;
       const before = s.promptId;
-      s.pty.write(`${PASTE_START}${text}${PASTE_END}`);
-      await sleep(100);
-      if (s.ended || s.closing) return;
-      s.pty.write('\r');
+      // Paste and Enter in one write (verified live): no moment where a cancel could leave a
+      // prompt typed but not submitted.
+      s.pty.write(`${PASTE_START}${text}${PASTE_END}\r`);
       clearTimeout(s.ackTimer);
       s.ackTimer = setTimeout(() => {
         if (s.promptId === before && s.state === 'running' && !s.ended && !s.closing) {
@@ -463,6 +472,8 @@ export class PtyAdapter implements AgentAdapter {
    */
   #cancelTurn(s: Session, interruptedByDenial = false): void {
     s.queue.length = 0;
+    s.epoch++;
+    s.cancelledPromptId = s.promptId;
     if (interruptedByDenial || s.approvals.size > 0) {
       for (const p of s.approvals.values()) {
         if (p.toolUseId) this.#toolResult(s, p.toolUseId, false);
@@ -473,6 +484,9 @@ export class PtyAdapter implements AgentAdapter {
       s.pty.write(ESC);
       s.escAt = Date.now();
     }
+    // Tool calls of the cancelled turn end here: no result follows for them.
+    for (const t of s.openTools) this.#toolResult(s, t.id, false);
+    s.openTools = [];
     clearTimeout(s.ackTimer);
     this.#setState(s, 'cancelled');
   }
@@ -500,6 +514,7 @@ export class PtyAdapter implements AgentAdapter {
       ev.hook_event_name !== 'SessionStart' &&
       ev.hook_event_name !== 'UserPromptSubmit' &&
       (s.state === 'cancelled' ||
+        (promptId !== undefined && promptId === s.cancelledPromptId) ||
         (promptId !== undefined && s.promptId !== undefined && promptId !== s.promptId));
     if (stale) {
       if (ev.hook_event_name === 'PreToolUse')
@@ -515,7 +530,13 @@ export class PtyAdapter implements AgentAdapter {
         reply();
         return;
       case 'UserPromptSubmit':
+        // A cancelled prompt's own submit (its Enter beat the cancel) is not a new turn.
+        if (promptId !== undefined && promptId === s.cancelledPromptId) {
+          reply();
+          return;
+        }
         s.promptId = promptId;
+        s.cancelledPromptId = undefined;
         clearTimeout(s.ackTimer);
         if (s.state !== 'running') this.#setState(s, 'running');
         reply();
@@ -554,7 +575,8 @@ export class PtyAdapter implements AgentAdapter {
         this.#emit(s, {
           t: 'approval.request',
           id,
-          summary: `${ev.tool_name}: ${summarize(ev.tool_input)}`,
+          // Scrubbed before it is cut short, so no secret is left half there.
+          summary: `${ev.tool_name}: ${summarize(scrubLiterals(redactSecrets(ev.tool_input), s.secrets))}`,
           toolName: ev.tool_name,
           options: ['allow_once', 'reject', 'cancel'],
           ...(ev.tool_input !== undefined ? { requestedGrant: { input: ev.tool_input } } : {}),
@@ -603,6 +625,8 @@ export class PtyAdapter implements AgentAdapter {
     clearTimeout(s.ackTimer);
     s.openTools = [];
     this.#setState(s, state, message);
+    // Never while a prompt is being typed: the queue drains after its turn.
+    if (s.typing) return;
     const next = s.queue.shift();
     if (next !== undefined) void this.#type(s, next);
   }
@@ -688,7 +712,11 @@ export function promptText(text: string): string {
       return c === '\t' || c === '\n' || !(code < 0x20 || (code >= 0x7f && code <= 0x9f));
     })
     .join('');
-  const first = clean.replace(/^[\s\p{Cf}\p{Z}]+/u, '').charAt(0);
+  // Whatever Claude Code may skip before the first character: spaces, format and combining
+  // characters, and blank-looking letters (Hangul fillers, Braille blank).
+  const first = clean
+    .replace(/^[\s\p{Cf}\p{Z}\p{M}\u115f\u1160\u3164\uffa0\u2800]+/u, '')
+    .charAt(0);
   if (first === '/' || first === '!') {
     throw new Error(
       `a PTY prompt must not start with "${first}": Claude Code would run it as a command`,
