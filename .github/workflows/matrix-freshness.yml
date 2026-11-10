@@ -1,0 +1,23 @@
+name: matrix-freshness
+
+# The capability matrix goes stale with time, not with commits (#66): check it weekly too, so
+# main shows it even when nothing is pushed. Pull requests and pushes run it in ci.yml.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Capability matrix is fresh
+        run: node scripts/check-matrix-freshness.mjs

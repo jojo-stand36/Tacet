@@ -2,11 +2,31 @@
 
 Verified facts about each agent surface Tacet can drive. Written for issue #8. Rules: see the `verify-vendor-facts` skill and `.github/instructions/adapters.instructions.md`.
 
-- **Checked** date for every row is **2026-11-09** unless a row says otherwise. Rows tagged `(#15)` (PTY mode, hooks, PTY library) were checked on **2026-11-10** against Claude Code 2.1.319 (SDK 0.3.319) docs and binary strings, and the npm registry.
+- **Checked** date for every row is **2026-11-09** unless a row says otherwise. Per surface, the freshness table below is authoritative. Rows tagged `(#15)` (PTY mode, hooks, PTY library) were checked on **2026-11-10** against Claude Code 2.1.319 (SDK 0.3.319) docs and binary strings, and the npm registry.
 - **Status**: `verified` = read in a primary source on the checked date. `UNVERIFIED` = not confirmed from a primary source; do not build on it. `PARTIAL` = some of it confirmed, remainder noted.
 - Sources are paraphrased. Each row has its own link.
 - No vendor CLI was installed in the research environment, so "version" means the version the docs or schema state, or the repo ref read. Adapter authors must re-pin against the version they install (Codex: `codex app-server generate-json-schema`; OpenCode: `GET /doc`).
 - Network note: `developers.openai.com`, `openai.com`, `opencode.ai`, `geminicli.com` and `agentclientprotocol.com` did not resolve from the research environment. Codex, OpenCode and Gemini facts therefore come from the vendors' GitHub repos (source, schema, docs files), which are primary. Anything that exists only on the blocked sites is marked UNVERIFIED.
+
+## Keeping it fresh
+
+Vendor surfaces under active development change monthly. The `matrix-freshness` CI job (`node scripts/check-matrix-freshness.mjs`, #66) warns a week before an active surface's date is 30 days old and fails after that; it also runs weekly on `main`. A surface's **Checked** date below is the oldest date of its version pin and its rows. To refresh a surface:
+1. Re-verify its rows against primary sources (`verify-vendor-facts` skill): at least its version pin in section 0, plus every row a newer version could change.
+2. Update the facts and pins that changed, and put the date you checked in each row you re-checked.
+3. Set its **Checked** date here.
+
+Do not bump a date without re-checking.
+
+<!-- freshness:start -->
+| Surface | Active | Checked |
+|---|---|---|
+| Claude Code | yes | 2026-11-09 |
+| Codex app-server | yes | 2026-11-09 |
+| OpenCode server | yes | 2026-11-09 |
+| Gemini CLI | yes | 2026-11-09 |
+| ACP | yes | 2026-11-09 |
+| MCP | no | 2026-11-09 |
+<!-- freshness:end -->
 
 ## 0. Version pins and reference points
 
@@ -244,4 +264,4 @@ Roadmap status (2026-11-09): items 1 to 7, 9, 10 and 11 are tracked in `roadmap/
 8. **Done 2026-11-09: `docs/RESEARCH.md` section 7 corrected on the Agent SDK credit change.** Original note - primary help article says the 2026-06-15 change is paused and subscription logins still draw plan limits; re-check before each release.
 9. **Closed 2026-11-09 (#65): parallel Claude Workers on one subscription.** No ruling on "ordinary, individual usage" was sought; the owner decided Tacet never runs parallel or unattended Workers on a subscription login (Claude or Codex). The config loader rejects `auth.unattended: subscription`; interactive sessions may still use the user's own login.
 10. **Add the shared adapter conformance fixtures plan** - record real-session fixtures per surface (stream, approval, interrupt, usage) so CI never calls vendors live.
-11. **Pin matrix versions in CI** - add a check that fails when a recorded "Checked" date is older than N days for surfaces under active development.
+11. **Matrix freshness check** - done (#66): the freshness table under "Keeping it fresh" and `scripts/check-matrix-freshness.mjs` (warns from 23 days, fails after 30, active surfaces only).
