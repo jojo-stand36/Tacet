@@ -5,6 +5,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { Workspaces } from './daemon/ports.js';
 import { WorktreeManager } from './worktree.js';
 
 const execFileAsync = promisify(execFile);
@@ -60,9 +61,7 @@ describe('WorktreeManager', () => {
 
   it('creates ten parallel detached workers with unique integration refs and paths', async () => {
     const worktrees = await Promise.all(
-      Array.from({ length: 10 }, (_, index) =>
-        manager.create(`worker-${index}`, { baseBranch: 'main' }),
-      ),
+      Array.from({ length: 10 }, (_, index) => manager.create(`worker-${index}`, 'main')),
     );
     const firstWorktree = worktrees[0];
     if (!firstWorktree) {
@@ -135,8 +134,7 @@ describe('WorktreeManager', () => {
     await git(repository, ['checkout', 'main']);
     await writeFile(path.join(repository, '.env'), 'test-value\n');
 
-    const worktree = await manager.create('setup-worker', {
-      baseBranch: 'setup-base',
+    const worktree = await manager.create('setup-worker', 'setup-base', {
       setup: {
         command: process.execPath,
         args: ['-e', "require('node:fs').writeFileSync('setup.txt', process.cwd())"],
@@ -194,38 +192,218 @@ describe('WorktreeManager', () => {
     await expect(readFile(worktree.path, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('retains unreachable Worker commits in gc and remove until integrated', async () => {
+  it('keeps Worker commits through gc and remove until they are merged, unless forced', async () => {
     const worktree = await manager.create('unintegrated-worker');
     await writeFile(path.join(worktree.path, 'private.txt'), 'not integrated yet\n');
     await workerGit(worktree.path, ['add', 'private.txt']);
     await workerGit(worktree.path, ['commit', '-m', 'private worker commit']);
     const head = (await workerGit(worktree.path, ['rev-parse', 'HEAD'])).trim();
 
-    await expect(manager.remove(worktree.id, { force: true })).rejects.toThrow(
-      'worker HEAD is not reachable from a ref',
+    await expect(manager.remove(worktree.id)).rejects.toThrow(
+      'Worker has unintegrated private commits',
     );
     expect(await manager.gc({ olderThanMs: 0 })).toMatchObject({
       removed: [],
-      skipped: [{ id: worktree.id, reason: 'worker HEAD is not reachable from a ref' }],
+      skipped: [{ id: worktree.id, reason: 'Worker has unintegrated private commits' }],
     });
     await expect(git(repository, ['cat-file', '-e', `${head}^{commit}`])).rejects.toThrow();
 
+    // Integrated, the commit is only on tacet/<id>, which remove would delete.
     expect(await manager.checkConflicts(worktree.id, 'main')).toEqual([]);
     expect((await git(repository, ['rev-parse', `refs/heads/${worktree.branchName}`])).trim()).toBe(
       head,
     );
+    await expect(manager.remove(worktree.id)).rejects.toThrow(
+      'Worker has commits no other ref contains',
+    );
+    expect(await manager.gc({ olderThanMs: 0 })).toMatchObject({
+      removed: [],
+      skipped: [{ id: worktree.id, reason: 'Worker has commits no other ref contains' }],
+    });
+
+    await git(repository, ['merge', '--ff-only', worktree.branchName]);
     await manager.remove(worktree.id);
     expect((await manager.list()).map(({ id }) => id)).not.toContain(worktree.id);
-    expect((await git(repository, ['cat-file', '-e', `${head}^{commit}`])).trim()).toBe('');
     await expect(
       git(repository, ['show-ref', '--verify', `refs/heads/${worktree.branchName}`]),
     ).rejects.toThrow();
   });
 
+  it('discards unmerged Worker commits and the task branch only when forced', async () => {
+    const worktree = await manager.create('forced-worker');
+    await writeFile(path.join(worktree.path, 'work.txt'), 'work\n');
+    await workerGit(worktree.path, ['add', 'work.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'work']);
+    expect(await manager.merge(worktree.id, 'pr', 'main')).toMatchObject({ status: 'ready' });
+
+    await manager.remove(worktree.id, { force: true });
+
+    expect(await manager.get(worktree.id)).toBeUndefined();
+    await expect(
+      git(repository, ['show-ref', '--verify', `refs/heads/${worktree.branchName}`]),
+    ).rejects.toThrow();
+  });
+
+  it('keeps the Worker commit after a PR-ready merge or a conflict', async () => {
+    const ready = await manager.create('pr-worker');
+    await writeFile(path.join(ready.path, 'pr.txt'), 'for a PR\n');
+    await workerGit(ready.path, ['add', 'pr.txt']);
+    await workerGit(ready.path, ['commit', '-m', 'pr work']);
+    const readyHead = (await workerGit(ready.path, ['rev-parse', 'HEAD'])).trim();
+    const conflicting = await manager.create('conflict-worker');
+    await writeFile(path.join(conflicting.path, 'file.txt'), 'worker side\n');
+    await workerGit(conflicting.path, ['commit', '-am', 'worker side']);
+    const conflictHead = (await workerGit(conflicting.path, ['rev-parse', 'HEAD'])).trim();
+    await writeFile(path.join(repository, 'file.txt'), 'target side\n');
+    await git(repository, ['commit', '-am', 'target side']);
+
+    expect(await manager.merge(ready.id, 'pr', 'main')).toMatchObject({ status: 'ready' });
+    expect(await manager.merge(conflicting.id, 'manual', 'main')).toMatchObject({
+      status: 'conflict',
+    });
+
+    for (const worktree of [ready, conflicting]) {
+      await expect(manager.remove(worktree.id)).rejects.toThrow(
+        'Worker has commits no other ref contains',
+      );
+    }
+    expect((await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).removed).toEqual([]);
+    for (const [worktree, head] of [
+      [ready, readyHead],
+      [conflicting, conflictHead],
+    ] as const) {
+      expect(
+        (await git(repository, ['rev-parse', `refs/heads/${worktree.branchName}`])).trim(),
+      ).toBe(head);
+    }
+  });
+
+  it('keeps commits a Worker without a sandbox left only in its HEAD reflog', async () => {
+    const worktree = await manager.create('unsandboxed-worker');
+    // Plain git in the checkout writes the shared object store, as a Worker without a sandbox.
+    await writeFile(path.join(worktree.path, 'shared.txt'), 'in the shared store\n');
+    await git(worktree.path, ['add', 'shared.txt']);
+    await git(worktree.path, ['commit', '-m', 'shared store commit']);
+    const commit = (await git(worktree.path, ['rev-parse', 'HEAD'])).trim();
+    await git(worktree.path, ['checkout', '--detach', 'refs/heads/main']);
+    expect((await git(repository, ['cat-file', '-t', commit])).trim()).toBe('commit');
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow(
+      'Worker has commits no other ref contains',
+    );
+    expect(await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).toMatchObject({
+      removed: [],
+      skipped: [{ id: worktree.id, reason: 'Worker has commits no other ref contains' }],
+    });
+  });
+
+  it("never gives the Worker's object store alternates to git", async () => {
+    const worktree = await manager.create('alternates-worker');
+    const other = path.join(temporaryDirectory, 'other');
+    await mkdir(other);
+    await git(other, ['init', '-b', 'main']);
+    await writeFile(path.join(other, 'other.txt'), 'elsewhere\n');
+    await git(other, ['add', 'other.txt']);
+    await git(other, [
+      '-c',
+      'user.name=Other',
+      '-c',
+      'user.email=other@example.invalid',
+      'commit',
+      '-m',
+      'other',
+    ]);
+    const gitDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    await mkdir(path.join(gitDirectory, 'objects', 'info'), { recursive: true });
+    await writeFile(
+      path.join(gitDirectory, 'objects', 'info', 'alternates'),
+      `${path.join(other, '.git', 'objects')}\n`,
+    );
+
+    await manager.remove(worktree.id);
+
+    expect(await manager.get(worktree.id)).toBeUndefined();
+  });
+
+  it('refuses to vouch for a Worker object store with packs', async () => {
+    const worktree = await manager.create('packed-worker');
+    const gitDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    await mkdir(path.join(gitDirectory, 'objects', 'pack'), { recursive: true });
+    await writeFile(path.join(gitDirectory, 'objects', 'pack', 'pack-1.pack'), 'PACK');
+
+    await expect(manager.remove(worktree.id)).rejects.toThrow('unable to verify Worker commits');
+    expect(await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).toMatchObject({
+      skipped: [{ id: worktree.id, reason: 'unable to verify Worker commits' }],
+    });
+  });
+
+  it('does not pass git stderr through remove', async () => {
+    const worktree = await manager.create('corrupt-index-worker');
+    const gitDirectory = (
+      await git(repository, [
+        'rev-parse',
+        '--path-format=absolute',
+        '--git-path',
+        `worktrees/${worktree.id}`,
+      ])
+    ).trim();
+    await writeFile(path.join(gitDirectory, 'index'), 'SECRET-WORKER-CONTENT not an index');
+
+    const error = await manager.remove(worktree.id).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/^git command failed/);
+    expect((error as Error).message).not.toMatch(/index|SECRET/);
+  });
+
+  it('creates at a commit id for the Workspaces port, and removes ids that are gone', async () => {
+    await git(repository, ['checkout', '--detach']);
+    await writeFile(path.join(repository, 'tagged.txt'), 'only on a tag\n');
+    await git(repository, ['add', 'tagged.txt']);
+    await git(repository, ['commit', '-m', 'tagged']);
+    const commit = (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    await git(repository, ['tag', 'only-tag', commit]);
+    await git(repository, ['checkout', 'main']);
+    const workspaces: Workspaces = manager;
+
+    const workspace = await workspaces.create('sha-worker', commit);
+    expect(await readFile(path.join(workspace.path, 'tagged.txt'), 'utf8')).toBe('only on a tag\n');
+    expect(await manager.get(workspace.id)).toMatchObject({ baseCommit: commit });
+    expect((await manager.get(workspace.id))?.baseBranch).toBeUndefined();
+    await expect(workspaces.create('bad-base', '--upload-pack=touch')).rejects.toThrow();
+    await expect(workspaces.create('missing-commit', 'f'.repeat(40))).rejects.toThrow();
+
+    await workspaces.remove(workspace.id);
+    expect(await workspaces.get(workspace.id)).toBeUndefined();
+    await workspaces.remove(workspace.id);
+    await workspaces.remove('never-existed');
+
+    const deleted = await manager.create('deleted-by-hand');
+    await rm(deleted.path, { recursive: true, force: true });
+    await workspaces.remove(deleted.id);
+    expect(await git(repository, ['worktree', 'list'])).not.toContain(deleted.id);
+    await expect(
+      readFile(path.join(temporaryDirectory, 'worktrees', `.tacet-${deleted.id}.json`)),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('includes the worktree ID when setup fails and retains it for recovery', async () => {
     let worktreeId: string | undefined;
     try {
-      await manager.create('setup-failure-worker', {
+      await manager.create('setup-failure-worker', undefined, {
         setup: { command: process.execPath, args: ['-e', 'process.exit(1)'] },
       });
     } catch (error) {
@@ -486,6 +664,121 @@ describe('WorktreeManager', () => {
     expect((await git(resultWorktreePath, ['diff', '--cached', '--name-only'])).trim()).toBe(
       'addition.txt',
     );
+    // The working tree has the result too, not only the index.
+    expect(await readFile(path.join(resultWorktreePath, 'addition.txt'), 'utf8')).toBe(
+      'worker result\n',
+    );
+    expect((await git(resultWorktreePath, ['status', '--porcelain'])).trim()).toBe(
+      'A  addition.txt',
+    );
+  });
+
+  it('keeps a committed squash result until its branch is merged', async () => {
+    const worktree = await manager.create('squash-worker');
+    await writeFile(path.join(worktree.path, 'squashed.txt'), 'squashed\n');
+    await workerGit(worktree.path, ['add', 'squashed.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'to squash']);
+    const result = await manager.merge(worktree.id, 'squash-to-branch', 'main');
+    const stagingPath = result.resultWorktreePath;
+    const stagingBranch = result.resultBranchName;
+    if (!stagingPath || !stagingBranch) throw new Error('squash result was not returned');
+    const staging = (await manager.list()).find(({ path: p }) => p === stagingPath);
+    if (!staging) throw new Error('staging worktree is not managed');
+
+    await expect(manager.remove(staging.id)).rejects.toThrow('local or ignored files');
+    await git(stagingPath, ['commit', '-m', 'squashed result']);
+    const squashed = (await git(repository, ['rev-parse', `refs/heads/${stagingBranch}`])).trim();
+    await expect(manager.remove(staging.id)).rejects.toThrow(
+      'Worker has commits no other ref contains',
+    );
+    expect(await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).toMatchObject({
+      removed: [],
+    });
+    expect((await git(repository, ['cat-file', '-t', squashed])).trim()).toBe('commit');
+
+    await git(repository, ['merge', '--ff-only', stagingBranch]);
+    await manager.remove(staging.id);
+    await expect(
+      git(repository, ['show-ref', '--verify', `refs/heads/${stagingBranch}`]),
+    ).rejects.toThrow();
+    expect(await manager.get(staging.id)).toBeUndefined();
+  });
+
+  it('protects the source and staging worktrees from every manager while a squash runs', async () => {
+    const other = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'));
+    const skippedDuringMerge: Array<{ id: string; reason: string }> = [];
+    let ids: { source: string; staging: string } | undefined;
+    const hooked = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      onSquashStaging: async (seen) => {
+        ids = seen;
+        const later = Date.now() + 10_000;
+        for (const gc of [other, hooked]) {
+          skippedDuringMerge.push(...(await gc.gc({ olderThanMs: 0, now: later })).skipped);
+        }
+        await expect(other.remove(seen.source, { force: true })).rejects.toThrow(
+          'in use by a merge',
+        );
+        await expect(other.remove(seen.staging, { force: true })).rejects.toThrow(
+          'in use by a merge',
+        );
+      },
+    });
+    const worktree = await hooked.create('guarded-worker');
+    await writeFile(path.join(worktree.path, 'guarded.txt'), 'guarded\n');
+    await workerGit(worktree.path, ['add', 'guarded.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'guarded']);
+
+    const result = await hooked.merge(worktree.id, 'squash-to-branch', 'main');
+
+    expect(result.status).toBe('applied');
+    if (!ids || !result.resultWorktreePath) throw new Error('hook did not run');
+    expect(skippedDuringMerge).toEqual(
+      expect.arrayContaining([
+        { id: ids.source, reason: 'in use by a merge' },
+        { id: ids.staging, reason: 'in use by a merge' },
+      ]),
+    );
+    expect(await readFile(path.join(result.resultWorktreePath, 'guarded.txt'), 'utf8')).toBe(
+      'guarded\n',
+    );
+    expect(await hooked.get(worktree.id)).toBeDefined();
+  });
+
+  it('cleans up the staging worktree and releases both worktrees when a squash fails', async () => {
+    const failing = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      onSquashStaging: async () => {
+        throw new Error('staging failed');
+      },
+    });
+    const worktree = await failing.create('failed-squash-worker');
+    await writeFile(path.join(worktree.path, 'failed.txt'), 'failed\n');
+    await workerGit(worktree.path, ['add', 'failed.txt']);
+    await workerGit(worktree.path, ['commit', '-m', 'failed']);
+
+    await expect(failing.merge(worktree.id, 'squash-to-branch', 'main')).rejects.toThrow(
+      'staging failed',
+    );
+
+    expect((await failing.list()).map(({ id }) => id)).toEqual([worktree.id]);
+    expect(await git(repository, ['for-each-ref', 'refs/heads/tacet/squash-*'])).toBe('');
+    await failing.remove(worktree.id, { force: true });
+    expect(await failing.list()).toEqual([]);
+  });
+
+  it('ignores busy markers left by a manager that died', async () => {
+    const worktree = await manager.create('orphaned-marker-worker');
+    const child = execFile(process.execPath, ['-e', '']);
+    const deadPid = child.pid;
+    await new Promise((resolve) => child.on('exit', resolve));
+    if (deadPid === undefined) throw new Error('no pid');
+    const locks = path.join(temporaryDirectory, 'worktrees', '.tacet-locks');
+    await mkdir(locks, { recursive: true });
+    await writeFile(path.join(locks, `${worktree.id}.busy.${deadPid}.stale`), '');
+    await writeFile(path.join(locks, `${worktree.id}.removing`), `${deadPid}\n`);
+
+    expect((await manager.gc({ olderThanMs: 0, now: Date.now() + 1_000 })).removed).toEqual([
+      worktree.id,
+    ]);
   });
 
   it('returns no-changes with the target SHA when a Worker has no commits', async () => {

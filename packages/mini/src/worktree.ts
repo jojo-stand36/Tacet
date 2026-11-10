@@ -3,8 +3,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { readWorkerFile, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
-import { MergeConflictError } from './daemon/ports.js';
-import { integrateWorktree, taskBranch } from './git/integrate.js';
+import { MergeConflictError, type Workspaces } from './daemon/ports.js';
+import { integrateWorktree, looseCommits, taskBranch } from './git/integrate.js';
 import { combineCommits } from './git/merge.js';
 
 export interface WorktreeSetup {
@@ -15,8 +15,15 @@ export interface WorktreeSetup {
 }
 
 export interface CreateWorktreeOptions {
-  baseBranch?: string;
   setup?: WorktreeSetup;
+}
+
+export interface RemoveWorktreeOptions {
+  /**
+   * Discard the checkout even if it holds local files or commits no other ref contains, and
+   * delete its `tacet/<id>` branch. Without it, `remove` refuses rather than lose work.
+   */
+  force?: boolean;
 }
 
 export interface WorktreeInfo {
@@ -25,7 +32,8 @@ export interface WorktreeInfo {
   branch: string;
   branchName: string;
   path: string;
-  baseBranch: string;
+  /** The local branch the checkout started from; absent when it started at a commit. */
+  baseBranch?: string;
   baseCommit: string;
   createdAt: number;
   lastActivityAt: number;
@@ -55,6 +63,22 @@ export interface WorktreeGcResult {
   skipped: Array<{ id: string; reason: string }>;
 }
 
+export interface WorktreeManagerOptions {
+  /** @internal Test seam: runs once a squash's staging worktree exists, before it is filled. */
+  onSquashStaging?: (ids: { source: string; staging: string }) => Promise<void>;
+}
+
+/** `remove` kept the checkout: `reason` says why (also what `gc` reports). */
+export class WorktreeKeptError extends Error {
+  override name = 'WorktreeKeptError';
+  constructor(
+    readonly reason: string,
+    message = reason,
+  ) {
+    super(message);
+  }
+}
+
 interface ProcessFailure extends Error {
   code?: number | string;
   stdout?: string;
@@ -69,7 +93,10 @@ interface ManagerPaths {
 
 const commandTimeoutMs = 120_000;
 const maxBuffer = 1024 * 1024;
+const maxReflogBytes = 4 * 1024 * 1024;
 const worktreeIdPattern = /^[a-z0-9-]+$/;
+const commitIdPattern = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const locksDirectoryName = '.tacet-locks';
 const managerGitArgs = [
   ...SAFE_GIT_ARGS,
   '-c',
@@ -84,9 +111,10 @@ function runCommand(
   cwd: string,
   timeoutMs = commandTimeoutMs,
   env?: NodeJS.ProcessEnv,
+  input?: string,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(
+    const child = execFile(
       command,
       [...args],
       {
@@ -108,7 +136,18 @@ function runCommand(
         resolve(stdout);
       },
     );
+    if (input !== undefined) {
+      child.stdin?.on('error', () => {});
+      child.stdin?.end(input);
+    }
   });
+}
+
+/** git's stderr can carry paths and Worker-written content: never pass it on. */
+function gitFailure(error: unknown): Error {
+  const failure = error as ProcessFailure;
+  const code = failure.code === undefined ? '' : ` (exit ${failure.code})`;
+  return new Error(`git command failed${code}`);
 }
 
 async function runGit(cwd: string, args: readonly string[]): Promise<string> {
@@ -150,9 +189,7 @@ async function runGit(cwd: string, args: readonly string[]): Promise<string> {
       gitEnv,
     );
   } catch (error) {
-    const failure = error as ProcessFailure;
-    const code = failure.code === undefined ? '' : ` (exit ${failure.code})`;
-    throw new Error(`git command failed${code}`);
+    throw gitFailure(error);
   }
 }
 
@@ -179,16 +216,289 @@ function workerSlug(workerId: string): string {
   return normalized.slice(start, Math.min(end, start + 48)) || 'worker';
 }
 
-export class WorktreeManager {
+function processAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+/**
+ * Git worktrees for Workers (#16), outside the repository, one detached checkout per Worker with
+ * its own object store. Implements the Mini-conductor's `Workspaces` port.
+ *
+ * Removal never loses work unless forced: a checkout is kept while it has local or ignored files,
+ * while its HEAD, its HEAD reflog or its `tacet/<id>` branch holds a commit that no other branch,
+ * tag or remote-tracking ref contains, and while its private object store has a commit the shared
+ * store lacks. A merge marks its source and staging worktrees busy (marker files under the
+ * worktree root, shared by every manager on the repo), and removal skips busy worktrees.
+ */
+export class WorktreeManager implements Workspaces {
   private pathsPromise: Promise<ManagerPaths> | undefined;
-  private readonly activeStagingWorktrees = new Set<string>();
 
   constructor(
     private readonly repositoryPath: string,
     private readonly worktreeRoot?: string,
+    private readonly options: WorktreeManagerOptions = {},
   ) {}
 
-  async create(workerId: string, options: CreateWorktreeOptions = {}): Promise<WorktreeInfo> {
+  /**
+   * A fresh detached checkout for `workerId`, at `base`: a full commit id, or a local branch
+   * name. Without `base`, it starts at the repository's current branch.
+   */
+  async create(
+    workerId: string,
+    base?: string,
+    options: CreateWorktreeOptions = {},
+  ): Promise<WorktreeInfo> {
+    return this.createWorktree(workerId, base, options, this.newId(workerId));
+  }
+
+  async list(): Promise<WorktreeInfo[]> {
+    const { root } = await this.paths();
+    const entries = await readdir(root, { withFileTypes: true });
+    const result: WorktreeInfo[] = [];
+
+    for (const entry of entries) {
+      const match = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name);
+      if (!entry.isFile() || !match) continue;
+      const id = match[1];
+      if (!id || !worktreeIdPattern.test(id)) continue;
+      const info = await this.readInfo(root, id);
+      if (!info || info.path !== path.join(root, id)) continue;
+      const actualPath = await realpath(info.path).catch(() => undefined);
+      if (actualPath === info.path) result.push(info);
+    }
+    return result;
+  }
+
+  async get(worktreeId: string): Promise<WorktreeInfo | undefined> {
+    if (!worktreeIdPattern.test(worktreeId)) return undefined;
+    return (await this.list()).find(({ id }) => id === worktreeId);
+  }
+
+  async touch(worktreeId: string, now = Date.now()): Promise<WorktreeInfo> {
+    const info = await this.requireWorktree(worktreeId);
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error('now must be a non-negative safe integer');
+    const updated = { ...info, lastActivityAt: now };
+    const { root } = await this.paths();
+    await this.writeInfo(root, updated);
+    return updated;
+  }
+
+  /**
+   * Remove a checkout and its `tacet/<id>` branch. Throws `WorktreeKeptError` instead when that
+   * would lose work (see the class comment) or a merge is using it, unless `force` is given. An
+   * id with no checkout is a no-op; a checkout deleted by hand is unregistered, and its branch is
+   * kept.
+   */
+  async remove(worktreeId: string, options: RemoveWorktreeOptions = {}): Promise<void> {
+    if (!worktreeIdPattern.test(worktreeId)) throw new Error('invalid worktree id');
+    const { root } = await this.paths();
+    const info = await this.readInfo(root, worktreeId);
+    if (!info || info.path !== path.join(root, worktreeId)) return;
+    if ((await realpath(info.path).catch(() => undefined)) !== info.path) {
+      const release = await this.lockRemoval(worktreeId);
+      try {
+        await this.git(['worktree', 'prune']);
+        await rm(this.infoPath(root, worktreeId), { force: true });
+      } finally {
+        await release();
+      }
+      return;
+    }
+    await this.removeWorktree(info, options.force === true);
+  }
+
+  async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
+    if (!Number.isSafeInteger(options.olderThanMs) || options.olderThanMs < 0) {
+      throw new Error('olderThanMs must be a non-negative safe integer');
+    }
+    const now = options.now ?? Date.now();
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error('now must be a non-negative safe integer');
+    const active = new Set(options.activeWorktreeIds ?? []);
+    const result: WorktreeGcResult = { removed: [], skipped: [] };
+
+    for (const info of await this.list()) {
+      if (active.has(info.id)) {
+        result.skipped.push({ id: info.id, reason: 'active' });
+        continue;
+      }
+      if (now - info.lastActivityAt < options.olderThanMs) {
+        result.skipped.push({ id: info.id, reason: 'not stale' });
+        continue;
+      }
+      try {
+        await this.removeWorktree(info, false);
+        result.removed.push(info.id);
+      } catch (error) {
+        const reason =
+          error instanceof WorktreeKeptError ? error.reason : 'Git refused to remove the worktree';
+        result.skipped.push({ id: info.id, reason });
+      }
+    }
+    return result;
+  }
+
+  async checkConflicts(worktreeId: string, targetBranch: string): Promise<string[]> {
+    const info = await this.requireWorktree(worktreeId);
+    await this.requireLocalBranch(targetBranch);
+    const release = await this.hold([info.id]);
+    try {
+      const workerCommit = await this.integrate(info);
+      if (!workerCommit) return [];
+      try {
+        await this.combineWithTarget(targetBranch, workerCommit);
+        return [];
+      } catch (error) {
+        if (error instanceof MergeConflictError) return error.files;
+        throw error;
+      }
+    } finally {
+      await release();
+    }
+  }
+
+  private async combineWithTarget(
+    targetBranch: string,
+    workerCommit: string,
+  ): Promise<{ commit: string; targetTip: string }> {
+    try {
+      const targetTip = (
+        await this.git(['rev-parse', '--verify', `refs/heads/${targetBranch}^{commit}`])
+      ).trim();
+      const combined = await combineCommits([targetTip, workerCommit], {
+        repoRoot: (await this.paths()).repository,
+      });
+      if (!combined) throw new Error('commit combination returned no result');
+      return { commit: combined, targetTip };
+    } catch (error) {
+      if (error instanceof MergeConflictError) throw error;
+      throw new Error('unable to combine Worker commits');
+    }
+  }
+
+  /**
+   * Bring the Worker's commits into `tacet/<id>` and combine them with `targetBranch`, without
+   * touching the target. `squash-to-branch` also stages the combined tree, uncommitted, in a new
+   * worktree on its own `tacet/<staging-id>` branch. The Worker's work then lives only on those
+   * branches, so `remove` keeps both worktrees until it is merged elsewhere or forced away.
+   */
+  async merge(
+    worktreeId: string,
+    strategy: MergeStrategy,
+    targetBranch: string,
+  ): Promise<MergeResult> {
+    await this.requireWorktree(worktreeId);
+    await this.requireLocalBranch(targetBranch);
+    const release = await this.hold([worktreeId]);
+    try {
+      const info = await this.requireWorktree(worktreeId);
+      return await this.mergeHeld(info, strategy, targetBranch);
+    } finally {
+      await release();
+    }
+  }
+
+  private async mergeHeld(
+    info: WorktreeInfo,
+    strategy: MergeStrategy,
+    targetBranch: string,
+  ): Promise<MergeResult> {
+    const workerCommit = await this.integrate(info);
+    if (!workerCommit) {
+      const targetTip = (
+        await this.git(['rev-parse', '--verify', `refs/heads/${targetBranch}^{commit}`])
+      ).trim();
+      return {
+        strategy,
+        status: 'no-changes',
+        branchName: targetBranch,
+        headSha: targetTip,
+        targetBranch,
+        conflicts: [],
+      };
+    }
+    let combinedCommit: string;
+    let targetTip: string;
+    try {
+      const combined = await this.combineWithTarget(targetBranch, workerCommit);
+      combinedCommit = combined.commit;
+      targetTip = combined.targetTip;
+    } catch (error) {
+      if (!(error instanceof MergeConflictError)) throw error;
+      return {
+        strategy,
+        status: 'conflict',
+        branchName: info.branchName,
+        headSha: workerCommit,
+        targetBranch,
+        conflicts: error.files,
+      };
+    }
+
+    if (strategy !== 'squash-to-branch') {
+      return {
+        strategy,
+        status: 'ready',
+        branchName: info.branchName,
+        headSha: workerCommit,
+        targetBranch,
+        conflicts: [],
+      };
+    }
+
+    // Marked busy before it exists, so no manager's gc can take it while it is filled.
+    const stagingId = this.newId(`squash-${info.id}`);
+    const releaseStaging = await this.hold([stagingId]);
+    let staging: WorktreeInfo | undefined;
+    try {
+      staging = await this.createWorktree(`squash-${info.id}`, targetTip, {}, stagingId);
+      await this.options.onSquashStaging?.({ source: info.id, staging: staging.id });
+      const stagingBase = await this.worktreeHead(staging);
+      if (stagingBase !== targetTip) throw new Error('target branch moved while preparing squash');
+      await this.attachStagingBranch(staging, stagingBase);
+      // `-u` writes the combined tree to the working tree too, not only the index.
+      await this.runWorktreeGit(staging, ['read-tree', '--reset', '-u', combinedCommit]);
+      return {
+        strategy,
+        status: 'applied',
+        branchName: info.branchName,
+        headSha: workerCommit,
+        targetBranch,
+        conflicts: [],
+        resultBranchName: staging.branchName,
+        resultWorktreePath: staging.path,
+      };
+    } catch (error) {
+      await releaseStaging();
+      if (staging) await this.remove(staging.id, { force: true }).catch(() => {});
+      throw error;
+    } finally {
+      await releaseStaging();
+    }
+  }
+
+  private newId(workerId: string): string {
+    if (!workerId.trim()) throw new Error('workerId must not be empty');
+    return `${workerSlug(workerId)}-${randomUUID()}`;
+  }
+
+  private async createWorktree(
+    workerId: string,
+    base: string | undefined,
+    options: CreateWorktreeOptions,
+    id: string,
+  ): Promise<WorktreeInfo> {
     if (!workerId.trim()) throw new Error('workerId must not be empty');
     if (options.setup) {
       const timeoutMs = options.setup.timeoutMs ?? commandTimeoutMs;
@@ -198,16 +508,11 @@ export class WorktreeManager {
       }
     }
     const { root } = await this.paths();
-    const baseBranch = options.baseBranch ?? (await this.currentBranch());
-    await this.requireLocalBranch(baseBranch);
-    const baseCommit = (
-      await this.git(['rev-parse', '--verify', `refs/heads/${baseBranch}^{commit}`])
-    ).trim();
+    const { baseBranch, baseCommit } = await this.resolveBase(base);
 
-    const id = `${workerSlug(workerId)}-${randomUUID()}`;
     const branchName = taskBranch(id).slice('refs/heads/'.length);
     const worktreePath = path.join(root, id);
-    await this.git(['worktree', 'add', '--detach', worktreePath, `refs/heads/${baseBranch}`]);
+    await this.git(['worktree', 'add', '--detach', worktreePath, baseCommit]);
 
     const timestamp = Date.now();
     const info: WorktreeInfo = {
@@ -216,7 +521,7 @@ export class WorktreeManager {
       branch: branchName,
       branchName,
       path: worktreePath,
-      baseBranch,
+      ...(baseBranch !== undefined ? { baseBranch } : {}),
       baseCommit,
       createdAt: timestamp,
       lastActivityAt: timestamp,
@@ -272,269 +577,266 @@ export class WorktreeManager {
     return info;
   }
 
-  async list(): Promise<WorktreeInfo[]> {
-    const { root } = await this.paths();
-    const entries = await readdir(root, { withFileTypes: true });
-    const result: WorktreeInfo[] = [];
-
-    for (const entry of entries) {
-      const match = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name);
-      if (!entry.isFile() || !match) continue;
-      const id = match[1];
-      if (!id || !worktreeIdPattern.test(id)) continue;
-      const info = await this.readInfo(root, id);
-      if (!info || info.path !== path.join(root, id)) continue;
-      const actualPath = await realpath(info.path).catch(() => undefined);
-      if (actualPath === info.path) result.push(info);
-    }
-    return result;
-  }
-
-  async get(worktreeId: string): Promise<WorktreeInfo | undefined> {
-    if (!worktreeIdPattern.test(worktreeId)) return undefined;
-    return (await this.list()).find(({ id }) => id === worktreeId);
-  }
-
-  async touch(worktreeId: string, now = Date.now()): Promise<WorktreeInfo> {
-    const info = await this.requireWorktree(worktreeId);
-    if (!Number.isSafeInteger(now) || now < 0)
-      throw new Error('now must be a non-negative safe integer');
-    const updated = { ...info, lastActivityAt: now };
-    const { root } = await this.paths();
-    await this.writeInfo(root, updated);
-    return updated;
-  }
-
-  async remove(worktreeId: string, options: { force?: boolean } = {}): Promise<void> {
-    const info = await this.requireWorktree(worktreeId);
-    const { root } = await this.paths();
-    if (!options.force) {
-      const status = await this.runWorktreeGit(info, [
-        'status',
-        '--porcelain',
-        '--untracked-files=all',
-        '--ignored=matching',
-      ]);
-      if (isDirty(status)) {
-        throw new Error(
-          'worktree contains local or ignored files; pass { force: true } to remove it',
-        );
-      }
-    }
-    if (!(await this.headIsReachable(info))) {
-      throw new Error('worker HEAD is not reachable from a ref; integrate it before removal');
-    }
-    await this.ensureNoPrivateCommits(info, options.force === true);
-    const gitDirectory = await this.managerWorktreeGitDirectory(info);
-    await this.restoreAdminGitdir(info, gitDirectory);
-    const gitFile = path.join(info.path, '.git');
-    const temporaryGitFile = path.join(info.path, `.git.${randomUUID()}.tmp`);
-    await writeFile(temporaryGitFile, `gitdir: ${gitDirectory}\n`, {
-      flag: 'wx',
-      mode: 0o600,
-    });
-    try {
-      await rm(gitFile, { recursive: true, force: true });
-      await rename(temporaryGitFile, gitFile);
-    } catch (error) {
-      await rm(temporaryGitFile, { force: true });
-      throw error;
-    }
-    await this.git(['worktree', 'remove', '--force', info.path]);
-    await this.git(['update-ref', '-d', taskBranch(info.id)]).catch(() => {});
-    await rm(this.infoPath(root, worktreeId), { force: true });
-    this.activeStagingWorktrees.delete(worktreeId);
-  }
-
-  async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
-    if (!Number.isSafeInteger(options.olderThanMs) || options.olderThanMs < 0) {
-      throw new Error('olderThanMs must be a non-negative safe integer');
-    }
-    const now = options.now ?? Date.now();
-    if (!Number.isSafeInteger(now) || now < 0)
-      throw new Error('now must be a non-negative safe integer');
-    const active = new Set(options.activeWorktreeIds ?? []);
-    for (const id of this.activeStagingWorktrees) active.add(id);
-    const result: WorktreeGcResult = { removed: [], skipped: [] };
-
-    for (const info of await this.list()) {
-      if (active.has(info.id)) {
-        result.skipped.push({ id: info.id, reason: 'active' });
-        continue;
-      }
-      if (now - info.lastActivityAt < options.olderThanMs) {
-        result.skipped.push({ id: info.id, reason: 'not stale' });
-        continue;
-      }
-      let status: string;
-      try {
-        status = await this.runWorktreeGit(info, [
-          'status',
-          '--porcelain',
-          '--untracked-files=all',
-          '--ignored=matching',
-        ]);
-      } catch {
-        result.skipped.push({ id: info.id, reason: 'worktree Git metadata is invalid' });
-        continue;
-      }
-      if (isDirty(status)) {
-        result.skipped.push({ id: info.id, reason: 'worktree contains local or ignored files' });
-        continue;
-      }
-      try {
-        await this.ensureNoPrivateCommits(info, false);
-      } catch {
-        result.skipped.push({ id: info.id, reason: 'Worker has unintegrated private commits' });
-        continue;
-      }
-      try {
-        await this.remove(info.id);
-        result.removed.push(info.id);
-      } catch (error) {
-        const reason =
-          error instanceof Error && error.message.includes('not reachable')
-            ? 'worker HEAD is not reachable from a ref'
-            : 'Git refused to remove the worktree';
-        result.skipped.push({ id: info.id, reason });
-      }
-    }
-    return result;
-  }
-
-  async checkConflicts(worktreeId: string, targetBranch: string): Promise<string[]> {
-    const info = await this.requireWorktree(worktreeId);
-    await this.requireLocalBranch(targetBranch);
-    const workerCommit = await this.integrate(info);
-    if (!workerCommit) return [];
-    try {
-      await this.combineWithTarget(targetBranch, workerCommit);
-      return [];
-    } catch (error) {
-      if (error instanceof MergeConflictError) return error.files;
-      throw error;
-    }
-  }
-
-  private async combineWithTarget(
-    targetBranch: string,
-    workerCommit: string,
-  ): Promise<{ commit: string; targetTip: string }> {
-    try {
-      const targetTip = (
-        await this.git(['rev-parse', '--verify', `refs/heads/${targetBranch}^{commit}`])
+  /** A full commit id, or a local branch (default: the current one). Never an option or range. */
+  private async resolveBase(
+    base: string | undefined,
+  ): Promise<{ baseBranch?: string; baseCommit: string }> {
+    if (base !== undefined && commitIdPattern.test(base)) {
+      const commit = (
+        await this.git(['rev-parse', '--verify', '--end-of-options', `${base}^{commit}`])
       ).trim();
-      const combined = await combineCommits([targetTip, workerCommit], {
-        repoRoot: (await this.paths()).repository,
+      if (commit !== base) throw new Error('base commit does not name a commit');
+      return { baseCommit: commit };
+    }
+    const baseBranch = base ?? (await this.currentBranch());
+    await this.requireLocalBranch(baseBranch);
+    const baseCommit = (
+      await this.git(['rev-parse', '--verify', `refs/heads/${baseBranch}^{commit}`])
+    ).trim();
+    return { baseBranch, baseCommit };
+  }
+
+  private async removeWorktree(info: WorktreeInfo, force: boolean): Promise<void> {
+    const { root } = await this.paths();
+    const release = await this.lockRemoval(info.id);
+    try {
+      if (await this.isBusy(info.id)) {
+        throw new WorktreeKeptError('in use by a merge', 'worktree is in use by a merge');
+      }
+      const branchRef = taskBranch(info.id);
+      const branchTip = await this.refTip(branchRef);
+      if (!force) {
+        let status: string;
+        try {
+          status = await this.runWorktreeGit(info, [
+            'status',
+            '--porcelain',
+            '--untracked-files=all',
+            '--ignored=matching',
+          ]);
+        } catch (error) {
+          throw new WorktreeKeptError(
+            'worktree Git metadata is invalid',
+            error instanceof Error ? error.message : undefined,
+          );
+        }
+        if (isDirty(status)) {
+          throw new WorktreeKeptError(
+            'worktree contains local or ignored files',
+            'worktree contains local or ignored files; pass { force: true } to remove it',
+          );
+        }
+        await this.ensureWorkIsKept(info, branchTip);
+      }
+      const gitDirectory = await this.managerWorktreeGitDirectory(info);
+      await this.restoreAdminGitdir(info, gitDirectory);
+      const gitFile = path.join(info.path, '.git');
+      const temporaryGitFile = path.join(info.path, `.git.${randomUUID()}.tmp`);
+      await writeFile(temporaryGitFile, `gitdir: ${gitDirectory}\n`, {
+        flag: 'wx',
+        mode: 0o600,
       });
-      if (!combined) throw new Error('commit combination returned no result');
-      return { commit: combined, targetTip };
-    } catch (error) {
-      if (error instanceof MergeConflictError) throw error;
-      throw new Error('unable to combine Worker commits');
+      try {
+        await rm(gitFile, { recursive: true, force: true });
+        await rename(temporaryGitFile, gitFile);
+      } catch (error) {
+        await rm(temporaryGitFile, { force: true });
+        throw error;
+      }
+      await this.git(['worktree', 'remove', '--force', info.path]);
+      // Only the tip that was checked: a branch moved since then is left alone.
+      if (branchTip) await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
+      await rm(this.infoPath(root, info.id), { force: true });
+    } finally {
+      await release();
     }
   }
 
-  async merge(
-    worktreeId: string,
-    strategy: MergeStrategy,
-    targetBranch: string,
-  ): Promise<MergeResult> {
-    const info = await this.requireWorktree(worktreeId);
-    await this.requireLocalBranch(targetBranch);
+  /**
+   * Throws `WorktreeKeptError` unless every commit the checkout could hold is somewhere that
+   * survives its removal: its HEAD, every commit in its HEAD reflog (a Worker that writes the
+   * shared store and then moves HEAD), its `tacet/<id>` branch, and its private loose commits.
+   * "Survives" means contained in a branch, tag or remote-tracking ref other than `tacet/<id>`.
+   */
+  private async ensureWorkIsKept(info: WorktreeInfo, branchTip: string | undefined): Promise<void> {
+    const unverifiable = (reason: string) =>
+      new WorktreeKeptError(
+        'unable to verify Worker commits',
+        `unable to verify Worker commits: ${reason}`,
+      );
+    const gitDirectory = await this.managerWorktreeGitDirectory(info);
+    const candidates = new Set<string>();
+    if (branchTip) candidates.add(branchTip);
 
-    const workerCommit = await this.integrate(info);
-    if (!workerCommit) {
-      const targetTip = (
-        await this.git(['rev-parse', '--verify', `refs/heads/${targetBranch}^{commit}`])
-      ).trim();
-      return {
-        strategy,
-        status: 'no-changes',
-        branchName: targetBranch,
-        headSha: targetTip,
-        targetBranch,
-        conflicts: [],
-      };
-    }
-    let combinedCommit: string;
-    let targetTip: string;
+    let head: string;
     try {
-      const combined = await this.combineWithTarget(targetBranch, workerCommit);
-      combinedCommit = combined.commit;
-      targetTip = combined.targetTip;
-    } catch (error) {
-      if (!(error instanceof MergeConflictError)) throw error;
-      return {
-        strategy,
-        status: 'conflict',
-        branchName: info.branchName,
-        headSha: workerCommit,
-        targetBranch,
-        conflicts: error.files,
-      };
+      head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
+    } catch {
+      throw unverifiable('the Worker HEAD cannot be read');
+    }
+    if (commitIdPattern.test(head)) {
+      candidates.add(head);
+    } else {
+      const ref = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
+      if (!ref) throw unverifiable('the Worker HEAD is neither a commit nor a branch');
+      const tip = await this.refTip(ref);
+      // An unborn branch has nothing to lose.
+      if (tip) candidates.add(tip);
     }
 
-    if (strategy !== 'squash-to-branch') {
-      return {
-        strategy,
-        status: 'ready',
-        branchName: info.branchName,
-        headSha: workerCommit,
-        targetBranch,
-        conflicts: [],
-      };
-    }
-
-    const stagingWorktree = await this.create(`squash-${info.id}`, { baseBranch: targetBranch });
-    this.activeStagingWorktrees.add(stagingWorktree.id);
-    let stagingBranchCreated = false;
-    let stagingBase: string | undefined;
+    let reflog = '';
     try {
-      stagingBase = await this.worktreeHead(stagingWorktree);
-      if (stagingBase !== targetTip) throw new Error('target branch moved while preparing squash');
-      await this.attachStagingBranch(stagingWorktree, stagingBase);
-      stagingBranchCreated = true;
-      await this.runWorktreeGit(stagingWorktree, ['read-tree', '--reset', combinedCommit]);
-      return {
-        strategy,
-        status: 'applied',
-        branchName: info.branchName,
-        headSha: workerCommit,
-        targetBranch,
-        conflicts: [],
-        resultBranchName: stagingWorktree.branchName,
-        resultWorktreePath: stagingWorktree.path,
-      };
+      reflog = readWorkerFile(path.join(gitDirectory, 'logs', 'HEAD'), maxReflogBytes);
     } catch (error) {
-      let unmerged = '';
-      try {
-        unmerged = await this.runWorktreeGit(stagingWorktree, [
-          'diff',
-          '--name-only',
-          '--diff-filter=U',
-        ]);
-      } catch {
-        // Preserve the original squash failure.
+      if (errorCode(error) !== 'ENOENT') throw unverifiable('the Worker reflog cannot be read');
+    }
+    for (const line of reflog.split('\n')) {
+      const commit = /^[0-9a-f]+ ([0-9a-f]{40}(?:[0-9a-f]{24})?) /.exec(line)?.[1];
+      if (commit && !/^0+$/.test(commit)) candidates.add(commit);
+    }
+
+    let privateCommits: string[];
+    try {
+      privateCommits = await looseCommits(
+        path.join(gitDirectory, 'objects'),
+        Date.now() + commandTimeoutMs,
+      );
+    } catch (error) {
+      throw unverifiable(error instanceof Error ? error.message : 'the object store is unreadable');
+    }
+    const shared = await this.commitsInSharedStore([...candidates, ...privateCommits]);
+    if (privateCommits.some((commit) => !shared.has(commit))) {
+      throw new WorktreeKeptError(
+        'Worker has unintegrated private commits',
+        'Worker has unintegrated private commits; integrate them or pass { force: true }',
+      );
+    }
+    for (const commit of privateCommits) candidates.add(commit);
+    // A HEAD or reflog commit the shared store lacks is a private commit, checked just above,
+    // or one that no longer exists anywhere: there is nothing left to keep.
+    const kept = [...candidates].filter((commit) => shared.has(commit));
+    if (kept.length === 0) return;
+    const unique = (
+      await this.git([
+        'rev-list',
+        '--max-count=1',
+        ...kept,
+        '--not',
+        `--exclude=${info.branchName}`,
+        '--branches',
+        '--tags',
+        '--remotes',
+      ])
+    ).trim();
+    if (unique) {
+      throw new WorktreeKeptError(
+        'Worker has commits no other ref contains',
+        'Worker has commits no other ref contains; merge them or pass { force: true }',
+      );
+    }
+  }
+
+  /** Which of `commits` are commits in the shared object store (never the Worker's). */
+  private async commitsInSharedStore(commits: readonly string[]): Promise<Set<string>> {
+    const unique = [...new Set(commits)];
+    if (unique.length === 0) return new Set();
+    const out = await this.git(
+      ['cat-file', '--batch-check=%(objectname) %(objecttype)'],
+      `${unique.join('\n')}\n`,
+    );
+    const found = new Set<string>();
+    for (const line of out.split('\n')) {
+      const [name, type] = line.split(' ');
+      if (name && type === 'commit') found.add(name);
+    }
+    return found;
+  }
+
+  private async refTip(ref: string): Promise<string | undefined> {
+    const out = await this.git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).catch(
+      () => '',
+    );
+    const tip = out.trim();
+    return commitIdPattern.test(tip) ? tip : undefined;
+  }
+
+  private async locksDirectory(): Promise<string> {
+    const { root } = await this.paths();
+    const directory = path.join(root, locksDirectoryName);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    return directory;
+  }
+
+  /**
+   * Mark worktrees busy for an operation, across every manager on the repository: a marker file
+   * per worktree, written before checking that none is being removed. Removal takes its lock
+   * before checking for markers, so one of the two always sees the other.
+   */
+  private async hold(ids: readonly string[]): Promise<() => Promise<void>> {
+    const directory = await this.locksDirectory();
+    const markers: string[] = [];
+    const release = async () => {
+      const taken = markers.splice(0);
+      await Promise.all(taken.map((marker) => rm(marker, { force: true })));
+    };
+    try {
+      for (const id of ids) {
+        const marker = path.join(directory, `${id}.busy.${process.pid}.${randomUUID()}`);
+        await writeFile(marker, '', { flag: 'wx', mode: 0o600 });
+        markers.push(marker);
       }
-      if (unmerged.trim()) {
-        return {
-          strategy,
-          status: 'conflict',
-          branchName: info.branchName,
-          headSha: workerCommit,
-          targetBranch,
-          conflicts: unmerged.trim().split('\n'),
-          resultBranchName: stagingWorktree.branchName,
-          resultWorktreePath: stagingWorktree.path,
-        };
+      for (const id of ids) {
+        if (await this.removalLocked(directory, id)) {
+          throw new Error('worktree is being removed');
+        }
       }
-      await this.remove(stagingWorktree.id, { force: true }).catch(() => {});
-      if (stagingBranchCreated && stagingBase) {
-        await this.deleteStagingBranch(stagingWorktree, stagingBase).catch(() => {});
-      }
+    } catch (error) {
+      await release();
       throw error;
     }
+    return release;
+  }
+
+  private async isBusy(id: string): Promise<boolean> {
+    const directory = await this.locksDirectory();
+    const prefix = `${id}.busy.`;
+    for (const name of await readdir(directory)) {
+      if (!name.startsWith(prefix)) continue;
+      const pid = Number(name.slice(prefix.length).split('.')[0]);
+      if (Number.isSafeInteger(pid) && pid > 0 && processAlive(pid)) return true;
+      // Left by a manager that died mid-merge.
+      await rm(path.join(directory, name), { force: true });
+    }
+    return false;
+  }
+
+  private async removalLocked(directory: string, id: string): Promise<boolean> {
+    const lock = path.join(directory, `${id}.removing`);
+    let owner: number;
+    try {
+      owner = Number((await readFile(lock, 'utf8')).trim());
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return false;
+      throw error;
+    }
+    return !(Number.isSafeInteger(owner) && owner > 0) || processAlive(owner);
+  }
+
+  private async lockRemoval(id: string): Promise<() => Promise<void>> {
+    const directory = await this.locksDirectory();
+    const lock = path.join(directory, `${id}.removing`);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await writeFile(lock, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+        return () => rm(lock, { force: true });
+      } catch (error) {
+        if (errorCode(error) !== 'EEXIST') throw error;
+        if (await this.removalLocked(directory, id)) break;
+        // Left by a manager that died mid-removal.
+        await rm(lock, { force: true });
+      }
+    }
+    throw new WorktreeKeptError('being removed', 'worktree is already being removed');
   }
 
   private async paths(): Promise<ManagerPaths> {
@@ -571,7 +873,7 @@ export class WorktreeManager {
     return this.pathsPromise;
   }
 
-  private async git(args: readonly string[]): Promise<string> {
+  private async git(args: readonly string[], input?: string): Promise<string> {
     const { repository, commonDirectory } = await this.paths();
     const env = trustedGitEnv(
       repository,
@@ -579,15 +881,20 @@ export class WorktreeManager {
       process.env,
     );
     try {
-      return await runCommand('git', [...managerGitArgs, ...args], repository, commandTimeoutMs, {
-        ...env,
-        GIT_CONFIG_NOSYSTEM: '1',
-        GIT_CONFIG_GLOBAL: '/dev/null',
-      });
+      return await runCommand(
+        'git',
+        [...managerGitArgs, ...args],
+        repository,
+        commandTimeoutMs,
+        {
+          ...env,
+          GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: '/dev/null',
+        },
+        input,
+      );
     } catch (error) {
-      const failure = error as ProcessFailure;
-      const code = failure.code === undefined ? '' : ` (exit ${failure.code})`;
-      throw new Error(`git command failed${code}`);
+      throw gitFailure(error);
     }
   }
 
@@ -643,13 +950,17 @@ export class WorktreeManager {
     if (worktree.commonDir !== commonDirectory) {
       throw new Error('worktree common directory is not the manager-owned directory');
     }
-    return runCommand(
-      'git',
-      [...managerGitArgs, ...args],
-      repository,
-      commandTimeoutMs,
-      trustedGitEnv(info.path, worktree, process.env),
-    );
+    try {
+      return await runCommand(
+        'git',
+        [...managerGitArgs, ...args],
+        repository,
+        commandTimeoutMs,
+        trustedGitEnv(info.path, worktree, process.env),
+      );
+    } catch (error) {
+      throw gitFailure(error);
+    }
   }
 
   private async integrate(info: WorktreeInfo): Promise<string | undefined> {
@@ -674,59 +985,8 @@ export class WorktreeManager {
     }
   }
 
-  private async deleteStagingBranch(info: WorktreeInfo, commit: string): Promise<void> {
-    await this.git(['update-ref', '-d', `refs/heads/${info.branchName}`, commit]);
-  }
-
   private async worktreeHead(info: WorktreeInfo): Promise<string> {
     return (await this.runWorktreeGit(info, ['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
-  }
-
-  private async headIsReachable(info: WorktreeInfo): Promise<boolean> {
-    try {
-      const gitDirectory = await this.managerWorktreeGitDirectory(info);
-      const head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
-      let commit = head;
-      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) {
-        const ref = /^ref: (refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
-        if (!ref) return false;
-        commit = (await this.git(['rev-parse', '--verify', `${ref}^{commit}`])).trim();
-      }
-
-      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) return false;
-      await this.git(['cat-file', '-e', `${commit}^{commit}`]);
-      const refs = await this.git(['for-each-ref', `--contains=${commit}`, '--format=%(refname)']);
-      return refs.trim().length > 0;
-    } catch {
-      return false;
-    }
-  }
-
-  private async ensureNoPrivateCommits(info: WorktreeInfo, force: boolean): Promise<void> {
-    if (force) return;
-    let unreachable: string;
-    try {
-      unreachable = await this.runWorktreeGit(info, [
-        'fsck',
-        '--full',
-        '--unreachable',
-        '--no-reflogs',
-        '--no-progress',
-      ]);
-    } catch {
-      throw new Error('unable to verify Worker private commits');
-    }
-    for (const match of unreachable.matchAll(
-      /(?:unreachable|dangling) commit ([0-9a-f]{40}(?:[0-9a-f]{24})?)/g,
-    )) {
-      const commit = match[1];
-      if (!commit) continue;
-      try {
-        await this.git(['cat-file', '-e', `${commit}^{commit}`]);
-      } catch {
-        throw new Error('Worker has unintegrated private commits');
-      }
-    }
   }
 
   private async commonGitDirectory(): Promise<string> {
@@ -769,7 +1029,9 @@ export class WorktreeManager {
         typeof info.workerId !== 'string' ||
         typeof info.branchName !== 'string' ||
         typeof info.path !== 'string' ||
-        typeof info.baseBranch !== 'string' ||
+        (info.baseBranch !== undefined && typeof info.baseBranch !== 'string') ||
+        typeof info.baseCommit !== 'string' ||
+        !commitIdPattern.test(info.baseCommit) ||
         !Number.isSafeInteger(info.createdAt) ||
         !Number.isSafeInteger(info.lastActivityAt)
       ) {
