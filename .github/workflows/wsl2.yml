@@ -66,6 +66,7 @@ jobs:
           $SUDO apt-get install -y -qq curl git ca-certificates build-essential python3 bubblewrap socat
           # The namespaces that sandbox uses must work in WSL2 too: fail here, with the reason,
           # rather than in every Claude test. Not skipped if they don't (coordinator, #163 follow-up).
+          id -un
           bwrap --version
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone 2>/dev/null || true
           bwrap --ro-bind / / --dev /dev --proc /proc --unshare-all true && echo "bwrap sandbox: ok"
