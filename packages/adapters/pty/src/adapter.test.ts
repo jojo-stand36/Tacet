@@ -51,9 +51,12 @@ class FakeClaude implements Pty {
     const settings = JSON.parse(
       readFileSync(args[args.indexOf('--settings') + 1] as string, 'utf8'),
     );
+    // Every hook is a command that relays to Tacet (#164); its 0600 file holds the URL and token.
     const stop = settings.hooks.Stop[0].hooks[0];
-    this.url = String(stop.url).replace(/\/Stop$/, '');
-    this.token = String(stop.headers.Authorization).replace('Bearer ', '');
+    const file = /'([^']*\.hook\.json)'/.exec(String(stop.command))?.[1] as string;
+    const { url, token } = JSON.parse(readFileSync(file, 'utf8')) as { url: string; token: string };
+    this.url = url;
+    this.token = token;
     const i = args.indexOf('--session-id');
     this.sessionId =
       i >= 0 ? (args[i + 1] as string) : (args[args.indexOf('--resume') + 1] as string);
@@ -256,13 +259,6 @@ describe('PtyAdapter (fake claude)', () => {
     writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
     writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
     const adapter = make({ PATH: bin }, { subprocessScrub: true });
-    if (process.platform === 'linux') {
-      // Not on Linux yet: the sandbox blocks the hooks (#164).
-      await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
-        /can't run on Linux yet.*#164/,
-      );
-      return;
-    }
     const h = await adapter.start({ cwd: join(root, 'wt') });
     expect(fake().opts.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
     await adapter.close(h);
