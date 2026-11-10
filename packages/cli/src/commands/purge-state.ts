@@ -31,6 +31,8 @@ export interface StatePlan {
   events: boolean;
   /** Everything directly in the state dir, all of which goes (Worker homes, logs, the lock). */
   entries: string[];
+  /** Tacet's internal refs (`refs/tacet/*`, e.g. a task's pinned target, #236): all deleted. */
+  refs: string[];
   checkouts: StateCheckout[];
   /** Set when the config could not be read and the default state dir was assumed. */
   note?: string;
@@ -38,6 +40,8 @@ export interface StatePlan {
 
 export interface StateResult {
   removed: string[];
+  /** Internal refs deleted. */
+  refs: string[];
   refused: StateCheckout[];
   /** Git still lists these worktrees under the state dir, so the dir was left in place. */
   leftovers: string[];
@@ -90,6 +94,7 @@ export async function planState(io: Io, root: string, userDir: string): Promise<
     exists: existsSync(paths.dir),
     events: existsSync(paths.events),
     entries: [],
+    refs: [],
     checkouts: [],
     ...(note ? { note } : {}),
   };
@@ -97,6 +102,7 @@ export async function planState(io: Io, root: string, userDir: string): Promise<
   const pid = await liveRun(paths.lock);
   if (pid !== undefined) throw liveRunError(pid);
   plan.entries = readdirSync(paths.dir).sort();
+  plan.refs = [...internalRefs(io, root).keys()];
   // Only looked at when it exists: the manager would create it.
   if (!existsSync(paths.worktrees)) return plan;
   const worktrees = await manager(io, root, paths);
@@ -136,6 +142,7 @@ export async function applyState(
     leftovers: [],
     dirRemoved: false,
     warnings: [],
+    refs: [],
   };
   if (!existsSync(paths.dir)) return result;
   if (note) {
@@ -172,6 +179,18 @@ export async function applyState(
       if (result.refused.length > 0) return;
       result.leftovers = registeredUnder(io, root, paths.dir);
       if (result.leftovers.length > 0) return;
+      // Tacet's internal refs go with its state; the tacet/* branches are the user's to keep.
+      for (const [ref, tip] of internalRefs(io, root)) {
+        try {
+          execFileSync('git', [...SAFE_GIT_ARGS, '-C', root, 'update-ref', '-d', ref, tip], {
+            stdio: 'ignore',
+            env: gitEnv(io),
+          });
+          result.refs.push(ref);
+        } catch {
+          result.warnings.push(`could not delete ${ref}`);
+        }
+      }
       // Everything but the lock, which goes last, as the lock is released.
       const lockName = basename(paths.lock);
       for (const name of readdirSync(paths.dir)) {
@@ -203,6 +222,35 @@ export async function applyState(
  * Every `refs/heads/tacet/*` branch and its tip. The purge keeps them all, so (owner decision on
  * #211) work they hold counts as kept: a checkout whose commits are on one need no `--force`.
  */
+/** `refs/tacet/*` and their tips (#236): never branches, only Tacet's own bookkeeping. */
+function internalRefs(io: Io, root: string): Map<string, string> {
+  const refs = new Map<string, string>();
+  let out = '';
+  try {
+    out = execFileSync(
+      'git',
+      [
+        ...SAFE_GIT_ARGS,
+        '-C',
+        root,
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/tacet/',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv(io) },
+    );
+  } catch {
+    // None listed: none deleted.
+  }
+  for (const line of out.split('\n')) {
+    const [tip, ref] = line.trim().split(' ');
+    if (tip && ref?.startsWith('refs/tacet/') && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(tip)) {
+      refs.set(ref, tip);
+    }
+  }
+  return refs;
+}
+
 function tacetTips(io: Io, root: string): Map<string, string> {
   const tips = new Map<string, string>();
   let out = '';

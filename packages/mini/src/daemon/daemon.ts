@@ -865,6 +865,13 @@ export class MiniConductor {
     if (dropped() || this.#target(taskId)) return;
     const target = TaskTarget.safeParse(head);
     if (!target.success) throw new Error('cannot tell which branch the task targets');
+    // The ref first (#236): git gc then never prunes the commit, even if the branch is rewritten.
+    try {
+      await this.#o.workspaces.pin?.(taskId, target.data.commit);
+    } catch (err) {
+      throw new Error(`cannot hold the task's target commit: ${(err as Error).message}`);
+    }
+    if (dropped() || this.#target(taskId)) return;
     this.#o.store.append(this.#env(taskId, 'task.target', target.data));
   }
 

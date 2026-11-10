@@ -334,6 +334,8 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       branch: 'main',
       commit: mainTip,
     });
+    // Held by a ref of the task's, so git gc never prunes it (#236).
+    expect(git(repo, ['rev-parse', `refs/tacet/${id}/target`])).toBe(mainTip);
   });
 
   describe('the pinned target (#219)', () => {

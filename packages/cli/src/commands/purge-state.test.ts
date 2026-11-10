@@ -355,4 +355,20 @@ describe('tacet uninstall --purge: run state (#211)', () => {
       expect(existsSync(w.path)).toBe(true);
     });
   });
+
+  it("deletes Tacet's internal refs with its state, and keeps the tacet branches (#236)", async () => {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['update-ref', 'refs/tacet/task-1/target', head]);
+    const preview = await tacet(['uninstall', '--purge']);
+    expect(preview.out).toContain('would delete refs/tacet/task-1/target');
+    expect(git(repo, ['rev-parse', 'refs/tacet/task-1/target'])).toBe(head);
+
+    const r = await tacet(['uninstall', '--purge', '--apply']);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain('deleted refs/tacet/task-1/target');
+    expect(git(repo, ['for-each-ref', 'refs/tacet/'])).toBe('');
+    expect(git(repo, ['for-each-ref', '--format=%(refname)', 'refs/heads/tacet/'])).toBe(
+      'refs/heads/tacet/some-task/result',
+    );
+  });
 });
