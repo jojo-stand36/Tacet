@@ -21,7 +21,8 @@ export const API_KEY_PROVIDER_ID = 'tacet-openai-api-key';
 /** Codex's default Responses API base URL for API-key auth (model-provider-info, 0.167.0). */
 export const OPENAI_API_BASE_URL = 'https://api.openai.com/v1';
 
-const KEY_VARS = ['OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
+/** The variables that hold a Codex API key; kept from the commands a Worker runs (#150). */
+export const KEY_VARS = ['OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
 /**
  * Debug logging for the Rust binary. At trace level it may write protocol traffic (including the
  * thread config with MCP headers) to its logs; whether it does is unverified, so Workers never

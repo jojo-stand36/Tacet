@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `ENV_TOOL`: asks for a Bash tool call that writes its environment to `tool-env.txt` (#150).
  * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
  *   without asking for a file in its working directory.
  * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
@@ -104,6 +105,16 @@ function plan(body: Body): Block[] {
           description: 'start a background job',
           run_in_background: true,
         },
+      },
+    ];
+  }
+  if (/ENV_TOOL/.test(text)) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Bash',
+        input: { command: 'env > tool-env.txt', description: 'record the environment' },
       },
     ];
   }
