@@ -168,6 +168,20 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     expect(await turn(h4, new EventTap(adapter.events(h4)), 'SAY fork3')).toBe('You said fork3.');
     expect(sent('SAY fork3')).toEqual({ model: 'gpt-5.5', effort: 'high' });
     await adapter.close(h4);
+
+    // An explicit model keeps the source's effort where that model lists it (Codex alone would
+    // run it at the model's default effort, spike #175).
+    const h5 = await adapter.start({
+      cwd: worktree,
+      model: 'gpt-6-luna',
+      resume: { vendorSessionId: id, fork: true },
+    });
+    expect(await turn(h5, new EventTap(adapter.events(h5)), 'SAY fork4')).toBe('You said fork4.');
+    expect(sent('SAY fork4')).toEqual({ model: 'gpt-6-luna', effort: 'low' });
+    await adapter.close(h5);
+
+    // An effort the model does not list is refused before anything reaches the API.
+    const before = api.requests.length;
     await expect(
       adapter.start({
         cwd: worktree,
@@ -175,6 +189,7 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
         resume: { vendorSessionId: id, fork: true },
       }),
     ).rejects.toMatchObject({ name: 'ProfileRefusedError', field: 'effort' });
+    expect(api.requests.length).toBe(before);
   });
 
   it('refuses effort levels and context windows it cannot honour', {

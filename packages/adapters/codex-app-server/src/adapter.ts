@@ -437,18 +437,18 @@ export class CodexAppServerAdapter implements AgentAdapter {
       await rpc.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null });
       rpc.notify('initialized');
       // A fork sent without a model runs on the catalog's default model, not the source thread's
-      // (observed on 0.167.0, #175), so the source's model, and its effort when the model stays,
-      // are read and sent: the fork continues on what the source ran.
+      // (observed on 0.167.0, #175), so the source's model and effort are read and sent where the
+      // caller gave none: the fork continues on what the source ran.
       let model = opts.model;
       let effort = opts.effort;
+      let inherited: string | undefined;
       if (opts.resume?.fork && (model === undefined || effort === undefined)) {
         const read = await rpc.request<Obj>('thread/read', {
           threadId: opts.resume.vendorSessionId,
         });
         const source = isObj(read.thread) ? read.thread : {};
-        const sourceModel = str(source.model);
-        model ??= sourceModel;
-        if (effort === undefined && model === sourceModel) effort = str(source.reasoningEffort);
+        model ??= str(source.model);
+        if (effort === undefined) inherited = str(source.reasoningEffort);
       }
       // Checked before the thread starts, since `thread/start` takes any level without a word.
       // Without a model named, the thread's model (config may choose it) is checked below.
@@ -457,6 +457,20 @@ export class CodexAppServerAdapter implements AgentAdapter {
       if (effort !== undefined && model !== undefined) {
         models = listModels(rpc);
         checkEffort(await catalog(models), model, effort);
+      }
+      // The source's effort is sent only when the fork's model lists it. Otherwise nothing is
+      // sent and Codex keeps what it keeps: the caller asked for no effort, so an effort it never
+      // named is not a reason to refuse the fork.
+      if (inherited !== undefined && model !== undefined) {
+        models ??= listModels(rpc);
+        try {
+          checkEffort(await catalog(models), model, inherited);
+          effort = inherited;
+        } catch (err) {
+          if (!(err instanceof ProfileRefusedError)) throw err;
+          // A failed read is not kept: a later effort check reads the catalog again.
+          if (!(await models.then(() => true).catch(() => false))) models = undefined;
+        }
       }
       const threadParams = {
         cwd: opts.cwd,

@@ -273,6 +273,98 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
       .filter((m) => m.method === 'turn/start')
       .map((m) => m.params.input[0].text);
 
+  describe('forks keep the source thread’s model and effort (#175)', () => {
+    const fork = { vendorSessionId: 'source-1', fork: true };
+    const sent = (method: string) => clientLog().filter((m) => m.method === method);
+
+    it('reads the source only for a fork that lacks a model or effort', async () => {
+      const adapter = make('normal');
+      for (const opts of [
+        { cwd: root },
+        { cwd: root, resume: { vendorSessionId: 'source-1' } },
+        { cwd: root, model: 'fake-model', effort: 'low', resume: fork },
+      ]) {
+        await adapter.close(await adapter.start(opts));
+      }
+      expect(sent('thread/read')).toEqual([]);
+      expect(sent('thread/fork')[0].params).toMatchObject({
+        model: 'fake-model',
+        config: { model_reasoning_effort: 'low' },
+      });
+    });
+
+    it('sends the source’s model and effort, checked against model/list', async () => {
+      const adapter = make('normal');
+      await adapter.close(await adapter.start({ cwd: root, resume: fork }));
+      expect(sent('thread/read')[0].params).toEqual({ threadId: 'source-1' });
+      expect(sent('model/list').length).toBeGreaterThan(0);
+      expect(sent('thread/fork')[0].params).toMatchObject({
+        threadId: 'source-1',
+        model: 'fake-model',
+        config: { model_reasoning_effort: 'high' },
+      });
+    });
+
+    it('forks without the source’s effort when its model cannot confirm it, not refusing', async () => {
+      for (const mode of ['read-uncatalogued', 'models-fail-once']) {
+        const adapter = make(mode);
+        const h = await adapter.start({ cwd: root, resume: fork });
+        const params = sent('thread/fork').at(-1).params;
+        expect(params.config, mode).not.toHaveProperty('model_reasoning_effort');
+        expect(params.model, mode).toBe(
+          mode === 'read-uncatalogued' ? 'other-model' : 'fake-model',
+        );
+        await adapter.close(h);
+      }
+      // An effort the caller names is still refused when it cannot be confirmed.
+      await expect(
+        make('read-uncatalogued').start({ cwd: root, effort: 'high', resume: fork }),
+      ).rejects.toMatchObject({ name: 'ProfileRefusedError', field: 'effort' });
+    });
+
+    it('falls back to a plain fork when the source reports no model', async () => {
+      const adapter = make('read-nomodel');
+      await adapter.close(await adapter.start({ cwd: root, resume: fork }));
+      const params = sent('thread/fork')[0].params;
+      expect(params).not.toHaveProperty('model');
+      expect(params.config).not.toHaveProperty('model_reasoning_effort');
+      expect(sent('model/list')).toEqual([]);
+    });
+
+    it('fails the start, scrubbed, when the source cannot be read', async () => {
+      const token = 'sk-live-header-value-0123456789';
+      const adapter = make('read-fail', {
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: root,
+          OPENAI_API_KEY: FAKE_KEY,
+          FAKE_MODE: 'read-fail',
+          FAKE_ERROR: `no such thread (headers: ${token})`,
+          FAKE_LOG: join(root, 'log.jsonl'),
+        },
+      });
+      const err = await adapter
+        .start({
+          cwd: root,
+          resume: fork,
+          mcpServers: [
+            {
+              name: 'tacet',
+              url: 'http://127.0.0.1:1/mcp',
+              headers: { authorization: `Bearer ${token}` },
+            },
+          ],
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e as Error,
+        );
+      expect(err?.message).toContain('failed to start the session');
+      expect(err?.message).not.toContain(token);
+      expect(sent('thread/fork')).toEqual([]);
+    });
+  });
+
   it('keeps send order when an earlier send waits on the effort check', async () => {
     const adapter = make('models-slow');
     const h = await adapter.start({ cwd: root });

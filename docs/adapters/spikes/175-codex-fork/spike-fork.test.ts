@@ -11,6 +11,7 @@ import { startMockResponsesApi } from './testing/mock-responses-api.js';
 
 const OUT = process.env.SPIKE_OUT ?? 'spike.out';
 const log = (...a: unknown[]) => appendFileSync(OUT, `${a.map(String).join(' ')}\n`);
+// biome-ignore lint/suspicious/noExplicitAny: a throwaway spike reading untyped JSON-RPC results.
 type Obj = Record<string, any>;
 const pick = (x: Obj | undefined) =>
   JSON.stringify({ model: x?.model, reasoningEffort: x?.reasoningEffort });
@@ -108,6 +109,23 @@ it('fork model and effort', { timeout: 120_000 }, async () => {
 
   const resumed = await b.rpc.request<Obj>('thread/resume', { threadId: id, cwd: root });
   log('RESUME response', pick(resumed));
+
+  // A per-turn model switch on a thread: does thread/read follow it?
+  const sw = await b.rpc.request<Obj>('thread/start', { cwd: root, model: 'gpt-5.5' });
+  await b.turn(sw.thread.id, 'SAY e', { model: 'gpt-6-luna', effort: 'high' });
+  log('SWITCHED turn sent', last());
+  const swRead = await b.rpc.request<Obj>('thread/read', { threadId: sw.thread.id });
+  log('READ after per-turn switch', pick(swRead.thread));
+
+  // A fork naming another model and no effort: which effort does it run at?
+  const modelOnly = await b.rpc.request<Obj>('thread/fork', {
+    threadId: id,
+    cwd: root,
+    model: 'gpt-6-luna',
+  });
+  log('FORK model only response', pick(modelOnly));
+  await b.turn(modelOnly.thread.id, 'SAY f');
+  log('FORK model only turn sent', last());
 
   b.proc.kill();
   await api.close();

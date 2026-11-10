@@ -47,6 +47,19 @@ rl.on('line', async (line) => {
   if (m.method === 'account/read') {
     return send({ id: m.id, result: { account: null, requiresOpenaiAuth: true } });
   }
+  if (m.method === 'thread/read') {
+    // The stored source thread a fork reads (#175). read-fail echoes FAKE_ERROR, so a test can
+    // check that the adapter scrubs secrets from it.
+    if (mode === 'read-fail') {
+      return send({ id: m.id, error: { code: -32603, message: process.env.FAKE_ERROR ?? 'no' } });
+    }
+    const thread = { id: m.params.threadId };
+    if (mode !== 'read-nomodel') {
+      thread.model = mode === 'read-uncatalogued' ? 'other-model' : 'fake-model';
+      thread.reasoningEffort = 'high';
+    }
+    return send({ id: m.id, result: { thread } });
+  }
   if (m.method === 'thread/start' || m.method === 'thread/resume' || m.method === 'thread/fork') {
     send({ id: m.id, result: { thread: { id: 'thread-1' }, model: 'fake-model' } });
     if (mode === 'close-stdin') {
