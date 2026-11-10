@@ -161,6 +161,17 @@ describe('PtyCliAdapter (a line-based CLI in a real PTY)', () => {
       resumable.start({ cwd, resume: { vendorSessionId: PTY_LAST_SESSION, fork: true } }),
     ).rejects.toThrow(/fork/);
     await resumable.close(resumed);
+
+    // Resumed with nothing saved (the marker is set before the CLI saves anything): this fake
+    // CLI says so and starts empty; what a real CLI does then is its own (capability matrix).
+    const empty = realpathSync(mkdtempSync(join(root, 'wt-')));
+    const none = await resumable.start({
+      cwd: empty,
+      resume: { vendorSessionId: PTY_LAST_SESSION },
+    });
+    const tap4 = new EventTap(resumable.events(none));
+    expect(reply((await turn(resumable, none, tap4, 'RECALL')).events)).toContain('(nothing)');
+    await resumable.close(none);
   });
 
   it('refuses what a generic CLI cannot do, and reports a crash once', {

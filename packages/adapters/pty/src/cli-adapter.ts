@@ -28,8 +28,9 @@ import { plainText, TerminalBuffer } from './terminal.js';
  * What a CLI with no structured interface supports through the PTY adapter (#15). Its state is
  * read from its output: the turn ends when the CLI shows its ready prompt again (or goes quiet),
  * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals. It is
- * resumed only if its preset has `resumeArgs` (`resume` is then reported). `modelSwitch` is `launch-only` because the preset's command fixes the model:
- * `start({ model })` is refused, never ignored.
+ * resumed only if its preset has `resumeArgs` (`capabilities()` then reports `resume`).
+ * `modelSwitch` is `launch-only` because the preset's command fixes the model: `start({ model })`
+ * is refused, never ignored.
  */
 export const PTY_CLI_CAPABILITIES: AdapterCapabilities = {
   streaming: false,
@@ -62,12 +63,14 @@ export interface PtyPreset {
    */
   readyPrompt?: string;
   /**
-   * Arguments added to `command` to continue the CLI's most recent session in the working
+   * Arguments appended after `command` to continue the CLI's most recent session in the working
    * directory (#157), e.g. `['resume', '--last']` for Codex, whose `--last` picks among the
    * sessions of the current directory (codex-cli 0.167.0 `resume --help`), or `['--resume',
-   * 'latest']` for Gemini CLI, whose sessions are per project (0.67.0 `--help`). Tacet resumes a
-   * Worker only in the checkout it ran in, so "the last session here" is that Worker's. A generic
-   * CLI has no session id Tacet can read, so the session's `vendorSessionId` is a marker.
+   * 'latest']` for Gemini CLI, whose sessions are per project (0.67.0 `--help`; whether a git
+   * worktree is its own project is unverified). Tacet resumes a Worker only in the checkout it
+   * ran in, so "the last session here" is that checkout's, which can be an earlier attempt's. A
+   * generic CLI has no session id Tacet can read, so `vendorSessionId` is a marker, set at start:
+   * a CLI resumed before it saved anything gets the arguments with nothing to continue.
    */
   resumeArgs?: string[];
 }

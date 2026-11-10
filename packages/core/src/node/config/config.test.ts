@@ -280,6 +280,16 @@ describe('loadConfig', () => {
     expect(config.secrets?.webhook).toEqual({ keychain: 'tacet/webhook' });
   });
 
+  it('refuses empty resume arguments and the removed process_name (#157)', () => {
+    for (const bad of ['resume_flag: []', 'resume_flag: ""', 'process_name: aider']) {
+      write(
+        join(userDir, 'config.yaml'),
+        `agents:\n  aider:\n    kind: pty\n    command: [aider]\n    ${bad}\n`,
+      );
+      expect(() => loadConfig({ userDir }), bad).toThrow(ConfigError);
+    }
+  });
+
   it('replaces a secret reference whole when a higher layer switches its kind', () => {
     const layers = (lower: object, higher: object) =>
       mergeConfig([
