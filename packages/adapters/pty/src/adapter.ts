@@ -86,8 +86,15 @@ export interface PtyAdapterOptions {
    * is reported as `waiting_input`: something in the terminal holds it up. Default 15000.
    */
   ackTimeoutMs?: number;
+  /**
+   * Longest wait after `SessionStart` for the interface to take input (it turns on bracketed
+   * paste) before `start()` fails. Default 30000.
+   */
+  inputReadyTimeoutMs?: number;
   /** Name of Tacet's own MCP server in the Worker's config: its tools never ask. Default `tacet`. */
   tacetMcpServer?: string;
+  /** Milliseconds `close()` waits for Claude Code to exit by itself before SIGTERM. Default 3000. */
+  exitTimeoutMs?: number;
   /** Milliseconds to wait after SIGTERM before SIGKILL. Default 5000. */
   killTimeoutMs?: number;
   /** Terminal size. Default 200 × 50. */
@@ -134,8 +141,10 @@ interface Session {
   /** Tool calls whose result was reported. */
   finished: Set<string>;
   queue: string[];
-  /** When Esc was last written: a key right after it would read as Alt+key. */
-  escAt: number;
+  /** When the last turn was cancelled (Esc, or a denial that interrupts). */
+  cancelledAt: number;
+  /** When the terminal last showed output. */
+  lastOutputAt: number;
   ready: () => void;
   exited: Promise<void>;
   exit?: { exitCode: number; signal?: number };
@@ -144,6 +153,8 @@ interface Session {
 }
 
 const ESC = '\x1b';
+/** Bracketed paste mode on: the interface reads input from here on (verified live, #15). */
+const PASTE_MODE_ON = '\x1b[?2004h';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
@@ -316,15 +327,33 @@ export class PtyAdapter implements AgentAdapter {
         ackTimer: undefined,
         finished: new Set(),
         queue: [],
-        escAt: 0,
+        cancelledAt: 0,
+        lastOutputAt: 0,
         ready,
         exited,
         closing: false,
         ended: false,
       };
       const session = s;
-      // The terminal itself is not an event stream; it is drained so the child never blocks.
-      pty.onData(() => {});
+      // The terminal itself is not an event stream; it is drained so the child never blocks, and
+      // watched only for the moment the interface takes input (see below). The tail of the last
+      // chunk is kept so the sequence is found across chunk boundaries.
+      let inputReady = false;
+      let tail = '';
+      let onInputReady: () => void = () => {};
+      const inputReadyP = new Promise<void>((r) => {
+        onInputReady = r;
+      });
+      pty.onData((d) => {
+        session.lastOutputAt = Date.now();
+        if (inputReady) return;
+        const seen = tail + d;
+        if (seen.includes(PASTE_MODE_ON)) {
+          inputReady = true;
+          onInputReady();
+        }
+        tail = seen.slice(-PASTE_MODE_ON.length);
+      });
       pty.onExit((e) => {
         session.exit = e;
         resolveExit();
@@ -348,6 +377,23 @@ export class PtyAdapter implements AgentAdapter {
           session.exit
             ? `claude exited during start (code ${session.exit.exitCode})`
             : `claude did not report ready within ${timeout} ms`,
+        );
+      }
+      // `SessionStart` comes before the interface reads input: a prompt typed then was lost, or
+      // its Enter was (verified live). The interface turns on bracketed paste when it takes
+      // input; typed from then on, prompts were taken every time, under load too.
+      const takesInput = await Promise.race([
+        inputReadyP.then(() => true),
+        session.exited.then(() => false),
+        deadline(this.#opts.inputReadyTimeoutMs ?? 30_000).then(() => false),
+      ]);
+      if (!takesInput) {
+        // Set by the exit handler meanwhile; TypeScript keeps the narrowing from the check above.
+        const exit = session.exit as Session['exit'];
+        throw new Error(
+          exit
+            ? `claude exited during start (code ${exit.exitCode})`
+            : 'claude never became ready for input',
         );
       }
     } catch (err) {
@@ -414,7 +460,7 @@ export class PtyAdapter implements AgentAdapter {
     s.queue.length = 0;
     clearTimeout(s.ackTimer);
     this.#releaseApprovals(s);
-    await this.#terminate(s);
+    await this.#terminate(s, true);
     for (const f of s.files) removeSessionFile(f);
     await this.#hooks.unregister(s.hookKey);
     this.#setState(s, 'done');
@@ -445,9 +491,17 @@ export class PtyAdapter implements AgentAdapter {
     const gone = () => s.epoch !== epoch || s.ended || s.closing;
     this.#setState(s, 'running');
     try {
-      // A key right after Esc reads as Alt+key.
-      const since = Date.now() - s.escAt;
-      if (since < 500) await sleep(500 - since);
+      // After a cancel, the interface takes input again only once it has drawn the interruption:
+      // a prompt typed at once was dropped (seen live under load), and a key right after Esc
+      // reads as Alt+key. So wait a moment, and until the terminal is quiet.
+      const until = Date.now() + 5000;
+      while (
+        Date.now() < until &&
+        (Date.now() - s.cancelledAt < 500 || Date.now() - s.lastOutputAt < 300)
+      ) {
+        await sleep(50);
+        if (gone()) return;
+      }
       if (gone()) return;
       const before = s.promptId;
       // Paste and Enter in one write (verified live): no moment where a cancel could leave a
@@ -482,8 +536,8 @@ export class PtyAdapter implements AgentAdapter {
       s.approvals.clear();
     } else {
       s.pty.write(ESC);
-      s.escAt = Date.now();
     }
+    s.cancelledAt = Date.now();
     // Tool calls of the cancelled turn end here: no result follows for them.
     for (const t of s.openTools) this.#toolResult(s, t.id, false);
     s.openTools = [];
@@ -648,13 +702,25 @@ export class PtyAdapter implements AgentAdapter {
     void this.#hooks.unregister(s.hookKey);
   }
 
-  /** End the process group: SIGTERM, then SIGKILL. node-pty makes the child a session leader. */
-  async #terminate(s: Session): Promise<void> {
-    if (s.exit) return;
+  /**
+   * End the session. With `graceful`, Claude Code is first asked to exit (Ctrl-D twice, as its
+   * docs say): killed at once, it can lose the last turn's transcript, so the session cannot be
+   * resumed (seen live: "No conversation found"). Then the process group, which node-pty makes
+   * the child lead, gets SIGTERM, and SIGKILL if it stays: background processes of the Worker
+   * end too.
+   */
+  async #terminate(s: Session, graceful = false): Promise<void> {
+    if (graceful && !s.exit) {
+      s.pty.write('\x04');
+      await sleep(150);
+      if (!s.exit) s.pty.write('\x04');
+      await Promise.race([s.exited, deadline(this.#opts.exitTimeoutMs ?? 3000)]);
+    }
     const signal = (sig: NodeJS.Signals) => {
       try {
         process.kill(-s.pty.pid, sig);
       } catch {
+        if (s.exit) return;
         try {
           s.pty.kill(sig);
         } catch {
@@ -663,6 +729,7 @@ export class PtyAdapter implements AgentAdapter {
       }
     };
     signal('SIGTERM');
+    if (s.exit) return;
     const timeout = this.#opts.killTimeoutMs ?? 5000;
     const gone = await Promise.race([
       s.exited.then(() => true),

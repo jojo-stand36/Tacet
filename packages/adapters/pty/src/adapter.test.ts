@@ -30,6 +30,7 @@ class FakeClaude implements Pty {
   typed = '';
   writes: string[] = [];
   promptId: string | undefined;
+  ctrlD = 0;
   readonly url: string;
   readonly token: string;
   readonly sessionId: string;
@@ -67,7 +68,14 @@ class FakeClaude implements Pty {
   async json(event: string, extra: object = {}): Promise<unknown> {
     return (await this.hook(event, extra)).json();
   }
-  onData() {
+  onData(l: (data: string) => void) {
+    // Turns on bracketed paste once it reads input, as the real interface does, in two chunks.
+    if (this.opts.env.FAKE_MODE !== 'NO_INPUT') {
+      setTimeout(() => {
+        l('> \x1b[?20');
+        l('04h');
+      }, 5);
+    }
     return { dispose() {} };
   }
   onExit(l: (e: { exitCode: number }) => void) {
@@ -76,8 +84,13 @@ class FakeClaude implements Pty {
   }
   write(data: string) {
     this.writes.push(data);
-    // Esc is a key: it ends the turn, it is not typed.
+    // Esc is a key: it ends the turn, it is not typed. Ctrl-D twice exits.
     if (data === '\x1b') return;
+    if (data === '\x04') {
+      this.ctrlD++;
+      if (this.ctrlD === 2) setTimeout(() => this.exit(0), 5);
+      return;
+    }
     this.typed += unpaste(data.replace(/\r$/, ''));
     if (!data.endsWith('\r')) return;
     const text = this.typed;
@@ -485,10 +498,15 @@ describe('PtyAdapter (fake claude)', () => {
   });
 
   it('reports a start that fails, and leaves no files', async () => {
-    for (const mode of ['NO_START', 'EXIT_EARLY']) {
-      await expect(make({ FAKE_MODE: mode }).start({ cwd: join(root, 'wt') })).rejects.toThrow(
-        mode === 'NO_START' ? /did not report ready/ : /exited during start/,
-      );
+    const expected: Record<string, RegExp> = {
+      NO_START: /did not report ready/,
+      EXIT_EARLY: /exited during start/,
+      NO_INPUT: /never became ready for input/,
+    };
+    for (const [mode, error] of Object.entries(expected)) {
+      await expect(
+        make({ FAKE_MODE: mode }, { inputReadyTimeoutMs: 300 }).start({ cwd: join(root, 'wt') }),
+      ).rejects.toThrow(error);
     }
     const left = existsSync(join(root, 'run'))
       ? readdirSync(join(root, 'run'), { recursive: true }).filter((f) =>

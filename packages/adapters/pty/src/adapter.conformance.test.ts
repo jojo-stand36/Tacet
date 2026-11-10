@@ -17,7 +17,7 @@ import { type MockMessagesApi, startMockMessagesApi } from '@tacet/adapter-claud
 import type { SessionHandle } from '@tacet/core';
 import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { PtyAdapter } from './adapter.js';
 import { loadPty } from './pty.js';
 
@@ -39,9 +39,12 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
   let adapter: PtyAdapter;
   let worktree: string;
 
+  /** The terminal output of the sessions started, so a failing test shows what was on screen. */
+  const screens: string[] = [];
+
   beforeAll(async () => {
     // node-pty must really load here: a PTY test that quietly skipped would prove nothing.
-    await loadPty();
+    const spawn = await loadPty();
     api = await startMockMessagesApi();
     root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-')));
     worktree = join(root, 'worktree');
@@ -52,6 +55,14 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
       killTimeoutMs: 2000,
       stateDir: join(root, 'state'),
       sessionFileDir: join(root, 'run', 'mcp'),
+      spawn: (file, args, opts) => {
+        const pty = spawn(file, args, opts);
+        const i = screens.push('') - 1;
+        pty.onData((d) => {
+          screens[i] = ((screens[i] ?? '') + d).slice(-20_000);
+        });
+        return pty;
+      },
       // Only what the binary needs; never the developer's own environment or credentials.
       baseEnv: {
         PATH: process.env.PATH,
@@ -61,6 +72,23 @@ describe('PtyAdapter conformance (interactive Claude Code in a PTY, mock Message
         DISABLE_AUTOUPDATER: '1',
       },
     });
+  });
+
+  afterEach((ctx) => {
+    if (ctx.task.result?.state !== 'fail') return;
+    // Escape sequences built from char codes: control characters are not written in a regex.
+    const esc = String.fromCharCode(27);
+    const bel = String.fromCharCode(7);
+    const csi = new RegExp(`${esc}\\[[0-9;?]*[ -/]*[@-~]`, 'g');
+    const osc = new RegExp(`${esc}\\][^${bel}]*${bel}`, 'g');
+    const plain = (t: string) => t.replace(csi, '').replace(osc, '').slice(-1500);
+    // The failing test's own sessions are the latest ones.
+    for (const [i, t] of screens.entries()) {
+      if (i >= screens.length - 3) console.log(`--- screen of session ${i}:\n${plain(t)}`);
+    }
+    if (process.env.TACET_PTY_SCREENS) {
+      writeFileSync(process.env.TACET_PTY_SCREENS, JSON.stringify(screens));
+    }
   });
 
   afterAll(async () => {
