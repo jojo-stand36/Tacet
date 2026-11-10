@@ -13,6 +13,7 @@ import {
   type WorkerAdapter,
   workerRefusal,
 } from '../daemon/ports.js';
+import { unfence } from '../daemon/reply.js';
 import { sessionTurns } from '../daemon/turns.js';
 import { type ReviewDiffOptions, reviewDiff } from '../git/diff.js';
 
@@ -42,10 +43,8 @@ export function parseReview(text: string): {
   verdict: 'approve' | 'request_changes';
   findings: ReviewFinding[];
 } {
-  const body = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/, '');
+  // An over-long reply is an invalid reply too, with its own reason (#203).
+  const body = unfence(text);
   let json: unknown;
   try {
     json = JSON.parse(body);

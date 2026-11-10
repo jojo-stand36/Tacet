@@ -85,6 +85,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude + human`
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
+- [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 

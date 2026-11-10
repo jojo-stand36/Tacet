@@ -1,5 +1,6 @@
 import { assertSafePrompt, type SessionHandle } from '@tacet/core';
 import type { WorkerAdapter } from './ports.js';
+import { MAX_REPLY_CHARS } from './reply.js';
 
 export interface TurnUsage {
   inputTokens: number;
@@ -37,8 +38,11 @@ export function sessionTurns(
       ]);
       if (next.done) throw new Error(`${o.label} session ended`);
       const e = next.value;
-      if (e.t === 'message.delta') reply += e.text;
-      else if (e.t === 'usage') {
+      // Past the parse cap the reply is invalid anyway: stop growing it, keep reading the turn
+      // (#203).
+      if (e.t === 'message.delta') {
+        if (reply.length <= MAX_REPLY_CHARS) reply += e.text;
+      } else if (e.t === 'usage') {
         usage.inputTokens += e.inputTokens;
         usage.outputTokens += e.outputTokens;
         usage.costUsd += e.costUsd ?? 0;
