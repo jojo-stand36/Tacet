@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:workspace-removed:v1",
+  "title": "Tacet workspace.removed payload",
+  "type": "object",
+  "properties": {
+    "workspaceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "reason": {
+      "enum": [
+        "removed",
+        "forced",
+        "gone"
+      ],
+      "x-tacet-fallback": "removed",
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspaceId",
+    "reason"
+  ]
+}

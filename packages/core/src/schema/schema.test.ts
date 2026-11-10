@@ -13,6 +13,7 @@ import {
   EscalationExt,
   EventEnvelope,
   HandoffPacket,
+  isForwardable,
   isKnownEventNamespace,
   type JsonSchemaName,
   jsonSchemas,
@@ -214,5 +215,15 @@ describe('JSON Schema export', () => {
 
   it.each(names)('committed schema/v1/%s.json matches the zod source', (name) => {
     expect(readJson(join(root, 'schema', 'v1', `${name}.json`))).toEqual(toJsonSchema(name));
+  });
+});
+
+describe('local event namespaces (#126)', () => {
+  it('keeps the worktree registry local, and forwards the rest', () => {
+    expect(isForwardable('workspace.created')).toBe(false);
+    expect(isForwardable('workspace.removed')).toBe(false);
+    expect(isForwardable('worker.started')).toBe(true);
+    expect(isForwardable('task.landed')).toBe(true);
+    expect(isForwardable('workspacex.created')).toBe(true);
   });
 });

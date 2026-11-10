@@ -53,7 +53,7 @@ export interface StoredEvent {
 /**
  * Retention: events older than `before` whose type starts with one of `dropTypes` are deleted.
  * The default keeps every summary-grade event (task, escalation, decision, handoff, worker,
- * budget and `agent.usage`) forever, and drops transcript-grade events (`agent.message`,
+ * workspace, budget and `agent.usage`) forever, and drops transcript-grade events (`agent.message`,
  * `agent.tool`, `agent.approval`, `agent.status`, `agent.escalation`) once they are old. Task
  * state replays exactly after compaction because the task projection only reads kept types, and
  * a restarted Mini-conductor rebuilds its Worker pool from the kept `worker.*` events.

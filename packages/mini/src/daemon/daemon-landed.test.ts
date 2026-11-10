@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newUlid, type SummaryPacket, type TacetConfig, type TaskLanded } from '@tacet/core';
@@ -56,7 +56,10 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     git(repo, ['add', 'README']);
     git(repo, ['commit', '-qm', 'init']);
     store = openEventStore(':memory:');
-    manager = new WorktreeManager(repo, join(root, 'worktrees'), { env });
+    manager = new WorktreeManager(repo, join(root, 'worktrees'), {
+      env,
+      log: { store, miniId: 'mini' },
+    });
   });
 
   afterEach(async () => {
@@ -277,6 +280,49 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       await severalSweeps();
       expect(await manager.list()).toHaveLength(1);
     });
+  });
+
+  it('finds every live checkout from the event log after a restart, with no state files (#126)', async () => {
+    const { id } = await runTask(commitWork, { remove_merged: false });
+    const started = store
+      .query({ taskId: `${id}/1`, typePrefix: 'worker.started' })
+      .map((e) => (e.envelope.data as { workspaceId: string }).workspaceId);
+    await daemon?.stop();
+    daemon = undefined;
+    expect(
+      readdirSync(join(root, 'worktrees')).filter(
+        (n) => n !== '.tacet-locks' && !started.includes(n),
+      ),
+    ).toEqual([]);
+
+    const restarted = new WorktreeManager(repo, join(root, 'worktrees'), {
+      env,
+      log: { store, miniId: 'mini' },
+    });
+    await restarted.reconcile();
+    for (const workspaceId of started) {
+      expect(await restarted.get(workspaceId)).toMatchObject({ id: workspaceId });
+    }
+  });
+
+  it('reconciles the worktree registry when it starts (#126)', async () => {
+    // A checkout whose creation a crashed Mini-conductor never finished.
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'mini', id: 'mini' },
+      type: 'workspace.created',
+      data: {
+        workspaceId: 'crashed-1',
+        workerId: 'w',
+        baseCommit: git(repo, ['rev-parse', 'HEAD']),
+      },
+    });
+    await runTask(commitWork, { remove_merged: false });
+    expect(
+      store.query({ typePrefix: 'workspace.removed' }).map((e) => e.envelope.data),
+    ).toContainEqual({ workspaceId: 'crashed-1', reason: 'gone' });
   });
 
   it('starts every sub-task from the target pinned when the task started (#219)', async () => {

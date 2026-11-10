@@ -93,6 +93,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`
+- [ ] **Worktree gc by activity, and cleanup of planner checkouts a crash left behind** — `feature` `P2` `claude`
 - [ ] **Worktree manager** — `feature` `P0` `copilot`
 - [ ] **Worktree manager state into the event log** — `chore` `P2` `either`
 - [ ] **`tacet init` installer for repos** — `feature` `P0` `copilot`
@@ -131,6 +132,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
+- [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
 
 ## M4 · Visual & terminal UI
