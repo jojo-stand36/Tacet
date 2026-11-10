@@ -217,7 +217,10 @@ export class MiniMcpServer {
     const token = this.#opts.tokens.mint(binding);
     return {
       config: { name: 'tacet', url: this.url, headers: mcpAuthHeaders(token) },
-      revoke: () => void this.#opts.tokens.revoke(binding.workerSessionId),
+      revoke: () => {
+        this.#opts.tokens.revoke(binding.workerSessionId);
+        this.#opts.backend.forget?.(binding.workerSessionId);
+      },
     };
   }
 

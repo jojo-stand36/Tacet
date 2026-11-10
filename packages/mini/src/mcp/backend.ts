@@ -55,6 +55,11 @@ export interface MiniBackend {
     b: WorkerBinding,
     i: ToolInput<'search_decisions'>,
   ): Promise<ToolOutput<'search_decisions'>>;
+  /**
+   * The Worker's token was revoked (its session ended): drop whatever is kept in memory for it
+   * (#122). Anything needed later is in the event log.
+   */
+  forget?(workerSessionId: string): void;
 }
 
 export interface EventLogBackendOptions {
@@ -82,6 +87,7 @@ const ANSWER_SOURCES = new Set(['policy', 'precedent', 'mini', 'user']);
 /** The MCP tools over the append-only event log (ADR-003 §1); all state changes are events. */
 export class EventLogBackend implements MiniBackend {
   readonly #o: EventLogBackendOptions;
+  /** When each Worker's last progress report was stored: only for the rate limit. */
   readonly #lastProgress = new Map<string, number>();
 
   constructor(opts: EventLogBackendOptions) {
@@ -152,11 +158,26 @@ export class EventLogBackend implements MiniBackend {
     };
   }
 
+  forget(workerSessionId: string): void {
+    this.#lastProgress.delete(workerSessionId);
+  }
+
+  /** @internal Tests only: how many Workers the backend keeps state for. */
+  get workersWithState(): number {
+    return this.#lastProgress.size;
+  }
+
   async reportProgress(b: WorkerBinding, i: ToolInput<'report_progress'>) {
     const now = this.#now().getTime();
+    const interval = this.#o.progressIntervalMs ?? 1000;
+    // An entry older than the interval limits nothing: drop it. This also bounds what a call
+    // still in flight when its token was revoked can leave behind.
+    for (const [id, at] of this.#lastProgress) {
+      if (now - at >= interval) this.#lastProgress.delete(id);
+    }
     const last = this.#lastProgress.get(b.workerSessionId) ?? Number.NEGATIVE_INFINITY;
     // Rate limit (ADR-003 §6): reports inside the interval are acknowledged but not stored.
-    if (now - last >= (this.#o.progressIntervalMs ?? 1000)) {
+    if (now - last >= interval) {
       this.#lastProgress.set(b.workerSessionId, now);
       this.#append(b, 'worker.progress', i, 'worker');
     }
