@@ -28,13 +28,36 @@ export const EventType = z
   .string()
   .regex(/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/, 'expected a dotted lowercase event type');
 
-/** Namespaces that stay with the Mini-conductor and are never forwarded upward (ADR-003 §3). */
+/**
+ * Namespaces that stay with the Mini-conductor (ADR-003 §1 addenda): the worktree registry (#126)
+ * and the failures of its own upkeep (#254). Documentation: forwarding is decided by the §4
+ * allowlist below, and these are not on it.
+ */
 export const LOCAL_EVENT_NAMESPACES = ['workspace', 'maintenance'] as const;
 
-/** False for an event type a forwarder must keep local, such as the worktree registry (#126). */
+/**
+ * The upward stream by default (ADR-003 §4, `tacet/event`): summary-grade namespaces sent to the
+ * Conductor. Transcripts never are; of `agent.*`, only `agent.usage` (#256).
+ */
+export const UPWARD_EVENT_NAMESPACES = [
+  'task',
+  'escalation',
+  'decision',
+  'handoff',
+  'worker',
+] as const;
+/** Single event types sent upward from namespaces that otherwise stay local (ADR-003 §4). */
+export const UPWARD_EVENT_TYPES = ['agent.usage'] as const;
+
+/**
+ * True only for an event type the ADR-003 §4 allowlist sends upward to the Conductor (#256).
+ * Everything else stays with the Mini-conductor: local namespaces, transcripts, a malformed type
+ * and any namespace not on the list, including one added later, until the list says otherwise.
+ */
 export function isForwardable(type: string): boolean {
-  const ns = type.split('.', 1)[0];
-  return !(LOCAL_EVENT_NAMESPACES as readonly string[]).includes(ns ?? '');
+  if (!EventType.safeParse(type).success) return false;
+  if ((UPWARD_EVENT_TYPES as readonly string[]).includes(type)) return true;
+  return (UPWARD_EVENT_NAMESPACES as readonly string[]).includes(type.split('.', 1)[0] ?? '');
 }
 
 /** True if `type` belongs to a namespace this version of Tacet knows. */

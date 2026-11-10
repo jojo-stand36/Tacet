@@ -12,6 +12,7 @@ import {
   readState,
   repoRootFrom,
   rootTasks,
+  sleep,
   statePaths,
   subtasksOf,
 } from '../state.js';
@@ -28,6 +29,8 @@ export interface RunOptions {
   /** `<escalation id>=<answer>`, given before the run continues. */
   answer?: string[];
   json?: boolean;
+  /** The background run `tacet run --detach` started (#201): waits for answers, never asks. */
+  'detached-child'?: boolean;
 }
 
 /** Exit codes of `tacet run`. */
@@ -158,6 +161,8 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
       }
     };
 
+    /** Escalations the background run has already said it waits on. */
+    const told = new Set<string>();
     for (;;) {
       // Short waits, so an interrupt is noticed and progress is shown while Workers run.
       for (;;) {
@@ -181,6 +186,18 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
       if (open.length === 0) return report(io, sa, roots, o.json);
 
       const pending = open.flatMap((r) => pendingEscalations(state, r));
+      if (pending.length > 0 && o['detached-child']) {
+        // In the background nobody is at a terminal: say once what waits, then wait for an
+        // answer over the control port (`tacet answer`), a cancel, or a signal.
+        for (const x of pending) {
+          if (told.has(x.id)) continue;
+          told.add(x.id);
+          io.err(terminalSafe(`escalation ${x.id} (${x.taskId}) waits: ${x.question}`));
+          io.err(`answer it with: tacet answer ${x.id} <answer>`);
+        }
+        await sleep(io.pollMs ?? 1000, io.signal);
+        continue;
+      }
       if (pending.length > 0) {
         let answered = 0;
         if (io.prompt) io.err('answer each question, or press Enter to leave it for later');

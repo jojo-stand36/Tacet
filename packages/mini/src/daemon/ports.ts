@@ -91,6 +91,16 @@ export interface Integrator {
    * Throws `MergeConflictError` when they conflict.
    */
   combine(commits: readonly string[]): Promise<string | undefined>;
+  /**
+   * What the checkout has that `commit` (a commit already in the repo; without one, the
+   * checkout's HEAD, if the repo has it) does not: changed, deleted or new files (#261).
+   * Undefined when it cannot tell; throws `WorktreeRefusedError` for a checkout that fails its
+   * integrity checks, and an error when the check itself fails.
+   */
+  uncommitted?(
+    workspace: Workspace,
+    commit?: string,
+  ): Promise<{ path: string; untracked: boolean }[] | undefined>;
   /** Point the branch holding a task's combined result at `commit`; returns the ref. */
   publish(taskId: string, commit: string): Promise<string>;
   /**
