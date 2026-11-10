@@ -13,6 +13,7 @@ import {
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
+  promptCommandPrefix,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
@@ -779,12 +780,8 @@ export function promptText(text: string): string {
       return c === '\t' || c === '\n' || !(code < 0x20 || (code >= 0x7f && code <= 0x9f));
     })
     .join('');
-  // Whatever Claude Code may skip before the first character: spaces, format and combining
-  // characters, and blank-looking letters (Hangul fillers, Braille blank).
-  const first = clean
-    .replace(/^[\s\p{Cf}\p{Z}\p{M}\u115f\u1160\u3164\uffa0\u2800]+/u, '')
-    .charAt(0);
-  if (first === '/' || first === '!') {
+  const first = promptCommandPrefix(clean);
+  if (first !== undefined) {
     throw new Error(
       `a PTY prompt must not start with "${first}": Claude Code would run it as a command`,
     );

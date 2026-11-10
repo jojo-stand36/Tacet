@@ -10,11 +10,13 @@
 export const COMMAND_PREFIXES: readonly string[] = ['/', '!'];
 
 /**
- * The command character `text` starts with, after whatever a CLI may skip first (spaces, format
- * and combining characters, blank-looking letters), or `undefined`.
+ * The command character `text` starts with, after whatever a CLI may skip first (spaces, control,
+ * format and combining characters, blank-looking letters), or `undefined`.
  */
 export function promptCommandPrefix(text: string): string | undefined {
-  const first = text.replace(/^[\s\p{Cf}\p{Z}\p{M}ᅟᅠㅤﾠ⠀]+/u, '').charAt(0);
+  const first = text
+    .replace(/^[\s\p{Cc}\p{Cf}\p{Z}\p{M}\u115f\u1160\u3164\uffa0\u2800]+/u, '')
+    .charAt(0);
   return COMMAND_PREFIXES.includes(first) ? first : undefined;
 }
 

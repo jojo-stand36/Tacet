@@ -22,12 +22,8 @@ Reply with JSON only, no prose and no code fences, in exactly this shape:
 {"rationale": "...", "subtasks": [{"key": "short-id", "goal": "...", "acceptanceCriteria": ["..."],
 "kind": "implement", "dependsOn": ["other-key"]}]}`;
 
-/**
- * Every prompt the Mini-conductor sends goes through `assertSafePrompt`: none may start with a
- * character an interactive Worker CLI runs as a command (`/`, `!`; #15).
- */
 export function plannerPrompt(task: Task): string {
-  return safe([
+  return safePrompt([
     `Task: ${task.goal}`,
     'Acceptance criteria:',
     ...task.acceptanceCriteria.map((c) => `- ${c}`),
@@ -42,7 +38,7 @@ report_progress at milestones, escalate when you are blocked on a decision only 
 When the sub-task is done, end your turn with a short summary of what you did.`;
 
 export function workerPrompt(subtask: Task, feedback?: string, context: string[] = []): string {
-  return safe([
+  return safePrompt([
     `Sub-task: ${subtask.goal}`,
     'Acceptance criteria:',
     ...subtask.acceptanceCriteria.map((c) => `- ${c}`),
@@ -51,8 +47,12 @@ export function workerPrompt(subtask: Task, feedback?: string, context: string[]
   ]);
 }
 
-/** Join lines into a prompt that no interactive Worker would run as a command. */
-export function safe(lines: string[], sep = '\n'): string {
+/**
+ * Join lines into a prompt. Every prompt the Mini-conductor sends goes through here or
+ * `assertSafePrompt`: none may start with a character an interactive Worker CLI runs as a
+ * command (`/`, `!`; #15).
+ */
+export function safePrompt(lines: string[], sep = '\n'): string {
   return assertSafePrompt(lines.join(sep));
 }
 

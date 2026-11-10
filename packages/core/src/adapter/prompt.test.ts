@@ -6,12 +6,15 @@ describe('prompt command prefixes', () => {
     ['/login', '/'],
     ['!rm -rf .', '!'],
     ['  !x', '!'],
-    ['​/status', '/'],
+    ['\u200b/status', '/'],
     ['\n\n/x', '/'],
-    ['ㅤ/x', '/'],
-    ['️/x', '/'],
-    ['͏!x', '!'],
-    ['⠀/x', '/'],
+    ['\u3164/x', '/'],
+    ['\ufe0f/x', '/'],
+    ['\u034f!x', '!'],
+    ['\u2800/x', '/'],
+    ['\x01/x', '/'],
+    ['\x1b!x', '!'],
+    ['\u0085/x', '/'],
   ])('%j starts with a command', (text, prefix) => {
     expect(promptCommandPrefix(text)).toBe(prefix);
     expect(() => assertSafePrompt(text)).toThrow(UnsafePromptError);
