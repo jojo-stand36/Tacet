@@ -20,6 +20,8 @@ export interface StateCheckout {
   kept?: string;
   /** `kept` is the worktree manager's own refusal (`--force` overrides it), not a failure. */
   forceable?: boolean;
+  /** Branches (other than its own) that hold its work, so it survives the purge there. */
+  heldBy?: string[];
 }
 
 export interface StatePlan {
@@ -98,13 +100,16 @@ export async function planState(io: Io, root: string, userDir: string): Promise<
   // Only looked at when it exists: the manager would create it.
   if (!existsSync(paths.worktrees)) return plan;
   const worktrees = await manager(io, root, paths);
+  const tips = tacetTips(io, root);
   for (const w of await worktrees.registered()) {
-    const kept = await worktrees.check(w.id);
+    const kept = await worktrees.check(w.id, { landed: keptElsewhere(tips, w.branchName) });
+    const heldBy = await worktrees.holders(w.id);
     plan.checkouts.push({
       id: w.id,
       path: w.path,
       missing: w.missing,
       ...(kept ? { kept: kept.message, forceable: true } : {}),
+      ...(heldBy.length > 0 ? { heldBy } : {}),
     });
   }
   return plan;
@@ -144,9 +149,14 @@ export async function applyState(
     locked = await withStoppedMini(paths.lock, async () => {
       if (existsSync(paths.worktrees)) {
         const worktrees = await manager(io, root, paths);
+        const tips = tacetTips(io, root);
         for (const w of await worktrees.registered()) {
           try {
-            await worktrees.remove(w.id, { force, keepBranch: true });
+            await worktrees.remove(w.id, {
+              force,
+              keepBranch: true,
+              landed: keptElsewhere(tips, w.branchName),
+            });
             result.removed.push(w.path);
           } catch (err) {
             result.refused.push({
@@ -189,18 +199,58 @@ export async function applyState(
   return result;
 }
 
+/**
+ * Every `refs/heads/tacet/*` branch and its tip. The purge keeps them all, so (owner decision on
+ * #211) work they hold counts as kept: a checkout whose commits are on one need no `--force`.
+ */
+function tacetTips(io: Io, root: string): Map<string, string> {
+  const tips = new Map<string, string>();
+  let out = '';
+  try {
+    out = execFileSync(
+      'git',
+      [
+        ...SAFE_GIT_ARGS,
+        '-C',
+        root,
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/heads/tacet/',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv(io) },
+    );
+  } catch {
+    // None counted: checkouts are then kept unless forced, as before.
+  }
+  for (const line of out.split('\n')) {
+    const [tip, ref] = line.trim().split(' ');
+    if (tip && ref && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(tip)) tips.set(ref, tip);
+  }
+  return tips;
+}
+
+/** The kept `tacet/*` tips that may cover a checkout: never its own `tacet/<id>` branch. */
+function keptElsewhere(tips: ReadonlyMap<string, string>, ownBranch: string): string[] {
+  const own = `refs/heads/${ownBranch}`;
+  return [...new Set([...tips].filter(([ref]) => ref !== own).map(([, tip]) => tip))];
+}
+
+function gitEnv(io: Io): Record<string, string> {
+  const env = io.env ?? process.env;
+  return {
+    ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+    ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+  };
+}
+
 /** Worktrees git still has registered at or under `dir`. On any doubt, `dir` itself. */
 function registeredUnder(io: Io, root: string, dir: string): string[] {
-  const env = io.env ?? process.env;
   let out: string;
   try {
     out = execFileSync('git', [...SAFE_GIT_ARGS, '-C', root, 'worktree', 'list', '--porcelain'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
-      env: {
-        ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
-        ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
-      },
+      env: gitEnv(io),
     });
   } catch {
     return [dir];

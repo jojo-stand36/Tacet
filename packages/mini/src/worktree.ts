@@ -366,16 +366,57 @@ export class WorktreeManager implements Workspaces {
    * Why `remove(worktreeId)` without `force` would keep the checkout, or undefined when it would
    * remove it (or there is nothing to remove). Runs the same checks and changes nothing (#211).
    */
-  async check(worktreeId: string): Promise<WorktreeKeptError | undefined> {
+  async check(
+    worktreeId: string,
+    options: Pick<RemoveWorktreeOptions, 'landed'> = {},
+  ): Promise<WorktreeKeptError | undefined> {
     const found = await this.registeredEntry(worktreeId);
     if (!found) return undefined;
     try {
-      await this.removeWorktree(found.info, false, found.missing, true);
+      await this.removeWorktree(found.info, false, found.missing, true, {
+        landed: options.landed ?? [],
+      });
       return undefined;
     } catch (error) {
       if (error instanceof WorktreeKeptError) return error;
       throw error;
     }
+  }
+
+  /**
+   * The branches, tags and remote-tracking refs other than the checkout's own `tacet/<id>` that
+   * contain its HEAD commit: where its work lives once it is gone (#211). Empty when its HEAD
+   * cannot be read or nothing else holds it.
+   */
+  async holders(worktreeId: string): Promise<string[]> {
+    const found = await this.registeredEntry(worktreeId);
+    if (!found) return [];
+    let head: string;
+    try {
+      const gitDirectory = await this.managerWorktreeGitDirectory(found.info);
+      head = readWorkerFile(path.join(gitDirectory, 'HEAD'), 512).trim();
+    } catch {
+      return [];
+    }
+    let commit: string | undefined = commitIdPattern.test(head) ? head : undefined;
+    if (!commit) {
+      const ref = /^ref: (refs\/heads\/[A-Za-z0-9._/-]+)$/.exec(head)?.[1];
+      if (ref) commit = await this.refTip(ref);
+    }
+    if (!commit) return [];
+    const own = taskBranch(found.info.id);
+    const out = await this.git([
+      'for-each-ref',
+      `--contains=${commit}`,
+      '--format=%(refname)',
+      'refs/heads',
+      'refs/tags',
+      'refs/remotes',
+    ]).catch(() => '');
+    return out
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((ref) => ref && ref !== own);
   }
 
   /**

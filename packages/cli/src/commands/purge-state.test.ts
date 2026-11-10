@@ -306,4 +306,53 @@ describe('tacet uninstall --purge: run state (#211)', () => {
     expect(existsSync(p.events)).toBe(true);
     expect(existsSync(join(repo, '.tacet'))).toBe(true);
   });
+
+  describe('work held by a kept tacet branch (owner decision on #211)', () => {
+    /** A checkout whose commit was integrated, so it sits on tacet/<id> and a task branch. */
+    async function integratedCheckout(taskBranch: string | undefined) {
+      const w = await checkoutWithWork();
+      expect(await manager().checkConflicts(w.id, 'main')).toEqual([]);
+      const commit = git(repo, ['rev-parse', `refs/heads/${w.branchName}`]);
+      if (taskBranch) git(repo, ['update-ref', `refs/heads/${taskBranch}`, commit]);
+      return { w, commit };
+    }
+
+    it('removes a checkout whose work a kept tacet branch holds, without --force, and names it', async () => {
+      const { w, commit } = await integratedCheckout('tacet/task-1/1');
+      const preview = await tacet(['uninstall', '--purge']);
+      expect(preview.out).toContain(
+        `would remove checkout ${w.path}; its work stays on tacet/task-1/1`,
+      );
+      expect(
+        JSON.parse((await tacet(['uninstall', '--purge', '--json'])).out).state.checkouts,
+      ).toEqual([
+        expect.objectContaining({
+          id: w.id,
+          heldBy: expect.arrayContaining(['refs/heads/tacet/task-1/1']),
+        }),
+      ]);
+
+      expect((await tacet(['uninstall', '--purge', '--apply'])).code).toBe(0);
+      expect(existsSync(w.path)).toBe(false);
+      expect(git(repo, ['rev-parse', 'refs/heads/tacet/task-1/1'])).toBe(commit);
+      expect(git(repo, ['rev-parse', `refs/heads/${w.branchName}`])).toBe(commit);
+    });
+
+    it('still refuses one with local files', async () => {
+      const { w } = await integratedCheckout('tacet/task-2/1');
+      writeFileSync(join(w.path, 'scratch.txt'), 'local\n');
+      const r = await tacet(['uninstall', '--purge', '--apply']);
+      expect(r.code).toBe(1);
+      expect(r.err).toContain(`kept checkout ${w.path}: worktree contains local or ignored files`);
+      expect(existsSync(join(w.path, 'scratch.txt'))).toBe(true);
+    });
+
+    it('refuses one whose work only its own tacet branch holds', async () => {
+      const { w } = await integratedCheckout(undefined);
+      const r = await tacet(['uninstall', '--purge', '--apply']);
+      expect(r.code).toBe(1);
+      expect(r.err).toContain(`kept checkout ${w.path}: Worker has commits no other ref contains`);
+      expect(existsSync(w.path)).toBe(true);
+    });
+  });
 });

@@ -349,7 +349,12 @@ function reportState(
     for (const c of state.checkouts) {
       const what = `${c.missing ? 'checkout (deleted by hand)' : 'checkout'} ${terminalSafe(c.path)}`;
       if (c.kept && !o.force) io.out(`would keep ${what}: ${terminalSafe(c.kept)}`);
-      else io.out(`would remove ${what}${c.kept ? ' (forced)' : ''}`);
+      else {
+        const held = c.heldBy?.length
+          ? `; its work stays on ${c.heldBy.map((r) => terminalSafe(r.replace(/^refs\/heads\//, ''))).join(', ')}`
+          : '';
+        io.out(`would remove ${what}${c.kept ? ' (forced)' : ''}${held}`);
+      }
     }
     io.out(
       `would remove run state ${terminalSafe(state.dir)}${state.events ? ' (with the event log)' : ''}: ${state.entries.map(terminalSafe).join(', ')}`,
