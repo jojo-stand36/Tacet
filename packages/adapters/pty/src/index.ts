@@ -3,4 +3,11 @@ export const packageName = '@tacet/adapter-pty' as const;
 
 export { CLAUDE_PTY_CAPABILITIES, PtyAdapter, type PtyAdapterOptions } from './adapter.js';
 export { CLAUDE_PTY_VERIFIED_VERSION } from './claude.js';
+export {
+  PTY_CLI_CAPABILITIES,
+  PtyCliAdapter,
+  type PtyCliAdapterOptions,
+  type PtyPreset,
+} from './cli-adapter.js';
 export { loadPty, PtyUnavailableError } from './pty.js';
+export { TerminalBuffer } from './terminal.js';

@@ -71,7 +71,7 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 
 ```ts
 interface AgentAdapter {               // packages/core/src/adapter/types.ts (#10)
-  id: string;                         // "claude-sdk", "codex-app-server", "acp", "pty"
+  id: string;                         // "claude-sdk", "codex-app-server", "acp", "pty:claude", "pty:<preset>"
   capabilities(): AdapterCapabilities; // streaming, liveInput, approvals, interrupt, resume, fork, usage, modelSwitch, injectContext, effortSwitch?, contextSizes?
   start(opts: SessionOptions): Promise<SessionHandle>;   // resolves when ready; opts.resume continues or forks a vendor session; model, effort and contextWindow form the SessionProfile
   send(h: SessionHandle, input: UserInput, opts?: { model?: string; effort?: Effort }): Promise<void>;
@@ -81,6 +81,7 @@ interface AgentAdapter {               // packages/core/src/adapter/types.ts (#1
   events(h: SessionHandle): AsyncIterable<AgentEvent>; // normalized
   status(h: SessionHandle): SessionState;
   injectContext?(h: SessionHandle, text: string): Promise<void>;
+  terminal?(h: SessionHandle): AgentTerminal; // PTY adapters (#15): read-only scrollback + live output for `tacet attach`; never persisted, never events
 }
 
 type AgentEvent =                     // zod source: packages/core/src/schema/agent-event.ts
@@ -143,7 +144,7 @@ budget:
 auth:
   unattended: api_key      # default: API key for parallel or unattended Workers
   interactive: subscription
-agents:                     # acp:<slug> agents and PTY presets (pty:<slug>; the built-in Claude preset is pty:claude)
+agents:                     # acp:<slug> agents and PTY presets (pty:<slug>, run by PtyCliAdapter: command, env, ready_prompt; resume_flag and process_name are not used yet; the built-in Claude preset is pty:claude)
   goose: { kind: acp, command: [goose, acp], env: { GOOSE_API_KEY: { env: GOOSE_API_KEY } } }
   # a tier on such an agent: tiers.worker: { adapter: "acp:goose" } (no model: its command fixes it)
 policies:
