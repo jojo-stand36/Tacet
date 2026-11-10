@@ -34,6 +34,8 @@ export interface RemoveWorktreeOptions {
    * delete its `tacet/<id>` branch. Without it, `remove` refuses rather than lose work.
    */
   force?: boolean;
+  /** Keep the checkout's `tacet/<id>` branch, whatever it holds (#211: a purge keeps branches). */
+  keepBranch?: boolean;
 }
 
 export interface WorktreeInfo {
@@ -348,7 +350,9 @@ export class WorktreeManager implements Workspaces {
   async remove(worktreeId: string, options: RemoveWorktreeOptions = {}): Promise<void> {
     const found = await this.registeredEntry(worktreeId);
     if (!found) return;
-    await this.removeWorktree(found.info, options.force === true, found.missing);
+    await this.removeWorktree(found.info, options.force === true, found.missing, false, {
+      keepBranch: options.keepBranch === true,
+    });
   }
 
   /**
@@ -695,11 +699,13 @@ export class WorktreeManager implements Workspaces {
     force: boolean,
     missing = false,
     dryRun = false,
+    options: { keepBranch?: boolean } = {},
   ): Promise<void> {
     const { root } = await this.paths();
-    const release = await this.lockRemoval(info.id);
+    // A dry run writes nothing: no lock, and stale markers are left where they are.
+    const release = dryRun ? async () => {} : await this.lockRemoval(info.id);
     try {
-      if (await this.isBusy(info.id)) {
+      if (await this.isBusy(info.id, !dryRun)) {
         throw new WorktreeKeptError('in use by a merge', 'worktree is in use by a merge');
       }
       const branchRef = taskBranch(info.id);
@@ -742,7 +748,9 @@ export class WorktreeManager implements Workspaces {
         await this.removeCheckout(info, gitDirectory);
       }
       // Only the tip that was checked: a branch moved since then is left alone.
-      if (branchTip) await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
+      if (branchTip && !options.keepBranch) {
+        await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
+      }
       await rm(this.infoPath(root, info.id), { force: true });
     } finally {
       await release();
@@ -961,8 +969,11 @@ export class WorktreeManager implements Workspaces {
     }
   }
 
-  private async isBusy(id: string): Promise<boolean> {
-    const directory = await this.locksDirectory();
+  private async isBusy(id: string, sweep = true): Promise<boolean> {
+    const { root } = await this.paths();
+    const directory = path.join(root, locksDirectoryName);
+    if (!sweep && !(await stat(directory).catch(() => undefined))) return false;
+    if (sweep) await this.locksDirectory();
     const prefix = `${id}.busy.`;
     for (const name of await readdir(directory)) {
       if (!name.startsWith(prefix)) continue;
@@ -972,7 +983,7 @@ export class WorktreeManager implements Workspaces {
       if (modified === undefined) continue;
       if (holderIsLive(pid, modified)) return true;
       // Left by a manager that died mid-merge.
-      await rm(marker, { force: true });
+      if (sweep) await rm(marker, { force: true });
     }
     return false;
   }

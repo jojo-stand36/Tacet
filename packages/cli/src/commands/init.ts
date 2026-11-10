@@ -245,11 +245,12 @@ export async function uninstall(io: Io, o: UninstallOptions): Promise<number> {
       }
     }
 
-    if (o.apply && state?.exists) {
+    if (o.apply && state) {
+      // Checked again under the run lock: a run may have started, or made the dir, since.
       stateResult = await applyState(io, root, userDirOf(io, o), o.force === true);
-      if (!stateResult.dirRemoved) {
+      if (existsSync(state.dir) && !stateResult.dirRemoved) {
         // Nothing of .tacet/ is touched until the run state is gone.
-        reportStateRefusal(io, o, root, stateResult);
+        reportStateRefusal(io, o, root, state, stateResult, { removals, kept, committed });
         return 1;
       }
     }
@@ -295,7 +296,7 @@ export async function uninstall(io: Io, o: UninstallOptions): Promise<number> {
       );
       return 0;
     }
-    if (state) reportState(io, o, state);
+    if (state) reportState(io, o, state, stateResult);
     if (removals.length === 0) io.out('nothing to remove');
     for (const path of removals)
       io.out(`${o.apply ? 'removed' : 'would remove'} ${terminalSafe(path)}`);
@@ -316,31 +317,59 @@ export async function uninstall(io: Io, o: UninstallOptions): Promise<number> {
   }
 }
 
-function reportState(io: Io, o: UninstallOptions, state: StatePlan): void {
+function reportState(
+  io: Io,
+  o: UninstallOptions,
+  state: StatePlan,
+  result: StateResult | undefined,
+): void {
   if (state.note) io.err(`note: ${state.note}`);
-  if (!state.exists) {
+  if (!state.exists && !result?.dirRemoved) {
     io.out(`no run state at ${terminalSafe(state.dir)}`);
     return;
   }
-  const verb = o.apply ? 'removed' : 'would remove';
-  for (const c of state.checkouts) {
-    const what = `${c.missing ? 'checkout (deleted by hand)' : 'checkout'} ${terminalSafe(c.path)}`;
-    if (c.kept && !o.force) {
-      io.out(`${o.apply ? 'kept' : 'would keep'} ${what}: ${terminalSafe(c.kept)}`);
-    } else io.out(`${verb} ${what}${c.kept ? ' (forced)' : ''}`);
-  }
-  io.out(
-    `${verb} run state ${terminalSafe(state.dir)}${state.events ? ' (with the event log)' : ''}`,
-  );
-  if (!o.apply && state.checkouts.some((c) => c.kept) && !o.force) {
-    io.err('checkouts with unintegrated work are kept: --force removes them too');
+  if (result) {
+    // What was done, which may differ from the preview (a checkout made since).
+    for (const path of result.removed) io.out(`removed checkout ${terminalSafe(path)}`);
+    io.out(`removed run state ${terminalSafe(state.dir)}`);
+    for (const w of result.warnings) io.err(`warning: ${terminalSafe(w)}`);
+  } else {
+    for (const c of state.checkouts) {
+      const what = `${c.missing ? 'checkout (deleted by hand)' : 'checkout'} ${terminalSafe(c.path)}`;
+      if (c.kept && !o.force) io.out(`would keep ${what}: ${terminalSafe(c.kept)}`);
+      else io.out(`would remove ${what}${c.kept ? ' (forced)' : ''}`);
+    }
+    io.out(
+      `would remove run state ${terminalSafe(state.dir)}${state.events ? ' (with the event log)' : ''}: ${state.entries.map(terminalSafe).join(', ')}`,
+    );
+    if (state.checkouts.some((c) => c.kept) && !o.force) {
+      io.err('checkouts with unintegrated work are kept: --force removes them too');
+    }
   }
   io.err('the tacet/* branches are kept; list them with: git for-each-ref refs/heads/tacet/');
 }
 
-function reportStateRefusal(io: Io, o: UninstallOptions, root: string, r: StateResult): void {
+function reportStateRefusal(
+  io: Io,
+  o: UninstallOptions,
+  root: string,
+  state: StatePlan,
+  r: StateResult,
+  tacet: { removals: string[]; kept: string[]; committed: string[] },
+): void {
   if (o.json) {
-    io.out(safeJson({ repo: root, applied: true, state: { result: r } }));
+    // The shape of a successful run, with nothing applied.
+    io.out(
+      safeJson({
+        repo: root,
+        applied: false,
+        refused: true,
+        removals: [],
+        kept: tacet.kept,
+        committed: tacet.committed,
+        state: { ...state, result: r },
+      }),
+    );
     return;
   }
   for (const path of r.removed) io.out(`removed checkout ${terminalSafe(path)}`);
@@ -351,8 +380,9 @@ function reportStateRefusal(io: Io, o: UninstallOptions, root: string, r: StateR
       `git still lists the worktree ${terminalSafe(path)}: remove it with git worktree remove`,
     );
   }
+  for (const w of r.warnings) io.err(`warning: ${terminalSafe(w)}`);
   io.err(
-    r.refused.length > 0
+    r.refused.some((c) => c.forceable)
       ? 'nothing else was removed: --force removes checkouts with unintegrated work'
       : 'nothing else was removed',
   );
