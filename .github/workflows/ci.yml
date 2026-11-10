@@ -37,6 +37,11 @@ jobs:
       - name: Generated files are current
         run: pnpm check:generated
 
+      # Fails once an active vendor surface was last checked more than 30 days ago (#66):
+      # refresh it as "Keeping it fresh" in docs/adapters/capability-matrix.md says.
+      - name: Capability matrix is fresh
+        run: pnpm check:matrix
+
   test:
     name: ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}

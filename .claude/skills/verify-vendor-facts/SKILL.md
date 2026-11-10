@@ -21,6 +21,7 @@ The agent-tooling ecosystem changes monthly. Memory and old blog posts are not e
    |---|---|---|---|---|---|
    | Codex | app-server | server-initiated approval requests over JSON-RPC | 0.x.y | link | YYYY-MM-DD |
 
+   When you re-checked a whole surface, set its date in the matrix's freshness table ("Keeping it fresh"). CI fails once an active surface is over 30 days old.
 4. **Auth and terms are facts too.** Record the current rule for subscription vs API-key use per vendor, with link and date. Never design around using a vendor's OAuth tokens outside its own binary.
 5. **If you can't verify it**, say so in the PR or ADR, mark the assumption `UNVERIFIED`, and open a follow-up issue labelled `agent:claude`.
 
