@@ -338,6 +338,28 @@ export class MiniConductor {
   }
 
   /**
+   * Answer an open escalation as the user (standalone `tacet run`, #21, until the inbox of #26):
+   * recorded as `escalation.resolved` with source `user` and delivered to the Worker as its next
+   * turn. Throws for an unknown escalation or one already resolved.
+   */
+  answer(escalationId: string, answer: string): void {
+    if (!this.#started) throw new Error('call start() first');
+    const x = this.#state().escalations.get(escalationId);
+    if (!x) throw new Error(`unknown escalation ${escalationId}`);
+    if (x.resolved) throw new Error(`escalation ${escalationId} is already resolved`);
+    if (answer.trim() === '') throw new Error('an answer must not be empty');
+    this.#o.store.append(
+      this.#env(
+        x.taskId,
+        'escalation.resolved',
+        { escalationId, answer, source: 'user' },
+        x.sessionId,
+      ),
+    );
+    this.#kick();
+  }
+
+  /**
    * Wait until there is nothing left to do now: nothing planning or running, nothing ready to
    * start, no answer waiting to be delivered and no result waiting to be rolled up.
    */
@@ -2003,6 +2025,20 @@ function answerText(x: EscalationRecord): string {
  */
 export function isOwnMcpTool(e: { toolName?: string | undefined }, serverName: string): boolean {
   return TOOL_NAMES.some((t) => e.toolName === `mcp__${serverName}__${t}`);
+}
+
+/**
+ * The pid of the running Mini-conductor holding the lock at `lockPath` (`MiniConductorOptions`),
+ * or undefined when none is running. For `tacet status` (#21); never takes the lock.
+ */
+export function miniLockHolder(lockPath: string): number | undefined {
+  let pid: number;
+  try {
+    pid = Number.parseInt(readFileSync(lockPath, 'utf8'), 10);
+  } catch {
+    return undefined;
+  }
+  return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
 }
 
 /** Lock files held by Mini-conductors in this process. */

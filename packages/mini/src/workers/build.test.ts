@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
+import { gatedTitle, ptyGate } from '@tacet/adapter-pty/testing';
 import type { TacetConfig } from '@tacet/core';
 import {
   defaultStateDir,
@@ -26,6 +27,9 @@ import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
 import { TempWorkspaces } from '../daemon/testing.js';
 import { buildWorkerAdapters, WorkerConfigError } from './build.js';
+
+// node-pty must load in CI; locally a machine that could not build it skips these (#189).
+const gate = await ptyGate();
 
 /** The ACP adapter's fake agent: logs its environment's names, replies with the prompt's text. */
 const FAKE_AGENT = join(
@@ -89,6 +93,21 @@ describe('buildWorkerAdapters', () => {
       );
       expect(resumable['pty:codex']?.adapter.capabilities().resume).toBe(true);
     }
+  });
+
+  it('also builds the planner tier when asked, with the same checks (#21)', () => {
+    const tiers = {
+      mini: { adapter: 'codex-app-server', model: 'm' },
+      worker: { adapter: 'claude-sdk', model: 'm' },
+    };
+    const built = buildWorkerAdapters(config({ tiers }), { baseEnv: {}, withPlanner: true });
+    expect(Object.keys(built).sort()).toEqual(['claude-sdk', 'codex-app-server']);
+    expect(() =>
+      buildWorkerAdapters(config({ tiers: { ...tiers, mini: { adapter: 'codex-app-server' } } }), {
+        baseEnv: {},
+        withPlanner: true,
+      }),
+    ).toThrow(/tiers\.mini\.model/);
   });
 
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
@@ -461,7 +480,7 @@ describe('a Mini-conductor started from a config file (#149)', () => {
   });
 });
 
-describe('a PTY preset built from config (#149)', () => {
+describe.skipIf(!gate.ok)(gatedTitle('a PTY preset built from config (#149)', gate), () => {
   it('passes its resolved secret to the CLI and never into events', {
     timeout: 60_000,
   }, async () => {

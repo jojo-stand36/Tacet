@@ -35,6 +35,10 @@ Details and prior art: [docs/RESEARCH.md](docs/RESEARCH.md). Proposed design: [d
 
 Tacet is built by people working with Claude Code and the GitHub Copilot cloud agent. Start with [AGENTS.md](AGENTS.md), the canonical instructions for every agent and a good primer for humans too. Issues carry routing labels (`agent:copilot`, `agent:claude`, `agent:either`, `needs-human`). How the hybrid setup works: [docs/HYBRID_WORKFLOW.md](docs/HYBRID_WORKFLOW.md).
 
+## Developer setup
+
+Node.js 24 or later and pnpm (see `packageManager` in `package.json`); then `pnpm install` and `pnpm test`. The PTY adapter's native dependency `node-pty` is built by `node-gyp` where no prebuilt binary fits your platform, which needs a C++ toolchain (on Ubuntu, `build-essential` and Python 3; on macOS, the Xcode command line tools). Without it `pnpm install` still succeeds, and `pnpm test` skips the live PTY suites with the reason on stderr; CI, where `CI` is set, fails instead, so those suites always run there (#189).
+
 ## Bootstrapping this repo's issues
 
 ```bash
