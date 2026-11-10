@@ -1,5 +1,8 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import {
   type ClientConnection,
@@ -36,6 +39,7 @@ import {
   type WorkerEnvPolicy,
   workerEnv,
 } from '@tacet/core';
+import { defaultStateDir, repoStateDir } from '@tacet/core/node';
 import type { AcpAgentSpec } from './agents.js';
 import {
   approvalChoices,
@@ -81,6 +85,10 @@ export interface AcpAdapterOptions {
   onEnvDropped?: (names: string[]) => void;
   /** Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL. Default 5000. */
   killTimeoutMs?: number;
+  /** The repo the Workers belong to; keys the agent's own home (`agent.home`). Default: the cwd. */
+  repoRoot?: string;
+  /** Tacet's state directory, where the agent's own home lives. Default `~/.tacet/state`. */
+  stateDir?: string;
   /** Receives the agent's stderr (free-form logging; ACP keeps stdout for messages). Scrubbed. */
   stderr?: (text: string, h: SessionHandle) => void;
   /**
@@ -394,12 +402,46 @@ export class AcpAdapter implements AgentAdapter {
     for (const [k, v] of Object.entries({ ...filtered.env, ...spec.env, ...opts.env })) {
       if (v !== undefined) env[k] = v;
     }
+    for (const k of spec.envDeny ?? []) delete env[k];
+    if (spec.home) env[spec.home.env] = this.#prepareHome(spec, opts.cwd);
     if (spec.apiKeyEnv.length > 0 && !spec.apiKeyEnv.some((k) => env[k])) {
       throw new AuthRoutingError(
         `${spec.id}: Workers use an API key only; set ${spec.apiKeyEnv.join(' or ')}`,
       );
     }
     return env;
+  }
+
+  /**
+   * The agent's own home (#150): `<repo state dir>/acp-<agent>`, mode 0700, with its files
+   * written afresh (0600) for every session, so the agent never runs on settings it changed.
+   */
+  #prepareHome(spec: AcpAgentSpec, cwd: string): string {
+    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
+    const dir = join(
+      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
+      `acp-${spec.id.replace(/^acp:/, '')}`,
+    );
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const st = lstatSync(dir);
+    if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) {
+      throw new Error(`${spec.id}: ${dir} is not a private directory`);
+    }
+    chmodSync(dir, 0o700);
+    for (const [rel, content] of Object.entries(spec.home?.files ?? {})) {
+      const path = join(dir, rel);
+      if (!path.startsWith(`${dir}/`))
+        throw new Error(`${spec.id}: home file ${rel} is outside it`);
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      // Never written through a symlink a session left in the home.
+      for (let d = dirname(path); d !== dir; d = dirname(d)) {
+        if (!lstatSync(d).isDirectory()) throw new Error(`${spec.id}: ${d} is not a directory`);
+      }
+      const tmp = `${path}.tacet-${process.pid}-${randomUUID()}`;
+      writeFileSync(tmp, content, { mode: 0o600, flag: 'wx' });
+      renameSync(tmp, path);
+    }
+    return dir;
   }
 
   #mcpServers(init: InitializeResponse, servers: McpServerConfig[] | undefined): McpServer[] {

@@ -11,6 +11,7 @@ import type { AddressInfo } from 'node:net';
  * last user text:
  * - `SAY <word>`: streams `You said <word>.` in several chunks.
  * - `RUN_TOOL`: calls `run_shell_command` (`touch tool-ran.txt`), which needs approval.
+ * - `ENV_TOOL`: calls `run_shell_command` writing its environment to `tool-env.txt` (#150).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the model in the request path.
  * Requests are recorded (model, last user text, whether it carried a tool result); the API key,
@@ -76,6 +77,21 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function script(model: string, body: Body): { chunks: Part[][]; delayMs: number } {
   const { text, toolResult } = lastUser(body);
   if (toolResult) return { chunks: [[{ text: 'Tool finished.' }]], delayMs: 0 };
+  if (/ENV_TOOL/.test(text)) {
+    return {
+      chunks: [
+        [
+          {
+            functionCall: {
+              name: 'run_shell_command',
+              args: { command: 'env > tool-env.txt', description: 'record the environment' },
+            },
+          },
+        ],
+      ],
+      delayMs: 0,
+    };
+  }
   if (/RUN_TOOL/.test(text)) {
     return {
       chunks: [

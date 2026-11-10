@@ -23,7 +23,7 @@ export class WorkerConfigError extends Error {
 }
 
 export interface BuildWorkerAdaptersOptions {
-  /** The repo the Workers work on: keys per-repo adapter state (the Claude PTY sessions, #153). */
+  /** The repo the Workers work on: keys per-repo adapter state (Claude PTY sessions, #153; ACP agent homes, #150). */
   repoRoot?: string;
   /**
    * The user's environment: what Workers get an allowlist of, and where `{ env }` secret
@@ -38,7 +38,7 @@ export interface BuildWorkerAdaptersOptions {
   /** Passed through to the adapters as they are built; for tests and the entry point. */
   claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs'>;
-  acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr'>;
+  acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
   /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
@@ -112,7 +112,13 @@ export function buildWorkerAdapters(
     const slug = ACP_ID.exec(id)?.[1];
     if (slug !== undefined) {
       const { agent, secrets } = acpAgent(slug, where);
-      return new AcpAdapter({ ...opts.acp, ...common, agent, secrets });
+      return new AcpAdapter({
+        ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...opts.acp,
+        ...common,
+        agent,
+        secrets,
+      });
     }
     const ptySlug = PTY_ID.exec(id)?.[1];
     if (ptySlug === 'claude') {

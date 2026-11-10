@@ -16,4 +16,5 @@ export {
   type CustomAcpAgentConfig,
   customAcpAgent,
   GEMINI_AGENT,
+  GEMINI_WORKER_SETTINGS,
 } from './agents.js';

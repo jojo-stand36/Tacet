@@ -43,7 +43,29 @@ export interface AcpAgentSpec {
   capabilities: AdapterCapabilities;
   /** Version the spec was verified against, for the capability matrix. */
   verifiedVersion?: string;
+  /**
+   * A home of the agent's own that Tacet prepares (#150): the directory, private to the user and
+   * kept per repo so sessions resume, is passed in `env`, and `files` (paths relative to it) are
+   * written there before every session. Used to give the agent settings without the user's.
+   */
+  home?: { env: string; files: Readonly<Record<string, string>> };
+  /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
+  envDeny?: readonly string[];
 }
+
+/**
+ * Gemini CLI settings for Workers (#150), verified live on 0.67.0 over ACP: with them, a shell
+ * command the Worker runs gets no `GEMINI_API_KEY` (redaction drops secret-looking names, and
+ * never lets one back in through `allowed`), and no `.env` of the checkout or its parents is
+ * loaded (`ignoreLocalEnv`). The user's `~/.env` stays out because Gemini looks for it in its
+ * home, which is `GEMINI_CLI_HOME`. They only take effect as user settings: the system settings
+ * and system defaults paths had no effect in ACP mode, and `--ignore-env` is refused by the
+ * argument parser.
+ */
+export const GEMINI_WORKER_SETTINGS = {
+  security: { environmentVariableRedaction: { enabled: true } },
+  advanced: { ignoreLocalEnv: true },
+};
 
 /** Capabilities every ACP v1 agent can offer through this adapter. */
 const ACP_BASE: AdapterCapabilities = {
@@ -85,6 +107,14 @@ export const GEMINI_AGENT: AcpAgentSpec = {
     usage: { live: true, context: true, cost: 'none' },
   },
   verifiedVersion: '@google/gemini-cli 0.67.0',
+  // Its own `.gemini` root with the Worker settings, never the user's `~/.gemini` (#150).
+  home: {
+    env: 'GEMINI_CLI_HOME',
+    files: { '.gemini/settings.json': `${JSON.stringify(GEMINI_WORKER_SETTINGS, null, 2)}\n` },
+  },
+  // It would trust the checkout, and a trusted folder's `.gemini/.env` loads whatever
+  // `ignoreLocalEnv` says (bundle `findEnvFile`).
+  envDeny: ['GEMINI_CLI_TRUST_WORKSPACE'],
 };
 
 /**
