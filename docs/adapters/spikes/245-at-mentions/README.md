@@ -33,3 +33,18 @@ No script is committed: the run used the `-c model_providers.*` flags from `pack
 
 - `@<outside>` and `@note.txt`, inline, on their own line, or after Esc: the request carried the text as typed. Nothing was read in.
 - A prompt that **ends** in an `@token` opens Codex's Mentions picker. The typed Enter then inserts a completion (`@note.txt` became `note.txt`) instead of submitting, so the turn did not start until Esc and Enter. Tracked in #249, together with pasted image paths, which the source attaches as images (not run live).
+
+### Follow-up #249 (2026-11-10, same setup, `CODEX_HOME/config.toml` pre-trusting the checkout)
+
+Each case pasted (bracketed) into a fresh session, then Enter; the mock recorded what the model got.
+
+| Pasted | Sent |
+|---|---|
+| `SAY hi see @note.txt` | nothing: the Mentions popup stayed open |
+| `SAY hi see @note.txt ` (trailing space) | `SAY hi see @note.txt` |
+| `SAY hi see @note.txt`, then Esc and Enter | `SAY hi see @note.txt` |
+| `SAY hi @note.txt here` | as pasted |
+| `<checkout>/in.png`, `<outside>/out.png`, `'<outside>/out.png'`, `<outside>/out.png ` and with a newline before or after | `[Image #1]`, the file attached as an image (`<image name=[Image #1] path=…>`) |
+| `SAY look at <outside>/out.png please`, `SAY first line\n<outside>/out.png` | as pasted, nothing attached |
+
+The rule, from `normalize_pasted_path` (`codex-rs/tui/src/clipboard_paste.rs`, `rust-v0.167.0`): after trimming, a string in matching quotes, a `file://` URL, a Windows path, or one `shlex` word is a path, and `handle_paste_image_path` attaches it when it is an image file. Tacet's fix (`PtyPreset.codexPaste`) was then run live through `PtyCliAdapter`, built from a `pty:codex` preset: `packages/mini/src/workers/codex-pty.test.ts`.
