@@ -52,6 +52,11 @@ describe.runIf(sandbox || Boolean(process.env.CI))('Claude sandbox and the Worke
     writeFileSync(join(cwd, '.env'), 'EXISTING=1\n');
     writeFileSync(join(cwd, 'package.json'), '{"name":"x"}\n');
     writeFileSync(join(cwd, 'src.txt'), 'source\n');
+    // Existing directories the sandbox also masks when absent: are they hidden when they exist?
+    mkdirSync(join(cwd, 'scripts'));
+    writeFileSync(join(cwd, 'scripts', 'run.sh'), 'echo scripts-visible\n');
+    mkdirSync(join(cwd, '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(cwd, '.github', 'workflows', 'ci.yml'), 'name: github-visible\n');
     const adapter = new ClaudeSdkAdapter({
       authRoute: 'api_key',
       baseEnv: {
@@ -68,6 +73,9 @@ describe.runIf(sandbox || Boolean(process.env.CI))('Claude sandbox and the Worke
     });
     const probe = [
       'cat .env package.json',
+      'cat scripts/run.sh; echo "read scripts: $?"',
+      'cat .github/workflows/ci.yml; echo "read .github: $?"',
+      'echo more >> scripts/run.sh; echo "append scripts: $?"',
       'echo appended >> package.json; echo "append package.json: $?"',
       'echo NEW=1 > .npmrc; echo "write .npmrc: $?"',
       'mkdir -p node_modules/x && echo ok > node_modules/x/f; echo "write node_modules: $?"',
@@ -98,7 +106,9 @@ describe.runIf(sandbox || Boolean(process.env.CI))('Claude sandbox and the Worke
     console.log(
       `#150 sandbox on ${process.platform}\n--- the command saw:\n${seen}\n--- left in the checkout:\n${after.join('\n')}\n--- .env: ${JSON.stringify(readFileSync(join(cwd, '.env'), 'utf8'))}\n--- package.json: ${JSON.stringify(readFileSync(join(cwd, 'package.json'), 'utf8'))}`,
     );
-    // Existing files are never replaced by the sandbox.
+    // Existing files are never replaced by the sandbox, nor hidden from the Worker's commands.
+    expect(seen).toContain('scripts-visible');
+    expect(seen).toContain('github-visible');
     expect(readFileSync(join(cwd, '.env'), 'utf8')).toBe('EXISTING=1\n');
     expect(readFileSync(join(cwd, 'package.json'), 'utf8')).toMatch(/^\{"name":"x"\}\n/);
   });
