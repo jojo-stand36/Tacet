@@ -163,7 +163,7 @@ describe('EventLogBackend', () => {
     for (let n = 0; n < 6; n++) await ask(W1, n);
     const err = await ask(W1, 6).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ToolError);
-    expect((err as ToolError).message).toMatch(/rate-limited.*at most 6 calls per 10 minutes/);
+    expect((err as ToolError).message).toMatch(/rate-limited.*at most 6 per 10 minutes/);
     expect((err as ToolError).detail).toMatchObject({ tool: 'escalate', limit: 6 });
     await expect(ask(W1, 7)).rejects.toBeInstanceOf(ToolError);
     const raised = () => store.query({ typePrefix: 'escalation.raised' });
@@ -198,6 +198,53 @@ describe('EventLogBackend', () => {
     expect(b.workersWithState).toBe(0);
     // Escalate keeps its default limit.
     await b.escalate(W1, { question: 'q?', urgency: 'normal' });
+  });
+
+  it('slides the window, and never counts a refused call', async () => {
+    const b = make({ limits: { escalate: { max: 2, windowMs: 60_000 } } });
+    const ask = () => b.escalate(W1, { question: 'q?', urgency: 'normal' });
+    await ask(); // t=0
+    clock += 30_000;
+    await ask(); // t=30s
+    // At t=59.999s the first call is still in the window: refused, 1 ms to wait.
+    clock += 29_999;
+    const err = (await ask().catch((e: unknown) => e)) as ToolError;
+    expect(err.detail).toMatchObject({ retryAfterMs: 1 });
+    expect(err.message).toMatch(/before 1 second from now/);
+    // Refused calls do not count: at t=60s the first call has left the window, one slot is free.
+    for (let n = 0; n < 3; n++) await expect(ask()).rejects.toBeInstanceOf(ToolError);
+    clock += 1;
+    await ask();
+    await expect(ask()).rejects.toBeInstanceOf(ToolError);
+    expect(store.query({ typePrefix: 'escalation.raised' })).toHaveLength(3);
+  });
+
+  it('counts a repo decision that needs approval as an escalation too', async () => {
+    const b = make();
+    const propose = (n: number) =>
+      b.recordDecision(W1, { topic: `t${n}`, decision: 'd', scope: 'repo' });
+    for (let n = 0; n < 6; n++)
+      expect(await propose(n)).toMatchObject({ status: 'needs_approval' });
+    await expect(propose(6)).rejects.toThrow(/escalate is rate-limited/);
+    await expect(b.escalate(W1, { question: 'q?', urgency: 'normal' })).rejects.toBeInstanceOf(
+      ToolError,
+    );
+    expect(store.query({ typePrefix: 'escalation.raised' })).toHaveLength(6);
+    // A task decision, which asks nobody, is still allowed: it only counts as a decision.
+    expect(await b.recordDecision(W1, { topic: 'x', decision: 'd', scope: 'task' })).toMatchObject({
+      status: 'recorded',
+    });
+  });
+
+  it('refuses limits that are not positive integers', () => {
+    for (const bad of [
+      { max: 0, windowMs: 1000 },
+      { max: 2, windowMs: 0 },
+      { max: 1.5, windowMs: 1000 },
+      { max: Number.NaN, windowMs: 1000 },
+    ]) {
+      expect(() => make({ limits: { escalate: bad } })).toThrow(/positive integers/);
+    }
   });
 
   it('drops call counts once their window has passed, for every Worker', async () => {
