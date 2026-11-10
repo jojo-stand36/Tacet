@@ -41,8 +41,12 @@ export const AgentPreset = z.strictObject({
   command: z.array(NonEmpty).min(1).describe('argv; the first element is the executable'),
   env: z.record(z.string(), SecretRef).optional().describe('Environment from secret references'),
   ready_prompt: z.string().optional().describe('PTY: text that shows the CLI is ready for input'),
-  resume_flag: z.string().optional().describe('PTY: flag that resumes the last session'),
-  process_name: z.string().optional().describe('PTY: process name to watch'),
+  resume_flag: z
+    .union([NonEmpty, z.array(NonEmpty).min(1)])
+    .optional()
+    .describe(
+      "PTY: argument(s) added to the command to continue the CLI's last session in the Worker's checkout, e.g. [resume, --last] (Codex). Only for a CLI whose resume picks among the sessions of its working directory: otherwise a Worker could continue another Worker's session",
+    ),
 });
 export type AgentPreset = z.infer<typeof AgentPreset>;
 
