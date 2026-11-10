@@ -129,6 +129,54 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     await adapter.close(h3);
   });
 
+  it('forks onto the source thread’s model and effort unless told otherwise (#175)', {
+    timeout: 180_000,
+  }, async () => {
+    const h1 = await adapter.start({ cwd: worktree, model: 'gpt-5.5' });
+    const tap1 = new EventTap(adapter.events(h1));
+    expect(await turn(h1, tap1, 'SAY source', { effort: 'low' })).toBe('You said source.');
+    await adapter.close(h1);
+    const id = h1.vendorSessionId as string;
+    const sent = (text: string) => {
+      const r = api.requests.findLast((x) => x.text === text);
+      return { model: r?.model, effort: r?.effort };
+    };
+
+    // Without a model or effort: what the source ran on, not the catalog's default model.
+    const h2 = await adapter.start({ cwd: worktree, resume: { vendorSessionId: id, fork: true } });
+    expect(await turn(h2, new EventTap(adapter.events(h2)), 'SAY fork1')).toBe('You said fork1.');
+    expect(sent('SAY fork1')).toEqual({ model: 'gpt-5.5', effort: 'low' });
+    await adapter.close(h2);
+
+    // An explicit model and effort still win.
+    const h3 = await adapter.start({
+      cwd: worktree,
+      model: 'gpt-6-luna',
+      effort: 'high',
+      resume: { vendorSessionId: id, fork: true },
+    });
+    expect(await turn(h3, new EventTap(adapter.events(h3)), 'SAY fork2')).toBe('You said fork2.');
+    expect(sent('SAY fork2')).toEqual({ model: 'gpt-6-luna', effort: 'high' });
+    await adapter.close(h3);
+
+    // An explicit effort keeps the source's model, and is checked against it.
+    const h4 = await adapter.start({
+      cwd: worktree,
+      effort: 'high',
+      resume: { vendorSessionId: id, fork: true },
+    });
+    expect(await turn(h4, new EventTap(adapter.events(h4)), 'SAY fork3')).toBe('You said fork3.');
+    expect(sent('SAY fork3')).toEqual({ model: 'gpt-5.5', effort: 'high' });
+    await adapter.close(h4);
+    await expect(
+      adapter.start({
+        cwd: worktree,
+        effort: 'ultra',
+        resume: { vendorSessionId: id, fork: true },
+      }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError', field: 'effort' });
+  });
+
   it('refuses effort levels and context windows it cannot honour', {
     timeout: 120_000,
   }, async () => {
