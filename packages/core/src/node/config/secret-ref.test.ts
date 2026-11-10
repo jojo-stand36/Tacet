@@ -16,15 +16,39 @@ describe('resolveSecretRef', () => {
         /^agents\.goose\.env\.X: environment variable GOOSE_API_KEY is not set$/,
       );
     }
+  });
+
+  it('reads a keychain reference through the platform tool, and names the path when it cannot (#160)', () => {
+    const run =
+      (stdout: string, status = 0) =>
+      () => ({ status, stdout, stderr: '' });
+    const found = resolveSecretRef(
+      { keychain: 'tacet/goose' },
+      'agents.goose.env.X',
+      {},
+      {
+        keychain: { platform: 'darwin', run: run('value-1234\n') },
+      },
+    );
+    expect(found.reveal()).toBe('value-1234');
     const err = (() => {
       try {
-        resolveSecretRef({ keychain: 'tacet/goose' }, 'agents.goose.env.X', {});
+        resolveSecretRef(
+          { keychain: 'tacet/goose' },
+          'agents.goose.env.X',
+          {},
+          {
+            keychain: { platform: 'darwin', run: run('', 44) },
+          },
+        );
       } catch (e) {
         return e;
       }
     })();
     expect(err).toBeInstanceOf(SecretRefError);
     expect(err).toMatchObject({ path: 'agents.goose.env.X' });
-    expect(String(err)).toMatch(/keychain references are not supported yet/);
+    expect(String(err)).toMatch(
+      /^SecretRefError: agents\.goose\.env\.X: no keychain item for service "tacet" and account "goose", or the keychain is locked$/,
+    );
   });
 });

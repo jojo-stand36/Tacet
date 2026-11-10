@@ -15,11 +15,19 @@ if (process.env.FAKE_ENV_LOG) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let turns = 0;
+let modelLists = 0;
 let active;
 
 if (mode === 'child') {
   // A background child, like Codex's plugin sync, that outlives a plain kill of this process.
   const child = spawn('sleep', ['60'], { stdio: 'ignore' });
+  log({ childPid: child.pid });
+}
+if (mode === 'child-term' || mode === 'child-term-crash') {
+  // A child that ignores SIGTERM, like a tool or MCP server still shutting down (#191).
+  const child = spawn('sh', ['-c', 'trap "" TERM; while :; do sleep 0.1; done'], {
+    stdio: 'ignore',
+  });
   log({ childPid: child.pid });
 }
 
@@ -39,6 +47,19 @@ rl.on('line', async (line) => {
   if (m.method === 'account/read') {
     return send({ id: m.id, result: { account: null, requiresOpenaiAuth: true } });
   }
+  if (m.method === 'thread/read') {
+    // The stored source thread a fork reads (#175). read-fail echoes FAKE_ERROR, so a test can
+    // check that the adapter scrubs secrets from it.
+    if (mode === 'read-fail') {
+      return send({ id: m.id, error: { code: -32603, message: process.env.FAKE_ERROR ?? 'no' } });
+    }
+    const thread = { id: m.params.threadId };
+    if (mode !== 'read-nomodel') {
+      thread.model = mode === 'read-uncatalogued' ? 'other-model' : 'fake-model';
+      thread.reasoningEffort = 'high';
+    }
+    return send({ id: m.id, result: { thread } });
+  }
   if (m.method === 'thread/start' || m.method === 'thread/resume' || m.method === 'thread/fork') {
     send({ id: m.id, result: { thread: { id: 'thread-1' }, model: 'fake-model' } });
     if (mode === 'close-stdin') {
@@ -52,6 +73,31 @@ rl.on('line', async (line) => {
     if (mode === 'exit-idle') setTimeout(() => process.exit(5), 100);
     return;
   }
+  if (m.method === 'model/list') {
+    modelLists++;
+    if (mode === 'models-fail-once' && modelLists === 1) {
+      return send({ id: m.id, error: { code: -32603, message: 'catalog unavailable' } });
+    }
+    if (mode === 'models-slow' || mode === 'slow-both') await sleep(200);
+    const levels = ['low', 'high'].map((reasoningEffort) => ({ reasoningEffort }));
+    return send({
+      id: m.id,
+      result: {
+        data: [
+          {
+            id: 'fake-model',
+            model: 'fake-model',
+            isDefault: true,
+            supportedReasoningEfforts: levels,
+          },
+          // Malformed: no supportedReasoningEfforts. Skipped by the adapter.
+          { id: 'broken', model: 'broken' },
+        ],
+        // A server that repeats its cursor must not make the adapter loop.
+        nextCursor: mode === 'models-loop' ? 'same' : null,
+      },
+    });
+  }
   if (m.method === 'turn/interrupt') {
     send({ id: m.id, result: {} });
     if (active) complete(active, 'interrupted');
@@ -63,7 +109,8 @@ rl.on('line', async (line) => {
     if (mode === 'slow-start') await sleep(300);
     send({ id: m.id, result: { turn: { id: turnId, status: 'inProgress' } } });
     send({ method: 'turn/started', params: { threadId: 'thread-1', turn: { id: turnId } } });
-    if (mode === 'crash') process.exit(3);
+    // child-term-crash: exits by itself while its SIGTERM-ignoring child still runs (#198).
+    if (mode === 'crash' || mode === 'child-term-crash') process.exit(3);
     if (mode === 'drop-stdout') {
       process.stdout.end();
       setTimeout(() => process.exit(4), 100);
@@ -73,7 +120,8 @@ rl.on('line', async (line) => {
       send({ id: 900, method: 'account/chatgptAuthTokens/refresh', params: {} });
       return;
     }
-    if (mode === 'slow-start') return; // Stays running until interrupted.
+    // Stays running until interrupted.
+    if (mode === 'slow-start' || mode === 'slow-both') return;
     if (mode === 'approval' && turns === 1) {
       send({
         id: 901,

@@ -10,4 +10,5 @@ export {
   SubprocessScrubError,
   withSubprocessScrub,
 } from './auth.js';
+export { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 export { removeMcpConfig, writeMcpConfig } from './mcp-config.js';

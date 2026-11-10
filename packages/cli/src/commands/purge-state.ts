@@ -1,0 +1,396 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync, readdirSync, realpathSync, rmdirSync, rmSync } from 'node:fs';
+import { basename, join, resolve, sep } from 'node:path';
+import {
+  openEventStore,
+  type RepoStatePaths,
+  repoStatePaths,
+  resolveStateDir,
+  SAFE_GIT_ARGS,
+} from '@tacet/core/node';
+import type { Io } from '../io.js';
+import { statePaths } from '../state.js';
+
+/** One Worker or planner checkout under the repo's state dir. */
+export interface StateCheckout {
+  id: string;
+  path: string;
+  /** Deleted by hand: only its git registration is left. */
+  missing: boolean;
+  /** Why `remove` would keep it (unintegrated work, local files); undefined when removable. */
+  kept?: string;
+  /** `kept` is the worktree manager's own refusal (`--force` overrides it), not a failure. */
+  forceable?: boolean;
+  /** Branches (other than its own) that hold its work, so it survives the purge there. */
+  heldBy?: string[];
+}
+
+export interface StatePlan {
+  dir: string;
+  exists: boolean;
+  /** The event log is there. */
+  events: boolean;
+  /** Everything directly in the state dir, all of which goes (Worker homes, logs, the lock). */
+  entries: string[];
+  /**
+   * This state's internal refs (`refs/tacet/<task>/target`, #236): those of tasks its event log
+   * knows, never another run state's on the same repository. All deleted.
+   */
+  refs: string[];
+  checkouts: StateCheckout[];
+  /** Set when the config could not be read and the default state dir was assumed. */
+  note?: string;
+}
+
+export interface StateResult {
+  removed: string[];
+  /** Internal refs deleted. */
+  refs: string[];
+  refused: StateCheckout[];
+  /** Git still lists these worktrees under the state dir, so the dir was left in place. */
+  leftovers: string[];
+  /** The state dir itself was removed. */
+  dirRemoved: boolean;
+  /** Problems ending Worker processes a crashed run left behind. */
+  warnings: string[];
+}
+
+export class StatePurgeError extends Error {
+  override name = 'StatePurgeError';
+}
+
+/** Where `tacet run` keeps this repo's state, as it resolves it. */
+function pathsFor(io: Io, root: string, userDir: string): { paths: RepoStatePaths; note?: string } {
+  try {
+    return { paths: statePaths(root, userDir, io.home) };
+  } catch {
+    return {
+      paths: repoStatePaths(root, resolveStateDir(undefined, root, io.home)),
+      note: 'the config could not be read, so the default state dir is assumed',
+    };
+  }
+}
+
+async function liveRun(lock: string): Promise<number | undefined> {
+  const { miniLockHolder } = await import('@tacet/mini');
+  return miniLockHolder(lock);
+}
+
+const liveRunError = (pid: number) =>
+  new StatePurgeError(
+    `a tacet run is live for this repo (process ${pid}): stop it before purging its state`,
+  );
+
+/**
+ * The worktree manager on the repo's event log, which holds its registry (#126): read-only for a
+ * preview (no lock is held), writable under the run lock. Without a log, only pre-#126 registry
+ * files are found.
+ */
+async function manager(io: Io, root: string, paths: RepoStatePaths, writable: boolean) {
+  const { WorktreeManager } = await import('@tacet/mini');
+  let store: ReturnType<typeof openEventStore> | undefined;
+  let warning: string | undefined;
+  if (existsSync(paths.events)) {
+    try {
+      store = openEventStore(paths.events, { readonly: !writable });
+    } catch (err) {
+      // Purge is the way out of a broken setup: go on with what the disk shows. A checkout git
+      // still lists in the state dir keeps the dir anyway.
+      warning = `the event log cannot be read (${err instanceof Error ? err.message : String(err)}): checkouts it registered are not listed`;
+    }
+  }
+  const worktrees = new WorktreeManager(root, paths.worktrees, {
+    env: io.env ?? process.env,
+    ...(store
+      ? { log: { store, repo: paths.repoId, miniId: 'tacet-uninstall', readonly: !writable } }
+      : {}),
+  });
+  return { worktrees, warning, close: () => store?.close() };
+}
+
+/**
+ * What `tacet uninstall --purge` would do to the repo's run state (#211): the state dir, its event
+ * log, and each checkout with the reason the worktree manager would keep it. Changes nothing.
+ * Throws `StatePurgeError` while a run holds the repo's lock.
+ */
+export async function planState(io: Io, root: string, userDir: string): Promise<StatePlan> {
+  const { paths, note } = pathsFor(io, root, userDir);
+  const plan: StatePlan = {
+    dir: paths.dir,
+    exists: existsSync(paths.dir),
+    events: existsSync(paths.events),
+    entries: [],
+    refs: [],
+    checkouts: [],
+    ...(note ? { note } : {}),
+  };
+  if (!plan.exists) return plan;
+  const pid = await liveRun(paths.lock);
+  if (pid !== undefined) throw liveRunError(pid);
+  plan.entries = readdirSync(paths.dir).sort();
+  plan.refs = [...(await ownRefs(io, root, paths)).refs.keys()];
+  // Only looked at when it exists: the manager would create it.
+  if (!existsSync(paths.worktrees)) return plan;
+  const { worktrees, warning, close } = await manager(io, root, paths, false);
+  if (warning) plan.note = plan.note ? `${plan.note}; ${warning}` : warning;
+  try {
+    const tips = tacetTips(io, root);
+    for (const w of await worktrees.registered()) {
+      const kept = await worktrees.check(w.id, { landed: keptElsewhere(tips, w.branchName) });
+      const heldBy = await worktrees.holders(w.id);
+      plan.checkouts.push({
+        id: w.id,
+        path: w.path,
+        missing: w.missing,
+        ...(kept ? { kept: kept.message, forceable: true } : {}),
+        ...(heldBy.length > 0 ? { heldBy } : {}),
+      });
+    }
+  } finally {
+    close();
+  }
+  return plan;
+}
+
+/**
+ * Remove the repo's run state (#211) while holding the run lock as `tacet run` takes it, after
+ * ending the Worker processes a crashed run left behind: each checkout through
+ * `WorktreeManager.remove` (refused with unintegrated work unless `force`; its `tacet/<id>`
+ * branch kept), then the rest of the state dir, the lock file last. Never `git worktree prune`,
+ * which would also prune the user's own worktrees; the dir is kept if git still lists a worktree
+ * in it. Refuses when the config cannot be read: the state may be elsewhere.
+ */
+export async function applyState(
+  io: Io,
+  root: string,
+  userDir: string,
+  force: boolean,
+): Promise<StateResult> {
+  const { paths, note } = pathsFor(io, root, userDir);
+  const result: StateResult = {
+    removed: [],
+    refused: [],
+    leftovers: [],
+    dirRemoved: false,
+    warnings: [],
+    refs: [],
+  };
+  if (!existsSync(paths.dir)) return result;
+  if (note) {
+    throw new StatePurgeError(
+      'the config could not be read, so where the run state lives is unknown: fix .tacet/tacet.yaml first',
+    );
+  }
+  const { withStoppedMini, WorktreeKeptError } = await import('@tacet/mini');
+  let locked: { errors: unknown[] };
+  try {
+    locked = await withStoppedMini(paths.lock, async () => {
+      if (existsSync(paths.worktrees)) {
+        const { worktrees, close } = await manager(io, root, paths, true);
+        try {
+          const tips = tacetTips(io, root);
+          for (const w of await worktrees.registered()) {
+            try {
+              await worktrees.remove(w.id, {
+                force,
+                keepBranch: true,
+                landed: keptElsewhere(tips, w.branchName),
+              });
+              result.removed.push(w.path);
+            } catch (err) {
+              result.refused.push({
+                id: w.id,
+                path: w.path,
+                missing: w.missing,
+                kept: err instanceof Error ? err.message : String(err),
+                forceable: err instanceof WorktreeKeptError && !force,
+              });
+            }
+          }
+        } finally {
+          close();
+        }
+      }
+      if (result.refused.length > 0) return;
+      result.leftovers = registeredUnder(io, root, paths.dir);
+      if (result.leftovers.length > 0) return;
+      // This state's internal refs go with it; the tacet/* branches are the user's to keep.
+      const own = await ownRefs(io, root, paths);
+      if (own.warning) result.warnings.push(own.warning);
+      for (const [ref, tip] of own.refs) {
+        try {
+          execFileSync('git', [...SAFE_GIT_ARGS, '-C', root, 'update-ref', '-d', ref, tip], {
+            stdio: 'ignore',
+            env: gitEnv(io),
+          });
+          result.refs.push(ref);
+        } catch {
+          result.warnings.push(`could not delete ${ref}`);
+        }
+      }
+      // Everything but the lock, which goes last, as the lock is released.
+      const lockName = basename(paths.lock);
+      for (const name of readdirSync(paths.dir)) {
+        if (name !== lockName) rmSync(join(paths.dir, name), { recursive: true, force: true });
+      }
+      result.dirRemoved = true;
+    });
+  } catch (err) {
+    if (err instanceof Error && /running for this repo/.test(err.message)) {
+      const pid = await liveRun(paths.lock);
+      throw pid !== undefined ? liveRunError(pid) : new StatePurgeError(err.message);
+    }
+    throw err;
+  }
+  result.warnings.push(...locked.errors.map((e) => (e instanceof Error ? e.message : String(e))));
+  if (result.dirRemoved) {
+    try {
+      // A run that started since the lock was released keeps its dir: nothing of it is touched.
+      rmdirSync(paths.dir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTEMPTY' && code !== 'EEXIST') throw err;
+    }
+  }
+  return result;
+}
+
+/**
+ * The `refs/tacet/<task>/target` refs (and tips) of the tasks this state's event log pinned (#236).
+ * `refs/tacet/*` is shared by every run state of the repository (another checkout of it has its
+ * own state dir), so only this state's own are named. An unreadable log names none.
+ */
+async function ownRefs(
+  io: Io,
+  root: string,
+  paths: RepoStatePaths,
+): Promise<{ refs: Map<string, string>; warning?: string }> {
+  const all = internalRefs(io, root);
+  if (all.size === 0 || !existsSync(paths.events)) return { refs: new Map() };
+  const { targetRef } = await import('@tacet/mini');
+  const wanted = new Set<string>();
+  try {
+    const store = openEventStore(paths.events, { readonly: true });
+    try {
+      for (const { envelope } of store.query({ typePrefix: 'task.target' })) {
+        try {
+          if (envelope.taskId) wanted.add(targetRef(envelope.taskId));
+        } catch {
+          // A task id no ref can be made for: it has none.
+        }
+      }
+    } finally {
+      store.close();
+    }
+  } catch {
+    return {
+      refs: new Map(),
+      warning: 'the event log could not be read, so no refs/tacet/* ref was deleted',
+    };
+  }
+  return { refs: new Map([...all].filter(([ref]) => wanted.has(ref))) };
+}
+
+/** `refs/tacet/*` and their tips (#236): never branches, only Tacet's own bookkeeping. */
+function internalRefs(io: Io, root: string): Map<string, string> {
+  const refs = new Map<string, string>();
+  let out = '';
+  try {
+    out = execFileSync(
+      'git',
+      [
+        ...SAFE_GIT_ARGS,
+        '-C',
+        root,
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/tacet/',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv(io) },
+    );
+  } catch {
+    // None listed: none deleted.
+  }
+  for (const line of out.split('\n')) {
+    const [tip, ref] = line.trim().split(' ');
+    if (tip && ref?.startsWith('refs/tacet/') && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(tip)) {
+      refs.set(ref, tip);
+    }
+  }
+  return refs;
+}
+
+/**
+ * Every `refs/heads/tacet/*` branch and its tip. The purge keeps them all, so (owner decision on
+ * #211) work they hold counts as kept: a checkout whose commits are on one need no `--force`.
+ */
+function tacetTips(io: Io, root: string): Map<string, string> {
+  const tips = new Map<string, string>();
+  let out = '';
+  try {
+    out = execFileSync(
+      'git',
+      [
+        ...SAFE_GIT_ARGS,
+        '-C',
+        root,
+        'for-each-ref',
+        '--format=%(objectname) %(refname)',
+        'refs/heads/tacet/',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: gitEnv(io) },
+    );
+  } catch {
+    // None counted: checkouts are then kept unless forced, as before.
+  }
+  for (const line of out.split('\n')) {
+    const [tip, ref] = line.trim().split(' ');
+    if (tip && ref && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(tip)) tips.set(ref, tip);
+  }
+  return tips;
+}
+
+/** The kept `tacet/*` tips that may cover a checkout: never its own `tacet/<id>` branch. */
+function keptElsewhere(tips: ReadonlyMap<string, string>, ownBranch: string): string[] {
+  const own = `refs/heads/${ownBranch}`;
+  return [...new Set([...tips].filter(([ref]) => ref !== own).map(([, tip]) => tip))];
+}
+
+function gitEnv(io: Io): Record<string, string> {
+  const env = io.env ?? process.env;
+  return {
+    ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+    ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+  };
+}
+
+/** Worktrees git still has registered at or under `dir`. On any doubt, `dir` itself. */
+function registeredUnder(io: Io, root: string, dir: string): string[] {
+  let out: string;
+  try {
+    out = execFileSync('git', [...SAFE_GIT_ARGS, '-C', root, 'worktree', 'list', '--porcelain'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: gitEnv(io),
+    });
+  } catch {
+    return [dir];
+  }
+  // Both sides as given and resolved: a missing worktree path cannot be resolved, and git may
+  // report either form (macOS: /var is a symlink to /private/var).
+  const bases = [...new Set([resolve(dir), real(dir)])];
+  const under = (p: string) => bases.some((b) => p === b || p.startsWith(`${b}${sep}`));
+  return out
+    .split('\n')
+    .filter((line) => line.startsWith('worktree '))
+    .map((line) => line.slice('worktree '.length))
+    .filter((path) => under(resolve(path)) || under(real(path)));
+}
+
+function real(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}

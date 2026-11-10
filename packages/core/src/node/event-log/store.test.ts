@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -96,6 +96,43 @@ describe('event log', () => {
     expect(store.replay(tasksProjection)).toEqual(expected);
   });
 
+  it('opens read-only beside the writer: sees its appends, never writes (#21)', () => {
+    store.append(fixture.slice(0, 10));
+    const reader = openEventStore(path, { readonly: true });
+    try {
+      expect(reader.count()).toBe(10);
+      store.append(fixture.slice(10));
+      expect(reader.count()).toBe(30);
+      expect(reader.replay(tasksProjection)).toEqual(expected);
+      expect(reader.query({ afterSeq: 29 })).toHaveLength(1);
+      expect(() => reader.append(fixture[0])).toThrow(/read-only/);
+      expect(() => reader.compact({ before: '2100-01-01T00:00:00.000Z' })).toThrow(/read-only/);
+    } finally {
+      reader.close();
+    }
+  });
+
+  it('reads a closed log read-only without changing it (#21)', () => {
+    store.append(fixture);
+    store.close();
+    const reader = openEventStore(path, { readonly: true });
+    try {
+      expect(reader.replay(tasksProjection)).toEqual(expected);
+    } finally {
+      reader.close();
+    }
+    // Only SQLite's own sidecars may appear, beside the log.
+    expect(readdirSync(dir).every((f) => /^events\.db(-wal|-shm)?$/.test(f))).toBe(true);
+    store = openEventStore(path);
+    expect(store.count()).toBe(30);
+  });
+
+  it('refuses to open a missing log read-only, and creates nothing (#21)', () => {
+    const missing = join(dir, 'nope', 'events.db');
+    expect(() => openEventStore(missing, { readonly: true })).toThrow();
+    expect(() => statSync(join(dir, 'nope'))).toThrow();
+  });
+
   it('replays identically when events arrive one at a time', () => {
     for (const e of fixture) store.append(e);
     expect(store.replay(tasksProjection)).toEqual(expected);
@@ -159,12 +196,26 @@ describe('event log', () => {
     expect(store.query({ typePrefix: 'agent.message' })).toHaveLength(0);
     expect(store.query({ typePrefix: 'agent.usage' })).toHaveLength(4);
     expect(store.replay(tasksProjection)).toEqual(expected);
+
     const raw = new Database(path);
     try {
       expect(() => raw.prepare('DELETE FROM events').run()).toThrow(/append-only/);
     } finally {
       raw.close();
     }
+  });
+
+  it('keeps the worktree registry (workspace.*) through retention (#126)', () => {
+    store.append({
+      v: 1,
+      id: '01J00000000000000000000W01',
+      ts: '2026-01-01T00:00:00.000Z',
+      source: { kind: 'mini', id: 'mini' },
+      type: 'workspace.created',
+      data: { workspaceId: 'w-1', workerId: 's-1', baseCommit: 'a'.repeat(40) },
+    });
+    store.compact({ before: '2100-01-01T00:00:00.000Z' });
+    expect(store.query({ typePrefix: 'workspace' })).toHaveLength(1);
   });
 
   it('refuses a database with a newer schema version', () => {

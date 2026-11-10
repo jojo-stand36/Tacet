@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { cpSync, mkdirSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
   type CanUseTool,
   type EffortLevel,
+  type HookCallback,
   type ModelInfo,
   type Options,
   type PermissionResult,
@@ -30,8 +34,13 @@ import {
   type WorkerEnvPolicy,
   workerEnv,
 } from '@tacet/core';
+import { defaultStateDir, repoStateDir } from '@tacet/core/node';
 import { authEnv, type ClaudeAuthRoute, claudeEnvAllow, withSubprocessScrub } from './auth.js';
+import { isOwnDir, removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
+
+/** Vendor session ids are UUIDs: they name each session's config directory. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const CONTEXT_1M = 1_000_000;
 
@@ -72,6 +81,19 @@ export interface ClaudeSdkAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
+  /**
+   * The repo the sessions belong to; keys their config directories (#237). Default: the repo of
+   * the session's cwd (the main checkout, for a git worktree), else the cwd itself.
+   */
+  repoRoot?: string;
+  /** Tacet's state directory, where the sessions' config directories live. Default `~/.tacet/state`. */
+  stateDir?: string;
+  /**
+   * Days after its last write that a session's config directory (its transcript) is removed, if
+   * no Mini-conductor discarded it before (#237). Swept when the adapter starts its first session
+   * for a repo. Default 30, as `events.retention.transcript_days`.
+   */
+  retentionDays?: number;
   /** Directory for per-session MCP config files. Default `~/.tacet/run/mcp`. */
   mcpConfigDir?: string;
   /**
@@ -79,7 +101,18 @@ export interface ClaudeSdkAdapterOptions {
    * this adapter started its first session (#108). Only the count: never names or contents.
    */
   onSweep?: (removedFiles: number) => void;
-  /** SDK options passed through unchanged, e.g. `settingSources` or `pathToClaudeCodeExecutable`. */
+  /**
+   * SDK options passed through unchanged, e.g. `pathToClaudeCodeExecutable`.
+   *
+   * `settingSources` defaults to `[]` (#181): no user, project or local settings and no CLAUDE.md,
+   * so a checkout a Worker wrote cannot add hooks, permissions, environment or instructions to a
+   * later session. Passing it here is the explicit opt-in, e.g. `['project']` for an interactive
+   * session in the user's own repo. Never opt in for a session in a Worker's checkout.
+   * On the API-key route `user` means the session's own config dir (#237), which is empty, not
+   * the user's `~/.claude`. MCP servers
+   * come only from Tacet's config either way (`strictMcpConfig` is always on), never from the
+   * user's or the project's settings or `.mcp.json`.
+   */
   sdkOptions?: Pick<
     Options,
     'settingSources' | 'pathToClaudeCodeExecutable' | 'permissionMode' | 'allowedTools'
@@ -89,9 +122,33 @@ export interface ClaudeSdkAdapterOptions {
    * `true`; `false` is honoured only with `query` (a test that replaces the Claude Code binary).
    */
   subprocessScrub?: boolean;
+  /**
+   * Unattended Workers (#206): the session gets only Claude Code's file tools, with no shell at
+   * all, and every read and search goes through `approval.request` like an edit does, so the
+   * Mini-conductor's policy (#200) decides each one.
+   *
+   * - `tools` names exactly the file tools, so Bash, the web tools and the rest do not exist, and
+   *   `Glob` and `Grep` are present (absent by default on macOS, Linux and WSL, where Claude Code
+   *   searches with Bash instead). `disallowedTools` removes the shell tools from the model's
+   *   context as well, in case `tools` ever stops being an allowlist.
+   * - A `PreToolUse` hook asks Tacet about `Read`, `Glob` and `Grep`, which the SDK otherwise runs
+   *   without calling `canUseTool` (reads inside the working directory need no permission). It
+   *   fails closed (`onFailure: 'block'`).
+   *
+   * Verified 2026-11-10 against SDK 0.3.319 types and code.claude.com/docs (tools reference,
+   * agent-sdk permissions); see docs/adapters/capability-matrix.md.
+   */
+  fileToolsOnly?: boolean;
   /** Replaces the SDK's `query()`; for tests. */
   query?: typeof sdkQuery;
 }
+
+/** The tools an unattended Worker gets (`fileToolsOnly`). */
+export const FILE_TOOLS = ['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep'] as const;
+/** Shell tools removed outright for `fileToolsOnly`, whatever `tools` does. */
+export const SHELL_TOOLS = ['Bash', 'PowerShell', 'Monitor'] as const;
+/** File tools the SDK runs without `canUseTool` inside the working directory. */
+const SELF_APPROVED = ['Read', 'Glob', 'Grep'];
 
 interface PendingApproval {
   resolve: (r: PermissionResult) => void;
@@ -169,6 +226,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   /** Last cumulative cost seen per vendor session, so resume and fork report deltas. */
   readonly #costTotals = new Map<string, number>();
   #swept = false;
+  /** Config roots already swept by this adapter (#237). */
+  readonly #sweptRoots = new Set<string>();
 
   constructor(opts: ClaudeSdkAdapterOptions = {}) {
     this.#opts = opts;
@@ -231,6 +290,59 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       sessionOpts.sessionId = vendorSessionId;
     }
 
+    // On the API-key route each session has a config dir of its own (#237), so its transcript is
+    // never in the user's `~/.claude` and can be removed when it will never be resumed. The
+    // subscription route keeps the user's own: their login lives there.
+    let configDir: string | undefined;
+    let madeConfigDir = false;
+    const claimed = opts.resume?.vendorSessionId;
+    if (this.#ownConfigDirs) {
+      if (claimed !== undefined && !UUID.test(claimed)) {
+        throw new Error('a Claude session to resume is named by its UUID');
+      }
+      const root = this.#configRoot(opts.cwd);
+      this.#sweep(root, claimed);
+      configDir = join(root, vendorSessionId);
+      if (opts.resume && !opts.resume.fork) {
+        if (!isOwnDir(configDir)) throw new Error(`no Claude session ${vendorSessionId} to resume`);
+      } else {
+        mkdirSync(root, { recursive: true, mode: 0o700 });
+        if (opts.resume) {
+          const from = opts.resume.vendorSessionId;
+          // Its transcript may be mid-write: a copy could cut a line or miss the last turn.
+          if ([...this.#sessions.values()].some((x) => x.handle.vendorSessionId === from)) {
+            throw new Error(`Claude session ${from} is open; fork it once it is closed`);
+          }
+          const source = join(root, from);
+          if (!isOwnDir(source)) {
+            throw new Error(`no Claude session ${opts.resume.vendorSessionId} to fork`);
+          }
+          // The fork resumes the source's transcript in a copy of its directory, so the source's
+          // own stays as it is and each can be removed alone. Links are copied as links.
+          // Set first: a copy that fails partway is removed too.
+          madeConfigDir = true;
+          try {
+            cpSync(source, configDir, {
+              recursive: true,
+              errorOnExist: true,
+              verbatimSymlinks: true,
+            });
+          } catch (err) {
+            rmSync(configDir, { recursive: true, force: true });
+            throw err;
+          }
+        } else {
+          mkdirSync(configDir, { mode: 0o700 });
+          madeConfigDir = true;
+        }
+      }
+      env.CLAUDE_CONFIG_DIR = configDir;
+    }
+    // A session that never started leaves nothing to resume.
+    const unmake = () => {
+      if (madeConfigDir && configDir) rmSync(configDir, { recursive: true, force: true });
+    };
+
     if (!this.#swept) {
       // Once per adapter, which lives as long as its Mini-conductor: files a crashed one left.
       this.#swept = true;
@@ -242,13 +354,20 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         // Tried again by the next Mini-conductor that starts.
       }
     }
-    const mcpConfigPath = opts.mcpServers?.length
-      ? writeMcpConfig(opts.mcpServers, {
-          sessionId: id,
-          worktree: opts.cwd,
-          ...(this.#opts.mcpConfigDir !== undefined ? { dir: this.#opts.mcpConfigDir } : {}),
-        })
-      : undefined;
+    let mcpConfigPath: string | undefined;
+    try {
+      mcpConfigPath = opts.mcpServers?.length
+        ? writeMcpConfig(opts.mcpServers, {
+            sessionId: id,
+            worktree: opts.cwd,
+            ...(this.#opts.mcpConfigDir !== undefined ? { dir: this.#opts.mcpConfigDir } : {}),
+          })
+        : undefined;
+    } catch (err) {
+      // Nothing started: the dir made above is removed with it.
+      unmake();
+      throw err;
+    }
 
     const inbox = new AsyncQueue<SDKUserMessage>();
     const handle: SessionHandle = { id, vendorSessionId };
@@ -256,6 +375,42 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     let s: Session | undefined;
     const canUseTool: CanUseTool = (toolName, input, ctx) =>
       s ? this.#askApproval(s, toolName, input, ctx) : Promise.resolve(deny('session not ready'));
+    // `fileToolsOnly`: reads and searches asked about too, through the same approval round trip.
+    const askHook: HookCallback = async (input, _id, { signal }) => {
+      if (input.hook_event_name !== 'PreToolUse') return {};
+      const toolInput =
+        typeof input.tool_input === 'object' && input.tool_input !== null
+          ? (input.tool_input as Record<string, unknown>)
+          : {};
+      const r = s
+        ? await this.#askApproval(s, input.tool_name, toolInput, {
+            signal,
+            suggestions: [],
+            toolUseID: input.tool_use_id,
+            requestId: `hook-${input.tool_use_id}`,
+          })
+        : deny('session not ready');
+      if (r.behavior === 'allow') {
+        // The whole decision, as `canUseTool` would take it: a rewritten input runs, never the
+        // original one the decision was not about.
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            ...(r.updatedInput !== undefined ? { updatedInput: r.updatedInput } : {}),
+          },
+        };
+      }
+      return {
+        // A cancel stops the turn, as `canUseTool`'s `interrupt` does.
+        ...(r.interrupt ? { continue: false, stopReason: r.message } : {}),
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: r.message,
+        },
+      };
+    };
 
     let q: Query;
     try {
@@ -263,11 +418,39 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         prompt: inbox,
         options: {
           ...this.#opts.sdkOptions,
+          // SDK isolation mode unless the caller opted in (#181); see `sdkOptions`.
+          settingSources: this.#opts.sdkOptions?.settingSources ?? [],
+          // Only Tacet's MCP config (the `--mcp-config` file below): never a checkout's `.mcp.json`
+          // or a plugin's servers, whatever the setting sources (#181).
+          strictMcpConfig: true,
           ...sessionOpts,
           cwd: opts.cwd,
           env,
           includePartialMessages: true,
           canUseTool,
+          ...(this.#opts.fileToolsOnly
+            ? {
+                tools: [...FILE_TOOLS],
+                disallowedTools: [...SHELL_TOOLS],
+                // Never auto-approve: an `allowedTools` entry would skip `canUseTool`.
+                allowedTools: [],
+                // No `@path` expansion or slash commands in prompts: Worker-written text (a verify
+                // command's output) reaches the next prompt, and an `@path` there would be read
+                // in without asking (#214 review; SDK 0.3.319 `verbatimPrompts`).
+                verbatimPrompts: true,
+                permissionMode: 'default' as const,
+                hooks: {
+                  PreToolUse: [
+                    {
+                      matcher: SELF_APPROVED.join('|'),
+                      hooks: [askHook],
+                      timeout: 3600,
+                      onFailure: 'block' as const,
+                    },
+                  ],
+                },
+              }
+            : {}),
           ...(opts.model !== undefined ? { model: opts.model } : {}),
           ...(effort !== undefined ? { effort } : {}),
           ...(opts.contextWindow === CONTEXT_1M ? { betas: ['context-1m-2025-08-07'] } : {}),
@@ -283,6 +466,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       });
     } catch (err) {
       if (mcpConfigPath) removeMcpConfig(mcpConfigPath);
+      unmake();
       throw err;
     }
 
@@ -318,6 +502,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         await this.#checkEffort(s, s.model, effort);
       } catch (err) {
         await this.close(handle);
+        // Refused before its first turn: its handle is never returned, so nothing resumes it.
+        unmake();
         throw err;
       }
     }
@@ -402,12 +588,66 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     }
   }
 
+  /**
+   * The closed session `vendorSessionId` will never be resumed (#153, #237): remove its config
+   * directory under Tacet's state dir, its transcript included. Only on the API-key route, where
+   * Tacet made that directory; never the user's own `~/.claude`. Refused while that session is
+   * open.
+   */
+  async discard(vendorSessionId: string, cwd: string): Promise<void> {
+    if (!this.#ownConfigDirs) return;
+    if (!UUID.test(vendorSessionId)) throw new Error('a Claude session is named by its UUID');
+    if (this.#liveIds().has(vendorSessionId)) {
+      throw new Error(`Claude session ${vendorSessionId} is still open`);
+    }
+    removeClaudeConfigDir(this.#configRoot(cwd), vendorSessionId);
+  }
+
   events(h: SessionHandle): AsyncIterable<AgentEvent> {
     return this.#session(h).events;
   }
 
   status(h: SessionHandle): SessionState {
     return this.#sessions.get(h.id)?.state ?? 'done';
+  }
+
+  /** Sessions on the API-key route get a config dir of their own (#237). */
+  get #ownConfigDirs(): boolean {
+    return (this.#opts.authRoute ?? 'api_key') === 'api_key';
+  }
+
+  /** `<repo state dir>/claude-sdk`: keyed by the user's HOME, never a session's environment. */
+  #configRoot(cwd: string): string {
+    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
+    return join(
+      repoStateDir(
+        this.#opts.repoRoot ?? repoOf(cwd),
+        this.#opts.stateDir ?? defaultStateDir(home),
+      ),
+      'claude-sdk',
+    );
+  }
+
+  /** Vendor ids of the sessions open in this adapter. */
+  #liveIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const s of this.#sessions.values()) {
+      if (s.handle.vendorSessionId !== undefined) ids.add(s.handle.vendorSessionId);
+    }
+    return ids;
+  }
+
+  /** Once per root: remove the config dirs untouched for the retention, never a live one. */
+  #sweep(root: string, claimed: string | undefined): void {
+    if (this.#sweptRoots.has(root)) return;
+    this.#sweptRoots.add(root);
+    try {
+      const keep = this.#liveIds();
+      if (claimed !== undefined) keep.add(claimed);
+      sweepClaudeConfigDirs(root, (this.#opts.retentionDays ?? 30) * 24 * 60 * 60 * 1000, keep);
+    } catch {
+      // Tried again by the next adapter that starts; the directories are only kept longer.
+    }
   }
 
   /** Refuse an effort level the model does not list, rather than let the SDK drop or lower it. */

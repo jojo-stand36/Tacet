@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
@@ -8,6 +16,7 @@ import {
   type EventEnvelope,
   newUlid,
   type Priority,
+  type ProfileField,
   redactSecrets,
   type SessionHandle,
   type SummaryPacket,
@@ -16,7 +25,9 @@ import {
   type TaskInput,
   TaskPlan,
   type TaskState,
+  TaskTarget,
   type TaskView,
+  type TierConfig,
   tasksProjection,
   type Verification,
   type VerificationStatus,
@@ -29,19 +40,27 @@ import {
   WORKER_MARKER_VAR,
 } from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
+import { reviewFeedback } from '../review/adapter-reviewer.js';
+import { reviewConfigProblem } from '../review/config.js';
 import {
   type Integrator,
   MergeConflictError,
   type Planner,
+  type Reviewer,
+  type ReviewResult,
   type Verifier,
+  type VerifyResult,
   type WorkerAdapter,
   type WorkerMcp,
   type Workspace,
   type Workspaces,
   WorktreeRefusedError,
+  workerRefusal,
 } from './ports.js';
+import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
 import { RESUME_PROMPT, safePrompt, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
+import { decideToolRequest } from './tool-policy.js';
 
 export interface MiniConductorOptions {
   store: EventStore;
@@ -53,6 +72,11 @@ export interface MiniConductorOptions {
   planner: Planner;
   /** Default: passes, with the configured `verify` commands recorded as not run (#19). */
   verifier?: Verifier;
+  /**
+   * Reviews each sub-task's integrated change after its commands pass, when `review.enabled`
+   * (#19): an `AdapterReviewer` on `tiers.review`. Required when review is on.
+   */
+  reviewer?: Reviewer;
   /** Brings Worker commits into the repo after each finished turn (#119). Default: none. */
   integrator?: Integrator;
   mcp: WorkerMcp;
@@ -69,6 +93,12 @@ export interface MiniConductorOptions {
   now?: () => Date;
   /** How often to look for answered escalations, in ms. Default 1000. */
   pollMs?: number;
+  /**
+   * How often to look for finished tasks whose result landed in its target, and free their
+   * Worker checkouts when `worktrees.remove_merged` is on (#210), in ms. Default 10 minutes; it
+   * also runs once at start.
+   */
+  landedSweepMs?: number;
 }
 
 /** What the pool knows about each Worker session, rebuilt from `worker.*` events. */
@@ -83,6 +113,8 @@ interface SessionRecord {
   refused?: boolean;
   /** The commit its checkout started at (#134). */
   baseCommit?: string;
+  /** The local branch its checkout started from, when it did: its task's target (#210). */
+  baseBranch?: string;
 }
 
 interface EscalationRecord {
@@ -103,6 +135,8 @@ interface View {
   tasks: Record<string, TaskView>;
   sessions: Map<string, SessionRecord>;
   kinds: Map<string, string>;
+  /** Sub-tasks the planner marked indivisible (#110). */
+  indivisible: Set<string>;
   escalations: Map<string, EscalationRecord>;
   decisions: Map<string, string>;
   progress: Map<string, string>;
@@ -138,6 +172,59 @@ interface Run {
   progressSeen?: number | undefined;
   /** The turn's end is being handled, so it is handled once. */
   settling: boolean;
+  /** Aborts a verification in progress when the session ends (#19). */
+  verifyAbort?: AbortController | undefined;
+}
+
+/**
+ * Whether `verify` commands run for Codex Workers (#19). Off until the owner decides: the
+ * commands run code the Worker wrote outside the Codex sandbox, which keeps the shared `.git`
+ * read-only for the Worker itself (ARCHITECTURE.md §6). Off, their sub-tasks are recorded as
+ * not verified, with this reason.
+ */
+export const VERIFY_CODEX_WORKERS = false;
+const CODEX_ADAPTERS: ReadonlySet<string> = new Set(['codex-app-server', 'acp:codex-acp']);
+const CODEX_NOT_VERIFIED = 'codex verify pending sandbox decision';
+/** The command name `worker.verification` records for a failure before any command ran. */
+const CHECKOUT_CHECK = '(verification failed before any command)';
+
+/**
+ * A check's result with the reviewer's verdict folded in (#19). Blocking findings fail it, with
+ * the findings as the Worker's feedback. A reviewer that gave no verdict turns `passed` into
+ * `partial` (owner decision pending: block instead) and leaves `not_run` or `partial` as they
+ * are; an approval turns commands `not_run` into `partial`.
+ */
+function withReview(v: VerifyResult, r: ReviewResult): VerifyResult {
+  const blocking = r.findings.filter((f) => f.severity !== 'minor').length;
+  const review = {
+    status: r.status,
+    adapter: r.adapter,
+    ...(r.model !== undefined ? { model: r.model } : {}),
+    blocking,
+  };
+  const notes = (extra: string) => (v.notes ? `${v.notes}\n${extra}` : extra);
+  if (r.status === 'failed') {
+    // Counts only: the findings' text goes to the Worker as its feedback, never into events or
+    // up to the Conductor (coordinator requirement on #19).
+    return {
+      ...v,
+      status: 'failed',
+      notes: notes(
+        `Review requested changes: ${blocking} blocking finding(s), ${r.findings.length - blocking} minor.`,
+      ),
+      feedback: reviewFeedback(r.findings),
+      review,
+    };
+  }
+  if (r.status === 'error') {
+    return {
+      ...v,
+      status: v.status === 'passed' ? 'partial' : v.status,
+      notes: notes(`Review did not finish: ${r.notes ?? 'no verdict'}.`),
+      review,
+    };
+  }
+  return { ...v, status: v.status === 'not_run' ? 'partial' : v.status, review };
 }
 
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
@@ -155,6 +242,8 @@ export class MiniConductor {
   readonly #o: MiniConductorOptions;
   readonly #runs = new Map<string, Run>();
   readonly #planning = new Set<string>();
+  /** Aborts the planner of a task, for `cancel()`. */
+  readonly #planAborts = new Map<string, AbortController>();
   /** Background work (plans, Worker event loops) that `stop()` waits for. */
   readonly #inflight = new Set<Promise<unknown>>();
   /** Process markers of Worker sessions that may be running, by session (#127). */
@@ -162,6 +251,13 @@ export class MiniConductor {
   /** Git errors combining a sub-task's dependencies, by sub-task (#134). */
   readonly #combineFailures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
+  #sweepTimer: NodeJS.Timeout | undefined;
+  /** The generation whose landed sweep is in flight, so a slow one is never started twice. */
+  #sweepingGen: number | undefined;
+  /** Landed-sweep problems already reported, so a slow timer does not grow `errors` forever. */
+  readonly #sweepErrors = new Set<string>();
+  /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
+  readonly #closing = new Set<string>();
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -179,6 +275,8 @@ export class MiniConductor {
           `adapter ${id}: Workers run unattended and must use the api_key route (#65)`,
         );
       }
+      const refused = workerRefusal(w);
+      if (refused) throw new Error(`adapter ${id}: refused for Workers: ${refused}`);
     }
     const worker = opts.config.tiers?.worker;
     if (!worker) throw new Error('config has no tiers.worker');
@@ -186,6 +284,11 @@ export class MiniConductor {
       if (tier && !opts.adapters[tier.adapter]) {
         throw new Error(`no Worker adapter ${tier.adapter} for its tier`);
       }
+    }
+    const problem = reviewConfigProblem(opts.config);
+    if (problem) throw new Error(problem);
+    if (opts.config.review?.enabled && !opts.reviewer) {
+      throw new Error('review.enabled: review is on but no reviewer was given');
     }
     this.#o = opts;
   }
@@ -206,6 +309,8 @@ export class MiniConductor {
       this.#unlock();
       throw err;
     }
+    // Under the lock, before a checkout is looked up: the registry catches up with the disk.
+    await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#errors.push(err));
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -243,6 +348,9 @@ export class MiniConductor {
     this.#timer = setInterval(() => this.#kick(), this.#o.pollMs ?? 1000);
     this.#timer.unref();
     this.#kick();
+    this.#sweepTimer = setInterval(() => this.#sweep(), this.#o.landedSweepMs ?? 10 * 60_000);
+    this.#sweepTimer.unref();
+    this.#sweep();
   }
 
   /** Accept a task. Returns its id; planning and scheduling continue in the background. */
@@ -258,6 +366,55 @@ export class MiniConductor {
     const view = this.#state().tasks[id];
     if (view) this.#plan(view.task);
     return id;
+  }
+
+  /**
+   * Answer an open escalation as the user (standalone `tacet run`, #21, until the inbox of #26):
+   * recorded as `escalation.resolved` with source `user` and delivered to the Worker as its next
+   * turn. Throws for an unknown escalation or one already resolved.
+   */
+  answer(escalationId: string, answer: string): void {
+    if (!this.#started) throw new Error('call start() first');
+    const x = this.#state().escalations.get(escalationId);
+    if (!x) throw new Error(`unknown escalation ${escalationId}`);
+    if (x.resolved) throw new Error(`escalation ${escalationId} is already resolved`);
+    if (answer.trim() === '') throw new Error('an answer must not be empty');
+    this.#o.store.append(
+      this.#env(
+        x.taskId,
+        'escalation.resolved',
+        { escalationId, answer, source: 'user' },
+        x.sessionId,
+      ),
+    );
+    this.#kick();
+  }
+
+  /**
+   * Cancel a task (#202): it and its unfinished sub-tasks are recorded as `canceled`, their open
+   * Worker sessions are ended (`worker.ended` with reason `canceled`, which is never resumed), its
+   * planner is stopped, and nothing more starts for it. Work already under way for it (a Worker
+   * starting, an integration, a roll-up) records nothing more once it returns. Returns the ids
+   * canceled. Throws for an unknown task, a sub-task, or a task that has already ended. A planner
+   * that ignores its abort signal keeps `settled()` waiting until it returns; its plan is dropped.
+   */
+  async cancel(taskId: string): Promise<string[]> {
+    if (!this.#started) throw new Error('call start() first');
+    const v = this.#state();
+    const problem = cancelProblem(v, taskId);
+    if (problem) throw new Error(problem);
+    this.#planAborts.get(taskId)?.abort();
+    const runs = [...this.#runs.values()].filter(
+      (r) => r.subtaskId === taskId || r.subtaskId.startsWith(`${taskId}/`),
+    );
+    // Recorded first, so the scheduler starts nothing more for it while the sessions close.
+    const { events, canceled } = cancelEvents(v, taskId, (...a) => this.#env(...a), {
+      open: new Set(runs.map((r) => r.sessionId)),
+    });
+    this.#o.store.append(events);
+    await Promise.all(runs.map((r) => this.#end(r, 'canceled', CANCELED_MESSAGE)));
+    this.#kick();
+    return canceled;
   }
 
   /**
@@ -289,6 +446,7 @@ export class MiniConductor {
     this.#gen += 1;
     this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
     await this.#ticking;
     await Promise.all([...this.#runs.values()].map((r) => this.#end(r, 'restart')));
     await Promise.allSettled([...this.#inflight]);
@@ -304,12 +462,26 @@ export class MiniConductor {
     this.#gen += 1;
     this.#abort.abort();
     if (this.#timer) clearInterval(this.#timer);
+    if (this.#sweepTimer) clearInterval(this.#sweepTimer);
     this.#runs.clear();
     this.#unlock();
   }
 
   #live(gen: number): boolean {
     return this.#started && gen === this.#gen;
+  }
+
+  /**
+   * Whether a sub-task, or the task it belongs to, has ended (canceled, say, #202): work still
+   * under way for it (a Worker starting, an integration, a roll-up) must not record anything more.
+   */
+  #ended(taskId: string): boolean {
+    const { tasks } = this.#state();
+    const root = taskId.split('/')[0] as string;
+    return [taskId, root].some((id) => {
+      const state = tasks[id]?.state;
+      return state !== undefined && TERMINAL.has(state);
+    });
   }
 
   #track<T>(p: Promise<T>): void {
@@ -327,11 +499,26 @@ export class MiniConductor {
     if (this.#planning.has(task.id)) return;
     this.#planning.add(task.id);
     const gen = this.#gen;
+    const abort = new AbortController();
+    this.#planAborts.set(task.id, abort);
+    // A task canceled while it was being planned keeps its state: the plan is dropped.
+    const dropped = () => {
+      const state = this.#state().tasks[task.id]?.state;
+      return !this.#live(gen) || (state !== undefined && TERMINAL.has(state));
+    };
     this.#track(
       (async () => {
         try {
-          const proposal = await this.#o.planner.plan(task, { signal: this.#abort.signal });
-          if (!this.#live(gen)) return;
+          if (this.#o.workspaces.head && !this.#target(task.id)) {
+            await this.#pinTarget(task.id, dropped);
+            if (dropped()) return;
+          }
+          const base = this.#target(task.id)?.commit;
+          const proposal = await this.#o.planner.plan(task, {
+            signal: AbortSignal.any([this.#abort.signal, abort.signal]),
+            ...(base !== undefined ? { base } : {}),
+          });
+          if (dropped()) return;
           const idOf = new Map(proposal.subtasks.map((s, i) => [s.key, `${task.id}/${i + 1}`]));
           const plan = TaskPlan.parse({
             subtasks: proposal.subtasks.map((s) => ({
@@ -340,6 +527,7 @@ export class MiniConductor {
               acceptanceCriteria: s.acceptanceCriteria,
               kind: s.kind ?? 'implement',
               dependsOn: (s.dependsOn ?? []).map((d) => idOf.get(d) ?? d),
+              ...(s.indivisible ? { indivisible: true } : {}),
             })),
             ...(proposal.planner ? { planner: proposal.planner } : {}),
             ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
@@ -371,7 +559,7 @@ export class MiniConductor {
             this.#env(task.id, 'task.status', { state: 'working' }),
           ]);
         } catch (err) {
-          if (!this.#live(gen)) return;
+          if (dropped()) return;
           this.#errors.push(err);
           this.#o.store.append(
             this.#env(task.id, 'task.status', {
@@ -381,6 +569,7 @@ export class MiniConductor {
           );
         } finally {
           this.#planning.delete(task.id);
+          if (this.#planAborts.get(task.id) === abort) this.#planAborts.delete(task.id);
           this.#kick();
         }
       })(),
@@ -412,6 +601,7 @@ export class MiniConductor {
       // One sub-task that cannot start must not hold up the others, nor be retried every tick.
       await this.#run(id, gen).catch((err: unknown) => {
         this.#errors.push(err);
+        if (this.#ended(id)) return;
         this.#o.store.append(
           this.#env(id, 'task.status', {
             state: 'failed',
@@ -533,15 +723,12 @@ export class MiniConductor {
     );
   }
 
-  #tierFor(kind: string | undefined): { adapter: string; model?: string; effort?: string } {
+  #tierFor(kind: string | undefined): TierConfig & { role: string } {
     const tiers = this.#o.config.tiers ?? {};
-    const tier = (kind === 'review' ? tiers.review : undefined) ?? tiers.worker;
+    const review = kind === 'review' ? tiers.review : undefined;
+    const tier = review ?? tiers.worker;
     if (!tier) throw new Error('config has no tiers.worker');
-    return {
-      adapter: tier.adapter,
-      ...(tier.model !== undefined ? { model: tier.model } : {}),
-      ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
-    };
+    return { ...tier, role: review ? 'review' : 'worker' };
   }
 
   /** Pending sub-tasks behind a failed one can never run: fail them. */
@@ -609,6 +796,8 @@ export class MiniConductor {
       // The parent's branch gets the work of every sub-task (#134).
       const published = done ? await this.#publish(parent.task.id, results) : undefined;
       if (!this.#live(gen)) return;
+      // Canceled while its work was being published (#202): it keeps that state.
+      if (this.#ended(parent.task.id)) continue;
       const statuses = results.map((r) => r.verification?.status);
       const verification: VerificationStatus =
         !done || statuses.includes('failed')
@@ -643,6 +832,9 @@ export class MiniConductor {
           ...results.flatMap((r) => r.openQuestions ?? []),
           ...(published?.question ? [published.question] : []),
         ],
+        ...(published?.commit && published.ref
+          ? { published: { ref: published.ref, commit: published.commit } }
+          : {}),
       };
       this.#o.store.append([
         this.#env(parent.task.id, 'task.result', summary),
@@ -652,6 +844,181 @@ export class MiniConductor {
         }),
       ]);
     }
+  }
+
+  // ---- target (#219) --------------------------------------------------------------------
+
+  /**
+   * Record where a task starts and lands, once, before it is planned: the repo's checked-out branch
+   * and commit now. Sub-tasks without dependencies start from that commit, so the user switching
+   * branch mid-task moves none of them. Without `Workspaces.head` nothing is recorded and
+   * sub-tasks start where the main checkout is when they start, as before. If it fails, it throws,
+   * and planning fails with its message: no checkout could be made there either.
+   */
+  async #pinTarget(taskId: string, dropped: () => boolean): Promise<void> {
+    if (this.#target(taskId) || !this.#o.workspaces.head) return;
+    let head: { branch?: string; commit: string };
+    try {
+      head = await this.#o.workspaces.head();
+    } catch (err) {
+      throw new Error(`cannot tell which branch the task targets: ${(err as Error).message}`);
+    }
+    // Canceled, or the Mini-conductor stopped, meanwhile: nothing more is written for it.
+    if (dropped() || this.#target(taskId)) return;
+    const target = TaskTarget.safeParse(head);
+    if (!target.success) throw new Error('cannot tell which branch the task targets');
+    // The ref first (#236): git gc then never prunes the commit, even if the branch is rewritten.
+    try {
+      await this.#o.workspaces.pin?.(taskId, target.data.commit);
+    } catch (err) {
+      throw new Error(`cannot hold the task's target commit: ${(err as Error).message}`);
+    }
+    if (dropped() || this.#target(taskId)) return;
+    this.#o.store.append(this.#env(taskId, 'task.target', target.data));
+  }
+
+  #target(taskId: string): TaskTarget | undefined {
+    const last = this.#o.store.query({ taskId, typePrefix: 'task.target' }).at(-1)?.envelope.data;
+    const parsed = TaskTarget.safeParse(last);
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  #rootOf(taskId: string): string {
+    const tasks = this.#state().tasks;
+    let id = taskId;
+    for (let parent = tasks[id]?.task.parentId; parent; parent = tasks[id]?.task.parentId) {
+      id = parent;
+    }
+    return id;
+  }
+
+  // ---- landed results (#210) ------------------------------------------------------------
+
+  #sweep(): void {
+    // One per generation: a sweep left over from before a stop exits at its next liveness check.
+    if (!this.#started || this.#sweepingGen === this.#gen) return;
+    const gen = this.#gen;
+    this.#sweepingGen = gen;
+    this.#track(
+      this.#sweepLanded(gen).finally(() => {
+        if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
+      }),
+    );
+  }
+
+  /**
+   * Free the Worker checkouts of finished tasks whose result landed in its target (#210), when
+   * `worktrees.remove_merged` is on. The user merges outside Tacet, so this looks again on a slow
+   * timer: for each completed task with a published result and a checkout left, it records
+   * `task.landed` once the result is merged or squash-merged into the branch its checkouts started
+   * from (only when they all agree on one), then removes each checkout with the result as landed.
+   * The worktree manager still keeps any with local files or work the result does not contain.
+   */
+  async #sweepLanded(gen: number): Promise<void> {
+    if (this.#o.config.worktrees?.remove_merged === false) return;
+    const integrator = this.#o.integrator;
+    if (!integrator?.landed) return;
+    const v = this.#state();
+    const inUse = () =>
+      new Set([...[...this.#runs.values()].map((r) => r.workspace.id), ...this.#closing]);
+    for (const root of Object.values(v.tasks)) {
+      if (!this.#live(gen)) return;
+      if (root.task.parentId || root.state !== 'completed') continue;
+      const result = this.#o.store
+        .query({ taskId: root.task.id, typePrefix: 'task.result' })
+        .at(-1)?.envelope;
+      const published = (result?.data as SummaryPacket | undefined)?.published;
+      if (!result || !published) continue;
+      const subs = new Set(
+        Object.values(v.tasks)
+          .filter((t) => t.task.parentId === root.task.id)
+          .map((t) => t.task.id),
+      );
+      const sessions = [...v.sessions.values()].filter((s) => subs.has(s.taskId));
+      const busy = inUse();
+      const workspaceIds = [
+        ...new Set(sessions.flatMap((s) => (s.workspaceId ? [s.workspaceId] : []))),
+      ].filter((id) => !busy.has(id));
+      const left: string[] = [];
+      for (const id of workspaceIds) if (await this.#o.workspaces.get(id)) left.push(id);
+      if (left.length === 0 || !this.#live(gen)) continue;
+
+      // The target recorded when the task started (#219); older tasks: the one branch their
+      // checkouts agree they started from.
+      const pinned = this.#target(root.task.id);
+      const recorded = this.#o.store
+        .query({ taskId: root.task.id, typePrefix: 'task.landed' })
+        .some((e) => (e.envelope.data as { commit?: unknown }).commit === published.commit);
+      if (!recorded) {
+        const branches = pinned
+          ? new Set(pinned.branch ? [pinned.branch] : [])
+          : new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
+        // No target (a task started on a detached HEAD), or sub-tasks that started from different
+        // branches: nothing to compare.
+        if (branches.size !== 1) continue;
+        const target = `refs/heads/${[...branches][0]}`;
+        let landed: Awaited<ReturnType<NonNullable<Integrator['landed']>>>;
+        try {
+          landed = await integrator.landed(published.commit, target);
+        } catch (err) {
+          const key = `${root.task.id} ${(err as Error).message}`;
+          if (!this.#sweepErrors.has(key)) {
+            this.#sweepErrors.add(key);
+            this.#errors.push(err);
+          }
+          continue;
+        }
+        if (!landed || !this.#live(gen)) continue;
+        this.#o.store.append({
+          ...this.#env(root.task.id, 'task.landed', {
+            commit: published.commit,
+            target,
+            how: landed.how,
+            ...(landed.landedAs ? { landedAs: landed.landedAs } : {}),
+          }),
+          causationId: result.id,
+        });
+      }
+      for (const id of left) {
+        if (!this.#live(gen) || inUse().has(id)) continue;
+        const superseded = await this.#supersededIn(id, sessions);
+        if (!this.#live(gen) || inUse().has(id)) continue;
+        // Kept (local files, or work none of these contain) until the user forces it.
+        await this.#o.workspaces
+          .remove(id, { landed: [published.commit, ...superseded] })
+          .catch(() => {});
+      }
+    }
+  }
+
+  /**
+   * Owner decision on #210: a commit integrated and then replaced by a later integration counts as
+   * covered once its task landed. Narrowed so it never frees work that did not land: only commits
+   * of a session that ran in this checkout, replaced by that same session's next integration, and
+   * only as an amend does (the same first parent), never unrelated work after a reset. Reflog
+   * reachability alone never counts.
+   */
+  async #supersededIn(workspaceId: string, sessions: readonly SessionRecord[]): Promise<string[]> {
+    const replaces = this.#o.integrator?.replaces?.bind(this.#o.integrator);
+    if (!replaces) return [];
+    const superseded: string[] = [];
+    const workspace = await this.#o.workspaces.get(workspaceId);
+    if (!workspace) return [];
+    for (const s of sessions) {
+      if (s.workspaceId !== workspaceId) continue;
+      const integrated = this.#o.store
+        .query({ sessionId: s.sessionId, typePrefix: 'worker.integrated' })
+        .map((e) => e.envelope.data as { sessionId?: unknown; commit?: unknown })
+        .filter((d) => d.sessionId === s.sessionId && typeof d.commit === 'string')
+        .map((d) => d.commit as string);
+      for (let i = 0; i + 1 < integrated.length; i += 1) {
+        const [earlier, later] = [integrated[i], integrated[i + 1]] as [string, string];
+        if (await replaces(earlier, later, workspace).catch(() => false)) {
+          superseded.push(earlier);
+        }
+      }
+    }
+    return superseded;
   }
 
   /**
@@ -716,7 +1083,7 @@ export class MiniConductor {
 
   /**
    * Where a new checkout of `subtaskId` starts (#134): the combined work of the sub-tasks it
-   * depends on, or the main branch. When their work conflicts, the user is asked first
+   * depends on, or the task's pinned target (#219; older tasks: the main branch). When their work conflicts, the user is asked first
    * (undefined: nothing runs). Once they answered, it starts from the first dependency's work,
    * and the Worker is told to merge the rest.
    */
@@ -728,13 +1095,17 @@ export class MiniConductor {
     const deps = this.#dependencies(subtaskId)
       .map((id) => ({ id, commit: this.#resultCommit(id) }))
       .filter((d): d is { id: string; commit: string } => d.commit !== undefined);
-    if (!integrator || deps.length === 0) return { notes: [] };
+    if (!integrator || deps.length === 0) {
+      // Nothing to combine: the task's pinned target, wherever the main checkout is now (#219).
+      const target = this.#target(this.#rootOf(subtaskId));
+      return { ...(target ? { commit: target.commit } : {}), notes: [] };
+    }
     try {
       const commit = await integrator.combine(deps.map((d) => d.commit));
       this.#combineFailures.delete(subtaskId);
       return { ...(commit !== undefined ? { commit } : {}), notes: [] };
     } catch (err) {
-      if (!this.#live(gen)) return undefined;
+      if (!this.#live(gen) || this.#ended(subtaskId)) return undefined;
       this.#errors.push(err);
       if (!(err instanceof MergeConflictError)) {
         // A git error (a timeout, say) may pass: try again on later ticks, a few times.
@@ -802,7 +1173,8 @@ export class MiniConductor {
   // ---- Workers ---------------------------------------------------------------------------
 
   async #run(subtaskId: string, gen: number): Promise<void> {
-    if (this.#runs.has(subtaskId) || !this.#live(gen)) return;
+    // A tick's ready list can outlive a cancellation made while an earlier run of it started.
+    if (this.#runs.has(subtaskId) || !this.#live(gen) || this.#ended(subtaskId)) return;
     const v = this.#state();
     const view = v.tasks[subtaskId];
     if (!view) return;
@@ -821,6 +1193,26 @@ export class MiniConductor {
     }
     const tier = this.#tierFor(v.kinds.get(subtaskId));
     const worker = this.#o.adapters[tier.adapter] as WorkerAdapter;
+    // Model, effort and context window within the tier's bounds (#110); outside them, the
+    // sub-task fails before any session starts.
+    let profile: ChosenProfile;
+    try {
+      profile = chooseProfile({
+        role: tier.role,
+        tier,
+        capabilities: worker.adapter.capabilities(),
+        failedAttempts: failed,
+        indivisible: v.indivisible.has(subtaskId),
+      });
+    } catch (err) {
+      this.#o.store.append(
+        this.#env(subtaskId, 'task.status', {
+          state: 'failed',
+          message: `session profile refused: ${(err as Error).message}`,
+        }),
+      );
+      return;
+    }
     const last = history.at(-1);
     // Reuse the checkout of an earlier run: a restart or a retry continues the same work.
     // Never one whose checkout failed the integrity checks: that run gets a fresh checkout.
@@ -855,6 +1247,8 @@ export class MiniConductor {
       await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
       if (!this.#live(gen)) return;
     }
+    // Canceled while the checkout was being made: start nothing (#202).
+    if (this.#ended(subtaskId)) return;
     // Intent first: a crash after this leaves a record of the session and its checkout.
     this.#o.store.append([
       this.#env(
@@ -863,20 +1257,24 @@ export class MiniConductor {
         {
           sessionId,
           adapter: tier.adapter,
-          ...(tier.model !== undefined ? { model: tier.model } : {}),
+          ...(profile.model !== undefined ? { model: profile.model } : {}),
           workspaceId: workspace.id,
           attempt: failed + 1,
           ...(last ? { previousSessionId: last.sessionId } : {}),
           ...(baseCommit !== undefined ? { baseCommit } : {}),
+          ...(workspace.baseBranch !== undefined ? { baseBranch: workspace.baseBranch } : {}),
         },
         sessionId,
       ),
+      this.#env(subtaskId, 'worker.profile', { sessionId, ...profile }, sessionId),
       ...(view.state !== 'working'
         ? [this.#env(subtaskId, 'task.status', { state: 'working' })]
         : []),
     ]);
     let revoke = () => {};
     let mcpServerName = '';
+    /** Set when the adapter refused a part with no fallback: the sub-task fails, no retry. */
+    let profileRefused: string | undefined;
     let handle: SessionHandle;
     // Recorded before the vendor process exists, so a crash at any point after this leaves it
     // findable (#127).
@@ -887,15 +1285,46 @@ export class MiniConductor {
       const minted = this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId });
       revoke = minted.revoke;
       mcpServerName = minted.config.name;
-      handle = await worker.adapter.start({
-        cwd: workspace.path,
-        systemPrompt: WORKER_SYSTEM_PROMPT,
-        mcpServers: [minted.config],
-        ...(tier.model !== undefined ? { model: tier.model } : {}),
-        ...(tier.effort !== undefined ? { effort: tier.effort } : {}),
-        ...(resume ? { resume } : {}),
-        env: { [WORKER_MARKER_VAR]: marker },
-      });
+      const launch = (p: ChosenProfile) =>
+        worker.adapter.start({
+          cwd: workspace.path,
+          systemPrompt: WORKER_SYSTEM_PROMPT,
+          mcpServers: [minted.config],
+          ...(p.model !== undefined ? { model: p.model } : {}),
+          ...(p.effort !== undefined ? { effort: p.effort } : {}),
+          ...(p.contextWindow !== undefined ? { contextWindow: p.contextWindow } : {}),
+          ...(resume ? { resume } : {}),
+          env: { [WORKER_MARKER_VAR]: marker },
+        });
+      // A refused part (#110) is logged and dropped or lowered, and the session started again:
+      // a cost lever is not worth a failed attempt. A refused model has no fallback.
+      for (;;) {
+        try {
+          handle = await launch(profile);
+          break;
+        } catch (err) {
+          const field = refusedField(err);
+          if (field === undefined || !this.#live(gen)) throw err;
+          const message = redactSecrets((err as Error).message);
+          this.#o.store.append(
+            this.#env(
+              subtaskId,
+              'worker.profile',
+              { sessionId, ...profile, refused: { field, message } },
+              sessionId,
+            ),
+          );
+          const next = afterRefusal(profile, field, tier.role, tier);
+          if (!next) {
+            profileRefused = `the adapter refused the ${field}: ${message}`;
+            throw err;
+          }
+          profile = next;
+          this.#o.store.append(
+            this.#env(subtaskId, 'worker.profile', { sessionId, ...profile }, sessionId),
+          );
+        }
+      }
     } catch (err) {
       revoke();
       // Whatever a failed start left running goes now, not at the next restart.
@@ -904,7 +1333,8 @@ export class MiniConductor {
           if (this.#markers.delete(sessionId)) this.#saveMarkers();
         }),
       );
-      if (!this.#live(gen)) return;
+      // Canceled meanwhile: the cancellation already recorded this session's end (#202).
+      if (!this.#live(gen) || this.#ended(subtaskId)) return;
       this.#errors.push(err);
       this.#o.store.append(
         this.#env(
@@ -916,14 +1346,31 @@ export class MiniConductor {
       );
       // A resume that failed is not tried again (the next run starts afresh): drop its state.
       if (resume) await this.#discard(tier.adapter, resume.vendorSessionId, workspace.path);
+      if (profileRefused !== undefined) {
+        // The same profile would be refused every time: fail now instead of using up retries.
+        this.#o.store.append(
+          this.#env(subtaskId, 'task.status', {
+            state: 'failed',
+            message: `session profile refused: ${profileRefused}`,
+          }),
+        );
+        this.#kick();
+        return;
+      }
       this.#afterFailure(subtaskId);
       return;
     }
-    if (!this.#live(gen)) {
-      // Stopped while the session started: give it back without registering it.
+    if (!this.#live(gen) || this.#ended(subtaskId)) {
+      // Stopped or canceled while the session started: give it back without registering it.
+      // A cancellation already recorded its end.
+      const canceled = this.#live(gen);
       revoke();
       await worker.adapter.close(handle).catch(() => {});
       if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      // A canceled session is never resumed: its vendor state can go (#153).
+      if (canceled && handle.vendorSessionId) {
+        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
+      }
       return;
     }
     const run: Run = {
@@ -994,18 +1441,47 @@ export class MiniConductor {
         else if (e.t === 'tool.result') run.openTools.delete(e.id);
         else if (e.t === 'status' && e.state !== 'running') run.openTools.clear();
         if (e.t === 'approval.request') {
-          // Calls to the Mini-conductor's own MCP tools are what a Worker is for; anything else
-          // is refused until policies exist (#25). A refused Worker can escalate.
+          // Calls to the Mini-conductor's own MCP tools are what a Worker is for. Otherwise the
+          // interim policy until #25 (#200): file tools inside the Worker's own checkout only;
+          // everything else is refused, and a refused Worker can escalate.
+          const own = isOwnMcpTool(e, run.mcpServerName);
+          const d = own
+            ? undefined
+            : decideToolRequest(
+                {
+                  adapterId: run.adapterId,
+                  toolName: e.toolName,
+                  input: (e.requestedGrant as { input?: unknown } | undefined)?.input,
+                },
+                run.workspace.path,
+              );
+          if (d) {
+            // Owner decision on #200: refusals are summary-grade (kept and forwarded), allows are
+            // transcript-grade (`agent.approval.decision`, dropped by retention).
+            this.#o.store.append(
+              this.#env(
+                run.subtaskId,
+                d.allow ? 'agent.approval.decision' : 'worker.approval',
+                {
+                  sessionId: run.sessionId,
+                  requestId: e.id.slice(0, 200),
+                  ...(e.toolName ? { toolName: e.toolName.slice(0, 200) } : {}),
+                  decision: d.allow ? 'allowed' : 'refused',
+                  reason: d.reason.slice(0, 2000),
+                },
+                run.sessionId,
+              ),
+            );
+          }
           await worker.adapter.respond(
             run.handle,
             e.id,
-            isOwnMcpTool(e, run.mcpServerName)
+            own || d?.allow
               ? { kind: 'allow_once', persist: false }
               : {
                   kind: 'reject',
                   persist: false,
-                  message:
-                    'Not approved: unattended Worker. Use the escalate tool if you need this.',
+                  message: `Not approved: ${d?.reason ?? 'unattended Worker'}. Unattended Workers may only use file tools inside their own checkout; use the escalate tool if you need more.`,
                 },
           );
         } else if (e.t === 'status') {
@@ -1092,6 +1568,7 @@ export class MiniConductor {
           ended = true;
           return;
         }
+        if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
         this.#o.store.append(this.#env(run.subtaskId, 'task.status', { state: 'input_required' }));
         return;
       }
@@ -1102,11 +1579,30 @@ export class MiniConductor {
         ended = true;
         return;
       }
-      const verification = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
-        view.task,
-        run.workspace,
-      );
+      // Ended meanwhile (canceled, say): nothing more is run in its checkout.
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // One round per check: the commands and the review of the same commit share it.
+      const round = this.#verifyRounds(run);
+      let verification: VerifyResult;
+      try {
+        verification = await this.#verify(run, view.task, round);
+      } catch (err) {
+        if (!(err instanceof WorktreeRefusedError)) throw err;
+        ended = true;
+        await this.#refused(run);
+        return;
+      }
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // Review only work whose commands did not fail: a reviewer cannot pass failing tests.
+      if (verification.status !== 'failed') {
+        const review = await this.#review(run, view.task, round);
+        if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+        if (review) verification = withReview(verification, review);
+      }
+      if (verification.status === 'failed' && (await this.#sendFix(run, verification))) {
+        // The same session fixes it: its next turn's end verifies again.
+        return;
+      }
       if (verification.status === 'failed') {
         this.#o.store.append(
           this.#env(run.subtaskId, 'task.result', this.#summary(run, 'failed', verification)),
@@ -1130,7 +1626,15 @@ export class MiniConductor {
     }
   }
 
-  #summary(run: Run, outcome: 'completed' | 'failed', verification: Verification): SummaryPacket {
+  #summary(run: Run, outcome: 'completed' | 'failed', result: VerifyResult): SummaryPacket {
+    // What goes up is the verification, never the feedback meant for the Worker (8 KB of output).
+    const verification: Verification = {
+      status: result.status,
+      commands: result.commands,
+      ...(result.notes !== undefined ? { notes: result.notes } : {}),
+      ...(result.results !== undefined ? { results: result.results } : {}),
+      ...(result.review !== undefined ? { review: result.review } : {}),
+    };
     const text = (run.lastMessage ?? run.text).trim();
     return {
       v: 1,
@@ -1170,16 +1674,10 @@ export class MiniConductor {
       return true;
     } catch (err) {
       this.#errors.push(err);
+      // Ended meanwhile (canceled, say): its end is recorded already.
+      if (this.#runs.get(run.subtaskId) !== run) return false;
       if (err instanceof WorktreeRefusedError) {
-        // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
-        this.#raise(
-          run.subtaskId,
-          `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
-          { urgency: 'high' },
-        );
-        await this.#end(run, 'canceled', 'checkout failed its integrity checks', {
-          workspaceRefused: true,
-        });
+        await this.#refused(run);
         return false;
       }
       if (opts.bestEffort) return true;
@@ -1200,10 +1698,251 @@ export class MiniConductor {
     }
   }
 
+  /** The Worker's checkout failed its integrity checks: ask the user, end the run. */
+  async #refused(run: Run): Promise<void> {
+    // Ended meanwhile (canceled, say): nothing to ask about a run that no longer exists.
+    if (this.#runs.get(run.subtaskId) !== run) return;
+    // Paths stay out: escalations go up to the Conductor. The workspace is named by id.
+    this.#raise(
+      run.subtaskId,
+      `The Worker's checkout ${run.workspace.id} for ${run.subtaskId} failed its integrity checks, so nothing was run in it. Inspect it; when you answer, the sub-task runs again in a fresh checkout.`,
+      { urgency: 'high' },
+    );
+    await this.#end(run, 'canceled', 'checkout failed its integrity checks', {
+      workspaceRefused: true,
+    });
+  }
+
+  /**
+   * Verify a finished turn (#19): with the process marker recorded first (a crash mid-run ends
+   * what the commands started at the next start) and aborted if the session ends meanwhile.
+   * Each command's result becomes a `worker.verification` event; the output never does.
+   */
+  async #verify(run: Run, task: Task, round: number): Promise<VerifyResult> {
+    const commands = this.#o.config.verify ?? [];
+    if (CODEX_ADAPTERS.has(run.adapterId) && !VERIFY_CODEX_WORKERS && commands.length > 0) {
+      return { status: 'not_run', commands, notes: CODEX_NOT_VERIFIED };
+    }
+    const abort = new AbortController();
+    run.verifyAbort = abort;
+    const marker = newWorkerMarker();
+    const key = `verify:${run.sessionId}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    let ranCommand = false;
+    try {
+      const result = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
+        task,
+        run.workspace,
+        {
+          ...(run.commit !== undefined ? { commit: run.commit } : {}),
+          signal: AbortSignal.any([abort.signal, this.#abort.signal]),
+          marker,
+          onCommand: (r) => {
+            ranCommand = true;
+            this.#o.store.append(
+              this.#env(
+                run.subtaskId,
+                'worker.verification',
+                {
+                  sessionId: run.sessionId,
+                  round,
+                  command: redactSecrets(r.command),
+                  status: r.status,
+                  ...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
+                  ...(r.signal !== undefined ? { signal: r.signal } : {}),
+                  durationMs: r.durationMs ?? 0,
+                  ...(run.commit !== undefined ? { commit: run.commit } : {}),
+                },
+                run.sessionId,
+              ),
+            );
+          },
+        },
+      );
+      if (result.status === 'failed' && !ranCommand) {
+        // Failed before any command (the checkout was not clean): still a round, so the fix
+        // loop ends.
+        this.#o.store.append(
+          this.#env(
+            run.subtaskId,
+            'worker.verification',
+            {
+              sessionId: run.sessionId,
+              round,
+              command: CHECKOUT_CHECK,
+              status: 'failed',
+              durationMs: 0,
+              ...(run.commit !== undefined ? { commit: run.commit } : {}),
+            },
+            run.sessionId,
+          ),
+        );
+      }
+      return result;
+    } catch (err) {
+      this.#errors.push(err);
+      // The checkout failed its integrity checks: the caller handles it as integration does.
+      if (err instanceof WorktreeRefusedError) throw err;
+      // No message: it can name paths, which stay out of what goes up.
+      return {
+        status: 'failed',
+        commands,
+        notes: 'Verification could not run (see the Mini-conductor log).',
+      };
+    } finally {
+      if (run.verifyAbort === abort) run.verifyAbort = undefined;
+      if (this.#markers.get(key) === marker) {
+        this.#markers.delete(key);
+        this.#saveMarkers();
+      }
+    }
+  }
+
+  /**
+   * Review a finished turn's integrated change (#19), when review is on: the reviewer's process
+   * marker recorded first, aborted if the session ends. Undefined when there is nothing to
+   * review: review off or no commit integrated (whatever the sub-task's kind: a commit is
+   * reviewed). The verdict becomes a `worker.review` event (counts only) and its usage is
+   * charged to the sub-task; a review that was stopped records only its usage, so it uses no
+   * fix round.
+   */
+  async #review(run: Run, task: Task, round: number): Promise<ReviewResult | undefined> {
+    const reviewer = this.#o.reviewer;
+    if (!this.#o.config.review?.enabled || !reviewer || run.commit === undefined) return undefined;
+    const tier = this.#o.config.tiers?.review;
+    const commit = run.commit;
+    const abort = new AbortController();
+    run.verifyAbort = abort;
+    const marker = newWorkerMarker();
+    const key = `review:${run.sessionId}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    const started = this.#now().getTime();
+    const signal = AbortSignal.any([abort.signal, this.#abort.signal]);
+    let result: ReviewResult;
+    try {
+      result = await reviewer.review(task, {
+        commit,
+        ...(run.baseCommit !== undefined ? { base: run.baseCommit } : {}),
+        signal,
+        marker,
+      });
+    } catch (err) {
+      this.#errors.push(err);
+      result = {
+        status: 'error',
+        adapter: tier?.adapter ?? 'unknown',
+        findings: [],
+        notes: 'the review could not run (see the Mini-conductor log)',
+      };
+    } finally {
+      if (run.verifyAbort === abort) run.verifyAbort = undefined;
+      // Whatever the reviewer's session left running goes with it.
+      await endMarkedProcesses([marker]).catch(() => undefined);
+      if (this.#markers.get(key) === marker) {
+        this.#markers.delete(key);
+        this.#saveMarkers();
+      }
+    }
+    const usage = result.usage
+      ? [
+          this.#env(run.subtaskId, 'agent.usage', {
+            t: 'usage',
+            source: 'reported',
+            ...result.usage,
+          }),
+        ]
+      : [];
+    if (signal.aborted) {
+      // Stopped, not judged: the session ended or the Mini-conductor stopped. No round is used.
+      if (usage.length > 0) this.#o.store.append(usage);
+      return undefined;
+    }
+    const count = (sev: string) => result.findings.filter((f) => f.severity === sev).length;
+    this.#o.store.append([
+      this.#env(
+        run.subtaskId,
+        'worker.review',
+        {
+          sessionId: run.sessionId,
+          ...(result.sessionId !== undefined ? { reviewerSessionId: result.sessionId } : {}),
+          round,
+          adapter: result.adapter,
+          ...(result.model !== undefined ? { model: result.model } : {}),
+          status: result.status,
+          blockers: count('blocker'),
+          majors: count('major'),
+          minors: count('minor'),
+          durationMs: Math.max(0, this.#now().getTime() - started),
+          commit,
+        },
+        run.sessionId,
+      ),
+      ...usage,
+    ]);
+    return result;
+  }
+
+  /**
+   * Verification rounds this attempt already had (each recorded its commands under one round):
+   * those of every session started under the same attempt number, so a restart (which resumes
+   * without counting as a failed attempt) does not buy fix rounds, while a retry after a failed
+   * attempt starts afresh even in the same checkout.
+   * A round a restart cut short (its commands `aborted`) counts too: the restart re-checks.
+   */
+  #verifyRounds(run: Run): number {
+    const started = this.#o.store
+      .query({ taskId: run.subtaskId, typePrefix: 'worker.started' })
+      .map((e) => e.envelope.data as { sessionId?: string; attempt?: number });
+    const attempt = started.find((d) => d.sessionId === run.sessionId)?.attempt;
+    const sessions = new Set([run.sessionId]);
+    for (const d of started) {
+      if (d.sessionId && attempt !== undefined && d.attempt === attempt) sessions.add(d.sessionId);
+    }
+    const rounds = new Set<string>();
+    // Commands and reviews alike: a repo without `verify` commands still has a cap on reviews.
+    for (const e of this.#o.store.query({ taskId: run.subtaskId, typePrefix: 'worker' })) {
+      if (e.envelope.type !== 'worker.verification' && e.envelope.type !== 'worker.review')
+        continue;
+      const d = e.envelope.data as { sessionId?: string; round?: number };
+      if (d.sessionId && sessions.has(d.sessionId) && typeof d.round === 'number') {
+        rounds.add(`${d.sessionId}:${d.round}`);
+      }
+    }
+    return rounds.size;
+  }
+
+  /**
+   * A failed verification goes back to the same session to fix, while fix rounds are left
+   * (`workers.verify_fix_attempts`). False when it should fail the attempt instead.
+   */
+  async #sendFix(run: Run, verification: VerifyResult): Promise<boolean> {
+    const allowed = this.#o.config.workers?.verify_fix_attempts ?? 2;
+    // The round that just failed is recorded: rounds so far = fix rounds used + 1.
+    if (!verification.feedback || this.#verifyRounds(run) > allowed) return false;
+    const worker = this.#o.adapters[run.adapterId];
+    if (!worker) return false;
+    run.turnActive = true;
+    run.settling = false;
+    run.lastActivity = this.#now().getTime();
+    run.nudgedAt = undefined;
+    try {
+      await worker.adapter.send(run.handle, { text: safePrompt([verification.feedback]) });
+      return true;
+    } catch (err) {
+      run.turnActive = false;
+      run.settling = true;
+      this.#errors.push(err);
+      return false;
+    }
+  }
+
   #defaultVerifier(): Verifier {
     const commands = this.#o.config.verify ?? [];
     return {
       // #19 runs the commands and a reviewer; until then nothing is claimed as verified.
+      // Without a verifier (the entry point passes a `CommandVerifier`), nothing is claimed.
       verify: async () => ({ status: commands.length > 0 ? 'not_run' : 'passed', commands }),
     };
   }
@@ -1214,11 +1953,17 @@ export class MiniConductor {
       .query({ taskId: subtaskId, typePrefix: 'task.result' })
       .map((e) => e.envelope.data as SummaryPacket)
       .at(-1);
-    return last && last.outcome !== 'completed' ? last.summary.slice(0, 1000) : undefined;
+    if (!last || last.outcome === 'completed') return undefined;
+    const notes = last.verification.status === 'failed' ? last.verification.notes : undefined;
+    // Why the last attempt failed verification, so a fresh session does not repeat it (#19).
+    return notes
+      ? `${last.summary.slice(0, 1000)}\n\nVerification of that attempt: ${notes.slice(0, 2000)}`
+      : last.summary.slice(0, 1000);
   }
 
   /** After a failed run: retry (a restart does not count) or fail the sub-task for good. */
   #afterFailure(subtaskId: string): void {
+    if (this.#ended(subtaskId)) return;
     const failed = [...this.#state().sessions.values()].filter(
       (s) => s.taskId === subtaskId && s.ended !== undefined && COUNTED.has(s.ended),
     ).length;
@@ -1241,6 +1986,23 @@ export class MiniConductor {
     extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
     if (this.#runs.get(run.subtaskId) !== run) return;
+    // A verification still running for it stops (its result is not used).
+    run.verifyAbort?.abort();
+    // Until it is closed and discarded below, the landed sweep must not take its checkout.
+    this.#closing.add(run.workspace.id);
+    try {
+      await this.#endRun(run, reason, message, extra);
+    } finally {
+      this.#closing.delete(run.workspace.id);
+    }
+  }
+
+  async #endRun(
+    run: Run,
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled',
+    message: string | undefined,
+    extra: { workspaceRefused?: boolean },
+  ): Promise<void> {
     this.#runs.delete(run.subtaskId);
     run.revoke();
     this.#o.store.append(
@@ -1297,33 +2059,7 @@ export class MiniConductor {
    * whose environment carries one of their markers, the vendor's tools included.
    */
   async #endStaleWorkers(): Promise<void> {
-    const file = this.#processFile;
-    // Temp files of a write a crash interrupted.
-    try {
-      const dir = dirname(file);
-      const prefix = `${basename(file)}.`;
-      for (const name of readdirSync(dir)) {
-        if (name.startsWith(prefix) && name.endsWith('.tmp'))
-          rmSync(join(dir, name), { force: true });
-      }
-    } catch {
-      // No directory yet.
-    }
-    let markers: string[] = [];
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
-      markers = (Array.isArray(parsed) ? parsed : []).filter(isWorkerMarker);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.#errors.push(err);
-    }
-    if (markers.length > 0) {
-      const { left } = await endMarkedProcesses(markers);
-      if (left.length > 0) {
-        this.#errors.push(
-          new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`),
-        );
-      }
-    }
+    this.#errors.push(...(await endStaleWorkerProcesses(this.#processFile)));
     this.#markers.clear();
     this.#saveMarkers();
   }
@@ -1381,105 +2117,12 @@ export class MiniConductor {
 
   /** The current reading of the log, rebuilt only when it has grown. */
   #state(): View {
-    const count = this.#o.store.count();
-    if (this.#view && this.#view.count === count) return this.#view;
-    const tasks = this.#o.store.replay(tasksProjection).tasks;
-    const sessions = new Map<string, SessionRecord>();
-    const kinds = new Map<string, string>();
-    const escalations = new Map<string, EscalationRecord>();
-    const decisions = new Map<string, string>();
-    const progress = new Map<string, string>();
-    const progressAt = new Map<string, number>();
-    for (const { envelope: e } of this.#o.store.query({})) {
-      const d = (e.data ?? {}) as Record<string, unknown>;
-      const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
-      if (e.type === 'worker.progress') {
-        // Written by the MCP backend: the session is on the envelope, the report is the data.
-        const summary = str('summary');
-        if (summary && e.taskId) progress.set(e.taskId, summary);
-        if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
-      } else if (e.type.startsWith('worker.')) {
-        const id = str('sessionId');
-        if (!id || !e.taskId) continue;
-        if (e.type === 'worker.started') {
-          const adapter = str('adapter');
-          const workspaceId = str('workspaceId');
-          const baseCommit = str('baseCommit');
-          sessions.set(id, {
-            sessionId: id,
-            taskId: e.taskId,
-            ...(adapter ? { adapter } : {}),
-            ...(workspaceId ? { workspaceId } : {}),
-            ...(baseCommit ? { baseCommit } : {}),
-          });
-        } else {
-          const s = sessions.get(id);
-          if (!s) continue;
-          const vendor = str('vendorSessionId');
-          if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
-          else if (e.type === 'worker.ended') {
-            s.ended = str('reason') ?? 'failed';
-            if (d.workspaceRefused === true) s.refused = true;
-          }
-        }
-      } else if (e.type === 'task.planned') {
-        const plan = TaskPlan.safeParse(e.data);
-        if (plan.success) for (const s of plan.data.subtasks) kinds.set(s.id, s.kind);
-      } else if (e.type === 'escalation.raised') {
-        const id = str('id');
-        if (id && e.taskId) {
-          escalations.set(id, {
-            id,
-            taskId: e.taskId,
-            ...(e.sessionId ? { sessionId: e.sessionId } : {}),
-            ...(str('contextRef') ? { contextRef: str('contextRef') } : {}),
-            resolved: false,
-            delivered: false,
-          });
-        }
-      } else if (e.type === 'escalation.resolved') {
-        const x = escalations.get(str('escalationId') ?? '');
-        if (x) {
-          x.resolved = true;
-          const answer = str('answer');
-          const decisionId = str('decisionId');
-          if (answer !== undefined) x.answer = answer;
-          if (decisionId !== undefined) x.decisionId = decisionId;
-        }
-      } else if (e.type === 'escalation.delivered') {
-        const x = escalations.get(str('escalationId') ?? '');
-        if (x) x.delivered = true;
-      } else if (e.type === 'decision.recorded') {
-        const dec = d as Partial<Decision>;
-        if (typeof dec.id === 'string' && typeof dec.decision === 'string') {
-          decisions.set(dec.id, dec.decision);
-        }
-      }
-    }
-    // An answer given as a recorded decision (ADR-003 §4 DecisionExt) carries its text there.
-    for (const x of escalations.values()) {
-      if (x.answer === undefined && x.decisionId) {
-        const text = decisions.get(x.decisionId);
-        if (text !== undefined) x.answer = text;
-      }
-    }
-    this.#view = { count, tasks, sessions, kinds, escalations, decisions, progress, progressAt };
+    this.#view = readView(this.#o.store, this.#view);
     return this.#view;
   }
 
   #env(taskId: string, type: string, data: unknown, sessionId?: string): EventEnvelope {
-    const now = this.#now();
-    return {
-      v: 1,
-      id: newUlid(now.getTime()),
-      ts: now.toISOString(),
-      source: { kind: 'mini', id: this.#o.miniId ?? 'mini' },
-      ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
-      taskId,
-      ...(sessionId !== undefined ? { sessionId } : {}),
-      type,
-      data,
-    } as EventEnvelope;
+    return envelope(this.#o, this.#now(), taskId, type, data, sessionId);
   }
 
   #now(): Date {
@@ -1489,46 +2132,347 @@ export class MiniConductor {
   // ---- single instance -------------------------------------------------------------------
 
   #lock(): void {
-    const path = this.#o.lockPath;
-    if (HELD_LOCKS.has(path)) {
-      throw new Error('a Mini-conductor in this process is already running for this repo');
-    }
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-        HELD_LOCKS.add(path);
-        return;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      }
-      // Take a stale lock over by renaming it away first: of two processes doing this at once,
-      // only one rename succeeds, and the loser retries against the winner's new lock.
-      const aside = `${path}.${process.pid}.${randomUUID()}.stale`;
-      try {
-        renameSync(path, aside);
-      } catch {
-        continue;
-      }
-      const pid = Number.parseInt(readFileSync(aside, 'utf8'), 10);
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
-        // Not stale after all: put it back and refuse.
-        try {
-          renameSync(aside, path);
-        } catch {
-          rmSync(aside, { force: true });
-        }
-        throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
-      }
-      rmSync(aside, { force: true });
-    }
-    throw new Error('could not take the Mini-conductor lock');
+    takeMiniLock(this.#o.lockPath);
   }
 
   #unlock(): void {
-    if (!HELD_LOCKS.delete(this.#o.lockPath)) return;
-    rmSync(this.#o.lockPath, { force: true });
+    releaseMiniLock(this.#o.lockPath);
   }
+}
+
+/** An event of this Mini-conductor. */
+function envelope(
+  o: { miniId?: string; repo?: string },
+  now: Date,
+  taskId: string,
+  type: string,
+  data: unknown,
+  sessionId?: string,
+): EventEnvelope {
+  return {
+    v: 1,
+    id: newUlid(now.getTime()),
+    ts: now.toISOString(),
+    source: { kind: 'mini', id: o.miniId ?? 'mini' },
+    ...(o.repo !== undefined ? { repo: o.repo } : {}),
+    taskId,
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    type,
+    data,
+  } as EventEnvelope;
+}
+
+const CANCELED_MESSAGE = 'canceled by the user';
+
+/** Why `taskId` cannot be canceled, or undefined when it can. */
+function cancelProblem(v: View, taskId: string): string | undefined {
+  const t = Object.hasOwn(v.tasks, taskId) ? v.tasks[taskId] : undefined;
+  if (!t) return `unknown task ${taskId}`;
+  if (t.task.parentId !== undefined || taskId.includes('/')) {
+    return `${taskId} is a sub-task: cancel its task ${t.task.parentId ?? taskId.split('/')[0]}`;
+  }
+  if (TERMINAL.has(t.state)) return `task ${taskId} has already ended (${t.state})`;
+  return undefined;
+}
+
+type MakeEnvelope = (
+  taskId: string,
+  type: string,
+  data: unknown,
+  sessionId?: string,
+) => EventEnvelope;
+
+/**
+ * The events that cancel `taskId`: `worker.ended` (`canceled`) for each of its sessions with no
+ * end recorded, except `open` ones the caller ends itself, then `task.status canceled` for each
+ * unfinished sub-task and the task last.
+ */
+function cancelEvents(
+  v: View,
+  taskId: string,
+  env: MakeEnvelope,
+  opts: { open?: ReadonlySet<string> } = {},
+): { events: EventEnvelope[]; canceled: string[] } {
+  const ours = (id: string) => id === taskId || id.startsWith(`${taskId}/`);
+  const events: EventEnvelope[] = [];
+  for (const s of v.sessions.values()) {
+    if (s.ended === undefined && ours(s.taskId) && !opts.open?.has(s.sessionId)) {
+      events.push(
+        env(
+          s.taskId,
+          'worker.ended',
+          { sessionId: s.sessionId, reason: 'canceled', message: CANCELED_MESSAGE },
+          s.sessionId,
+        ),
+      );
+    }
+  }
+  const subs = Object.values(v.tasks)
+    .filter((t) => t.task.id !== taskId && ours(t.task.id) && !TERMINAL.has(t.state))
+    .map((t) => t.task.id)
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const canceled = [...subs, taskId];
+  for (const id of canceled) {
+    events.push(env(id, 'task.status', { state: 'canceled', message: CANCELED_MESSAGE }));
+  }
+  return { events, canceled };
+}
+
+export interface CancelStoppedOptions {
+  store: EventStore;
+  /** The repo's Mini-conductor lock: taken for the change, so no Mini-conductor runs meanwhile. */
+  lockPath: string;
+  /** Default `<lockPath>.workers`, as for `MiniConductor`. */
+  processFile?: string;
+  repo?: string;
+  miniId?: string;
+  now?: () => Date;
+}
+
+/**
+ * Cancel a task while no Mini-conductor runs for the repo (`tacet cancel`, #202): takes the
+ * repo's lock (throws if a live Mini-conductor holds it), ends Worker processes a crashed one
+ * left running, records the cancellation as `MiniConductor.cancel` does, and releases the lock.
+ * Returns the ids canceled and any problems met ending stale processes.
+ */
+export async function cancelStopped(
+  taskId: string,
+  o: CancelStoppedOptions,
+): Promise<{ canceled: string[]; errors: unknown[] }> {
+  takeMiniLock(o.lockPath);
+  try {
+    const problem = cancelProblem(readView(o.store), taskId);
+    if (problem) throw new Error(problem);
+    const file = o.processFile ?? `${o.lockPath}.workers`;
+    const errors = await endStaleWorkerProcesses(file);
+    // As `#saveMarkers` writes it: a crash mid-write never leaves a half-written file.
+    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tmp, '[]\n', { flag: 'wx', mode: 0o600 });
+      renameSync(tmp, file);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      errors.push(err);
+    }
+    const env: MakeEnvelope = (t, type, data, sessionId) =>
+      envelope(o, o.now?.() ?? new Date(), t, type, data, sessionId);
+    const { events, canceled } = cancelEvents(readView(o.store), taskId, env);
+    o.store.append(events);
+    return { canceled, errors };
+  } finally {
+    releaseMiniLock(o.lockPath);
+  }
+}
+
+/**
+ * Run `fn` while holding the repo's Mini-conductor lock as `tacet run` takes it (a live holder is
+ * refused, a stale lock is taken over), after ending the Worker processes a crashed Mini-conductor
+ * left running (#127), as `cancelStopped` does. For maintenance that must not race a run, such as
+ * `tacet uninstall --purge` (#211). Throws when a run holds the lock; returns `fn`'s result and the
+ * problems met ending stale Workers.
+ */
+export async function withStoppedMini<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+  processFile = `${lockPath}.workers`,
+): Promise<{ result: T; errors: unknown[] }> {
+  takeMiniLock(lockPath);
+  try {
+    const errors = existsSync(processFile) ? await endStaleWorkerProcesses(processFile) : [];
+    return { result: await fn(), errors };
+  } finally {
+    releaseMiniLock(lockPath);
+  }
+}
+
+/** One reading of the log, rebuilt only when it has grown since `prev`. */
+function readView(store: EventStore, prev?: View): View {
+  const count = store.count();
+  if (prev && prev.count === count) return prev;
+  const tasks = store.replay(tasksProjection).tasks;
+  const sessions = new Map<string, SessionRecord>();
+  const kinds = new Map<string, string>();
+  const indivisible = new Set<string>();
+  const escalations = new Map<string, EscalationRecord>();
+  const decisions = new Map<string, string>();
+  const progress = new Map<string, string>();
+  const progressAt = new Map<string, number>();
+  for (const { envelope: e } of store.query({})) {
+    const d = (e.data ?? {}) as Record<string, unknown>;
+    const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
+    if (e.type === 'worker.progress') {
+      // Written by the MCP backend: the session is on the envelope, the report is the data.
+      const summary = str('summary');
+      if (summary && e.taskId) progress.set(e.taskId, summary);
+      if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
+    } else if (e.type.startsWith('worker.')) {
+      const id = str('sessionId');
+      if (!id || !e.taskId) continue;
+      if (e.type === 'worker.started') {
+        const adapter = str('adapter');
+        const workspaceId = str('workspaceId');
+        const baseCommit = str('baseCommit');
+        const baseBranch = str('baseBranch');
+        sessions.set(id, {
+          sessionId: id,
+          taskId: e.taskId,
+          ...(adapter ? { adapter } : {}),
+          ...(workspaceId ? { workspaceId } : {}),
+          ...(baseCommit ? { baseCommit } : {}),
+          ...(baseBranch ? { baseBranch } : {}),
+        });
+      } else {
+        const s = sessions.get(id);
+        if (!s) continue;
+        const vendor = str('vendorSessionId');
+        if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
+        else if (e.type === 'worker.ended') {
+          s.ended = str('reason') ?? 'failed';
+          if (d.workspaceRefused === true) s.refused = true;
+        }
+      }
+    } else if (e.type === 'task.planned') {
+      const plan = TaskPlan.safeParse(e.data);
+      if (plan.success) {
+        for (const s of plan.data.subtasks) {
+          kinds.set(s.id, s.kind);
+          // Each plan is the full current one, so a replan can also clear the mark.
+          if (s.indivisible) indivisible.add(s.id);
+          else indivisible.delete(s.id);
+        }
+      }
+    } else if (e.type === 'escalation.raised') {
+      const id = str('id');
+      if (id && e.taskId) {
+        escalations.set(id, {
+          id,
+          taskId: e.taskId,
+          ...(e.sessionId ? { sessionId: e.sessionId } : {}),
+          ...(str('contextRef') ? { contextRef: str('contextRef') } : {}),
+          resolved: false,
+          delivered: false,
+        });
+      }
+    } else if (e.type === 'escalation.resolved') {
+      const x = escalations.get(str('escalationId') ?? '');
+      if (x) {
+        x.resolved = true;
+        const answer = str('answer');
+        const decisionId = str('decisionId');
+        if (answer !== undefined) x.answer = answer;
+        if (decisionId !== undefined) x.decisionId = decisionId;
+      }
+    } else if (e.type === 'escalation.delivered') {
+      const x = escalations.get(str('escalationId') ?? '');
+      if (x) x.delivered = true;
+    } else if (e.type === 'decision.recorded') {
+      const dec = d as Partial<Decision>;
+      if (typeof dec.id === 'string' && typeof dec.decision === 'string') {
+        decisions.set(dec.id, dec.decision);
+      }
+    }
+  }
+  // An answer given as a recorded decision (ADR-003 §4 DecisionExt) carries its text there.
+  for (const x of escalations.values()) {
+    if (x.answer === undefined && x.decisionId) {
+      const text = decisions.get(x.decisionId);
+      if (text !== undefined) x.answer = text;
+    }
+  }
+  return {
+    count,
+    tasks,
+    sessions,
+    kinds,
+    indivisible,
+    escalations,
+    decisions,
+    progress,
+    progressAt,
+  };
+}
+
+/** Take the repo's single-instance Mini-conductor lock, or throw when a live one holds it. */
+function takeMiniLock(path: string): void {
+  if (HELD_LOCKS.has(path)) {
+    throw new Error('a Mini-conductor in this process is already running for this repo');
+  }
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+      HELD_LOCKS.add(path);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    // Take a stale lock over by renaming it away first: of two processes doing this at once,
+    // only one rename succeeds, and the loser retries against the winner's new lock.
+    const aside = `${path}.${process.pid}.${randomUUID()}.stale`;
+    try {
+      renameSync(path, aside);
+    } catch {
+      continue;
+    }
+    const pid = Number.parseInt(readFileSync(aside, 'utf8'), 10);
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
+      // Not stale after all: put it back and refuse.
+      try {
+        renameSync(aside, path);
+      } catch {
+        rmSync(aside, { force: true });
+      }
+      throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
+    }
+    rmSync(aside, { force: true });
+  }
+  throw new Error('could not take the Mini-conductor lock');
+}
+
+/** Release a lock this process took with `takeMiniLock`. */
+function releaseMiniLock(path: string): void {
+  if (!HELD_LOCKS.delete(path)) return;
+  rmSync(path, { force: true });
+}
+
+/**
+ * End every process whose environment carries a marker in `file` (#127). The caller then records
+ * that none is left. Returns the problems met, for the caller to report.
+ */
+async function endStaleWorkerProcesses(file: string): Promise<unknown[]> {
+  const errors: unknown[] = [];
+  // Temp files of a write a crash interrupted.
+  try {
+    const dir = dirname(file);
+    const prefix = `${basename(file)}.`;
+    for (const name of readdirSync(dir)) {
+      if (name.startsWith(prefix) && name.endsWith('.tmp'))
+        rmSync(join(dir, name), { force: true });
+    }
+  } catch {
+    // No directory yet.
+  }
+  let markers: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(file, 'utf8'));
+    markers = (Array.isArray(parsed) ? parsed : []).filter(isWorkerMarker);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') errors.push(err);
+  }
+  if (markers.length > 0) {
+    const { left } = await endMarkedProcesses(markers);
+    if (left.length > 0) {
+      errors.push(new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`));
+    }
+  }
+  return errors;
+}
+
+/** The part an adapter's `ProfileRefusedError` names; matched by name, as across package copies. */
+function refusedField(err: unknown): ProfileField | undefined {
+  if (!(err instanceof Error) || err.name !== 'ProfileRefusedError') return undefined;
+  const field = (err as { field?: unknown }).field;
+  return field === 'model' || field === 'effort' || field === 'contextWindow' ? field : undefined;
 }
 
 function answerText(x: EscalationRecord): string {
@@ -1546,6 +2490,20 @@ function answerText(x: EscalationRecord): string {
  */
 export function isOwnMcpTool(e: { toolName?: string | undefined }, serverName: string): boolean {
   return TOOL_NAMES.some((t) => e.toolName === `mcp__${serverName}__${t}`);
+}
+
+/**
+ * The pid of the running Mini-conductor holding the lock at `lockPath` (`MiniConductorOptions`),
+ * or undefined when none is running. For `tacet status` (#21); never takes the lock.
+ */
+export function miniLockHolder(lockPath: string): number | undefined {
+  let pid: number;
+  try {
+    pid = Number.parseInt(readFileSync(lockPath, 'utf8'), 10);
+  } catch {
+    return undefined;
+  }
+  return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
 }
 
 /** Lock files held by Mini-conductors in this process. */

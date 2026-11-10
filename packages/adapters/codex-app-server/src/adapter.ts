@@ -1,6 +1,16 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -15,6 +25,7 @@ import {
   findSecrets,
   type InterruptResult,
   mcpHeaderSecrets,
+  ProfileRefusedError,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
@@ -28,6 +39,8 @@ import {
 } from '@tacet/core';
 import {
   defaultStateDir,
+  processGroupAlive,
+  processGroupGone,
   repoStateDir,
   SAFE_GIT_ARGS,
   trustedGitEnv,
@@ -62,7 +75,12 @@ export const CODEX_CAPABILITIES: AdapterCapabilities = {
   usage: { live: true, context: true, cost: 'none' },
   modelSwitch: 'per-turn',
   injectContext: false,
+  // `turn/start.effort` applies to that turn and later ones (verified on 0.167.0, #110). Codex
+  // lowers a level the model lacks to its highest one and passes unlisted names through, so the
+  // adapter checks each level against `model/list` first.
   effortSwitch: 'per-turn',
+  // No window can be chosen: `model_context_window` only shrinks the model's window (#110).
+  contextSizes: [],
 };
 
 export interface CodexAdapterOptions {
@@ -88,7 +106,11 @@ export interface CodexAdapterOptions {
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */
   codexPath?: string;
-  /** Milliseconds to wait for the process to exit after SIGTERM before SIGKILL. */
+  /**
+   * Milliseconds to wait for the process to exit after SIGTERM before SIGKILL, and again for the
+   * rest of its process group (#191). Default 5000. Worst-case `close()` is about
+   * 0.5 s + 2 × this + 1 s.
+   */
   killTimeoutMs?: number;
   /**
    * Extra non-secret `-c key=value` overrides for `codex app-server`, e.g.
@@ -118,6 +140,14 @@ export interface CodexAdapterOptions {
 
 type Queued = { text: string; model?: string; effort?: string };
 
+/** The part of a `model/list` entry the effort check reads (fields checked by schema.test.ts). */
+interface CodexModel {
+  id: string;
+  model: string;
+  isDefault: boolean;
+  supportedReasoningEfforts: { reasoningEffort: string }[];
+}
+
 interface PendingApproval {
   kind: 'command' | 'fileChange' | 'permissions' | 'elicitation';
   params: Record<string, unknown>;
@@ -139,11 +169,26 @@ interface Session {
   closing: boolean;
   ended: boolean;
   model: string | undefined;
+  /** Model and effort the queued turns leave in force, for checking the next `send()`. */
+  planned: { model: string | undefined; effort: string | undefined };
+  /** The `model/list` catalog, fetched once when an effort first needs checking. */
+  models: Promise<CodexModel[]> | undefined;
+  /** Sends still waiting on an effort check; later sends queue behind them, in order. */
+  sending: Promise<void> | undefined;
   secrets: string[];
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
   exited: Promise<void>;
-  /** Set synchronously on exit; after that the process group must never be signalled. */
+  /**
+   * Resolves once the process has exited and its whole group is gone: the one reap of the group
+   * (#198). `close()` waits on it rather than polling the group again, since an id seen empty
+   * may belong to another group by then.
+   */
+  gone?: Promise<void>;
+  /**
+   * Set synchronously on exit; after that the process group is signalled only right after a
+   * running member was seen (`#terminate`), never blindly: its id could be reused once empty.
+   */
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 }
 
@@ -159,6 +204,82 @@ const TOOL_ITEMS = new Set([
   'imageGeneration',
 ]);
 const ALL_OPTIONS: ApprovalOption[] = ['allow_once', 'allow_always', 'reject', 'cancel'];
+
+/** The effort in force after a send with `opts`. */
+const effortOf = (s: Session, opts?: SendOptions): string | undefined =>
+  opts?.effort ?? s.planned.effort;
+
+/** Effort stays in force across turns, so a model switch must keep it valid too. */
+function needsEffortCheck(s: Session, opts?: SendOptions): boolean {
+  const model = opts?.model ?? s.planned.model;
+  return (
+    effortOf(s, opts) !== undefined && (opts?.effort !== undefined || model !== s.planned.model)
+  );
+}
+
+/** At most this many `model/list` pages, so a server that repeats its cursor cannot loop. */
+const MODEL_LIST_MAX_PAGES = 50;
+
+/** The whole `model/list` catalog, hidden models included; malformed entries are skipped. */
+async function listModels(rpc: JsonRpcPeer): Promise<CodexModel[]> {
+  const out: CodexModel[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MODEL_LIST_MAX_PAGES; page++) {
+    const res = await rpc.request<Obj>('model/list', {
+      includeHidden: true,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const m of Array.isArray(res.data) ? res.data : []) {
+      if (
+        isObj(m) &&
+        typeof m.id === 'string' &&
+        typeof m.model === 'string' &&
+        Array.isArray(m.supportedReasoningEfforts)
+      ) {
+        out.push({
+          id: m.id,
+          model: m.model,
+          isDefault: m.isDefault === true,
+          supportedReasoningEfforts: m.supportedReasoningEfforts.filter(
+            (e): e is { reasoningEffort: string } =>
+              isObj(e) && typeof e.reasoningEffort === 'string',
+          ),
+        });
+      }
+    }
+    cursor = str(res.nextCursor);
+    if (!cursor || seen.has(cursor)) break;
+    seen.add(cursor);
+  }
+  return out;
+}
+
+/** The catalog, or a refusal the policy can fall back from when it cannot be read. */
+async function catalog(models: Promise<CodexModel[]>): Promise<CodexModel[]> {
+  try {
+    return await models;
+  } catch (err) {
+    throw new ProfileRefusedError('effort', `cannot read model/list: ${errorMessage(err)}`);
+  }
+}
+
+/**
+ * Refuse an effort the model does not list. Codex lowers an unsupported level such as `ultra`
+ * to the model's highest one and passes unknown names through (#110), so neither is left to it.
+ * A model the catalog does not cover is refused too: its levels cannot be confirmed.
+ */
+function checkEffort(models: CodexModel[], model: string | undefined, effort: string): void {
+  const m =
+    model === undefined
+      ? models.find((x) => x.isDefault)
+      : models.find((x) => x.id === model || x.model === model);
+  const name = model ?? 'the default model';
+  if (!m) throw new ProfileRefusedError('effort', `cannot confirm effort support for ${name}`);
+  if (!m.supportedReasoningEfforts.some((e) => e.reasoningEffort === effort)) {
+    throw new ProfileRefusedError('effort', `${name} does not support effort ${effort}`);
+  }
+}
 
 function defaultCodexPath(): string {
   const require = createRequire(import.meta.url);
@@ -188,6 +309,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
+    if (opts.contextWindow !== undefined) {
+      throw new ProfileRefusedError(
+        'contextWindow',
+        `Codex has no context-window choice; ${opts.contextWindow} cannot be honoured`,
+      );
+    }
     const route = this.#opts.authRoute ?? 'api_key';
     const unattended = (this.#opts.mode ?? 'unattended') === 'unattended';
     if (unattended && route !== 'api_key') {
@@ -226,6 +353,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
       );
       privateDir(codexHome);
       launch.env.CODEX_HOME = codexHome;
+      // Codex trusts a repo by itself at the first thread that can write it, and a trusted
+      // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
+      // hooks) and AGENTS.md then apply: all of them files a Worker can write (#181, verified on
+      // 0.167.0). An explicit `untrusted` is respected and never overwritten.
+      untrustProjects(join(codexHome, 'config.toml'), [
+        workerRepoRoot(opts.cwd, this.#opts.repoRoot),
+        opts.cwd,
+      ]);
     } else {
       codexHome = launch.env.CODEX_HOME ?? join(home, '.codex');
       // Codex refuses to start when CODEX_HOME does not exist.
@@ -279,7 +414,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
         // Codex's children (e.g. its plugin `git` sync) keep the group alive, so signalling it
-        // here, synchronously on exit, cannot reach a reused group id. Later code never does.
+        // here, synchronously on exit, cannot reach a reused group id. Later code signals it only
+        // right after seeing a running member (#terminate).
         signalGroup(proc, 'SIGTERM');
         resolve();
       }),
@@ -302,14 +438,51 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // EPIPE when Codex closed its input: fail the peer instead of crashing the host process.
     proc.stdin?.on('error', (err) => rpc.fail(err));
 
+    let models: Promise<CodexModel[]> | undefined;
     try {
       await rpc.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null });
       rpc.notify('initialized');
+      // A fork sent without a model runs on the catalog's default model, not the source thread's
+      // (observed on 0.167.0, #175), so the source's model and effort are read and sent where the
+      // caller gave none: the fork continues on what the source ran.
+      let model = opts.model;
+      let effort = opts.effort;
+      let inherited: string | undefined;
+      if (opts.resume?.fork && (model === undefined || effort === undefined)) {
+        const read = await rpc.request<Obj>('thread/read', {
+          threadId: opts.resume.vendorSessionId,
+        });
+        const source = isObj(read.thread) ? read.thread : {};
+        model ??= str(source.model);
+        if (effort === undefined) inherited = str(source.reasoningEffort);
+      }
+      // Checked before the thread starts, since `thread/start` takes any level without a word.
+      // Without a model named, the thread's model (config may choose it) is checked below.
+      // The read is awaited where it starts: one left pending across `thread/start` would be an
+      // unhandled rejection if it failed meanwhile, and that ends the host process.
+      if (effort !== undefined && model !== undefined) {
+        models = listModels(rpc);
+        checkEffort(await catalog(models), model, effort);
+      }
+      // The source's effort is sent only when the fork's model lists it. Otherwise nothing is
+      // sent and Codex keeps what it keeps: the caller asked for no effort, so an effort it never
+      // named is not a reason to refuse the fork.
+      if (inherited !== undefined && model !== undefined) {
+        models ??= listModels(rpc);
+        try {
+          checkEffort(await catalog(models), model, inherited);
+          effort = inherited;
+        } catch (err) {
+          if (!(err instanceof ProfileRefusedError)) throw err;
+          // A failed read is not kept: a later effort check reads the catalog again.
+          if (!(await models.then(() => true).catch(() => false))) models = undefined;
+        }
+      }
       const threadParams = {
         cwd: opts.cwd,
         approvalPolicy: this.#opts.approvalPolicy ?? 'on-request',
         sandbox: this.#opts.sandbox ?? 'workspace-write',
-        ...(opts.model !== undefined ? { model: opts.model } : {}),
+        ...(model !== undefined ? { model } : {}),
         ...(opts.systemPrompt !== undefined ? { developerInstructions: opts.systemPrompt } : {}),
         config: {
           // Per-session MCP servers travel over stdin as thread config, so the Worker token is
@@ -324,7 +497,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
                 ),
               }
             : {}),
-          ...(opts.effort !== undefined ? { model_reasoning_effort: opts.effort } : {}),
+          ...(effort !== undefined ? { model_reasoning_effort: effort } : {}),
           // Codex keeps a linked worktree's git dir read-only; the Worker's own one is made
           // writable, and nothing else of the repo's .git (#116). Thread config keys are dotted
           // override paths, so this sets only `writable_roots` and keeps the rest of the table.
@@ -341,6 +514,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
       const thread = isObj(result.thread) ? result.thread : {};
       const threadId = str(thread.id);
       if (!threadId) throw new Error('app-server returned no thread id');
+      const threadModel = str(result.model) ?? model;
+      if (effort !== undefined && model === undefined) {
+        // No model call has been made yet, so refusing here is still before launch.
+        models = listModels(rpc);
+        checkEffort(await catalog(models), threadModel, effort);
+      }
       handle.vendorSessionId = threadId;
       s = {
         handle,
@@ -355,7 +534,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
         interrupting: false,
         closing: false,
         ended: false,
-        model: str(result.model) ?? opts.model,
+        model: str(result.model) ?? model,
+        // A resumed thread keeps the effort an earlier turn set (`reasoningEffort`, observed on
+        // 0.167.0, #110), so a later model switch is checked against it too.
+        planned: { model: threadModel, effort: effort ?? str(result.reasoningEffort) },
+        models,
+        sending: undefined,
         secrets,
         exited,
         get exit() {
@@ -366,6 +550,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
         `codex app-server failed to start the session: ${scrubLiterals(redactSecrets(errorMessage(err)), secrets)}`,
@@ -373,23 +558,63 @@ export class CodexAppServerAdapter implements AgentAdapter {
     }
     const session = s;
     this.#sessions.set(handle.id, session);
-    void exited.then(() => this.#onExit(session));
+    // Ended at once, so nothing more is sent to it; reported only once its whole process group is
+    // gone, so nothing of it still runs (or writes into the worktree) after the error (#198).
+    session.gone = exited.then(() => {
+      this.#exited(session);
+      return this.#reapGroup(proc);
+    });
+    void session.gone.then(() => this.#onExit(session));
 
     // The own-login route needs the user to have logged in to Codex; say so instead of failing
     // on the first turn.
     if (route === 'subscription') {
       const account = await rpc.request<Obj>('account/read', {}).catch(() => undefined);
+      // Exited meanwhile: its error is reported once its group is gone, not an `idle` first.
+      if (session.ended) return handle;
       if (account && account.account === null && account.requiresOpenaiAuth === true) {
         this.#setState(session, 'auth_required', 'log in with `codex login` first');
         return handle;
       }
     }
-    this.#setState(session, 'idle');
+    if (!session.ended) this.#setState(session, 'idle');
     return handle;
   }
 
   async send(h: SessionHandle, input: UserInput, opts?: SendOptions): Promise<void> {
     const s = this.#live(h);
+    // Without a pending check, input is queued at once, as before.
+    if (!s.sending && !needsEffortCheck(s, opts)) return this.#enqueue(s, input, opts);
+    // Otherwise behind earlier sends, so turns keep the order they were sent in.
+    const run = (s.sending ?? Promise.resolve()).then(async () => {
+      this.#live(h);
+      const effort = effortOf(s, opts);
+      if (effort !== undefined && needsEffortCheck(s, opts)) {
+        s.models ??= listModels(s.rpc);
+        const p = s.models;
+        // A failed read is not cached: the next send tries again.
+        const models = await catalog(p).catch((err: unknown) => {
+          if (s.models === p) s.models = undefined;
+          throw err;
+        });
+        checkEffort(models, opts?.model ?? s.planned.model, effort);
+      }
+      this.#enqueue(s, input, opts);
+    });
+    const tail = run.then(
+      () => {},
+      () => {},
+    );
+    s.sending = tail;
+    void tail.then(() => {
+      if (s.sending === tail) s.sending = undefined;
+    });
+    return run;
+  }
+
+  /** Queue a turn and record the model and effort it leaves in force. */
+  #enqueue(s: Session, input: UserInput, opts?: SendOptions): void {
+    s.planned = { model: opts?.model ?? s.planned.model, effort: effortOf(s, opts) };
     s.queue.push({
       text: input.text,
       ...(opts?.model !== undefined ? { model: opts.model } : {}),
@@ -400,6 +625,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
     const s = this.#live(h);
+    // Sends still waiting on an effort check are queued first, so the receipt lists them too.
+    if (s.sending) await s.sending;
     const stillQueued = s.queue.map((q) => q.text);
     const turn = s.turn;
     if (!turn) return { stillQueued };
@@ -445,7 +672,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // End of input asks app-server to finish; then SIGTERM (forwarded by the npm wrapper to
     // the native binary), then SIGKILL.
     s.proc.stdin?.end();
-    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined);
+    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined, s.gone);
     this.#setState(s, 'done');
     s.events.end();
     this.#sessions.delete(h.id);
@@ -461,21 +688,49 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   /**
    * End a Codex process: end of input asks it to finish; then SIGTERM to its group (the npm
-   * wrapper forwards it to the native binary), then SIGKILL. Signals are sent only while the
-   * process is still running, so a long-dead group id is never signalled.
+   * wrapper forwards it to the native binary), then SIGKILL; then it waits for the rest of the
+   * group and SIGKILLs what is left. The group is signalled only while it has a running member
+   * (the process itself, or a member seen just before), so a reused group id is never signalled.
    */
-  async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
+  async #terminate(
+    proc: ChildProcess,
+    exited: Promise<void>,
+    hasExited: () => boolean,
+    gone?: Promise<void>,
+  ) {
     const within = (ms: number) =>
       Promise.race([
         exited.then(() => true),
         new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
       ]);
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (await within(Math.min(500, timeout))) return;
-    if (!hasExited()) signalGroup(proc, 'SIGTERM');
-    if (await within(timeout)) return;
-    if (!hasExited()) signalGroup(proc, 'SIGKILL');
-    await exited;
+    if (!(await within(Math.min(500, timeout)))) {
+      if (!hasExited()) signalGroup(proc, 'SIGTERM');
+      if (!(await within(timeout))) {
+        if (!hasExited()) signalGroup(proc, 'SIGKILL');
+        await exited;
+      }
+    }
+    // Children Codex starts in its group (its plugin sync, and may include tool commands and MCP
+    // servers: not verified) got SIGTERM when it exited, but may still be shutting down and
+    // writing into the Worker's CODEX_HOME or checkout: wait for the whole group (#191). A child
+    // that starts a group or session of its own is not covered.
+    // A registered session's group is reaped once, by its exit handler: wait for that.
+    await (gone ?? this.#reapGroup(proc));
+  }
+
+  /**
+   * Once the leader has exited (and its group had SIGTERM), wait for the rest of the group, then
+   * SIGKILL what is left. SIGKILL only right after seeing a running member, synchronously: a pid
+   * is not reused while it is the id of a group with members, so this cannot reach a reused group
+   * id. Called once per process: never again once its group has been seen empty.
+   */
+  async #reapGroup(proc: ChildProcess): Promise<void> {
+    const timeout = this.#opts.killTimeoutMs ?? 5000;
+    if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
+      if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
+      await processGroupGone(proc.pid, 1000);
+    }
   }
 
   #session(h: SessionHandle): Session {
@@ -671,10 +926,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
     s.approvals.clear();
   }
 
-  #onExit(s: Session): void {
+  /** The process exited: the session takes no more input, and pending requests fail now. */
+  #exited(s: Session): void {
     s.ended = true;
     this.#denyPending(s);
     s.rpc.fail(new Error('app-server exited'));
+  }
+
+  /** Report the exit, once the process group is gone (#198). A close() reports its own end. */
+  #onExit(s: Session): void {
     if (s.closing) return;
     // Any exit we did not ask for is a crash (adapter rules), during a turn or not.
     const how = s.exit?.signal ? `signal ${s.exit.signal}` : `code ${s.exit?.code ?? '?'}`;
@@ -822,6 +1082,49 @@ export function configArgs(
     '-c',
     `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
   ]);
+}
+
+/**
+ * Mark `paths` (and their real paths) `untrusted` in a Codex `config.toml` Tacet owns, replacing
+ * any entry Codex wrote for them. Other content is kept. Written with a rename, mode 0600.
+ * The editor is line-based: it recognises the `[projects."<path>"]` tables Codex writes, not
+ * other TOML spellings of them (a duplicate table would make Codex refuse the file: fails closed).
+ */
+export function untrustProjects(file: string, paths: readonly string[]): void {
+  const keys = new Set<string>();
+  for (const p of paths) {
+    keys.add(p);
+    try {
+      keys.add(realpathSync(p));
+    } catch {}
+  }
+  const headers = new Set([...keys].map((k) => `[projects.${JSON.stringify(k)}]`));
+  let text = '';
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    // Only a missing file starts empty: any other read error must not drop its content.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  // Drop each table for these paths: its header line up to the next table header.
+  const kept: string[] = [];
+  let dropping = false;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('[')) dropping = headers.has(t);
+    if (!dropping) kept.push(line);
+  }
+  const body = kept.join('\n').replace(/\n*$/, '');
+  const tables = [...headers].map((h) => `${h}\ntrust_level = "untrusted"\n`).join('\n');
+  // A fresh name, created exclusively: never a planted file or symlink at a guessable path.
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, `${body ? `${body}\n\n` : ''}${tables}`, { mode: 0o600, flag: 'wx' });
+  try {
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Append `-c`-style settings through `GIT_CONFIG_COUNT`, keeping any the caller already set. */

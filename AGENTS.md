@@ -14,7 +14,7 @@ Read before non-trivial work:
 
 ## Current status
 
-Milestone **M0 · Foundations**. The monorepo is scaffolded (#1): TypeScript (`strict`, ESM) in a pnpm workspace with `packages/core`, `conductor`, `mini`, `adapters/*` (`claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty`), `web`, `tui` and `cli`, on Node.js 24 or later ([ADR-002](docs/adr/002-language-runtime.md)). The packages are placeholders until their roadmap issues land. Bun is not supported. Targets are macOS and Linux (Ubuntu) only. Do not add packages outside the issue that asks for it.
+Milestone **M0 · Foundations**. The monorepo is scaffolded (#1): TypeScript (`strict`, ESM) in a pnpm workspace with `packages/core`, `conductor`, `mini`, `adapters/*` (`claude-sdk`, `codex-app-server`, `opencode`, `acp`, `pty`), `web`, `tui` and `cli`, on Node.js 24 or later ([ADR-002](docs/adr/002-language-runtime.md)). The packages are placeholders until their roadmap issues land. Bun is not supported. Targets are macOS and Linux (Ubuntu), and Windows via WSL2: Tacet runs inside a WSL2 Linux distro as on Linux, with repos in the distro's own file system ([docs/WSL2.md](docs/WSL2.md); CI covers WSL2 only in the experimental, non-required `wsl2` workflow). Native Windows is not a target until its ADR is accepted (#194). Do not add packages outside the issue that asks for it.
 
 ## Repo layout
 
@@ -35,14 +35,16 @@ scripts/                      repo tooling (node, no dependencies)
 
 | Task | Command |
 |---|---|
-| Regenerate ROADMAP.md | `node scripts/gen-roadmap.mjs` |
+| Regenerate ROADMAP.md (and sort `roadmap/issues.json`) | `node scripts/gen-roadmap.mjs` |
 | Regenerate Copilot agents | `node scripts/sync-agents.mjs` |
 | Check generated files are current (CI runs this) | `pnpm check:generated` (roadmap, Copilot agents, and `@tacet/core` JSON Schemas) |
+| Check the capability matrix is fresh (CI runs this, separately) | `pnpm check:matrix` (warns a week ahead, fails when an active vendor surface was checked over 30 days ago; refresh it as the matrix's "Keeping it fresh" says) |
+| Test the repo scripts (CI runs this) | `pnpm check:scripts` |
 | Regenerate core JSON Schemas | `pnpm --filter @tacet/core gen:schemas` |
 | Create roadmap issues on GitHub | `scripts/create-issues.sh OWNER/REPO [--dry-run]` |
 | Install / lint / typecheck / test | `pnpm install`, `pnpm lint` (Biome), `pnpm typecheck` (`tsc -b`), `pnpm test` (Vitest) |
 
-`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. On pull requests CI runs them on Ubuntu with Node 24 and 26 and on macOS with Node 24, plus one `check` job (generated files, no tracked ignored files); pushes to `main` run the full Ubuntu and macOS × Node 24 and 26 matrix.
+`pnpm install`, `pnpm lint`, `pnpm typecheck` and `pnpm test` must all pass before a PR is ready. On pull requests CI runs them on Ubuntu with Node 24 and 26 and on macOS with Node 24, plus one `check` job (generated files, no tracked ignored files); pushes to `main` run the full Ubuntu and macOS × Node 24 and 26 matrix. Without `node-pty` (needs a C++ toolchain) the PTY suites skip locally with a reason on stderr; CI fails (#189).
 
 ## How to work an issue
 

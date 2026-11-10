@@ -1,0 +1,645 @@
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  accessSync,
+  constants,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, delimiter, dirname, join, resolve, sep } from 'node:path';
+import { TacetConfig } from '@tacet/core';
+import type { Io } from '../io.js';
+import { safeJson, terminalSafe } from '../render.js';
+import { repoRootFrom } from '../state.js';
+import { applyState, planState, type StatePlan, type StateResult } from './purge-state.js';
+
+// The symlink-safe file checks, `wx` writes, PATH detection and the uninstall backup layout are
+// adapted from Copilot's draft for #20 (PR #113).
+
+/**
+ * Worker adapters `tacet init` can set up, with what each needs. `claude-sdk` and
+ * `codex-app-server` ship with Tacet (their vendor binaries are npm dependencies) and choose a
+ * model per session; ACP agents are launched from the user's PATH and their command fixes the
+ * model. Key variables are the ones each adapter reads on the API-key route (capability matrix).
+ */
+export const WORKER_ADAPTERS = {
+  'claude-sdk': {
+    bundled: true,
+    needsModel: true,
+    keys: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'],
+  },
+  'codex-app-server': {
+    bundled: true,
+    needsModel: true,
+    keys: ['OPENAI_API_KEY', 'CODEX_API_KEY'],
+  },
+  'acp:gemini': { bundled: false, command: 'gemini', needsModel: false, keys: ['GEMINI_API_KEY'] },
+  'acp:claude-acp': {
+    bundled: false,
+    command: 'claude-agent-acp',
+    needsModel: false,
+    keys: ['ANTHROPIC_API_KEY'],
+  },
+} as const satisfies Record<
+  string,
+  { bundled: boolean; command?: string; needsModel: boolean; keys: readonly string[] }
+>;
+export type WorkerAdapterId = keyof typeof WORKER_ADAPTERS;
+
+/**
+ * Agent CLIs looked for on PATH, for the report; each command name is the one the adapters and
+ * the capability matrix use. Their logins are never read.
+ */
+const AGENT_CLIS = ['claude', 'codex', 'gemini', 'opencode', 'claude-agent-acp'] as const;
+
+/** First line of every file `tacet init` writes; the hash is of the lines after it. */
+const header = (hash: string) => `# Written by tacet init (sha256 ${hash}); edit freely.`;
+const HEADER_LINE = /^# Written by tacet init \(sha256 ([0-9a-f]{16})\); edit freely\.$/;
+
+export interface InitOptions {
+  repo?: string;
+  'user-dir'?: string;
+  worker?: string;
+  model?: string;
+  /** Keep Worker checkouts after their task's work is merged (`worktrees.remove_merged: false`). */
+  'keep-merged-worktrees'?: boolean;
+  json?: boolean;
+}
+
+export interface UninstallOptions {
+  repo?: string;
+  'user-dir'?: string;
+  apply?: boolean;
+  purge?: boolean;
+  /** With `--purge`: also remove checkouts that hold unintegrated work (#211). */
+  force?: boolean;
+  json?: boolean;
+}
+
+class InitError extends Error {
+  override name = 'InitError';
+}
+
+/**
+ * `tacet init` (#20): scaffold `.tacet/` in a git repo. It writes `.tacet/tacet.yaml` and
+ * `.tacet/.gitignore` (which ignores `local.yaml`) only when they are absent, so a re-run changes
+ * nothing; it never writes outside `.tacet/`, so the repo's own agent files (CLAUDE.md, AGENTS.md,
+ * `.claude/`) and `.gitignore` are left as they are. It reports which Worker adapters can run
+ * here and which key variables are set (names only; values and vendor logins are never read).
+ */
+export async function init(io: Io, o: InitOptions): Promise<number> {
+  const env = io.env ?? process.env;
+  const worker = (o.worker ?? 'claude-sdk') as WorkerAdapterId;
+  const spec = WORKER_ADAPTERS[worker];
+  if (spec === undefined) {
+    io.err(
+      `--worker: unknown adapter ${terminalSafe(String(o.worker))}; one of ${Object.keys(WORKER_ADAPTERS).join(', ')}`,
+    );
+    return 2;
+  }
+  let model = o.model?.trim();
+  if (model === '') {
+    io.err('--model needs a model name');
+    return 2;
+  }
+  if (model !== undefined && !spec.needsModel) {
+    io.err(`--model: ${worker} cannot choose a model (its command fixes it)`);
+    return 2;
+  }
+
+  try {
+    const root = repoFor(io, o);
+    const tacetDir = join(root, '.tacet');
+    const configPath = join(tacetDir, 'tacet.yaml');
+    const dirExists = pathExists(tacetDir);
+    if (dirExists) requireDirectory(tacetDir, '.tacet');
+    const configExists = dirExists && pathExists(configPath);
+    if (configExists) requireRegularFile(configPath, '.tacet/tacet.yaml');
+
+    if (!configExists && model === undefined && spec.needsModel && io.prompt && !o.json) {
+      const answer = await io.prompt(
+        `Model for ${worker} Workers (as the vendor names it; Enter to set it later): `,
+      );
+      if (answer?.trim()) model = answer.trim();
+    }
+    // Owner decision on #210: on by default, asked once at setup, and changeable in config later.
+    let removeMerged = o['keep-merged-worktrees'] !== true;
+    if (!configExists && o['keep-merged-worktrees'] === undefined && io.prompt && !o.json) {
+      removeMerged = await askRemoveMerged(io.prompt);
+    }
+    // Validated before anything is created, so a bad model leaves nothing behind.
+    const body = configExists ? undefined : configBody(worker, model, root, removeMerged);
+    if (!dirExists) mkdirSync(tacetDir);
+    const config = body === undefined ? 'kept' : writeOnce(configPath, body);
+    const ignore = writeOnce(join(tacetDir, '.gitignore'), IGNORE_BODY);
+    const flagsIgnored =
+      config === 'kept' &&
+      (o.worker !== undefined || o.model !== undefined || o['keep-merged-worktrees'] !== undefined);
+
+    const path = env.PATH ?? '';
+    const adapters = Object.entries(WORKER_ADAPTERS).map(([id, a]) => ({
+      id,
+      available: a.bundled || ('command' in a && onPath(a.command, path)),
+      keys: a.keys.map((name) => ({ name, set: Boolean(env[name]) })),
+    }));
+    const clis = AGENT_CLIS.map((command) => ({ command, onPath: onPath(command, path) }));
+    const modelMissing = config === 'written' && spec.needsModel && model === undefined;
+    const workerKeySet = spec.keys.some((k) => Boolean(env[k]));
+
+    if (flagsIgnored) {
+      io.err(
+        'note: --worker, --model and --keep-merged-worktrees are ignored: .tacet/tacet.yaml already exists (edit it)',
+      );
+    }
+    if (o.json) {
+      io.out(
+        safeJson({
+          repo: root,
+          files: { '.tacet/tacet.yaml': config, '.tacet/.gitignore': ignore },
+          worker,
+          modelMissing,
+          ...(config === 'written' ? { removeMerged } : {}),
+          adapters,
+          clis,
+        }),
+      );
+      return 0;
+    }
+    io.out(`${terminalSafe(root)}`);
+    io.out(`  .tacet/tacet.yaml   ${config === 'written' ? 'written' : 'kept (already there)'}`);
+    io.out(`  .tacet/.gitignore   ${ignore === 'written' ? 'written' : 'kept (already there)'}`);
+    io.out('Worker adapters:');
+    for (const a of adapters) {
+      const keys = a.keys.map((k) => `${k.name} ${k.set ? 'set' : 'not set'}`).join(', ');
+      io.out(`  ${a.id.padEnd(18)} ${a.available ? 'available' : 'not on PATH'}; ${keys}`);
+    }
+    io.out(
+      `Agent CLIs on PATH: ${
+        clis
+          .filter((c) => c.onPath)
+          .map((c) => c.command)
+          .join(', ') || 'none'
+      } (logins are not checked)`,
+    );
+    if (config === 'written') io.out(`Workers run on ${worker}.`);
+    if (modelMissing) {
+      io.err(`next: set tiers.worker.model in .tacet/tacet.yaml; ${worker} needs a model`);
+    }
+    if (!workerKeySet && config === 'written') {
+      const cloud =
+        worker === 'claude-sdk' ? ', or a cloud provider (Bedrock, Vertex, Foundry)' : '';
+      io.err(`next: set ${spec.keys.join(' or ')}${cloud}: unattended Workers run on your API key`);
+    }
+    io.err('then: tacet run "<task>"');
+    return 0;
+  } catch (err) {
+    return failed(io, err);
+  }
+}
+
+/**
+ * `tacet uninstall` (#20). A preview by default; `--apply` acts. Without `--purge` it removes only
+ * the files `tacet init` wrote that are still unchanged and not committed (owner decision on #209),
+ * then `.tacet/` if that leaves it empty.
+ * `--purge` removes the whole `.tacet/` after copying it to
+ * `<user dir>/backups/<repo>-<hash>/uninstall-<time>/`, and the repo's run state (#211):
+ * `<state_dir>/<repo-hash>/`, its Worker and planner checkouts first, each through the worktree
+ * manager, which refuses one with unintegrated work unless `--force`. It refuses while a run holds
+ * the repo's lock, and keeps the `tacet/*` branches.
+ */
+export async function uninstall(io: Io, o: UninstallOptions): Promise<number> {
+  let backup: string | undefined;
+  let backedUp = false;
+  try {
+    const root = repoFor(io, o);
+    if (o.force && !o.purge) {
+      io.err('--force only applies with --purge');
+      return 2;
+    }
+    // Before anything is removed: it reads the repo config, and refuses while a run is live.
+    const state = o.purge ? await planState(io, root, userDirOf(io, o)) : undefined;
+    let stateResult: StateResult | undefined;
+    const tacetDir = join(root, '.tacet');
+    const removals: string[] = [];
+    const kept: string[] = [];
+    const committed: string[] = [];
+    if (pathExists(tacetDir)) {
+      requireDirectory(tacetDir, '.tacet');
+      if (o.purge) {
+        removals.push(tacetDir);
+        const canonical = realpathSync(root);
+        backup = join(
+          userDirOf(io, o),
+          'backups',
+          `${basename(canonical)}-${sha256(canonical).slice(0, 12)}`,
+          `uninstall-${new Date().toISOString().replaceAll(/[:.]/g, '-')}`,
+        );
+      } else {
+        // Committed files are the team's, not this checkout's: only --purge removes them.
+        const tracked = trackedIn(root, '.tacet');
+        for (const name of readdirSync(tacetDir).sort()) {
+          const path = join(tacetDir, name);
+          if (tracked.has(name)) committed.push(path);
+          else (isUnchangedInitFile(path) ? removals : kept).push(path);
+        }
+        kept.push(...committed);
+        if (kept.length === 0) removals.push(tacetDir);
+      }
+    }
+
+    if (o.apply && state) {
+      // Checked again under the run lock: a run may have started, or made the dir, since.
+      stateResult = await applyState(io, root, userDirOf(io, o), o.force === true);
+      if (existsSync(state.dir) && !stateResult.dirRemoved) {
+        // Nothing of .tacet/ is touched until the run state is gone.
+        reportStateRefusal(io, o, root, state, stateResult, { removals, kept, committed });
+        return 1;
+      }
+    }
+
+    if (o.apply && removals.length > 0) {
+      if (backup !== undefined) {
+        mkdirSync(dirname(backup), { recursive: true, mode: 0o700 });
+        mkdirSync(backup, { mode: 0o700 });
+        try {
+          cpSync(tacetDir, join(backup, '.tacet'), {
+            recursive: true,
+            errorOnExist: true,
+            force: false,
+            verbatimSymlinks: true,
+          });
+        } catch (err) {
+          rmSync(backup, { recursive: true, force: true });
+          throw err;
+        }
+        backedUp = true;
+        rmSync(tacetDir, { recursive: true });
+      } else {
+        for (const path of removals) {
+          if (path === tacetDir) rmdirSync(path);
+          else rmSync(path);
+        }
+      }
+    }
+
+    if (o.json) {
+      io.out(
+        safeJson({
+          repo: root,
+          applied: Boolean(o.apply),
+          removals,
+          kept,
+          committed,
+          ...(backup ? { backup } : {}),
+          ...(state
+            ? { state: { ...state, ...(stateResult ? { result: stateResult } : {}) } }
+            : {}),
+        }),
+      );
+      return 0;
+    }
+    if (state) reportState(io, o, state, stateResult);
+    if (removals.length === 0) io.out('nothing to remove');
+    for (const path of removals)
+      io.out(`${o.apply ? 'removed' : 'would remove'} ${terminalSafe(path)}`);
+    for (const path of kept) {
+      const why = committed.includes(path)
+        ? 'committed to git'
+        : 'not written by tacet init, or changed';
+      io.out(`kept ${terminalSafe(path)} (${why})`);
+    }
+    if (backup) io.out(`${o.apply ? 'backed up to' : 'would back up to'} ${terminalSafe(backup)}`);
+    if (!o.apply && removals.length > 0) io.err('preview only: add --apply to remove');
+    if (kept.length > 0 && !o.purge) io.err('--purge removes all of .tacet/ (after a backup)');
+    return 0;
+  } catch (err) {
+    const code = failed(io, err);
+    if (backedUp && backup !== undefined) io.err(`the backup is at ${terminalSafe(backup)}`);
+    return code;
+  }
+}
+
+function reportState(
+  io: Io,
+  o: UninstallOptions,
+  state: StatePlan,
+  result: StateResult | undefined,
+): void {
+  if (state.note) io.err(`note: ${state.note}`);
+  if (!state.exists && !result?.dirRemoved) {
+    io.out(`no run state at ${terminalSafe(state.dir)}`);
+    return;
+  }
+  if (result) {
+    // What was done, which may differ from the preview (a checkout made since).
+    for (const path of result.removed) io.out(`removed checkout ${terminalSafe(path)}`);
+    for (const ref of result.refs) io.out(`deleted ${terminalSafe(ref)}`);
+    io.out(`removed run state ${terminalSafe(state.dir)}`);
+    for (const w of result.warnings) io.err(`warning: ${terminalSafe(w)}`);
+  } else {
+    for (const c of state.checkouts) {
+      const what = `${c.missing ? 'checkout (deleted by hand)' : 'checkout'} ${terminalSafe(c.path)}`;
+      if (c.kept && !o.force) io.out(`would keep ${what}: ${terminalSafe(c.kept)}`);
+      else {
+        const held = c.heldBy?.length
+          ? `; its work stays on ${c.heldBy.map((r) => terminalSafe(r.replace(/^refs\/heads\//, ''))).join(', ')}`
+          : '';
+        io.out(`would remove ${what}${c.kept ? ' (forced)' : ''}${held}`);
+      }
+    }
+    for (const ref of state.refs) io.out(`would delete ${terminalSafe(ref)}`);
+    io.out(
+      `would remove run state ${terminalSafe(state.dir)}${state.events ? ' (with the event log)' : ''}: ${state.entries.map(terminalSafe).join(', ')}`,
+    );
+    if (state.checkouts.some((c) => c.kept) && !o.force) {
+      io.err('checkouts with unintegrated work are kept: --force removes them too');
+    }
+  }
+  io.err('the tacet/* branches are kept; list them with: git for-each-ref refs/heads/tacet/');
+}
+
+function reportStateRefusal(
+  io: Io,
+  o: UninstallOptions,
+  root: string,
+  state: StatePlan,
+  r: StateResult,
+  tacet: { removals: string[]; kept: string[]; committed: string[] },
+): void {
+  if (o.json) {
+    // The shape of a successful run, with nothing applied.
+    io.out(
+      safeJson({
+        repo: root,
+        applied: false,
+        refused: true,
+        removals: [],
+        kept: tacet.kept,
+        committed: tacet.committed,
+        state: { ...state, result: r },
+      }),
+    );
+    return;
+  }
+  for (const path of r.removed) io.out(`removed checkout ${terminalSafe(path)}`);
+  for (const c of r.refused)
+    io.err(`kept checkout ${terminalSafe(c.path)}: ${terminalSafe(c.kept ?? '')}`);
+  for (const path of r.leftovers) {
+    io.err(
+      `git still lists the worktree ${terminalSafe(path)}: remove it with git worktree remove`,
+    );
+  }
+  for (const w of r.warnings) io.err(`warning: ${terminalSafe(w)}`);
+  io.err(
+    r.refused.some((c) => c.forceable)
+      ? 'nothing else was removed: --force removes checkouts with unintegrated work'
+      : 'nothing else was removed',
+  );
+}
+
+/**
+ * Names of the entries directly under `dir` (relative to the repo `root`) that git tracks. If git
+ * cannot answer, every entry counts as tracked, so nothing is removed on a guess.
+ */
+function trackedIn(root: string, dir: string): { has(name: string): boolean } {
+  try {
+    const out = execFileSync('git', ['-C', root, 'ls-files', '-z', '--', dir], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const names = new Set(
+      out
+        .split('\0')
+        .filter(Boolean)
+        .map((f) => f.slice(dir.length + 1).split('/')[0] as string),
+    );
+    return names;
+  } catch {
+    return { has: () => true };
+  }
+}
+
+/** Prints a failure without a stack trace; exit code 1. */
+function failed(io: Io, err: unknown): number {
+  io.err(terminalSafe(err instanceof Error ? err.message : String(err)));
+  return 1;
+}
+
+function userDirOf(io: Io, o: { 'user-dir'?: string }): string {
+  return resolve(o['user-dir'] ?? join(io.home ?? homedir(), '.tacet'));
+}
+
+/**
+ * The git repo `.tacet/` belongs to. Refused when the repo's `.tacet/` would be Tacet's own user
+ * directory (a home directory kept in git, say), which holds the user config, run state and
+ * backups: init would write into it and a purge would delete it.
+ */
+function repoFor(io: Io, o: { repo?: string; 'user-dir'?: string }): string {
+  const root = repoRootFrom(o.repo ?? io.cwd);
+  if (!existsSync(join(root, '.git'))) {
+    throw new InitError(`${root} is not in a git repository: Tacet works on a git repo`);
+  }
+  const tacetDir = canonical(join(root, '.tacet'));
+  for (const user of new Set([userDirOf(io, {}), userDirOf(io, o)])) {
+    const u = canonical(user);
+    if (u === tacetDir || u.startsWith(`${tacetDir}${sep}`) || tacetDir.startsWith(`${u}${sep}`)) {
+      throw new InitError(
+        `${join(root, '.tacet')} is, or overlaps, Tacet's user directory ${user}: run this in a project repo, not in your home directory`,
+      );
+    }
+  }
+  return root;
+}
+
+/** `path` with symbolic links resolved, as far as it exists. */
+function canonical(path: string): string {
+  const abs = resolve(path);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const up = dirname(abs);
+    return up === abs ? abs : join(canonical(up), basename(abs));
+  }
+}
+
+const IGNORE_BODY =
+  '# Personal settings (see docs/ARCHITECTURE.md §4); never commit them.\nlocal.yaml\n';
+
+/** The repo layer `tacet init` writes; checked against the config schema before it is written. */
+export function configBody(
+  worker: WorkerAdapterId,
+  model: string | undefined,
+  root: string,
+  removeMerged = true,
+): string {
+  const spec = WORKER_ADAPTERS[worker];
+  const tier: Record<string, string> = {
+    adapter: worker,
+    ...(model !== undefined ? { model } : {}),
+  };
+  const parsed = TacetConfig.safeParse({
+    tiers: { worker: tier },
+    worktrees: { remove_merged: removeMerged },
+  });
+  if (!parsed.success) throw new InitError(`invalid --model: ${parsed.error.issues[0]?.message}`);
+  const verify = suggestedVerify(root);
+  const lines = [
+    '# Repo config for Tacet (docs/ARCHITECTURE.md §4). Personal overrides go in local.yaml.',
+    'tiers:',
+    '  worker:',
+    `    adapter: ${worker}`,
+  ];
+  if (model !== undefined) lines.push(`    model: ${JSON.stringify(model)}`);
+  else if (spec.needsModel)
+    lines.push(`    # model: set the model ${worker} Workers run (required)`);
+  lines.push(
+    '  # A planner that splits tasks into sub-tasks; without it each task is one sub-task.',
+    '  # mini:',
+    `  #   adapter: ${worker}`,
+    ...(spec.needsModel ? ['  #   model: <a model>'] : []),
+    '',
+    '# A reviewer on another vendor checks each sub-task once verify passes; off by default.',
+    '# review:',
+    '#   enabled: true',
+    '# (with tiers.review: { adapter: <an adapter of another vendor>, model: <a model> })',
+    '',
+    '# Commands that check each finished sub-task in its checkout, with /bin/sh -c. A Worker',
+    '# checkout is a fresh git worktree: install dependencies first if a command needs them.',
+    '# verify:',
+    ...(verify.length > 0 ? verify.map((c) => `#   - ${c}`) : ['#   - <command>']),
+    '',
+    // Only an opt-out is written as a setting, so the committed file never fixes the default.
+    ...(removeMerged
+      ? [
+          "# Worker checkouts are removed once their task's work is merged into its branch.",
+          '# To keep them, set this here, or in local.yaml for yourself only:',
+          '# worktrees:',
+          '#   remove_merged: false',
+        ]
+      : [
+          "# Worker checkouts are kept after their task's work is merged (tacet init",
+          '# --keep-merged-worktrees). Delete this to have them removed.',
+          'worktrees:',
+          '  remove_merged: false',
+        ]),
+    '',
+  );
+  return lines.join('\n');
+}
+
+/** Asks once more after an answer it cannot read, then takes the default (remove). */
+async function askRemoveMerged(prompt: NonNullable<Io['prompt']>): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const answer = (
+      (await prompt('Remove worktrees automatically after their work is merged? [Y/n] ')) ?? ''
+    )
+      .trim()
+      .toLowerCase();
+    if (answer === '' || answer === 'y' || answer === 'yes') return true;
+    if (answer === 'n' || answer === 'no') return false;
+  }
+  return true;
+}
+
+/** Suggested verify commands from package.json scripts; only suggested, never switched on. */
+function suggestedVerify(root: string): string[] {
+  let scripts: Record<string, unknown> = {};
+  try {
+    const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+      scripts?: Record<string, unknown>;
+    };
+    if (pkg && typeof pkg.scripts === 'object' && pkg.scripts !== null) scripts = pkg.scripts;
+  } catch {
+    return [];
+  }
+  const pm = existsSync(join(root, 'pnpm-lock.yaml'))
+    ? 'pnpm'
+    : existsSync(join(root, 'yarn.lock'))
+      ? 'yarn'
+      : 'npm run';
+  const names = ['lint', 'typecheck', 'test'].filter((n) => typeof scripts[n] === 'string');
+  return names.map((n) => `${pm} ${n}`);
+}
+
+function withHeader(body: string): string {
+  return `${header(sha256(body).slice(0, 16))}\n${body}`;
+}
+
+/** Writes `path` only when it does not exist. */
+function writeOnce(path: string, body: string): 'written' | 'kept' {
+  try {
+    writeFileSync(path, withHeader(body), { flag: 'wx', mode: 0o644 });
+    return 'written';
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    requireRegularFile(path, basename(path));
+    return 'kept';
+  }
+}
+
+/** A regular file whose first line is init's header and whose body still matches its hash. */
+function isUnchangedInitFile(path: string): boolean {
+  const stat = lstatSync(path);
+  if (!stat.isFile()) return false;
+  const text = readFileSync(path, 'utf8');
+  const nl = text.indexOf('\n');
+  if (nl < 0) return false;
+  const m = HEADER_LINE.exec(text.slice(0, nl));
+  return m !== null && sha256(text.slice(nl + 1)).slice(0, 16) === m[1];
+}
+
+function sha256(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+function requireDirectory(path: string, label: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isDirectory()) {
+    throw new InitError(`${label} must be a directory, not a file or symbolic link: ${path}`);
+  }
+}
+
+function requireRegularFile(path: string, label: string): void {
+  const stat = lstatSync(path);
+  if (!stat.isFile()) {
+    throw new InitError(
+      `${label} must be a regular file (not a directory or symbolic link): ${path}`,
+    );
+  }
+}
+
+function onPath(command: string, path: string): boolean {
+  return path
+    .split(delimiter)
+    .filter(Boolean)
+    .some((dir) => {
+      try {
+        const p = join(dir, command);
+        if (!statSync(p).isFile()) return false;
+        accessSync(p, constants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+}

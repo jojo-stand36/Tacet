@@ -6,6 +6,7 @@ import { newUlid, tasksProjection } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { GitIntegrator, resultBranch, taskBranch } from '../git/integrate.js';
+import { CommandVerifier } from '../verify/command-verifier.js';
 import { MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
 import type { Planner, ProposedSubtask, Workspace, Workspaces } from './ports.js';
@@ -78,13 +79,27 @@ describe('MiniConductor with git worktrees', () => {
   function start(
     script: (cwd: string, input: string) => unknown,
     planner: Planner = new SingleStepPlanner(),
+    verify?: string[],
   ) {
     const fake = new ScriptedAdapter('fake', (input, s) => {
       return (script(s.opts.cwd, input) as Script | undefined) ?? { do: 'reply', text: 'done' };
     });
     daemon = new MiniConductor({
       store,
-      config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+      config: {
+        tiers: { worker: { adapter: 'fake', model: 'cheap' } },
+        ...(verify ? { verify, workers: { verify_fix_attempts: 2 } } : {}),
+      },
+      ...(verify
+        ? {
+            verifier: new CommandVerifier({
+              repoRoot: repo,
+              commands: verify,
+              env: { PATH: env.PATH ?? '', HOME: env.HOME ?? '' },
+              gitEnv: env,
+            }),
+          }
+        : {}),
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
       workspaces: new GitWorkspaces(),
       integrator: new GitIntegrator(repo, env),
@@ -109,6 +124,39 @@ describe('MiniConductor with git worktrees', () => {
     git(cwd, ['commit', '-qm', Object.keys(files).join(' ')], workerGitEnv(wt));
   };
   const commitAsWorker = (cwd: string) => commitFiles(cwd, { 'work.txt': 'work\n' });
+
+  it('verifies the integrated commit in the Worker checkout, and has the Worker fix a failure (#19)', async () => {
+    let turns = 0;
+    const d = start(
+      (cwd, input) => {
+        turns += 1;
+        // First turn: commits the wrong file. Told what failed, it commits the right one.
+        if (input.startsWith('Verification failed')) commitFiles(cwd, { 'work.txt': 'work\n' });
+        else commitFiles(cwd, { 'other.txt': 'x\n' });
+        return undefined;
+      },
+      new SingleStepPlanner(),
+      ['test -f work.txt'],
+    );
+    await d.start();
+    const id = d.submit({ goal: 'write work.txt', acceptanceCriteria: ['exists'], priority: 'p1' });
+    await d.settled();
+    const sub = `${id}/1`;
+    expect(store.replay(tasksProjection).tasks[sub]?.state).toBe('completed');
+    expect(turns).toBe(2);
+    const checks = store
+      .query({ taskId: sub, typePrefix: 'worker.verification' })
+      .map((e) => e.envelope.data as { round: number; status: string; commit?: string });
+    expect(checks.map((c) => [c.round, c.status])).toEqual([
+      [0, 'failed'],
+      [1, 'passed'],
+    ]);
+    // Each check names the commit it verified: what integration brought in.
+    const integrated = store
+      .query({ taskId: sub, typePrefix: 'worker.integrated' })
+      .map((e) => (e.envelope.data as { commit: string }).commit);
+    expect(checks.map((c) => c.commit)).toEqual(integrated);
+  });
 
   /** Two independent sub-tasks and a third that depends on both (#134). */
   const diamond: Planner = {

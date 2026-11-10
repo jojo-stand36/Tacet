@@ -8,6 +8,7 @@ import { TaskPlan } from '../schema/plan.js';
 import { type SummaryOutcome, SummaryPacket } from '../schema/summary.js';
 import { Task } from '../schema/task.js';
 import { WorkerEnded, WorkerStarted } from '../schema/worker.js';
+import { WorkspaceCreated, WorkspaceRemoved } from '../schema/workspace.js';
 
 /**
  * A pure fold over event envelopes. `apply` must not read the clock, randomness or anything
@@ -190,5 +191,56 @@ export const tasksProjection: Projection<TasksState> = {
       }
     }
     return { ...state, tasks: { ...state.tasks, [taskId]: next } };
+  },
+};
+
+/** A workspace in the Mini-conductor's worktree registry (#126). */
+export interface WorkspaceView {
+  workspaceId: string;
+  workerId: string;
+  baseCommit: string;
+  baseBranch?: string;
+  /** When `workspace.created` was recorded (the envelope's `ts`). */
+  createdAt: string;
+  migrated?: true;
+}
+
+export interface WorkspacesState {
+  /** Workspaces created and not removed, by id, in creation order. */
+  live: Record<string, WorkspaceView>;
+  /** Ids removed, so a late duplicate `created` does not bring one back. */
+  removed: Record<string, true>;
+}
+
+/**
+ * The worktree registry from `workspace.*` events (#126). Malformed payloads and unknown types
+ * are skipped. An id once removed stays removed.
+ */
+export const workspacesProjection: Projection<WorkspacesState> = {
+  name: 'workspaces',
+  initial: () => ({ live: {}, removed: {} }),
+  apply(state, e) {
+    if (e.type === 'workspace.created') {
+      const d = WorkspaceCreated.safeParse(e.data);
+      if (!d.success) return state;
+      const id = d.data.workspaceId;
+      if (state.removed[id] || state.live[id]) return state;
+      const view: WorkspaceView = {
+        workspaceId: id,
+        workerId: d.data.workerId,
+        baseCommit: d.data.baseCommit,
+        ...(d.data.baseBranch !== undefined ? { baseBranch: d.data.baseBranch } : {}),
+        createdAt: e.ts,
+        ...(d.data.migrated ? { migrated: true as const } : {}),
+      };
+      return { ...state, live: { ...state.live, [id]: view } };
+    }
+    if (e.type === 'workspace.removed') {
+      const d = WorkspaceRemoved.safeParse(e.data);
+      if (!d.success) return state;
+      const { [d.data.workspaceId]: _gone, ...live } = state.live;
+      return { live, removed: { ...state.removed, [d.data.workspaceId]: true } };
+    }
+    return state;
   },
 };

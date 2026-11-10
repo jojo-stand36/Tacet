@@ -6,7 +6,10 @@ import { fileURLToPath } from 'node:url';
 import {
   authEnv,
   claudeEnvAllow,
+  removeClaudeConfigDir,
+  repoOf,
   SubprocessScrubError,
+  sweepClaudeConfigDirs,
   withSubprocessScrub,
   writeMcpConfig,
 } from '@tacet/adapter-claude-sdk/launch';
@@ -17,6 +20,7 @@ import {
   type AgentTerminal,
   type ApprovalDecision,
   AsyncQueue,
+  ForkRefusedError,
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
@@ -48,7 +52,6 @@ import {
   prepareClaudeConfigDir,
   preToolUseDecision,
 } from './claude.js';
-import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
@@ -58,6 +61,8 @@ import { TerminalBuffer } from './terminal.js';
  * - no streaming: the reply's text arrives once, from the `Stop` hook (`last_assistant_message`);
  * - approvals round-trip through the `PermissionRequest` hook (allow or deny answered over HTTP);
  * - Esc ends a turn (the binary sends no `Stop` for it, so the adapter reports `cancelled`);
+ * - a prompt submitted while a turn still runs joins it under that turn's `prompt_id`, then runs
+ *   under a new, unannounced one (#190): turns are matched to what was typed by the prompt text;
  * - resume by session id (`--resume`) in the session's own config directory; no fork yet;
  * - no usage: the hooks carry no token counts;
  * - the model is chosen at launch (`--model`).
@@ -156,8 +161,29 @@ interface Session {
   promptId: string | undefined;
   /** A prompt is being typed: input sent meanwhile is queued. */
   typing: boolean;
-  /** The `prompt_id` of the last cancelled turn: its hooks are stale whenever they arrive. */
-  cancelledPromptId: string | undefined;
+  /**
+   * `prompt_id`s of turns that are not the one in progress (cancelled, joined, or seen while no
+   * turn of Tacet's owned an id): their hooks are stale whenever they arrive. Kept small.
+   */
+  staleIds: Set<string>;
+  /** The text of the prompt typed last, until its `UserPromptSubmit` arrives. */
+  typedPrompt: string | undefined;
+  /** The text of the turn in progress. */
+  currentPrompt: string | undefined;
+  /**
+   * The text of the last cancelled turn, so its `UserPromptSubmit` is known even when it arrives
+   * after the cancel (and so before its `prompt_id` could be recorded).
+   */
+  cancelledPrompt: string | undefined;
+  /** The cancelled prompt was typed but not acknowledged: its submit may still arrive. */
+  cancelledUnacked: boolean;
+  /**
+   * The typed prompt joined a turn that was still running (#190), under that turn's id. Claude
+   * Code ends that turn (`Stop` with the joined id) and then runs the prompt under a new id that
+   * no `UserPromptSubmit` announces: `awaitStop` until that `Stop`, then `armed` to take the next
+   * new id.
+   */
+  join: { id: string; stage: 'awaitStop' | 'armed' } | undefined;
   /** Bumped by a cancel or close, so a prompt being typed stops typing. */
   epoch: number;
   /** Fires when a typed prompt was not acknowledged in time. */
@@ -227,7 +253,9 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.contextWindow !== undefined) {
       throw new ProfileRefusedError('contextWindow', 'the PTY adapter does not set a context size');
     }
-    if (opts.resume?.fork) throw new Error('the PTY adapter does not fork sessions');
+    if (opts.resume?.fork) {
+      throw new ForkRefusedError(this.id, 'the PTY adapter does not fork sessions');
+    }
     // It names a directory and goes on the command line: only a session id Claude Code made.
     if (opts.resume && !UUID.test(opts.resume.vendorSessionId)) {
       throw new Error('a PTY session to resume is named by its UUID');
@@ -359,6 +387,13 @@ export class PtyAdapter implements AgentAdapter {
       const ptyEnv: Record<string, string> = {
         ...env,
         CLAUDE_CONFIG_DIR: configDir,
+        // Prompts are typed verbatim: Claude Code would otherwise read an `@path` mention into
+        // the prompt, outside the working directory too, with no hook or permission request, and
+        // a Worker's prompt can carry text a Worker wrote (a `verify` command's output). Verified
+        // live on 2.1.319, inline, at a line start and in a code fence; documented from 2.1.299
+        // (code.claude.com/docs/en/env-vars, checked 2026-11-10). Set here, last, so no base
+        // environment can unset it; Claude Code ignores it in project settings anyway (#226).
+        CLAUDE_CODE_DISABLE_FILE_MENTIONS: '1',
         TERM: env.TERM ?? 'xterm-256color',
         // The hook endpoint is local: never through a proxy the user has set.
         NO_PROXY: [env.NO_PROXY, '127.0.0.1'].filter(Boolean).join(','),
@@ -386,13 +421,18 @@ export class PtyAdapter implements AgentAdapter {
         openTools: [],
         promptId: undefined,
         typing: false,
-        cancelledPromptId: undefined,
+        staleIds: new Set(),
         epoch: 0,
         ackTimer: undefined,
         finished: new Set(),
         queue: [],
         cancelledAt: 0,
         lastOutputAt: 0,
+        typedPrompt: undefined,
+        currentPrompt: undefined,
+        cancelledPrompt: undefined,
+        cancelledUnacked: false,
+        join: undefined,
         screen: new TerminalBuffer(this.#opts.cols ?? 200, this.#opts.rows ?? 50),
         ready,
         exited,
@@ -599,7 +639,22 @@ export class PtyAdapter implements AgentAdapter {
         if (gone()) return;
       }
       if (gone()) return;
+      // The same text as a cancelled prompt whose submit has not arrived yet: wait (bounded) for
+      // it, so that late submit is not taken for this one (#190).
+      const late = Date.now() + Math.min(this.#opts.ackTimeoutMs ?? 15_000, 3000);
+      while (
+        s.cancelledUnacked &&
+        s.cancelledPrompt !== undefined &&
+        samePrompt(text, s.cancelledPrompt) &&
+        Date.now() < late
+      ) {
+        await sleep(50);
+        if (gone()) return;
+      }
+      if (gone()) return;
+      s.cancelledUnacked = false;
       const before = s.promptId;
+      s.typedPrompt = text;
       // Paste and Enter in one write (verified live): no moment where a cancel could leave a
       // prompt typed but not submitted.
       s.pty.write(`${PASTE_START}${text}${PASTE_END}\r`);
@@ -623,7 +678,19 @@ export class PtyAdapter implements AgentAdapter {
   #cancelTurn(s: Session, interruptedByDenial = false): void {
     s.queue.length = 0;
     s.epoch++;
-    s.cancelledPromptId = s.promptId;
+    if (s.promptId !== undefined) this.#stale(s, s.promptId);
+    if (s.join) this.#stale(s, s.join.id);
+    s.promptId = undefined;
+    s.join = undefined;
+    // Typed but not acknowledged yet: the turn is this prompt, whatever prompt_id it gets. A
+    // cancel while nothing was typed (the wait after an earlier Esc) keeps the earlier one.
+    const text = s.typedPrompt ?? s.currentPrompt;
+    if (text !== undefined) {
+      s.cancelledPrompt = text;
+      s.cancelledUnacked = s.typedPrompt !== undefined;
+    }
+    s.typedPrompt = undefined;
+    s.currentPrompt = undefined;
     if (interruptedByDenial || s.approvals.size > 0) {
       for (const p of s.approvals.values()) {
         if (p.toolUseId) this.#toolResult(s, p.toolUseId, false);
@@ -658,14 +725,52 @@ export class PtyAdapter implements AgentAdapter {
       return;
     }
     const promptId = typeof body.prompt_id === 'string' ? body.prompt_id : undefined;
+    const turnHook =
+      ev.hook_event_name !== 'SessionStart' && ev.hook_event_name !== 'UserPromptSubmit';
+    // After a prompt joined a running turn, and that turn's Stop came, the next new prompt_id is
+    // the prompt's own turn (#190). A subagent's hooks (`agent_id`) never decide it.
+    if (
+      turnHook &&
+      s.join?.stage === 'armed' &&
+      promptId !== undefined &&
+      !s.staleIds.has(promptId) &&
+      body.agent_id === undefined
+    ) {
+      s.promptId = promptId;
+      s.join = undefined;
+      clearTimeout(s.ackTimer);
+      // Reported as not taken while it waited: it was, after all.
+      if (s.state === 'waiting_input' && s.approvals.size === 0) this.#setState(s, 'running');
+    }
     // A turn-scoped hook from another turn than the one in progress (e.g. an interrupted one
-    // whose events arrive late) changes nothing.
+    // whose events arrive late) changes nothing. A hook with an id while no turn of Tacet's owns
+    // one (a prompt typed but not acknowledged, or the wait after a cancel) is an earlier turn's.
     const stale =
-      ev.hook_event_name !== 'SessionStart' &&
-      ev.hook_event_name !== 'UserPromptSubmit' &&
+      turnHook &&
       (s.state === 'cancelled' ||
-        (promptId !== undefined && promptId === s.cancelledPromptId) ||
-        (promptId !== undefined && s.promptId !== undefined && promptId !== s.promptId));
+        (promptId !== undefined && s.staleIds.has(promptId)) ||
+        (promptId !== undefined && s.promptId !== undefined && promptId !== s.promptId) ||
+        (promptId !== undefined && s.promptId === undefined));
+    if (stale && promptId !== undefined && s.promptId === undefined) {
+      // The joined turn's own end: from now on the next new id is the joined prompt's turn.
+      if (
+        s.join?.stage === 'awaitStop' &&
+        promptId === s.join.id &&
+        (ev.hook_event_name === 'Stop' || ev.hook_event_name === 'StopFailure')
+      ) {
+        s.join.stage = 'armed';
+        // If the prompt's own turn never shows, it waits in the terminal.
+        clearTimeout(s.ackTimer);
+        s.ackTimer = setTimeout(() => {
+          if (s.join && s.state === 'running' && !s.ended && !s.closing) {
+            this.#setState(s, 'waiting_input', 'the prompt was not taken; check the terminal');
+          }
+        }, this.#opts.ackTimeoutMs ?? 15_000);
+        s.ackTimer.unref();
+      } else if (promptId !== s.join?.id) {
+        this.#stale(s, promptId);
+      }
+    }
     if (stale) {
       if (ev.hook_event_name === 'PreToolUse')
         reply(preToolUseDecision(ev.tool_name, this.#tacetPrefix));
@@ -679,18 +784,51 @@ export class PtyAdapter implements AgentAdapter {
         s.ready();
         reply();
         return;
-      case 'UserPromptSubmit':
-        // A cancelled prompt's own submit (its Enter beat the cancel) is not a new turn.
-        if (promptId !== undefined && promptId === s.cancelledPromptId) {
+      case 'UserPromptSubmit': {
+        const text = typeof body.prompt === 'string' ? body.prompt : undefined;
+        if (s.typedPrompt !== undefined && samePrompt(text, s.typedPrompt)) {
+          s.typedPrompt = undefined;
+          s.currentPrompt = text;
+          clearTimeout(s.ackTimer);
+          if (promptId !== undefined && s.staleIds.has(promptId)) {
+            // Claude Code 2.1.319 (observed live, #190): a prompt submitted while a turn still
+            // runs (its Esc did not take) joins it. This hook carries the running turn's
+            // prompt_id, that turn's Stop follows with its own reply, and the prompt then runs
+            // under a new prompt_id that no UserPromptSubmit announces.
+            s.promptId = undefined;
+            s.join = { id: promptId, stage: 'awaitStop' };
+            // The joined turn may run for long; the wait for the prompt's own turn starts when
+            // that turn has ended.
+            clearTimeout(s.ackTimer);
+          } else {
+            s.promptId = promptId;
+            s.join = undefined;
+            s.cancelledPrompt = undefined;
+          }
+          if (s.state !== 'running') this.#setState(s, 'running');
           reply();
           return;
         }
+        // A cancelled prompt's own submit (its Enter beat the cancel, or its hook arrived after
+        // it) is not a new turn, and its later hooks are stale.
+        const cancelledText =
+          s.cancelledPrompt !== undefined && samePrompt(text, s.cancelledPrompt);
+        if ((promptId !== undefined && s.staleIds.has(promptId)) || cancelledText) {
+          if (promptId !== undefined) this.#stale(s, promptId);
+          if (cancelledText) s.cancelledUnacked = false;
+          reply();
+          return;
+        }
+        // Not recognisably Tacet's prompt (e.g. a binary that sends no `prompt`): by id only.
+        s.typedPrompt = undefined;
         s.promptId = promptId;
-        s.cancelledPromptId = undefined;
+        s.currentPrompt = text;
+        s.join = undefined;
         clearTimeout(s.ackTimer);
         if (s.state !== 'running') this.#setState(s, 'running');
         reply();
         return;
+      }
       case 'PreToolUse':
         s.openTools.push({
           id: ev.tool_use_id,
@@ -756,6 +894,15 @@ export class PtyAdapter implements AgentAdapter {
         this.#turnEnded(s, 'idle', 'the turn failed');
         reply();
         return;
+    }
+  }
+
+  /** Mark a turn's id stale; the set keeps the latest few. */
+  #stale(s: Session, id: string): void {
+    s.staleIds.add(id);
+    if (s.staleIds.size > 32) {
+      const oldest = s.staleIds.values().next().value;
+      if (oldest !== undefined) s.staleIds.delete(oldest);
     }
   }
 
@@ -859,6 +1006,23 @@ export class PtyAdapter implements AgentAdapter {
     if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
     return s;
   }
+}
+
+/**
+ * Whether a `UserPromptSubmit` prompt is the text Tacet typed. Claude Code 2.1.319 (observed live,
+ * #190) passes a single-line paste through as it is, but wraps a multi-line one in
+ * `<pasted_content id="…">…</pasted_content id="…">` and expands tabs: so the wrapper is removed
+ * and whitespace runs compare equal.
+ */
+export function samePrompt(hook: string | undefined, typed: string): boolean {
+  if (hook === undefined) return false;
+  return promptKey(hook) === promptKey(typed);
+}
+
+function promptKey(text: string): string {
+  const wrapped =
+    /^\s*<pasted_content id="([^"]*)">\n([\s\S]*)\n<\/pasted_content id="\1">\s*$/.exec(text);
+  return (wrapped?.[2] ?? text).replace(/\s+/g, ' ').trim();
 }
 
 /**

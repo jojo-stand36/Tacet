@@ -12,11 +12,11 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ProfileRefusedError } from '@tacet/core';
+import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { PtyAdapter, promptText } from './adapter.js';
+import { PtyAdapter, promptText, samePrompt } from './adapter.js';
 import type { Pty, PtySpawnOptions } from './pty.js';
 
 const KEY = 'sk-ant-placeholder-not-a-real-key-0123456789';
@@ -125,6 +125,19 @@ class FakeClaude implements Pty {
   }
 }
 
+describe('samePrompt (#190)', () => {
+  it('matches the prompt Claude Code reports to what was typed', () => {
+    expect(samePrompt('SAY one', 'SAY one')).toBe(true);
+    // Observed on 2.1.319: a multi-line paste comes back wrapped, with tabs expanded.
+    const wrapped =
+      '\n\n<pasted_content id="361d">\nSAY two\n    indented\n\n  end  \n</pasted_content id="361d">\n';
+    expect(samePrompt(wrapped, 'SAY two\n\tindented\n\n  end  ')).toBe(true);
+    expect(samePrompt(wrapped, 'SAY three\n\tindented')).toBe(false);
+    expect(samePrompt(undefined, 'x')).toBe(false);
+    expect(samePrompt('SLOW', 'SAY after')).toBe(false);
+  });
+});
+
 describe('promptText', () => {
   it('keeps text, newlines and tabs, and drops control characters', () => {
     expect(promptText('fix\tthe\nbug')).toBe('fix\tthe\nbug');
@@ -212,6 +225,15 @@ describe('PtyAdapter (fake claude)', () => {
     );
     expect(f.args[f.args.indexOf('--session-id') + 1]).toBe(h.vendorSessionId);
     expect(f.opts.env.CLAUDE_CONFIG_DIR).toContain(join(root, 'state'));
+    // No `@path` mention is read into a prompt (#226).
+    expect(f.opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
+    // Set last: neither the base environment nor a session's own env can turn it off.
+    const off = make(
+      { CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0' },
+      { envPolicy: { pass: ['FAKE_*', 'CLAUDE_CODE_DISABLE_FILE_MENTIONS'] } },
+    );
+    await off.start({ cwd: join(root, 'wt'), env: { CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0' } });
+    expect(fake().opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
     expect(f.opts.env.NO_PROXY).toContain('127.0.0.1');
     expect(f.opts.env.OPENAI_API_KEY).toBeUndefined();
     expect(dropped).toEqual([['OPENAI_API_KEY']]);
@@ -260,7 +282,7 @@ describe('PtyAdapter (fake claude)', () => {
     await expect(ok.start({ cwd, effort: 'high' })).rejects.toThrow(ProfileRefusedError);
     const id = randomUUID();
     await expect(ok.start({ cwd, resume: { vendorSessionId: id, fork: true } })).rejects.toThrow(
-      /fork/,
+      ForkRefusedError,
     );
     await expect(ok.start({ cwd, resume: { vendorSessionId: '../../x' } })).rejects.toThrow(/UUID/);
     await expect(ok.start({ cwd, resume: { vendorSessionId: id } })).rejects.toThrow(
@@ -356,6 +378,248 @@ describe('PtyAdapter (fake claude)', () => {
       'running',
       'idle',
     ]);
+    await adapter.close(h);
+  });
+
+  /**
+   * Claude Code 2.1.319, observed live (#190): a prompt submitted while a turn still runs (an Esc
+   * that did not take) gets a `UserPromptSubmit` carrying the running turn's `prompt_id` and the
+   * new prompt; that turn's `Stop` follows with its own reply; the queued prompt then runs under a
+   * new `prompt_id` that no `UserPromptSubmit` announces, and its `Stop` carries that id.
+   */
+  async function midTurnSubmit(cancelBeforeAck: boolean) {
+    const adapter = make({ FAKE_MODE: 'NO_ACK' }, { ackTimeoutMs: 60_000 });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    const p1 = randomUUID();
+    const p2 = randomUUID();
+    const typed = (t: string) => f.writes.includes(`\x1b[200~${t}\x1b[201~\r`);
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => typed('SLOW')).toBe(true);
+    if (cancelBeforeAck) {
+      // Esc before the turn's own UserPromptSubmit reached the adapter (a slow machine).
+      await adapter.interrupt(h);
+      await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+      expect(adapter.status(h)).toBe('cancelled');
+    } else {
+      await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+      await adapter.interrupt(h);
+    }
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'SAY after' });
+    await expect.poll(() => typed('SAY after')).toBe(true);
+    // The Esc did not take: the new prompt joined the running turn.
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SAY after' });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply slow reply' });
+    expect(texts(tap)).toEqual([]);
+    expect(adapter.status(h)).toBe('running');
+    // The queued prompt's own turn, under a prompt_id no UserPromptSubmit announced.
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'You said after.' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    const next = tap.events.slice(from);
+    expect(next.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []))).toEqual([
+      'You said after.',
+    ]);
+    expect(next.flatMap((e) => (e.t === 'status' ? [e.state] : []))).toEqual(['running', 'idle']);
+    await adapter.close(h);
+  }
+
+  it("never credits a cancelled turn's reply to a prompt that joined it (#190)", async () => {
+    await midTurnSubmit(false);
+  });
+
+  it('does the same when the cancel came before the turn was acknowledged (#190)', async () => {
+    await midTurnSubmit(true);
+  });
+
+  it('keeps a cancelled turn cancelled when its UserPromptSubmit arrives late (#190)', async () => {
+    const adapter = make({ FAKE_MODE: 'NO_ACK' }, { ackTimeoutMs: 60_000 });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    const p1 = randomUUID();
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => f.writes.some((w) => w.includes('SLOW'))).toBe(true);
+    await adapter.interrupt(h);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply' });
+    expect(adapter.status(h)).toBe('cancelled');
+    expect(texts(tap)).toEqual([]);
+    await adapter.close(h);
+  });
+
+  /** A session on the hook-less fake, where the test plays Claude Code's hooks itself (#190). */
+  async function scripted() {
+    const adapter = make({ FAKE_MODE: 'NO_ACK' }, { ackTimeoutMs: 60_000 });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    const typedCount = (t: string) =>
+      f.writes.filter((w) => w === `\x1b[200~${t}\x1b[201~\r`).length;
+    const deltas = (from: number) =>
+      tap.events.slice(from).flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+    return { adapter, h, tap, f, typedCount, deltas };
+  }
+
+  it('ignores hooks of earlier turns while a joined prompt waits, even after a second cancel (#190)', async () => {
+    const { adapter, h, tap, f, typedCount, deltas } = await scripted();
+    const [p1, p2, p3] = [randomUUID(), randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => typedCount('SLOW')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+    await adapter.interrupt(h);
+    await adapter.send(h, { text: 'B' });
+    await expect.poll(() => typedCount('B')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'B' });
+    // Cancelled again while B waits for its own turn; then C is typed.
+    await adapter.interrupt(h);
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'C' });
+    await expect.poll(() => typedCount('C')).toBe(1);
+    // Before C is acknowledged: the joined turn's end, and B's own turn, arrive late.
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'reply: B' });
+    expect(deltas(from)).toEqual([]);
+    // B's turn id is now known stale: C joining it is recognised as a join too.
+    await f.hook('UserPromptSubmit', { prompt_id: p2, prompt: 'C' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'reply: B again' });
+    await f.hook('Stop', { prompt_id: p3, last_assistant_message: 'reply: C' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(deltas(from)).toEqual(['reply: C']);
+    await adapter.close(h);
+  });
+
+  it('joins after a cancel by denial too (#190)', async () => {
+    const { adapter, h, tap, f, typedCount, deltas } = await scripted();
+    const [p1, p2] = [randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'TOOL' });
+    await expect.poll(() => typedCount('TOOL')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'TOOL' });
+    const ls = { tool_name: 'Bash', tool_input: { command: 'ls' } };
+    await f.hook('PreToolUse', { ...ls, tool_use_id: 't1' });
+    const pending = f.json('PermissionRequest', ls);
+    const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+    if (req.event.t !== 'approval.request') throw new Error('no request');
+    await adapter.respond(h, req.event.id, { kind: 'cancel', persist: false });
+    await pending;
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'SAY after' });
+    await expect.poll(() => typedCount('SAY after')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SAY after' });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'tool reply' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'You said after.' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(deltas(from)).toEqual(['You said after.']);
+    await adapter.close(h);
+  });
+
+  it("does not take a new id before the joined turn's Stop, nor a subagent's (#190)", async () => {
+    const { adapter, h, tap, f, typedCount, deltas } = await scripted();
+    const [p1, p2, stray, sub] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => typedCount('SLOW')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+    await adapter.interrupt(h);
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'SAY after' });
+    await expect.poll(() => typedCount('SAY after')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SAY after' });
+    // An id that is not the joined turn's, before that turn's Stop: never adopted.
+    await f.hook('Stop', { prompt_id: stray, last_assistant_message: 'stray' });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply' });
+    // A subagent's hook with a new id: not the prompt's turn either.
+    await f.hook('Stop', { prompt_id: sub, agent_id: 'a1', last_assistant_message: 'subagent' });
+    expect(deltas(from)).toEqual([]);
+    expect(adapter.status(h)).toBe('running');
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'You said after.' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(deltas(from)).toEqual(['You said after.']);
+    await adapter.close(h);
+  });
+
+  it('waits in the terminal when a joined prompt never gets its own turn (#190)', async () => {
+    const adapter = make({ FAKE_MODE: 'NO_ACK' }, { ackTimeoutMs: 200 });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const f = fake();
+    const p1 = randomUUID();
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => f.writes.length).toBeGreaterThan(0);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+    await adapter.interrupt(h);
+    await adapter.send(h, { text: 'SAY after' });
+    await expect.poll(() => f.writes.some((w) => w.includes('SAY after'))).toBe(true);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SAY after' });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply' });
+    await expect.poll(() => adapter.status(h)).toBe('waiting_input');
+    await adapter.close(h);
+  });
+
+  it('does not report a joined prompt as not taken while the turn it joined still runs (#190)', async () => {
+    const adapter = make({ FAKE_MODE: 'NO_ACK' }, { ackTimeoutMs: 200 });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    const [p1, p2] = [randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'SLOW' });
+    await expect.poll(() => f.writes.length).toBeGreaterThan(0);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SLOW' });
+    await adapter.interrupt(h);
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'SAY after' });
+    await expect.poll(() => f.writes.some((w) => w.includes('SAY after'))).toBe(true);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'SAY after' });
+    // The joined turn runs longer than the ack timeout before it ends.
+    await new Promise((r) => setTimeout(r, 600));
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'slow reply' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'You said after.' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(tap.events.slice(from).flatMap((e) => (e.t === 'status' ? [e.state] : []))).toEqual([
+      'running',
+      'idle',
+    ]);
+    await adapter.close(h);
+  });
+
+  it("types a cancelled prompt's text again only after its late submit, and credits the new turn (#190)", async () => {
+    const { adapter, h, tap, f, typedCount, deltas } = await scripted();
+    const [p1, p2] = [randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'continue' });
+    await expect.poll(() => typedCount('continue')).toBe(1);
+    // Cancelled before its submit arrived; the same text is sent again.
+    await adapter.interrupt(h);
+    const from = tap.events.length;
+    const again = adapter.send(h, { text: 'continue' });
+    await new Promise((r) => setTimeout(r, 800));
+    // Still waiting for the cancelled one's submit: not typed a second time yet.
+    expect(typedCount('continue')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1, prompt: 'continue' });
+    await again;
+    await expect.poll(() => typedCount('continue')).toBe(2);
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'cancelled reply' });
+    await f.hook('UserPromptSubmit', { prompt_id: p2, prompt: 'continue' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'new reply' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(deltas(from)).toEqual(['new reply']);
+    await adapter.close(h);
+  });
+
+  it('still tracks turns by id when UserPromptSubmit carries no prompt text (#190)', async () => {
+    const { adapter, h, tap, f, typedCount, deltas } = await scripted();
+    const [p1, p2] = [randomUUID(), randomUUID()];
+    await adapter.send(h, { text: 'one' });
+    await expect.poll(() => typedCount('one')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p1 });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'reply one' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    const from = tap.events.length;
+    await adapter.send(h, { text: 'two' });
+    await expect.poll(() => typedCount('two')).toBe(1);
+    await f.hook('UserPromptSubmit', { prompt_id: p2 });
+    await f.hook('Stop', { prompt_id: p1, last_assistant_message: 'late' });
+    await f.hook('Stop', { prompt_id: p2, last_assistant_message: 'reply two' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from);
+    expect(deltas(from)).toEqual(['reply two']);
     await adapter.close(h);
   });
 

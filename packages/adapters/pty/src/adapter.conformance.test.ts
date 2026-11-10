@@ -20,6 +20,10 @@ import { assertConformance, EventTap, formatResults, runConformance } from '@tac
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { PtyAdapter } from './adapter.js';
 import { loadPty } from './pty.js';
+import { gatedTitle, ptyGate } from './testing/pty-gate.js';
+
+// node-pty must load in CI; locally a machine that could not build it skips these (#189).
+const gate = await ptyGate();
 
 /** The Claude Code binary the pinned Agent SDK bundles for this platform. */
 function claudeBinary(): string {
@@ -40,7 +44,7 @@ function claudeBinary(): string {
  */
 const linux = process.platform === 'linux';
 
-describe.runIf(linux)('PtyAdapter on Linux (#164)', () => {
+describe.runIf(linux && gate.ok)('PtyAdapter on Linux (#164)', () => {
   it('refuses to start an interactive Claude Worker, saying why', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-linux-')));
     try {
@@ -63,8 +67,8 @@ describe.runIf(linux)('PtyAdapter on Linux (#164)', () => {
   });
 });
 
-describe.skipIf(linux)(
-  'PtyAdapter conformance (interactive Claude Code in a PTY, mock Messages API)',
+describe.skipIf(!gate.ok || linux)(
+  gatedTitle('PtyAdapter conformance (interactive Claude Code in a PTY, mock Messages API)', gate),
   () => {
     let api: MockMessagesApi;
     let root: string;
@@ -75,7 +79,7 @@ describe.skipIf(linux)(
     const screens: string[] = [];
 
     beforeAll(async () => {
-      // node-pty must really load here: a PTY test that quietly skipped would prove nothing.
+      // node-pty loaded (the gate above): in CI a PTY test that quietly skipped would prove nothing.
       const spawn = await loadPty();
       api = await startMockMessagesApi();
       root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-')));
@@ -164,6 +168,41 @@ describe.skipIf(linux)(
       });
       console.log(formatResults(results));
       assertConformance(results);
+    });
+
+    it('reads no @path mention into a Worker prompt (#226)', { timeout: 180_000 }, async () => {
+      const cwd = join(root, 'wt-at');
+      mkdirSync(cwd);
+      writeFileSync(join(cwd, 'note.txt'), 'INSIDE-AT-CONTENT\n');
+      const outside = join(root, 'outside-at.txt');
+      writeFileSync(outside, 'OUTSIDE-AT-CONTENT\n');
+      // A directory mention lists its entries (verified live without the variable).
+      const dir = join(root, 'outside-at-dir');
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'OUTSIDE-DIR-ENTRY.txt'), '');
+      // Inline, at the start of a line, and inside a fence: each was read in before (verified live).
+      for (const text of [
+        `SAY inline see @${outside} and @note.txt`,
+        `SAY line\n@${outside}`,
+        `SAY dir @${dir}/`,
+        `SAY fenced\n\`\`\`\nsee @${outside} and @note.txt\n\`\`\``,
+      ]) {
+        const h = await adapter.start({ cwd });
+        const tap = new EventTap(adapter.events(h));
+        const { end, events } = await turn(h, tap, text);
+        expect(end).toEqual({ t: 'status', state: 'idle' });
+        expect(events.some((e) => e.t === 'approval.request')).toBe(false);
+        const raw = api.requests.at(-1)?.raw ?? '';
+        // The typed text is kept as typed (Claude Code adds a note per mention telling the model
+        // to read it with its tools, which the policy then decides), and nothing is read in.
+        expect(api.requests.at(-1)?.text).toContain(
+          text.includes('dir @') ? `@${dir}` : `@${outside}`,
+        );
+        expect(raw).not.toContain('OUTSIDE-DIR-ENTRY');
+        expect(raw).not.toContain('OUTSIDE-AT-CONTENT');
+        expect(raw).not.toContain('INSIDE-AT-CONTENT');
+        await adapter.close(h);
+      }
     });
 
     it('reports running, waiting and idle from the hooks', { timeout: 120_000 }, async () => {

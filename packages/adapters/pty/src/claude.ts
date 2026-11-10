@@ -74,8 +74,9 @@ export function claudeArgs(opts: {
   return [
     '--settings',
     opts.settingsPath,
-    // Only Tacet's settings: not the user's, not the repo's (as the SDK adapter's
-    // `settingSources: []`). Their hooks, permissions and env would otherwise reach a Worker.
+    // Only Tacet's settings: not the user's, not the repo's, and no CLAUDE.md. A checkout's
+    // hooks, permissions, env and instructions would otherwise reach a Worker. The SDK adapter's
+    // default `settingSources: []` is the same flag: the SDK passes `--setting-sources ''` (#181).
     '--setting-sources',
     '',
     // Ask before tools run, so approvals reach Tacet: Claude Code otherwise starts in auto mode.

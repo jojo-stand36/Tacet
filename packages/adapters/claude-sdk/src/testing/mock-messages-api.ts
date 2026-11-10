@@ -11,6 +11,9 @@ import type { AddressInfo } from 'node:net';
  * - `RUN_CMD <shell command>`: asks for a Bash tool call running the rest of the line.
  * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
  *   without asking for a file in its working directory.
+ * - `GLOB_TOOL <path> <pattern>`: asks for `Glob` with that `path` and `pattern`.
+ * - `GREP_TOOL <path> <pattern>`: asks for `Grep` (`files_with_matches`) with that `path` and
+ *   regex.
  * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
  *   its shell's pid to `background.pid` and then becomes `sleep 600`; with `ESCALATE` in the same first message,
  *   it then escalates as below.
@@ -36,6 +39,15 @@ export interface MockRequest {
   tools: string[];
   /** The text of the tool result this request carries, if any (what the tool printed). */
   toolOutput?: string;
+  /** Which known credential authenticated it (see `startMockMessagesApi`); `none` if none. */
+  credential: string;
+  /** The request body as sent, to check that some text never reached the model (#181). */
+  raw: string;
+}
+
+export interface MockMessagesApiOptions {
+  /** Test credentials by label: each request records the label of the one it carried. */
+  credentials?: Record<string, string>;
 }
 
 export interface MockMessagesApi {
@@ -70,6 +82,19 @@ function lastUser(body: Body): { text: string; toolResult: boolean } {
       .join('\n'),
     toolResult: m.content.some((b) => b.type === 'tool_result'),
   };
+}
+
+/**
+ * Which of the known test credentials a request carried (#145): the label of the one in its
+ * `x-api-key` header or `Authorization: Bearer` token, `other` for an unknown one, or `none`.
+ * Values are compared, never kept.
+ */
+function credentialOf(req: IncomingMessage, known: Record<string, string>): string {
+  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const xKey = req.headers['x-api-key'];
+  const sent = typeof xKey === 'string' ? xKey : bearer;
+  if (sent === undefined) return 'none';
+  return Object.entries(known).find(([, v]) => v === sent)?.[0] ?? 'other';
 }
 
 let n = 0;
@@ -161,6 +186,32 @@ function plan(body: Body): Block[] {
       },
     ];
   }
+  const glob = /GLOB_TOOL (\S+) (\S+)/.exec(text);
+  if (glob) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Glob',
+        input: { path: glob[1] as string, pattern: glob[2] as string },
+      },
+    ];
+  }
+  const grep = /GREP_TOOL (\S+) (\S+)/.exec(text);
+  if (grep) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Grep',
+        input: {
+          path: grep[1] as string,
+          pattern: grep[2] as string,
+          output_mode: 'files_with_matches',
+        },
+      },
+    ];
+  }
   const read = /READ_TOOL (\S+)/.exec(text);
   if (read) {
     return [
@@ -190,6 +241,7 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   log: MockMessagesApi['requests'],
+  known: Record<string, string>,
 ): Promise<void> {
   let raw = '';
   for await (const c of req) raw += c;
@@ -211,6 +263,8 @@ async function handle(
   const output = toolOutput(body);
   log.push({
     ...(output !== undefined ? { toolOutput: output } : {}),
+    raw,
+    credential: credentialOf(req, known),
     model: body.model,
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
@@ -291,10 +345,12 @@ async function handle(
   res.end();
 }
 
-export async function startMockMessagesApi(): Promise<MockMessagesApi> {
+export async function startMockMessagesApi(
+  opts: MockMessagesApiOptions = {},
+): Promise<MockMessagesApi> {
   const requests: MockMessagesApi['requests'] = [];
   const server: Server = createServer((req, res) => {
-    handle(req, res, requests).catch(() => res.destroy());
+    handle(req, res, requests, opts.credentials ?? {}).catch(() => res.destroy());
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as AddressInfo;
@@ -302,9 +358,24 @@ export async function startMockMessagesApi(): Promise<MockMessagesApi> {
     url: `http://127.0.0.1:${port}`,
     requests,
     close: () =>
-      new Promise<void>((r) => {
+      new Promise<void>((resolve, reject) => {
         server.closeAllConnections();
-        server.close(() => r());
+        // Not expected to wait; if it ever does (#189), say what is still open rather than
+        // leaving a test hook to time out without a reason.
+        const stuck = setTimeout(() => {
+          server.getConnections((_err, open) =>
+            reject(
+              new Error(
+                `mock Messages API did not close within 5 s: ${open} connection(s) open, listening=${server.listening}`,
+              ),
+            ),
+          );
+        }, 5000);
+        stuck.unref();
+        server.close(() => {
+          clearTimeout(stuck);
+          resolve();
+        });
       }),
   };
 }

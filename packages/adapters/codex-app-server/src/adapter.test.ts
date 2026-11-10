@@ -1,11 +1,26 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, configArgs, grantSubset, toCodexDecision } from './adapter.js';
+import {
+  CodexAppServerAdapter,
+  configArgs,
+  grantSubset,
+  toCodexDecision,
+  untrustProjects,
+} from './adapter.js';
 import { API_KEY_PROVIDER_ID, AuthRoutingError, chooseAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, RpcError } from './jsonrpc.js';
 
@@ -105,6 +120,41 @@ describe('toCodexDecision', () => {
     });
     expect(toCodexDecision('elicitation', {}, d('cancel'))).toMatchObject({ action: 'cancel' });
     expect(toCodexDecision('elicitation', {}, d('allow_once'))).toMatchObject({ action: 'accept' });
+  });
+});
+
+describe('untrustProjects (#181)', () => {
+  it('marks the paths untrusted, replacing what Codex wrote and keeping the rest', () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-codex-trust-')));
+    try {
+      const file = join(dir, 'config.toml');
+      writeFileSync(
+        file,
+        `model = "x"\n\n[projects.${JSON.stringify(dir)}]\ntrust_level = "trusted"\n\n[projects."/other"]\ntrust_level = "trusted"\n`,
+      );
+      untrustProjects(file, [dir]);
+      const text = readFileSync(file, 'utf8');
+      expect(text).toContain('model = "x"');
+      expect(text).toContain('[projects."/other"]\ntrust_level = "trusted"');
+      expect(text).toContain(`[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"`);
+      expect(text.split(`[projects.${JSON.stringify(dir)}]`)).toHaveLength(2);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      // Idempotent, and a missing file is created.
+      untrustProjects(file, [dir]);
+      expect(readFileSync(file, 'utf8')).toBe(text);
+      rmSync(file);
+      untrustProjects(file, [dir]);
+      expect(readFileSync(file, 'utf8')).toBe(
+        `[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"\n`,
+      );
+      // Any read error but a missing file fails closed, leaving the path as it was.
+      const asDir = join(dir, 'is-a-dir');
+      mkdirSync(asDir);
+      expect(() => untrustProjects(asDir, [dir])).toThrow();
+      expect(statSync(asDir).isDirectory()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -218,6 +268,173 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
       .trim()
       .split('\n')
       .map((l) => JSON.parse(l));
+
+  const turnTexts = () =>
+    clientLog()
+      .filter((m) => m.method === 'turn/start')
+      .map((m) => m.params.input[0].text);
+
+  describe('forks keep the source thread’s model and effort (#175)', () => {
+    const fork = { vendorSessionId: 'source-1', fork: true };
+    const sent = (method: string) => clientLog().filter((m) => m.method === method);
+
+    it('reads the source only for a fork that lacks a model or effort', async () => {
+      const adapter = make('normal');
+      for (const opts of [
+        { cwd: root },
+        { cwd: root, resume: { vendorSessionId: 'source-1' } },
+        { cwd: root, model: 'fake-model', effort: 'low', resume: fork },
+      ]) {
+        await adapter.close(await adapter.start(opts));
+      }
+      expect(sent('thread/read')).toEqual([]);
+      expect(sent('thread/fork')[0].params).toMatchObject({
+        model: 'fake-model',
+        config: { model_reasoning_effort: 'low' },
+      });
+    });
+
+    it('sends the source’s model and effort, checked against model/list', async () => {
+      const adapter = make('normal');
+      await adapter.close(await adapter.start({ cwd: root, resume: fork }));
+      expect(sent('thread/read')[0].params).toEqual({ threadId: 'source-1' });
+      expect(sent('model/list').length).toBeGreaterThan(0);
+      expect(sent('thread/fork')[0].params).toMatchObject({
+        threadId: 'source-1',
+        model: 'fake-model',
+        config: { model_reasoning_effort: 'high' },
+      });
+    });
+
+    it('forks without the source’s effort when its model cannot confirm it, not refusing', async () => {
+      for (const mode of ['read-uncatalogued', 'models-fail-once']) {
+        const adapter = make(mode);
+        const h = await adapter.start({ cwd: root, resume: fork });
+        const params = sent('thread/fork').at(-1).params;
+        expect(params.config, mode).not.toHaveProperty('model_reasoning_effort');
+        expect(params.model, mode).toBe(
+          mode === 'read-uncatalogued' ? 'other-model' : 'fake-model',
+        );
+        await adapter.close(h);
+      }
+      // An effort the caller names is still refused when it cannot be confirmed.
+      await expect(
+        make('read-uncatalogued').start({ cwd: root, effort: 'high', resume: fork }),
+      ).rejects.toMatchObject({ name: 'ProfileRefusedError', field: 'effort' });
+    });
+
+    it('falls back to a plain fork when the source reports no model', async () => {
+      const adapter = make('read-nomodel');
+      await adapter.close(await adapter.start({ cwd: root, resume: fork }));
+      const params = sent('thread/fork')[0].params;
+      expect(params).not.toHaveProperty('model');
+      expect(params.config).not.toHaveProperty('model_reasoning_effort');
+      expect(sent('model/list')).toEqual([]);
+    });
+
+    it('fails the start, scrubbed, when the source cannot be read', async () => {
+      // No secret pattern matches it, so only the header-literal scrub can remove it.
+      const token = 'tacet-hdr-0123456789abcdef';
+      const adapter = make('read-fail', {
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: root,
+          OPENAI_API_KEY: FAKE_KEY,
+          FAKE_MODE: 'read-fail',
+          FAKE_ERROR: `no such thread (header value ${token})`,
+          FAKE_LOG: join(root, 'log.jsonl'),
+        },
+      });
+      const err = await adapter
+        .start({
+          cwd: root,
+          resume: fork,
+          mcpServers: [
+            {
+              name: 'tacet',
+              url: 'http://127.0.0.1:1/mcp',
+              headers: { authorization: `Bearer ${token}` },
+            },
+          ],
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e as Error,
+        );
+      expect(err?.message).toContain('failed to start the session');
+      expect(err?.message).not.toContain(token);
+      expect(sent('thread/fork')).toEqual([]);
+    });
+  });
+
+  it('keeps send order when an earlier send waits on the effort check', async () => {
+    const adapter = make('models-slow');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    // Not awaited one by one: live input from a caller that fires and forgets.
+    const a = adapter.send(h, { text: 'A' }, { effort: 'low' });
+    const b = adapter.send(h, { text: 'B' });
+    await Promise.all([a, b]);
+    // Both turns run to the end.
+    const idle = (e: { t: string; state?: string }) => e.t === 'status' && e.state === 'idle';
+    const first = await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const end1 = await tap.waitFor(idle, 5000, first.index + 1);
+    await tap.waitFor(idle, 5000, end1.index + 1);
+    expect(turnTexts()).toEqual(['A', 'B']);
+    expect(clientLog().find((m) => m.method === 'turn/start')?.params.effort).toBe('low');
+    await adapter.close(h);
+  });
+
+  it('does not cache a failed model/list read, and refuses unlisted levels', async () => {
+    const adapter = make('models-fail-once');
+    const h = await adapter.start({ cwd: root });
+    await expect(adapter.send(h, { text: 'A' }, { effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    await expect(adapter.send(h, { text: 'B' }, { effort: 'xhigh' })).rejects.toMatchObject({
+      field: 'effort',
+      message: expect.stringMatching(/does not support/),
+    });
+    await adapter.send(h, { text: 'C' }, { effort: 'high' });
+    expect(clientLog().filter((m) => m.method === 'model/list')).toHaveLength(2);
+    await adapter.close(h);
+    expect(turnTexts()).toEqual(['C']);
+  });
+
+  it('refuses, without an unhandled rejection, when model/list fails at start', async () => {
+    // No model named: the catalog is read after thread/start, against the thread's model.
+    const adapter = make('models-fail-once');
+    await expect(adapter.start({ cwd: root, effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    // Named model: checked before thread/start, which then never runs.
+    rmSync(join(root, 'log.jsonl'), { force: true });
+    await expect(
+      make('models-fail-once').start({ cwd: root, model: 'fake-model', effort: 'low' }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError' });
+    expect(clientLog().some((m) => m.method === 'thread/start')).toBe(false);
+  });
+
+  it('lists a send still waiting on the effort check in the interrupt receipt', async () => {
+    const adapter = make('slow-both');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'A' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const b = adapter.send(h, { text: 'B' }, { effort: 'low' });
+    expect(await adapter.interrupt(h)).toEqual({ stillQueued: ['B'] });
+    await b;
+    await adapter.close(h);
+  });
+
+  it('stops paging model/list when the cursor repeats', async () => {
+    const adapter = make('models-loop');
+    const h = await adapter.start({ cwd: root, model: 'fake-model', effort: 'low' });
+    expect(clientLog().filter((m) => m.method === 'model/list')).toHaveLength(2);
+    await adapter.close(h);
+  });
 
   it('gives unattended Workers an allowlist of the environment, interactive ones all of it', async () => {
     const envLog = join(root, 'env.json');
@@ -390,6 +607,75 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     },
   );
 
+  it.runIf(process.platform !== 'win32')(
+    'close() returns only once the whole process group is gone, SIGTERM or not (#191)',
+    async () => {
+      const adapter = make('child-term', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        await adapter.close(h);
+        // Gone when close() returns: no polling on Linux, where /proc shows a zombie init has yet
+        // to reap. Elsewhere `kill(pid, 0)` also finds a zombie, so allow launchd a moment.
+        if (process.platform !== 'linux') {
+          for (let i = 0; i < 20; i++) {
+            try {
+              process.kill(childPid, 0);
+            } catch {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        }
+        expect(running(childPid)).toBe(false);
+      } finally {
+        // Never leave the SIGTERM-ignoring child running on the test machine.
+        try {
+          if (childPid && running(childPid)) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'reports a self-exit only once the whole process group is gone (#198)',
+    async () => {
+      const adapter = make('child-term-crash', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        const tap = new EventTap(adapter.events(h));
+        await adapter.send(h, { text: 'go' });
+        // Checked the moment the error is seen: a caller cleaning up on it races nothing.
+        let alive: boolean | undefined;
+        const seen = tap.waitFor((e) => {
+          if (e.t === 'status' && e.state === 'error') {
+            alive = running(childPid as number);
+            return true;
+          }
+          return false;
+        }, 10_000);
+        const { event } = await seen;
+        expect(event).toMatchObject({ message: expect.stringContaining('exited unexpectedly') });
+        expect(alive).toBe(false);
+        // Ended at once, though: nothing more can be sent to it while its group is reaped.
+        await expect(adapter.send(h, { text: 'again' })).rejects.toThrow('has ended');
+        // close() after it waits on that one reap: the group, seen empty, is never polled again.
+        const before = Date.now();
+        await adapter.close(h);
+        expect(Date.now() - before).toBeLessThan(250);
+      } finally {
+        try {
+          if (childPid && running(childPid)) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
+    },
+  );
+
   it('queues input sent during a turn and reports it in the interrupt receipt', async () => {
     const adapter = make('approval');
     const h = await adapter.start({ cwd: root });
@@ -505,3 +791,30 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     await adapter.close(h);
   });
 });
+
+/**
+ * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
+ * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
+ * where `kill(pid, 0)` also finds a zombie.
+ */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+  } catch {
+    if (process.platform === 'linux') return false;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    return state.trim() !== '' && !state.trim().startsWith('Z');
+  } catch (err) {
+    // `ps` exits 1 once the pid is gone; anything else is a broken check, not an answer.
+    if ((err as { status?: number }).status === 1) return false;
+    throw err;
+  }
+}

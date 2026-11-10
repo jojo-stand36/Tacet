@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { ENV_PASS_PATTERN } from '../adapter/env.js';
+import { VENDORS } from '../adapter/vendor.js';
+import { EFFORT_LEVELS, effortRank } from '../schema/profile.js';
 
 /**
  * Tacet configuration (ARCHITECTURE.md §4). Config is written by people, so enums here are
@@ -17,8 +19,43 @@ export const TierConfig = z.strictObject({
    * out for `acp:<slug>` and `pty:<slug>` agents, whose command fixes it (#149).
    */
   model: NonEmpty.optional(),
-  effort: z.enum(['low', 'medium', 'high']).optional(),
+  /** Default effort; the policy may raise it up to `max_effort` (#110). */
+  effort: z.enum(EFFORT_LEVELS).optional(),
+  /**
+   * `tiers.review`: the reviewer must run a different vendor's models than `tiers.worker` (#19).
+   * Default true.
+   */
   cross_vendor: z.boolean().optional(),
+  /**
+   * Whose models the adapter runs, for cross-vendor review (#19). Built-in adapters are known;
+   * OpenCode and custom `acp:`/`pty:` agents need it to take part.
+   */
+  vendor: z.enum(VENDORS).optional(),
+  /**
+   * Bounds on what the session-profile policy may choose for a Worker tier (`worker`, `review`;
+   * #110). A profile outside them is refused before launch. The task layer may not set them. The
+   * planner's `mini` tier does not go through the policy and takes no bounds.
+   */
+  models: z
+    .array(NonEmpty)
+    .min(1)
+    .optional()
+    .describe('Models the policy may choose; `model` (the default) must be one of them'),
+  max_effort: z.enum(EFFORT_LEVELS).optional().describe('Highest effort the policy may choose'),
+  escalate_effort_on_retry: z
+    .boolean()
+    .optional()
+    .describe(
+      'Raise effort one level per failed attempt, up to max_effort (required with it). Off by default; the retry policy itself is #34',
+    ),
+  max_context_window: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      'Largest context window, in tokens, the policy may opt into, and only for a task marked indivisible. Absent: never more than the default window; Tacet hands off instead',
+    ),
 });
 export type TierConfig = z.infer<typeof TierConfig>;
 
@@ -41,8 +78,12 @@ export const AgentPreset = z.strictObject({
   command: z.array(NonEmpty).min(1).describe('argv; the first element is the executable'),
   env: z.record(z.string(), SecretRef).optional().describe('Environment from secret references'),
   ready_prompt: z.string().optional().describe('PTY: text that shows the CLI is ready for input'),
-  resume_flag: z.string().optional().describe('PTY: flag that resumes the last session'),
-  process_name: z.string().optional().describe('PTY: process name to watch'),
+  resume_flag: z
+    .union([NonEmpty, z.array(NonEmpty).min(1)])
+    .optional()
+    .describe(
+      "PTY: argument(s) added to the command to continue the CLI's last session in the Worker's checkout, e.g. [resume, --last] (Codex, whose command should also pass -c features.daemon_auto_start=false, #171) or [--resume, latest] (Gemini CLI), both checked per worktree (capability matrix, #168). Only for a CLI whose resume picks among the sessions of its working directory: otherwise a Worker could continue another Worker's session",
+    ),
 });
 export type AgentPreset = z.infer<typeof AgentPreset>;
 
@@ -70,7 +111,16 @@ export const TacetConfig = z.strictObject({
     .strictObject({ warn: Fraction, handoff: Fraction, hard: Fraction })
     .partial()
     .optional(),
+  /**
+   * Commands that check a Worker's finished sub-task in its checkout (#19), run with `/bin/sh -c`
+   * as Worker code: the Worker environment, no vendor keys. The task layer may not set it.
+   */
   verify: z.array(NonEmpty).optional(),
+  /**
+   * A reviewer agent on `tiers.review` checks each sub-task's diff after its `verify` commands
+   * pass (#19). Off by default. The task layer may turn it on, never off.
+   */
+  review: z.strictObject({ enabled: z.boolean() }).partial().optional(),
   budget: z
     .strictObject({
       per_task_usd: z.number().nonnegative(),
@@ -138,6 +188,13 @@ export const TacetConfig = z.strictObject({
       stuck_after_s: z.number().int().positive(),
       nudge_grace_s: z.number().int().positive(),
       max_attempts: z.number().int().positive(),
+      /** Seconds one `verify` command may run before it is ended (#19). */
+      verify_timeout_s: z.number().int().positive(),
+      /**
+       * Times a failed verification goes back to the same Worker session to fix before the attempt
+       * fails (#19); 0 fails it at once.
+       */
+      verify_fix_attempts: z.number().int().nonnegative(),
       /**
        * Worker environment (#147). A Worker starts with an allowlist of the user's environment;
        * `pass` adds names, or prefixes ending in `*`. A prefix never passes a secret-looking
@@ -157,6 +214,14 @@ export const TacetConfig = z.strictObject({
     })
     .partial()
     .optional(),
+  /**
+   * Worker worktrees (#16). With `remove_merged` on, garbage collection may remove a worktree once
+   * the event log records that its task's work landed in the target branch (merged or
+   * squash-merged), even when no ref contains its commits (#210). Worktrees whose work never
+   * landed are kept either way. Owner decision: on by default; `tacet init` asks. The task layer
+   * may not set it.
+   */
+  worktrees: z.strictObject({ remove_merged: z.boolean() }).partial().optional(),
 });
 /** One config file as written: every key is optional. */
 export type TacetConfig = z.infer<typeof TacetConfig>;
@@ -170,7 +235,15 @@ export const DEFAULT_CONFIG = {
   auth: { unattended: 'api_key', interactive: 'subscription' },
   policies: [],
   events: { retention: { transcript_days: 30 } },
-  workers: { max: 4, stuck_after_s: 300, nudge_grace_s: 900, max_attempts: 3 },
+  workers: {
+    max: 4,
+    stuck_after_s: 300,
+    nudge_grace_s: 900,
+    max_attempts: 3,
+    verify_timeout_s: 600,
+    verify_fix_attempts: 2,
+  },
+  worktrees: { remove_merged: true },
 } satisfies TacetConfig;
 
 /** Checks that only make sense on the merged result. */
@@ -180,6 +253,29 @@ export function validateEffective(config: TacetConfig): string[] {
   if (h?.warn !== undefined && h.handoff !== undefined && h.hard !== undefined) {
     if (!(h.warn < h.handoff && h.handoff < h.hard)) {
       errors.push('handoff: expected warn < handoff < hard');
+    }
+  }
+  for (const [role, t] of Object.entries(config.tiers ?? {})) {
+    if (t.models && t.model !== undefined && !t.models.includes(t.model)) {
+      errors.push(`tiers.${role}.model: ${t.model} is not in tiers.${role}.models`);
+    }
+    const effort = t.effort !== undefined ? effortRank(t.effort) : undefined;
+    const max = t.max_effort !== undefined ? effortRank(t.max_effort) : undefined;
+    if (effort !== undefined && max !== undefined && effort > max) {
+      errors.push(`tiers.${role}.effort: ${t.effort} is above tiers.${role}.max_effort`);
+    }
+    if (t.escalate_effort_on_retry && t.max_effort === undefined) {
+      errors.push(`tiers.${role}.escalate_effort_on_retry: needs tiers.${role}.max_effort`);
+    }
+    if (role === 'mini') {
+      for (const key of [
+        'models',
+        'max_effort',
+        'max_context_window',
+        'escalate_effort_on_retry',
+      ] as const) {
+        if (t[key] !== undefined) errors.push(`tiers.mini.${key}: only Worker tiers take bounds`);
+      }
     }
   }
   const w = config.workers;

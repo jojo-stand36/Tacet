@@ -5,6 +5,7 @@ export { CLAUDE_PTY_CAPABILITIES, PtyAdapter, type PtyAdapterOptions } from './a
 export { CLAUDE_PTY_VERIFIED_VERSION } from './claude.js';
 export {
   PTY_CLI_CAPABILITIES,
+  PTY_LAST_SESSION,
   PtyCliAdapter,
   type PtyCliAdapterOptions,
   type PtyPreset,

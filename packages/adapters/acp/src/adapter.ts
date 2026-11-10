@@ -17,6 +17,13 @@ import {
   type RequestPermissionRequest,
   type SessionNotification,
 } from '@agentclientprotocol/sdk';
+// Types only: the unstable `session/fork` and `sessionCapabilities.fork` (#146). The runtime stays
+// on the stable entrypoint.
+import type {
+  ForkSessionRequest,
+  ForkSessionResponse,
+  AgentCapabilities as UnstableAgentCapabilities,
+} from '@agentclientprotocol/sdk/unstable';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -24,6 +31,7 @@ import {
   type ApprovalDecision,
   AsyncQueue,
   DeltaScrubber,
+  ForkRefusedError,
   type InterruptResult,
   type McpServerConfig,
   mcpHeaderSecrets,
@@ -39,8 +47,14 @@ import {
   type WorkerEnvPolicy,
   workerEnv,
 } from '@tacet/core';
-import { defaultStateDir, repoStateDir } from '@tacet/core/node';
+import {
+  defaultStateDir,
+  processGroupAlive,
+  processGroupGone,
+  repoStateDir,
+} from '@tacet/core/node';
 import type { AcpAgentSpec } from './agents.js';
+import { assertSessionId, removeSessionFiles, sweepSessionFiles } from './session-files.js';
 import {
   approvalChoices,
   newTurnState,
@@ -52,6 +66,8 @@ import {
 } from './turn-v1.js';
 
 /** The ACP protocol version this adapter speaks (v2 is tracked in #85). */
+/** Mode drifts set back before a session is ended instead (#145). */
+const MAX_MODE_DRIFTS = 2;
 export const ACP_PROTOCOL_VERSION = 1;
 
 /** Version of `@agentclientprotocol/sdk` the adapter is built and tested against. */
@@ -83,12 +99,22 @@ export interface AcpAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
-  /** Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL. Default 5000. */
+  /**
+   * Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL, and again for the
+   * rest of its process group (#181). Default 5000. Worst-case `close()` is about
+   * 0.5 s + 2 × this + 1 s.
+   */
   killTimeoutMs?: number;
   /** The repo the Workers belong to; keys the agent's own home (`agent.home`). Default: the cwd. */
   repoRoot?: string;
   /** Tacet's state directory, where the agent's own home lives. Default `~/.tacet/state`. */
   stateDir?: string;
+  /**
+   * Days after its last write that a session's files in the agent's home (`agent.sessionFiles`)
+   * are removed, if no Mini-conductor discarded them before (#232). Swept when the adapter first
+   * prepares that home. Default 30, as `events.retention.transcript_days`.
+   */
+  retentionDays?: number;
   /** Receives the agent's stderr (free-form logging; ACP keeps stdout for messages). Scrubbed. */
   stderr?: (text: string, h: SessionHandle) => void;
   /**
@@ -123,7 +149,21 @@ interface Session {
   loading: boolean;
   /** The config option that selects the model, when the agent has one. */
   modelOption?: string;
+  /** The spec's `sessionMode`, once set, and the config option that sets it, if any (#145). */
+  pinnedMode?: { mode: string; configId?: string };
+  /** Started: mode drift is acted on only from here on. */
+  ready: boolean;
+  /** Setting a drifted mode back; further reports wait for it. */
+  restoring: boolean;
+  /** How often the agent left the pinned mode. */
+  drifts: number;
   exited: Promise<void>;
+  /**
+   * Resolves once the agent has exited and the exit handler's reap of its process group has
+   * finished: the one reap of the group (#218). Closing waits on it rather than polling the group
+   * again, since an id seen empty may belong to another group by then.
+   */
+  gone: Promise<void>;
   exit?: { code: number | null; signal: NodeJS.Signals | null };
   stderrTail: string;
   closing: boolean;
@@ -145,8 +185,25 @@ export class AcpAdapter implements AgentAdapter {
   readonly id: string;
   readonly #opts: AcpAdapterOptions;
   readonly #sessions = new Map<string, Session>();
+  /** Vendor session ids being resumed by a `start()` still in progress: never swept (#232). */
+  readonly #starting = new Map<string, number>();
+  /** Agent homes already swept by this adapter (#232). */
+  readonly #swept = new Set<string>();
+
+  /** Why unattended Workers may not run on this agent (`AcpAgentSpec.workerRefused`), if so. */
+  get workerRefused(): string | undefined {
+    return this.#opts.agent.workerRefused;
+  }
 
   constructor(opts: AcpAdapterOptions) {
+    const { fork, resume } = opts.agent.capabilities;
+    // The adapter forks by `session/fork` only (#146): no emulation, and never without resume.
+    if (fork === 'emulated') {
+      throw new Error(`${opts.agent.id}: fork 'emulated' is not offered over ACP`);
+    }
+    if (fork === 'native' && !resume) {
+      throw new Error(`${opts.agent.id}: fork 'native' needs resume`);
+    }
     this.#opts = opts;
     this.id = opts.agent.id;
   }
@@ -165,9 +222,25 @@ export class AcpAdapter implements AgentAdapter {
       throw new ProfileRefusedError('contextWindow', `${spec.id} over ACP has one context size`);
     }
     if (opts.resume && !caps.resume) throw new Error(`${spec.id} does not resume sessions`);
-    if (opts.resume?.fork)
-      throw new Error(`${spec.id}: forking over ACP is not supported yet (#146)`);
+    if (opts.resume?.fork && caps.fork !== 'native') {
+      throw new ForkRefusedError(spec.id, `${spec.id} does not fork sessions over ACP`);
+    }
 
+    const claimed = opts.resume?.vendorSessionId;
+    if (claimed !== undefined) this.#starting.set(claimed, (this.#starting.get(claimed) ?? 0) + 1);
+    try {
+      return await this.#start(opts);
+    } finally {
+      if (claimed !== undefined) {
+        const n = (this.#starting.get(claimed) ?? 1) - 1;
+        if (n > 0) this.#starting.set(claimed, n);
+        else this.#starting.delete(claimed);
+      }
+    }
+  }
+
+  async #start(opts: SessionOptions): Promise<SessionHandle> {
+    const spec = this.#opts.agent;
     const env = this.#env(opts);
     const command = [
       ...(this.#opts.executable ?? spec.command.slice(0, 1)),
@@ -195,7 +268,9 @@ export class AcpAdapter implements AgentAdapter {
     ].sort((a, b) => b.length - a.length);
     const handle: SessionHandle = { id: randomUUID() };
     let s: Session | undefined;
-    const exitInfo: { value?: Session['exit'] } = {};
+    const exitInfo: { value?: Session['exit']; reaped?: boolean } = {};
+    // Resolves only after an `exit`: wait on it only once the process has exited.
+    const { promise: gone, resolve: markGone } = Promise.withResolvers<void>();
     const exited = new Promise<void>((resolve) => {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
@@ -203,10 +278,16 @@ export class AcpAdapter implements AgentAdapter {
         signalGroup(proc, 'SIGTERM');
         resolve();
         // Messages still buffered on stdout (a last prompt response) are read first.
-        void drained(proc).then(() => {
-          flushStderr();
-          if (s) this.#onExit(s);
-        });
+        // The session is reported ended only once its whole process group is gone, so nothing
+        // of it still runs (or writes into the worktree) after the error status.
+        void drained(proc)
+          .then(() => this.#reapGroup(proc))
+          .then(() => {
+            markGone();
+            exitInfo.reaped = true;
+            flushStderr();
+            if (s) this.#onExit(s);
+          });
       });
       proc.on('error', () => resolve());
     });
@@ -282,10 +363,14 @@ export class AcpAdapter implements AgentAdapter {
         turning: false,
         loading: false,
         exited,
+        gone,
         ...(exitInfo.value ? { exit: exitInfo.value } : {}),
         stderrTail,
         closing: false,
         ended: false,
+        ready: false,
+        restoring: false,
+        drifts: 0,
       };
       const created = await this.#openSession(s, opts, mcpServers);
       s.acpSessionId = created.sessionId;
@@ -293,13 +378,21 @@ export class AcpAdapter implements AgentAdapter {
       const modelOption = (created.configOptions ?? []).find((o) => o.category === 'model');
       if (modelOption) s.modelOption = modelOption.id;
       if (opts.model !== undefined && !spec.modelArgs) await this.#setModel(s, opts.model);
+      // Last: an agent may revisit its mode when the model changes.
+      if (spec.sessionMode !== undefined) await this.#setMode(s, created, spec.sessionMode);
     } catch (err) {
       s = undefined;
       conn.close();
       proc.stdin?.end();
-      await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      await this.#terminate(proc, exited, () => exitInfo.value !== undefined, gone);
       flushStderr();
-      if (err instanceof ProfileRefusedError || err instanceof AuthRoutingError) throw err;
+      if (
+        err instanceof ProfileRefusedError ||
+        err instanceof AuthRoutingError ||
+        err instanceof ForkRefusedError
+      ) {
+        throw err;
+      }
       if (err instanceof RequestError && err.code === AUTH_REQUIRED) {
         throw new AuthRoutingError(
           `${spec.id} needs authentication, and Workers only use an API key: set ${spec.apiKeyEnv.join(' or ') || 'its API key'}`,
@@ -310,8 +403,11 @@ export class AcpAdapter implements AgentAdapter {
       );
     }
     this.#sessions.set(handle.id, s);
-    if (s.exit) this.#onExit(s);
-    else this.#emit(s, { t: 'status', state: 'idle' });
+    s.ready = true;
+    // An agent that exited during start is reported once its group is gone (the exit handler).
+    if (s.exit) {
+      if (exitInfo.reaped) this.#onExit(s);
+    } else this.#emit(s, { t: 'status', state: 'idle' });
     return handle;
   }
 
@@ -347,16 +443,31 @@ export class AcpAdapter implements AgentAdapter {
       return;
     }
     s.approvals.delete(requestId);
-    pending.resolve(permissionOutcome(pending.options, decision));
+    // With a pinned mode, "always" is answered once: agents offer mode changes as their
+    // `allow_always` options (claude-agent-acp: "Yes, and use auto mode"; #145).
+    const answer: ApprovalDecision =
+      s.pinnedMode && decision.kind === 'allow_always'
+        ? { ...decision, kind: 'allow_once', persist: false }
+        : decision;
+    pending.resolve(permissionOutcome(pending.options, answer));
   }
 
   async close(h: SessionHandle): Promise<void> {
     const s = this.#sessions.get(h.id);
     if (!s || s.closing) return;
+    await this.#shutdown(s);
+  }
+
+  /**
+   * End the session and its whole process group. `error`, when the adapter ends the session itself,
+   * is reported only after the processes are gone, so a caller that sees it can rely on nothing of
+   * the session still running.
+   */
+  async #shutdown(s: Session, error?: string): Promise<void> {
     s.closing = true;
     s.queue.length = 0;
     this.#cancelApprovals(s);
-    if (!s.ended && s.init.agentCapabilities?.sessionCapabilities?.close) {
+    if (!s.ended && !s.exit && s.init.agentCapabilities?.sessionCapabilities?.close) {
       await Promise.race([
         s.conn.agent.request('session/close', { sessionId: s.acpSessionId }).catch(() => {}),
         new Promise((r) => setTimeout(r, 1000).unref()),
@@ -364,10 +475,29 @@ export class AcpAdapter implements AgentAdapter {
     }
     s.conn.close();
     s.proc.stdin?.end();
-    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined);
+    await this.#terminate(s.proc, s.exited, () => s.exit !== undefined, s.gone);
+    if (error !== undefined) this.#setState(s, 'error', error);
     this.#setState(s, 'done');
     s.events.end();
-    this.#sessions.delete(h.id);
+    this.#sessions.delete(s.handle.id);
+  }
+
+  /**
+   * The closed session `vendorSessionId` will never be resumed (#153, #232): remove its files from
+   * the agent's own home (`agent.sessionFiles`), its transcript included. Never the user's own
+   * stores, the worktree or the event log. Refused while a session by that id is open or starting.
+   */
+  async discard(vendorSessionId: string, cwd: string): Promise<void> {
+    const spec = this.#opts.agent;
+    assertSessionId(vendorSessionId);
+    if (!spec.home || !spec.sessionFiles?.length) return;
+    if (this.#liveIds().has(vendorSessionId)) {
+      throw new Error(`${spec.id} session ${vendorSessionId} is still open`);
+    }
+    const dir = this.#homeDir(spec, cwd);
+    // Never made here: a home that does not exist holds nothing to remove.
+    if (!isPrivateDir(dir)) return;
+    removeSessionFiles(dir, spec.sessionFiles, vendorSessionId);
   }
 
   events(h: SessionHandle): AsyncIterable<AgentEvent> {
@@ -417,17 +547,23 @@ export class AcpAdapter implements AgentAdapter {
    * written afresh (0600) for every session, so the agent never runs on settings it changed.
    */
   #prepareHome(spec: AcpAgentSpec, cwd: string): string {
-    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
-    const dir = join(
-      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
-      `acp-${spec.id.replace(/^acp:/, '')}`,
-    );
+    const dir = this.#homeDir(spec, cwd);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const st = lstatSync(dir);
-    if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) {
-      throw new Error(`${spec.id}: ${dir} is not a private directory`);
-    }
+    if (!isPrivateDir(dir)) throw new Error(`${spec.id}: ${dir} is not a private directory`);
     chmodSync(dir, 0o700);
+    if (spec.sessionFiles?.length && !this.#swept.has(dir)) {
+      this.#swept.add(dir);
+      try {
+        sweepSessionFiles(
+          dir,
+          spec.sessionFiles,
+          (this.#opts.retentionDays ?? 30) * 24 * 60 * 60 * 1000,
+          this.#liveIds(),
+        );
+      } catch {
+        // Tried again by the next adapter that prepares it; the files are only kept longer.
+      }
+    }
     for (const [rel, content] of Object.entries(spec.home?.files ?? {})) {
       const path = join(dir, rel);
       if (!path.startsWith(`${dir}/`))
@@ -444,6 +580,24 @@ export class AcpAdapter implements AgentAdapter {
     return dir;
   }
 
+  /** `<repo state dir>/acp-<agent>`: the agent's own home, keyed by the user's HOME, never a session's. */
+  #homeDir(spec: AcpAgentSpec, cwd: string): string {
+    const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
+    return join(
+      repoStateDir(this.#opts.repoRoot ?? cwd, this.#opts.stateDir ?? defaultStateDir(home)),
+      `acp-${spec.id.replace(/^acp:/, '')}`,
+    );
+  }
+
+  /** Vendor ids of the sessions open or being resumed in this adapter. */
+  #liveIds(): Set<string> {
+    const ids = new Set(this.#starting.keys());
+    for (const s of this.#sessions.values()) {
+      if (s.handle.vendorSessionId !== undefined) ids.add(s.handle.vendorSessionId);
+    }
+    return ids;
+  }
+
   #mcpServers(init: InitializeResponse, servers: McpServerConfig[] | undefined): McpServer[] {
     if (!servers?.length) return [];
     if (!init.agentCapabilities?.mcpCapabilities?.http) {
@@ -457,7 +611,10 @@ export class AcpAdapter implements AgentAdapter {
     }));
   }
 
-  /** `session/new`, or for a resume `session/resume` or `session/load`, as the agent offers. */
+  /**
+   * `session/new`; for a fork `session/fork` (#146); for a resume `session/resume` or
+   * `session/load`, as the agent offers.
+   */
   async #openSession(
     s: Session,
     opts: SessionOptions,
@@ -465,14 +622,43 @@ export class AcpAdapter implements AgentAdapter {
   ): Promise<NewSessionResponse> {
     const caps = s.init.agentCapabilities;
     const vendorId = opts.resume?.vendorSessionId;
+    const sessionMeta = this.#opts.agent.sessionMeta;
+    const meta = sessionMeta ? { _meta: { ...sessionMeta } } : {};
     if (vendorId === undefined) {
-      return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers });
+      return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers, ...meta });
+    }
+    if (opts.resume?.fork) {
+      // Unstable ACP (#146): only when this agent advertised it in this session's `initialize`.
+      if (!(caps as UnstableAgentCapabilities | undefined)?.sessionCapabilities?.fork) {
+        throw new ForkRefusedError(
+          this.id,
+          `${this.id} did not advertise session/fork in its initialize response`,
+        );
+      }
+      // The stable entrypoint sends any method; only its types leave out the unstable ones. Relies on
+      // SDK 2.4.0 `dist/v1/stable/acp.js` `ClientContext.request` → `sendRequest(..., mapResponse)`
+      // with no param or response validation: recheck on an SDK bump.
+      const request = s.conn.agent.request as unknown as (
+        method: 'session/fork',
+        params: ForkSessionRequest,
+      ) => Promise<ForkSessionResponse>;
+      const r = await request.call(s.conn.agent, 'session/fork', {
+        sessionId: vendorId,
+        cwd: opts.cwd,
+        mcpServers,
+        ...meta,
+      });
+      if (typeof r?.sessionId !== 'string' || r.sessionId === '' || r.sessionId === vendorId) {
+        throw new Error(`${this.id} answered session/fork without a new session id`);
+      }
+      return r as NewSessionResponse;
     }
     if (caps?.sessionCapabilities?.resume) {
       const r = await s.conn.agent.request('session/resume', {
         sessionId: vendorId,
         cwd: opts.cwd,
         mcpServers,
+        ...meta,
       });
       return { ...r, sessionId: vendorId };
     }
@@ -484,6 +670,7 @@ export class AcpAdapter implements AgentAdapter {
           sessionId: vendorId,
           cwd: opts.cwd,
           mcpServers,
+          ...meta,
         });
         return { ...(r ?? {}), sessionId: vendorId };
       } finally {
@@ -491,6 +678,101 @@ export class AcpAdapter implements AgentAdapter {
       }
     }
     throw new Error(`${this.id} offers neither session/resume nor session/load`);
+  }
+
+  /** Put the session in `mode`, or fail: an agent left in its own mode may not ask (#145). */
+  async #setMode(s: Session, created: NewSessionResponse, mode: string): Promise<void> {
+    const option = (created.configOptions ?? []).find((o) => o.category === 'mode');
+    if (option && option.type === 'select') {
+      const values = option.options.flatMap((o) =>
+        'value' in o ? [o.value] : o.options.map((x) => x.value),
+      );
+      if (!values.includes(mode)) {
+        throw new Error(
+          `${this.id} offers no session mode ${JSON.stringify(mode)} (it has ${values.join(', ')})`,
+        );
+      }
+      s.pinnedMode = { mode, configId: option.id };
+      if (option.currentValue !== mode) {
+        const r = await s.conn.agent.request('session/set_config_option', {
+          sessionId: s.acpSessionId,
+          configId: option.id,
+          value: mode,
+        });
+        const now = (r.configOptions ?? []).find((o) => o.id === option.id)?.currentValue;
+        if (now !== mode) {
+          throw new Error(`${this.id} did not switch to session mode ${JSON.stringify(mode)}`);
+        }
+      }
+      return;
+    }
+    const modes = created.modes;
+    if (!modes?.availableModes.some((m) => m.id === mode)) {
+      throw new Error(`${this.id} offers no session mode ${JSON.stringify(mode)}`);
+    }
+    s.pinnedMode = { mode };
+    if (modes.currentModeId !== mode) {
+      await s.conn.agent.request('session/set_mode', { sessionId: s.acpSessionId, modeId: mode });
+    }
+  }
+
+  /**
+   * The agent reported a mode other than the pinned one (#145). Fail closed: the turn is cancelled
+   * first, as by `interrupt()`, so nothing more runs in that mode; then the mode is set back. A
+   * switch that fails or is not reported, or a third drift, ends the session.
+   */
+  #onDrift(s: Session, now: string): void {
+    if (!s.ready || s.restoring || s.closing || s.ended || s.exit || !s.pinnedMode) return;
+    s.restoring = true;
+    s.drifts += 1;
+    this.#restoreMode(s, now)
+      .catch(() => {})
+      .finally(() => {
+        s.restoring = false;
+      });
+  }
+
+  async #restoreMode(s: Session, now: string): Promise<void> {
+    const pin = s.pinnedMode;
+    if (!pin) return;
+    const left = `${this.id} left session mode ${JSON.stringify(pin.mode)} for ${JSON.stringify(now)}`;
+    s.queue.length = 0;
+    if (s.turning) await s.conn.agent.notify('session/cancel', { sessionId: s.acpSessionId });
+    this.#cancelApprovals(s);
+    let failure: string | undefined;
+    if (s.drifts > MAX_MODE_DRIFTS) failure = `it did so ${s.drifts} times`;
+    else {
+      try {
+        if (pin.configId !== undefined) {
+          const r = await s.conn.agent.request('session/set_config_option', {
+            sessionId: s.acpSessionId,
+            configId: pin.configId,
+            value: pin.mode,
+          });
+          const value = (r.configOptions ?? []).find((o) => o.id === pin.configId)?.currentValue;
+          if (value !== pin.mode) failure = 'it did not switch back';
+        } else {
+          // `session/set_mode` answers nothing to check: the agent is trusted here.
+          await s.conn.agent.request('session/set_mode', {
+            sessionId: s.acpSessionId,
+            modeId: pin.mode,
+          });
+        }
+      } catch (err) {
+        failure = `it could not be set back: ${this.#scrub(errorMessage(err), s.secrets)}`;
+      }
+    }
+    // An agent that exited is reported by the exit handler, with its own reason.
+    if (s.closing || s.ended || s.exit) return;
+    if (failure === undefined) {
+      this.#emit(s, {
+        t: 'status',
+        state: s.state,
+        message: `${left}: turn cancelled, mode set back`,
+      });
+      return;
+    }
+    await this.#shutdown(s, `${left}; ${failure}: session ended`);
   }
 
   async #setModel(s: Session, model: string): Promise<void> {
@@ -549,7 +831,18 @@ export class AcpAdapter implements AgentAdapter {
 
   #onUpdate(s: Session, n: SessionNotification): void {
     if (s.loading || s.ended || n.sessionId !== s.acpSessionId) return;
-    for (const e of updateToEvents(n.update, s.turn)) this.#emit(s, e);
+    const u = n.update;
+    const pin = s.pinnedMode;
+    if (pin) {
+      const now =
+        u.sessionUpdate === 'current_mode_update'
+          ? u.currentModeId
+          : u.sessionUpdate === 'config_option_update' && pin.configId !== undefined
+            ? u.configOptions.find((o) => o.id === pin.configId)?.currentValue
+            : undefined;
+      if (now !== undefined && now !== pin.mode) this.#onDrift(s, String(now));
+    }
+    for (const e of updateToEvents(u, s.turn)) this.#emit(s, e);
   }
 
   #onPermission(
@@ -571,7 +864,10 @@ export class AcpAdapter implements AgentAdapter {
         id,
         summary: tc.title || tc.name || tc.kind || 'tool call',
         toolName: tc.name || tc.kind || 'tool',
-        options: approvalChoices(req.options),
+        // With a pinned mode "always" is answered once, so it is not offered (#145).
+        options: approvalChoices(req.options).filter(
+          (o) => !(s.pinnedMode && o === 'allow_always'),
+        ),
         ...(tc.rawInput !== undefined ? { requestedGrant: { input: tc.rawInput } } : {}),
       });
     });
@@ -610,24 +906,53 @@ export class AcpAdapter implements AgentAdapter {
     return scrubLiterals(redactSecrets(text), secrets);
   }
 
-  async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
+  async #terminate(
+    proc: ChildProcess,
+    exited: Promise<void>,
+    hasExited: () => boolean,
+    gone: Promise<void>,
+  ) {
     const within = (ms: number) =>
       Promise.race([
         exited.then(() => true),
         new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
       ]);
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (await within(Math.min(500, timeout))) return;
-    if (!hasExited()) signalGroup(proc, 'SIGTERM');
-    if (await within(timeout)) return;
-    if (!hasExited()) signalGroup(proc, 'SIGKILL');
-    await exited;
+    if (!(await within(Math.min(500, timeout)))) {
+      if (!hasExited()) signalGroup(proc, 'SIGTERM');
+      if (!(await within(timeout))) {
+        if (!hasExited()) signalGroup(proc, 'SIGKILL');
+        await exited;
+      }
+    }
+    // The agent's own children (claude-agent-acp's Claude Code, its MCP servers) got SIGTERM
+    // when it exited, but may still be shutting down and writing: wait for the whole group, so
+    // nothing of a closed session is left running (#181 CI). The exit handler reaps the group,
+    // once (#218). A process that never exited (it failed to spawn) has no group to wait for; an
+    // `error` after a spawn without an `exit` cannot happen here (signals go through process.kill).
+    await (hasExited() ? gone : this.#reapGroup(proc));
+  }
+
+  /**
+   * Once the leader has exited (and the group had SIGTERM), wait for the rest of its group, then
+   * SIGKILL what is left. SIGKILL only right after seeing a running member: a pid is not reused
+   * while it is the id of a group with members, so this cannot reach a reused group id. Called
+   * once per process: never again once its group has been seen empty.
+   */
+  async #reapGroup(proc: ChildProcess): Promise<void> {
+    const timeout = this.#opts.killTimeoutMs ?? 5000;
+    if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
+      if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
+      await processGroupGone(proc.pid, 1000);
+    }
   }
 
   #live(h: SessionHandle): Session {
     const s = this.#sessions.get(h.id);
     if (!s || s.closing) throw new Error(`unknown or closed session ${h.id}`);
-    if (s.ended) throw new Error(`session ${h.id} has ended (${s.state})`);
+    // Exited but not yet reported (its group is still being reaped) counts as ended.
+    if (s.ended || s.exit)
+      throw new Error(`session ${h.id} has ended (${s.exit ? 'exited' : s.state})`);
     return s;
   }
 }
@@ -657,5 +982,15 @@ function signalGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
     else proc.kill(signal);
   } catch {
     // ESRCH: nothing left to signal.
+  }
+}
+
+/** A real directory (not a symlink) of the current user. */
+function isPrivateDir(path: string): boolean {
+  try {
+    const st = lstatSync(path);
+    return st.isDirectory() && (!process.getuid || st.uid === process.getuid());
+  } catch {
+    return false;
   }
 }

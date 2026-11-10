@@ -10,7 +10,7 @@ Thanks for helping. Tacet is built by humans and AI coding agents (Claude Code a
 
 ## Development setup
 
-Requirements: Node.js 24 or later (`.nvmrc`), pnpm 12 (pinned in `package.json` `packageManager`; use `corepack enable` on Node 24, or install pnpm directly on Node 25+, which no longer bundles Corepack), macOS or Linux. Windows is not a supported platform ([ADR-002](docs/adr/002-language-runtime.md)).
+Requirements: Node.js 24 or later (`.nvmrc`), pnpm 12 (pinned in `package.json` `packageManager`; use `corepack enable` on Node 24, or install pnpm directly on Node 25+, which no longer bundles Corepack), macOS, Linux, or Windows via WSL2 (work inside the WSL2 distro's own filesystem; setup in [docs/WSL2.md](docs/WSL2.md)). Native Windows is not supported (#194; [ADR-002](docs/adr/002-language-runtime.md)).
 
 ```bash
 corepack enable   # Node 24; on Node 25+ run `npm i -g pnpm@12` instead

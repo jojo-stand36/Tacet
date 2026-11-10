@@ -38,7 +38,8 @@ export interface AcpAgentSpec {
   /**
    * What this agent supports through this adapter. Declared, not negotiated: a declared resume
    * still fails at start if the agent's `initialize` offers neither `session/resume` nor
-   * `session/load`.
+   * `session/load`, and a declared `fork: 'native'` (which needs `resume`) is only attempted when
+   * the agent's `initialize` advertises `sessionCapabilities.fork` (unstable ACP, #146).
    */
   capabilities: AdapterCapabilities;
   /** Version the spec was verified against, for the capability matrix. */
@@ -49,8 +50,35 @@ export interface AcpAgentSpec {
    * written there before every session. Used to give the agent settings without the user's.
    */
   home?: { env: string; files: Readonly<Record<string, string>> };
+  /**
+   * Where in `home` the agent keeps a session's own files (#232): paths relative to it, `/`
+   * separated, where `{id}` is the session id and `*` any run of characters within one segment.
+   * The first pattern names the session's transcript. `discard()` removes them all once the
+   * session will never be resumed, and sessions untouched for `retentionDays` are swept. Without
+   * it the agent's sessions are kept.
+   */
+  sessionFiles?: readonly string[];
   /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
   envDeny?: readonly string[];
+  /**
+   * The ACP session mode every session is put in right after it opens (#145), for agents whose
+   * default runs tools without asking. Set by the `mode` config option, or `session/set_mode` when
+   * the agent has none; a session the agent can't put in this mode fails to start. The mode
+   * holds for the session: "always" approvals are answered once, and if the agent reports another
+   * mode the turn is cancelled and the mode set back. Only the config option's answer shows the
+   * switch; `session/set_mode` answers nothing, so there the agent is trusted.
+   */
+  sessionMode?: string;
+  /**
+   * `_meta` sent with `session/new`, `session/load`, `session/resume` and `session/fork`, for agent-specific
+   * session options (e.g. claude-agent-acp's `claudeCode.options`, #181).
+   */
+  sessionMeta?: Readonly<Record<string, unknown>>;
+  /**
+   * Why unattended Workers may not run on this agent, if they may not: `buildWorkerAdapters`
+   * refuses a Worker tier that names it. Direct (interactive) use of the adapter is unaffected.
+   */
+  workerRefused?: string;
 }
 
 /**
@@ -63,7 +91,13 @@ export interface AcpAgentSpec {
  * argument parser.
  */
 export const GEMINI_WORKER_SETTINGS = {
-  security: { environmentVariableRedaction: { enabled: true } },
+  security: {
+    environmentVariableRedaction: { enabled: true },
+    // Already the default on 0.67.0, stated so a changed default cannot trust a checkout: an
+    // untrusted folder loads none of its `.gemini/settings.json` (MCP servers, hooks), GEMINI.md,
+    // skills, agents or `.gemini/.env` (#181, verified live).
+    folderTrust: { enabled: true },
+  },
   advanced: { ignoreLocalEnv: true },
 };
 
@@ -118,10 +152,14 @@ export const GEMINI_AGENT: AcpAgentSpec = {
 };
 
 /**
- * Claude Code through `@agentclientprotocol/claude-agent-acp` (spike #62, 0.101.1; not run live
- * here). Not in `BUILTIN_ACP_AGENTS`: that it uses `ANTHROPIC_API_KEY` over a subscription login
- * already in `~/.claude` is not verified yet (#145). `--hide-claude-auth` hides the "Claude Subscription" login: Workers use
- * `ANTHROPIC_API_KEY` only (owner decision 2026-11-09). The native Agent SDK adapter stays first
+ * Claude Code through `@agentclientprotocol/claude-agent-acp`, verified live on 0.101.0 (Agent SDK
+ * 0.3.318) against the mock Messages API with a subscription login already in the user's
+ * `~/.claude` (#145): every request carried `ANTHROPIC_API_KEY`, and the stored login was neither
+ * used nor changed. Run with the user's own config dir it writes there (`~/.claude.json`, a
+ * backup of it, transcripts, a plugin store), so it gets a config dir of its own
+ * (`CLAUDE_CONFIG_DIR`, under the repo's state dir). `--hide-claude-auth` hides the "Claude
+ * Subscription" login: Workers use `ANTHROPIC_API_KEY` only (owner decision 2026-11-09). Its Bash
+ * tool sees the key until the scrub is decided (#150). The native Agent SDK adapter stays first
  * choice.
  */
 export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
@@ -130,32 +168,142 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   envAllow: { prefixes: ['ANTHROPIC_', 'CLAUDE_'] },
   apiKeyEnv: ['ANTHROPIC_API_KEY'],
   apiKeyAuthMethods: [],
-  capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  // Resume (`session/resume`, its transcripts in the repo's CLAUDE_CONFIG_DIR) and fork (unstable
+  // `session/fork`) keep the Worker restrictions: verified live on 0.101.0 (#224).
+  capabilities: {
+    ...ACP_BASE,
+    resume: true,
+    fork: 'native',
+    usage: { live: true, context: true, cost: 'none' },
+  },
+  verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
+  home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
+  // A session's own files in its config dir (#232), read from the Agent SDK 0.3.318 binary that
+  // claude-agent-acp 0.101.0 pins: the transcript `projects/<encoded cwd>/<id>.jsonl` (seen live),
+  // its subagent and tool-result directory `projects/<encoded cwd>/<id>/`, and the per-session
+  // `file-history/<id>/` and `debug/<id>.txt`. The project directory is matched, not computed:
+  // its encoding of the cwd is Claude Code's own.
+  sessionFiles: ['projects/*/{id}.jsonl', 'projects/*/{id}', 'file-history/{id}', 'debug/{id}.txt'],
+  // Never a subscription or gateway token, whatever the user passes through (#145).
+  envDeny: ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
+  // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`
+  // ("Manual: always ask before making changes") sends `session/request_permission` (verified).
+  sessionMode: 'default',
+  // It loads the user's, the project's and the local settings by default: the checkout's hooks,
+  // permissions, env, CLAUDE.md and `.mcp.json`, all files a Worker can write. Client options in
+  // `_meta.claudeCode.options` override that (0.101.0 `acp-agent.js`; #181, verified live).
+  sessionMeta: { claudeCode: { options: { settingSources: [], strictMcpConfig: true } } },
 };
 
 /**
- * Codex through `@agentclientprotocol/codex-acp` (spike #62, 2.6.0; not run live here). Not in
- * `BUILTIN_ACP_AGENTS`: what its `api-key` method does to the user's `~/.codex` login is not
- * verified yet (#145; Codex app-server needs its own `CODEX_HOME` for a key, capability matrix §2).
- * `NO_BROWSER=1` hides the ChatGPT login; the `api-key` method reads `CODEX_API_KEY` or
- * `OPENAI_API_KEY`. The native app-server adapter stays first choice.
+ * claude-agent-acp session options for an unattended Worker (#206), merged into
+ * `_meta.claudeCode.options` (passed to the SDK's `query()`, 0.101.0 `acp-agent.js`): the file
+ * tools only, no shell, every read and search asked about (an ask rule, #214), and prompts taken
+ * verbatim, so an `@path` in text the Worker wrote (a `verify` command's output, say) is not read
+ * into the prompt unasked (`verbatimPrompts`, SDK 0.3.318). Verified against the mock API by the
+ * vendor conformance test.
+ */
+export const CLAUDE_ACP_WORKER_OPTIONS = {
+  tools: ['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep'],
+  disallowedTools: ['Bash', 'PowerShell', 'Monitor'],
+  // Ask rules come before a tool's own approval of a read inside its working directory, so every
+  // read and search reaches `canUseTool`, which claude-agent-acp turns into
+  // `session/request_permission` (#214). Inline: the flag layer, which `settingSources: []` does
+  // not drop; never a path, which would resolve inside the Worker's checkout.
+  settings: { permissions: { ask: ['Read', 'Glob', 'Grep'] } },
+  verbatimPrompts: true,
+} as const;
+
+/** `spec` with `CLAUDE_ACP_WORKER_OPTIONS` merged into its `_meta.claudeCode.options`. */
+export function claudeAcpWorkerSpec(spec: AcpAgentSpec): AcpAgentSpec {
+  const meta = (spec.sessionMeta ?? {}) as { claudeCode?: { options?: Record<string, unknown> } };
+  return {
+    ...spec,
+    sessionMeta: {
+      ...meta,
+      claudeCode: {
+        ...meta.claudeCode,
+        options: {
+          ...meta.claudeCode?.options,
+          tools: [...CLAUDE_ACP_WORKER_OPTIONS.tools],
+          disallowedTools: [...CLAUDE_ACP_WORKER_OPTIONS.disallowedTools],
+          settings: {
+            permissions: { ask: [...CLAUDE_ACP_WORKER_OPTIONS.settings.permissions.ask] },
+          },
+          verbatimPrompts: CLAUDE_ACP_WORKER_OPTIONS.verbatimPrompts,
+        },
+      },
+    },
+  };
+}
+
+/** The model provider codex-acp's Codex uses for Workers: the key comes from the environment. */
+export const CODEX_ACP_PROVIDER = 'tacet-openai-api-key';
+
+/** `config.toml` for codex-acp's own `CODEX_HOME` (#145); `baseUrl` is for tests. */
+export function codexAcpConfig(baseUrl = 'https://api.openai.com/v1'): string {
+  return [
+    `model_provider = "${CODEX_ACP_PROVIDER}"`,
+    '',
+    `[model_providers.${CODEX_ACP_PROVIDER}]`,
+    'name = "OpenAI (API key, via Tacet)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'env_key = "OPENAI_API_KEY"',
+    'wire_api = "responses"',
+    '',
+    '# No plugin sync from GitHub when a Worker starts (as the native adapter, #116).',
+    '[features]',
+    'plugins = false',
+    '',
+    '# The commands the Worker runs never see the key (as the native adapter, #150).',
+    '[shell_environment_policy]',
+    'exclude = ["OPENAI_API_KEY", "CODEX_API_KEY"]',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Codex through `@agentclientprotocol/codex-acp`, verified live on 2.6.0 (Codex 0.166.0) against
+ * the mock Responses API with a ChatGPT login already in the user's `~/.codex` (#145). Its
+ * `api-key` auth method is never used: it runs Codex's `account/login/start`, which replaced the
+ * user's ChatGPT login in `~/.codex/auth.json` with the key, on disk; and in `~/.codex` it also
+ * synced a plugin marketplace from GitHub. So it gets a `CODEX_HOME` of its own (under the repo's
+ * state dir) whose config routes through a model provider with `env_key`, as the native adapter
+ * does: verified, it starts sessions without any login, every request carried the key, no
+ * `auth.json` is written, the user's `~/.codex` is untouched, and the commands Codex runs see no
+ * key. `NO_BROWSER=1` hides the ChatGPT login. The native app-server adapter stays first choice.
  */
 export const CODEX_ACP_AGENT: AcpAgentSpec = {
   id: 'codex-acp',
   command: ['codex-acp'],
+  // Interim default while the owner decides #183: verified live (#181), it marks every session
+  // root trusted after any config Tacet can pass, so a Worker-written checkout's
+  // `.codex/config.toml` (an MCP server command ran) and AGENTS.md apply.
+  workerRefused:
+    'it trusts every session directory itself, so a checkout a Worker or anyone else wrote can run commands through its .codex/config.toml; Tacet cannot turn that off (interim default until #183 is decided; use codex-app-server)',
   env: { NO_BROWSER: '1' },
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
-  apiKeyEnv: ['CODEX_API_KEY', 'OPENAI_API_KEY'],
-  apiKeyAuthMethods: ['api-key'],
+  apiKeyEnv: ['OPENAI_API_KEY'],
+  apiKeyAuthMethods: [],
   capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  verifiedVersion: '@agentclientprotocol/codex-acp 2.6.0',
+  home: { env: 'CODEX_HOME', files: { 'config.toml': codexAcpConfig() } },
+  // `CODEX_API_KEY` would be a second key route besides the provider's `env_key` (#145).
+  envDeny: ['CODEX_API_KEY'],
+  // It starts in `agent` ("Auto review: only ask for actions detected as potentially unsafe").
+  // `workspace-write` is the native adapter's default (`on-request`): edits in the checkout run in
+  // the sandbox, and leaving it (other files, the network) asks. `read-only` asks for every edit.
+  sessionMode: 'workspace-write',
 };
 
 /**
  * The agents a Worker can be configured with by id: only those whose API-key-only auth was
- * verified live. Claude and Codex have native adapters; their ACP specs join once verified.
+ * verified live, each with a home of its own so the user's login is never used or changed.
  */
 export const BUILTIN_ACP_AGENTS: Readonly<Record<string, AcpAgentSpec>> = {
   gemini: GEMINI_AGENT,
+  'claude-acp': CLAUDE_ACP_AGENT,
+  'codex-acp': CODEX_ACP_AGENT,
 };
 
 /** Config for an ACP agent that has no built-in spec. */
@@ -166,7 +314,8 @@ export interface CustomAcpAgentConfig {
   apiKeyAuthMethods?: string[];
   /**
    * Declared support beyond the ACP baseline. Only what this adapter can deliver for any agent:
-   * resume (by `session/resume` or `session/load`) and usage reporting.
+   * resume (by `session/resume` or `session/load`) and usage reporting. Fork is declared only by
+   * a built-in spec whose agent's fork was verified (#146).
    */
   capabilities?: Partial<Pick<AdapterCapabilities, 'resume' | 'usage'>>;
 }

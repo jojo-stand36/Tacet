@@ -1,7 +1,15 @@
-import { assertSafePrompt, planIssues, type SessionHandle, type Task } from '@tacet/core';
+import { planIssues, type Task } from '@tacet/core';
 import { z } from 'zod';
-import type { Planner, PlanResult, ProposedSubtask, WorkerAdapter } from './ports.js';
+import {
+  type Planner,
+  type PlanResult,
+  type ProposedSubtask,
+  type WorkerAdapter,
+  workerRefusal,
+} from './ports.js';
 import { PLANNER_SYSTEM_PROMPT, plannerPrompt } from './prompts.js';
+import { unfence } from './reply.js';
+import { sessionTurns } from './turns.js';
 
 const Proposal = z.object({
   rationale: z.string().optional(),
@@ -13,6 +21,7 @@ const Proposal = z.object({
         acceptanceCriteria: z.array(z.string().min(1)).min(1),
         kind: z.enum(['implement', 'review', 'explore']).optional(),
         dependsOn: z.array(z.string()).optional(),
+        indivisible: z.boolean().optional(),
       }),
     )
     .min(1)
@@ -24,10 +33,8 @@ export function parseProposal(text: string): {
   subtasks: ProposedSubtask[];
   rationale?: string;
 } {
-  const body = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/, '');
+  // An over-long reply is an invalid reply too, with its own reason (#203).
+  const body = unfence(text);
   let json: unknown;
   try {
     json = JSON.parse(body);
@@ -50,6 +57,7 @@ export function parseProposal(text: string): {
       acceptanceCriteria: s.acceptanceCriteria,
       ...(s.kind ? { kind: s.kind } : {}),
       ...(s.dependsOn ? { dependsOn: s.dependsOn } : {}),
+      ...(s.indivisible ? { indivisible: true } : {}),
     })),
     ...(rationale !== undefined ? { rationale } : {}),
   };
@@ -68,9 +76,10 @@ export interface AdapterPlannerOptions {
 }
 
 /**
- * Plans with one session on the `mini` tier. The session is read-only by instruction and every
- * approval request (a tool that would change something) is refused. An invalid reply is retried
- * once with the validation error.
+ * Plans with one session on the `mini` tier. The session is read-only by instruction. Its
+ * approval requests are refused, except reads and searches the Worker policy (#200) allows
+ * inside its own checkout (`cwd`, a throwaway checkout in standalone mode): an unattended Claude
+ * adapter asks about those too (#206). An invalid reply is retried once with the validation error.
  */
 export class AdapterPlanner implements Planner {
   readonly #o: AdapterPlannerOptions;
@@ -79,6 +88,8 @@ export class AdapterPlanner implements Planner {
     if (opts.worker.authRoute !== 'api_key') {
       throw new Error('the planner runs unattended and must use the api_key route (#65)');
     }
+    const refused = workerRefusal(opts.worker);
+    if (refused) throw new Error(`adapter ${opts.adapterId}: refused for the planner: ${refused}`);
     this.#o = opts;
   }
 
@@ -95,7 +106,12 @@ export class AdapterPlanner implements Planner {
     const onAbort = () => void adapter.close(h).catch(() => {});
     opts.signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      const turns = this.#turns(h, usage);
+      const turns = sessionTurns(this.#o.worker, h, usage, {
+        label: 'planner',
+        refusal: 'The planner is read-only.',
+        timeoutMs: this.#o.timeoutMs ?? 600_000,
+        reads: { adapterId: this.#o.adapterId, cwd: this.#o.cwd },
+      });
       let reply = await turns(plannerPrompt(task));
       let lastError: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -127,53 +143,10 @@ export class AdapterPlanner implements Planner {
     } finally {
       opts.signal?.removeEventListener('abort', onAbort);
       await adapter.close(h).catch(() => {});
+      // A planner session is never resumed: drop what the adapter keeps for that (#237).
+      if (h.vendorSessionId)
+        await adapter.discard?.(h.vendorSessionId, this.#o.cwd).catch(() => {});
     }
-  }
-
-  /** Send one input and collect the reply text until the turn ends. */
-  #turns(
-    h: SessionHandle,
-    usage: { inputTokens: number; outputTokens: number; costUsd: number },
-  ): (text: string) => Promise<string> {
-    const { adapter } = this.#o.worker;
-    const iterator = adapter.events(h)[Symbol.asyncIterator]();
-    return async (text) => {
-      await adapter.send(h, { text: assertSafePrompt(text) });
-      let reply = '';
-      let started = false;
-      const deadline = Date.now() + (this.#o.timeoutMs ?? 600_000);
-      for (;;) {
-        const next = await Promise.race([
-          iterator.next(),
-          new Promise<never>((_, reject) =>
-            setTimeout(
-              () => reject(new Error('planner timed out')),
-              Math.max(1, deadline - Date.now()),
-            ).unref(),
-          ),
-        ]);
-        if (next.done) throw new Error('planner session ended');
-        const e = next.value;
-        if (e.t === 'message.delta') reply += e.text;
-        else if (e.t === 'usage') {
-          usage.inputTokens += e.inputTokens;
-          usage.outputTokens += e.outputTokens;
-          usage.costUsd += e.costUsd ?? 0;
-        } else if (e.t === 'approval.request') {
-          await adapter.respond(h, e.id, {
-            kind: 'reject',
-            persist: false,
-            message: 'The planner is read-only.',
-          });
-        } else if (e.t === 'status') {
-          if (e.state === 'running') started = true;
-          else if (e.state === 'idle' && started) return reply;
-          else if (e.state === 'error' || e.state === 'auth_required' || e.state === 'done') {
-            throw new Error(`planner session ${e.state}${e.message ? `: ${e.message}` : ''}`);
-          }
-        }
-      }
-    };
   }
 }
 

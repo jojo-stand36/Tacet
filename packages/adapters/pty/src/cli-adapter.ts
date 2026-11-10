@@ -7,6 +7,7 @@ import {
   type AgentTerminal,
   type ApprovalDecision,
   AsyncQueue,
+  ForkRefusedError,
   type InterruptResult,
   looksSecret,
   ProfileRefusedError,
@@ -27,9 +28,10 @@ import { plainText, TerminalBuffer } from './terminal.js';
 /**
  * What a CLI with no structured interface supports through the PTY adapter (#15). Its state is
  * read from its output: the turn ends when the CLI shows its ready prompt again (or goes quiet),
- * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals, and
- * it is not resumed. `modelSwitch` is `launch-only` because the preset's command fixes the model:
- * `start({ model })` is refused, never ignored.
+ * and that turn's output is the reply, once, as one delta. It cannot be asked for approvals. It is
+ * resumed only if its preset has `resumeArgs` (`capabilities()` then reports `resume`).
+ * `modelSwitch` is `launch-only` because the preset's command fixes the model: `start({ model })`
+ * is refused, never ignored.
  */
 export const PTY_CLI_CAPABILITIES: AdapterCapabilities = {
   streaming: false,
@@ -61,7 +63,37 @@ export interface PtyPreset {
    * a CLI that can think silently for longer than that.
    */
   readyPrompt?: string;
+  /**
+   * Arguments appended after `command` to continue the CLI's most recent session in the working
+   * directory (#157). Only for a CLI whose resume is scoped to its working directory: one that
+   * picks the latest session of a wider scope could continue another Worker's session. Checked
+   * per worktree on Linux (#168): `['resume', '--last']` for codex-cli 0.167.0 (live, in a PTY),
+   * `['--resume', 'latest']` for Gemini CLI 0.67.0 (live with `-p`, and from the bundle's code for
+   * interactive use); with nothing saved there, both start a fresh session. A Codex preset's
+   * command also passes `-c features.daemon_auto_start=false`: interactive Codex otherwise starts
+   * a managed daemon, shared per `CODEX_HOME`, that outlives the session (#171). Tacet resumes a
+   * Worker only in the checkout it ran in, so "the last session here" is that checkout's, which
+   * can be an earlier attempt's. A generic CLI has no session id Tacet can read, so
+   * `vendorSessionId` is a marker, set at start.
+   */
+  resumeArgs?: string[];
+  /**
+   * For Gemini CLI (#245), which reads files named in a prompt into it with `ReadManyFiles`: a
+   * file in the workspace without asking, one outside after a confirmation whose default is Yes
+   * (the next Enter Tacet types would accept it). Two routes, both closed: an `@path` (also an
+   * `@agent` or MCP `@resource`), so every `@` is typed as `\@`, which Gemini takes as a literal
+   * at sign and sends as typed; and a paste made only of existing file paths (`./a.txt`, a quoted
+   * path), which Gemini turns into `@path` itself, so the prompt starts with `. ` and ends with
+   * ` .`: a segment that is a directory, never a file, which nothing before it can join (an
+   * unclosed quote or a trailing backslash in the text could join the suffix onto a path), and
+   * which the suffix keeps from ending in a backslash (Enter would add a newline). Verified live on Gemini CLI 0.67.0 against a local mock of
+   * its API (capability matrix, "Generic PTY presets: `@path` mentions").
+   */
+  escapeAt?: boolean;
 }
+
+/** `vendorSessionId` of a session whose CLI resumes by `resumeArgs`: there is no real id. */
+export const PTY_LAST_SESSION = 'pty:last-in-checkout';
 
 export interface PtyCliAdapterOptions {
   /** The preset's slug: the adapter is `pty:<slug>`. */
@@ -148,6 +180,11 @@ const deadline = (ms: number) => new Promise((r) => setTimeout(r, ms).unref());
 export class PtyCliAdapter implements AgentAdapter {
   readonly id: string;
   readonly #opts: PtyCliAdapterOptions;
+
+  /** The preset this adapter runs, read-only. */
+  get preset(): Readonly<PtyPreset> {
+    return this.#opts.preset;
+  }
   readonly #sessions = new Map<string, Session>();
 
   constructor(opts: PtyCliAdapterOptions) {
@@ -156,12 +193,19 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.preset.command.length === 0 || opts.preset.command.some((a) => a === '')) {
       throw new Error(`pty:${opts.slug}: command must be a non-empty list of strings`);
     }
+    const resume = opts.preset.resumeArgs;
+    if (resume !== undefined && (resume.length === 0 || resume.some((a) => a === ''))) {
+      throw new Error(`pty:${opts.slug}: resume arguments must be a non-empty list of strings`);
+    }
     this.#opts = opts;
     this.id = `pty:${opts.slug}`;
   }
 
   capabilities(): AdapterCapabilities {
-    return structuredClone(PTY_CLI_CAPABILITIES);
+    return {
+      ...structuredClone(PTY_CLI_CAPABILITIES),
+      resume: this.#opts.preset.resumeArgs !== undefined,
+    };
   }
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
@@ -174,7 +218,9 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.contextWindow !== undefined) {
       throw new ProfileRefusedError('contextWindow', `${this.id} does not set a context size`);
     }
-    if (opts.resume) throw new Error(`${this.id} does not resume sessions`);
+    const resumeArgs = this.#opts.preset.resumeArgs;
+    if (opts.resume && !resumeArgs) throw new Error(`${this.id} does not resume sessions`);
+    if (opts.resume?.fork) throw new ForkRefusedError(this.id, `${this.id} cannot fork a session`);
     if (opts.mcpServers?.length) {
       throw new Error(
         `${this.id} cannot be given MCP servers: a generic CLI has no known way to take them`,
@@ -209,13 +255,18 @@ export class PtyCliAdapter implements AgentAdapter {
       .sort((a, b) => b.length - a.length);
     const cols = this.#opts.cols ?? 200;
     const rows = this.#opts.rows ?? 50;
-    const [file, ...args] = preset.command as [string, ...string[]];
+    const [file, ...command] = preset.command as [string, ...string[]];
+    const args = opts.resume && resumeArgs ? [...command, ...resumeArgs] : command;
     const pty = spawn(file, args, { cwd: realpathSync(opts.cwd), env, cols, rows });
     let resolveExit!: () => void;
     const exited = new Promise<void>((r) => {
       resolveExit = r;
     });
-    const handle: SessionHandle = { id: randomUUID() };
+    const handle: SessionHandle = {
+      id: randomUUID(),
+      // Resumable: the daemon records a vendor session only when there is one to resume.
+      ...(resumeArgs ? { vendorSessionId: PTY_LAST_SESSION } : {}),
+    };
     const s: Session = {
       handle,
       pty,
@@ -281,7 +332,8 @@ export class PtyCliAdapter implements AgentAdapter {
     if (opts.effort !== undefined) {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
-    const text = promptText(input.text);
+    const typed = promptText(input.text);
+    const text = this.#opts.preset.escapeAt ? `. ${typed.replaceAll('@', '\\@')} .` : typed;
     // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
     if (s.stalled) {
       s.stalled = false;

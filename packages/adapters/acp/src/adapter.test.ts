@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -7,14 +8,16 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { AgentEvent } from '@tacet/core';
-import { ProfileRefusedError } from '@tacet/core';
-import { mcpAuthHeaders, Secret } from '@tacet/core/node';
+import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
+import { mcpAuthHeaders, repoStateDir, Secret } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AcpAdapter, AuthRoutingError } from './adapter.js';
 import {
   type AcpAgentSpec,
@@ -26,6 +29,7 @@ import {
 } from './agents.js';
 
 const FAKE = join(import.meta.dirname, 'testing', 'fake-acp-agent.mjs');
+
 const TOKEN = 'worker-token-0123456789abcdef';
 
 async function until(ok: () => boolean, ms = 5000): Promise<void> {
@@ -38,6 +42,46 @@ async function until(ok: () => boolean, ms = 5000): Promise<void> {
 const ends = (e: AgentEvent) => e.t === 'status' && e.state !== 'running';
 const text = (events: AgentEvent[]) =>
   events.map((e) => (e.t === 'message.delta' ? e.text : '')).join('');
+
+/** The session modes the built-in specs put their sessions in (#145), as an agent offers them. */
+const BUILTIN_MODES = {
+  FAKE_SESSION: JSON.stringify({
+    modes: {
+      currentModeId: 'default',
+      availableModes: [
+        { id: 'default', name: 'Manual' },
+        { id: 'workspace-write', name: 'Workspace access' },
+      ],
+    },
+  }),
+};
+
+/**
+ * Whether `pid` is running: a zombie its parent has yet to reap (a container init that does not
+ * reap, or launchd a moment after a SIGKILL) is not. `/proc` on Linux; `ps` elsewhere (macOS),
+ * where `kill(pid, 0)` also finds a zombie.
+ */
+function running(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+  } catch {
+    if (process.platform === 'linux') return false;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  try {
+    const state = execFileSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    return state.trim() !== '' && !state.trim().startsWith('Z');
+  } catch (err) {
+    // `ps` exits 1 once the pid is gone; anything else is a broken check, not an answer.
+    if ((err as { status?: number }).status === 1) return false;
+    throw err;
+  }
+}
 
 describe('AcpAdapter (fake ACP agent)', () => {
   let root: string;
@@ -54,7 +98,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
       agent,
       executable: [process.execPath, FAKE],
       killTimeoutMs: 1000,
-      baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...env },
+      baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...BUILTIN_MODES, ...env },
       // The fake agent is steered by FAKE_* variables (#147: passed through on purpose).
       envPolicy: { pass: ['FAKE_*'] },
       ...extra,
@@ -73,6 +117,45 @@ describe('AcpAdapter (fake ACP agent)', () => {
           )
       : [];
   const methods = () => received().flatMap((l) => (l.received?.method ? [l.received] : []));
+
+  it("leaves none of the agent's processes running after close, even one ignoring SIGTERM", async () => {
+    const adapter = make(
+      GEMINI_AGENT,
+      { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+      {
+        killTimeoutMs: 300,
+      },
+    );
+    const childPid = () =>
+      received()
+        .map((l) => (l as { childPid?: number }).childPid)
+        .find((p) => p !== undefined);
+    let pid: number | undefined;
+    try {
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      pid = childPid();
+      expect(pid).toBeTypeOf('number');
+      await adapter.close(h);
+    } catch (err) {
+      // Never leave the SIGTERM-ignoring child running on the test machine.
+      const p = childPid();
+      if (p !== undefined) {
+        try {
+          process.kill(p, 'SIGKILL');
+        } catch {}
+      }
+      throw err;
+    }
+    // Running, not a zombie its parent has yet to collect.
+    const alive = running(pid as number);
+    if (alive) process.kill(pid as number, 'SIGKILL');
+    expect(alive).toBe(false);
+  });
+
+  it('exposes why an agent may not run Workers (#183)', () => {
+    expect(make(CODEX_ACP_AGENT).workerRefused).toMatch(/#183/);
+    expect(make(GEMINI_AGENT).workerRefused).toBeUndefined();
+  });
 
   it('authenticates only with an API-key method, never a subscription login', async () => {
     const offered = [
@@ -316,6 +399,96 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await adapter.close(h);
     });
 
+    it('ends the events of a crashed agent only once its group is gone', async () => {
+      const adapter = make(
+        GEMINI_AGENT,
+        { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const done = (async () => {
+          for await (const _ of adapter.events(h));
+        })();
+        await adapter.send(h, { text: 'CRASH' });
+        // Exited (after 50 ms) but not yet reported while its group is reaped (at least
+        // killTimeoutMs): the session takes no more input.
+        await new Promise((r) => setTimeout(r, 150));
+        await expect(adapter.send(h, { text: 'more' })).rejects.toThrow(/has ended \(exited\)/);
+        await done;
+        expect(adapter.status(h)).toBe('error');
+        // The SIGTERM-ignoring child is gone by the time the events end.
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(false);
+        // close() waits on that one reap (#218): it neither polls nor signals the group again,
+        // and returns at once, well within the kill timeout.
+        const kill = vi.spyOn(process, 'kill');
+        const before = Date.now();
+        let calls: unknown[][];
+        try {
+          await adapter.close(h);
+        } finally {
+          // Copied first: restoring the spy clears what it recorded.
+          calls = [...kill.mock.calls];
+          kill.mockRestore();
+        }
+        const groupCalls = calls.filter(([p]) => typeof p === 'number' && p < 0);
+        expect(groupCalls).toEqual([]);
+        expect(Date.now() - before).toBeLessThan(250);
+      } finally {
+        const p = childPid();
+        if (p !== undefined && running(p)) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
+    });
+
+    it('close() during the reap of a crashed agent returns only once its group is gone (#218)', async () => {
+      const adapter = make(
+        GEMINI_AGENT,
+        { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        await adapter.send(h, { text: 'CRASH' });
+        // Exited (it takes no more input), its SIGTERM-ignoring child still being reaped.
+        await expect
+          .poll(
+            () =>
+              adapter.send(h, { text: 'more' }).then(
+                () => 'open',
+                (e: Error) => e.message,
+              ),
+            { timeout: 5000 },
+          )
+          .toMatch(/has ended \(exited\)/);
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(true);
+        await adapter.close(h);
+        expect(running(pid as number)).toBe(false);
+      } finally {
+        const p = childPid();
+        if (p !== undefined && running(p)) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
+    });
+
     it('resumes by session/load without replaying the history as new output', async () => {
       const adapter = gemini({ FAKE_CAPS: JSON.stringify({ loadSession: true }) });
       const h = await adapter.start({
@@ -336,6 +509,39 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await adapter.close(h);
     });
 
+    it("sends the spec's sessionMeta as _meta on session/new, load and resume (#181)", async () => {
+      const meta = { claudeCode: { options: { settingSources: [], strictMcpConfig: true } } };
+      const spec = { ...GEMINI_AGENT, sessionMeta: meta };
+      const env = { GEMINI_API_KEY: 'placeholder' };
+      const run = async (caps: object, resume?: string) => {
+        const a = make(spec, { ...env, FAKE_CAPS: JSON.stringify(caps) });
+        const h = await a.start({
+          cwd: join(root, 'wt'),
+          ...(resume ? { resume: { vendorSessionId: resume } } : {}),
+        });
+        await a.close(h);
+      };
+      await run({});
+      await run({ loadSession: true }, 'old-load');
+      await run({ sessionCapabilities: { resume: {} } }, 'old-resume');
+      const opened = methods().filter((m) =>
+        ['session/new', 'session/load', 'session/resume'].includes(m.method ?? ''),
+      );
+      expect(opened.map((m) => m.method)).toEqual([
+        'session/new',
+        'session/load',
+        'session/resume',
+      ]);
+      for (const m of opened) expect(m.params, m.method).toMatchObject({ _meta: meta });
+      // A spec without it sends none.
+      const plainAdapter = make(GEMINI_AGENT, env);
+      await plainAdapter.close(await plainAdapter.start({ cwd: join(root, 'wt') }));
+      const plain = methods()
+        .filter((m) => m.method === 'session/new')
+        .at(-1);
+      expect(plain?.params).not.toHaveProperty('_meta');
+    });
+
     it('prefers session/resume when the agent offers it, and refuses a resume it cannot do', async () => {
       const caps = { loadSession: true, sessionCapabilities: { resume: {} } };
       const adapter = gemini({ FAKE_CAPS: JSON.stringify(caps) });
@@ -349,6 +555,203 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await expect(
         gemini().start({ cwd: join(root, 'wt'), resume: { vendorSessionId: 'x' } }),
       ).rejects.toThrow(/neither session\/resume nor session\/load/);
+    });
+
+    describe('fork (#146)', () => {
+      // As a built-in spec declares it: custom agents may not declare fork.
+      const forking = (fork: 'native' | 'none'): AcpAgentSpec => {
+        const base = customAcpAgent('forker', { command: ['forker'] });
+        return { ...base, capabilities: { ...base.capabilities, resume: true, fork } };
+      };
+      const fork = { vendorSessionId: 'src-1', fork: true };
+
+      it('forks by session/fork when the spec declares it and the agent advertises it', async () => {
+        const adapter = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+        });
+        expect(adapter.capabilities().fork).toBe('native');
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork });
+        expect(h.vendorSessionId).toBe('src-1-fork');
+        const sent = methods().find((m) => m.method === 'session/fork');
+        expect(sent?.params).toMatchObject({ sessionId: 'src-1', cwd: join(root, 'wt') });
+        expect(methods().map((m) => m.method)).not.toContain('session/resume');
+        await adapter.close(h);
+      });
+
+      it('gives a fork the same MCP servers, _meta and mode pin as a new session (#181, #145)', async () => {
+        const meta = { claudeCode: { options: { settingSources: [] } } };
+        const spec: AcpAgentSpec = { ...forking('native'), sessionMeta: meta, sessionMode: 'ask' };
+        const adapter = make(spec, {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_SESSION: JSON.stringify({
+            modes: {
+              currentModeId: 'auto',
+              availableModes: [
+                { id: 'ask', name: 'Ask' },
+                { id: 'auto', name: 'Auto' },
+              ],
+            },
+          }),
+        });
+        const mcp = { name: 'tacet', url: 'http://127.0.0.1:1/mcp', headers: { 'x-t': 'v' } };
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork, mcpServers: [mcp] });
+        await adapter.close(h);
+        expect(methods().find((m) => m.method === 'session/fork')?.params).toMatchObject({
+          mcpServers: [
+            { type: 'http', name: 'tacet', url: mcp.url, headers: [{ name: 'x-t', value: 'v' }] },
+          ],
+          _meta: meta,
+        });
+        expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+          sessionId: 'src-1-fork',
+          modeId: 'ask',
+        });
+      });
+
+      it('refuses a fork the agent did not advertise, or the spec did not declare', async () => {
+        // An agent with a child that ignores SIGTERM: the refusal leaves none of it running.
+        const quiet = make(
+          forking('native'),
+          { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }), FAKE_CHILD: '1' },
+          { killTimeoutMs: 300 },
+        );
+        // Typed, so a caller can fall back to a HandoffPacket (#228); not "failed to start".
+        const refused = await quiet.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        const child = received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+        const alive = child !== undefined && running(child);
+        if (alive) process.kill(child, 'SIGKILL');
+        expect(child).toBeTypeOf('number');
+        expect(alive).toBe(false);
+        expect(refused).toBeInstanceOf(ForkRefusedError);
+        expect(refused).toMatchObject({ adapterId: 'acp:forker' });
+        expect((refused as Error).message).toMatch(/did not advertise session\/fork/);
+        expect((refused as Error).message).not.toMatch(/failed to start/);
+        const undeclared = make(forking('none'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+        });
+        await expect(undeclared.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
+          ForkRefusedError,
+        );
+        // Gemini declares no fork: refused before anything starts, as before.
+        const before = methods().length;
+        const declined = await gemini()
+          .start({ cwd: join(root, 'wt'), resume: fork })
+          .catch((e) => e);
+        expect(declined).toBeInstanceOf(ForkRefusedError);
+        expect((declined as Error).message).toMatch(/does not fork sessions/);
+        expect(methods()).toHaveLength(before);
+        expect(methods().map((m) => m.method)).not.toContain('session/fork');
+      });
+
+      it('refuses a fork answered without a new session id', async () => {
+        const adapter = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_FORK_ID: 'same',
+        });
+        // The agent forked, badly: a start failure, not a refusal to fall back from.
+        const err = await adapter.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        expect((err as Error).message).toMatch(/without a new session id/);
+        expect(err).not.toBeInstanceOf(ForkRefusedError);
+      });
+
+      it('never declares fork without resume, nor an emulated one', () => {
+        const base = customAcpAgent('x', { command: ['x'] });
+        const spec = (resume: boolean, fork: 'native' | 'emulated'): AcpAgentSpec => ({
+          ...base,
+          capabilities: { ...base.capabilities, resume, fork },
+        });
+        expect(() => make(spec(false, 'native'))).toThrow(/fork 'native' needs resume/);
+        expect(() => make(spec(true, 'emulated'))).toThrow(/not offered over ACP/);
+      });
+    });
+  });
+
+  describe('discard (#232)', () => {
+    // A spec with a home and the claude-acp layout, on the fake agent (sessions `fake-session-1`).
+    const homed = (): AcpAgentSpec => {
+      const base = customAcpAgent('homed', { command: ['homed'] });
+      return {
+        ...base,
+        capabilities: { ...base.capabilities, resume: true },
+        home: { env: 'HOMED_HOME', files: {} },
+        sessionFiles: CLAUDE_ACP_AGENT.sessionFiles as readonly string[],
+      };
+    };
+    const homeOf = (state: string) => join(repoStateDir(join(root, 'repo'), state), 'acp-homed');
+    const put = (dir: string, rel: string) => {
+      mkdirSync(dirname(join(dir, rel)), { recursive: true });
+      writeFileSync(join(dir, rel), 'transcript');
+    };
+
+    it("removes a closed session's files from the agent's home, refusing an open one", async () => {
+      const state = join(root, 'state');
+      const adapter = make(homed(), {}, { stateDir: state, repoRoot: join(root, 'repo') });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      expect(h.vendorSessionId).toBe('fake-session-1');
+      const home = homeOf(state);
+      put(home, 'projects/-wt/fake-session-1.jsonl');
+      put(home, 'file-history/fake-session-1/f@v1');
+      put(home, 'projects/-wt/other-session.jsonl');
+      await expect(adapter.discard('fake-session-1', join(root, 'wt'))).rejects.toThrow(
+        /still open/,
+      );
+      expect(existsSync(join(home, 'projects/-wt/fake-session-1.jsonl'))).toBe(true);
+      await adapter.close(h);
+      await adapter.discard('fake-session-1', join(root, 'wt'));
+      expect(existsSync(join(home, 'projects/-wt/fake-session-1.jsonl'))).toBe(false);
+      expect(existsSync(join(home, 'file-history/fake-session-1'))).toBe(false);
+      expect(existsSync(join(home, 'projects/-wt/other-session.jsonl'))).toBe(true);
+      // The cwd may be gone; the home is found by the repo, and a bad id is refused.
+      await adapter.discard('other-session', join(root, 'gone'));
+      expect(existsSync(join(home, 'projects/-wt/other-session.jsonl'))).toBe(false);
+      await expect(adapter.discard('../x', join(root, 'wt'))).rejects.toThrow(/not a session id/);
+    });
+
+    it('never makes a home just to discard, and keeps sessions of agents without a layout', async () => {
+      const state = join(root, 'state');
+      await make(homed(), {}, { stateDir: state, repoRoot: join(root, 'repo') }).discard(
+        'fake-session-1',
+        join(root, 'wt'),
+      );
+      expect(existsSync(homeOf(state))).toBe(false);
+      const { sessionFiles, ...bare } = homed();
+      expect(sessionFiles).toBeDefined();
+      mkdirSync(homeOf(state), { recursive: true, mode: 0o700 });
+      put(homeOf(state), 'projects/-wt/s1.jsonl');
+      await make(bare, {}, { stateDir: state, repoRoot: join(root, 'repo') }).discard(
+        's1',
+        join(root, 'wt'),
+      );
+      expect(existsSync(join(homeOf(state), 'projects/-wt/s1.jsonl'))).toBe(true);
+    });
+
+    it('sweeps sessions older than the retention when it first prepares the home, never the one resumed', async () => {
+      const state = join(root, 'state');
+      const home = homeOf(state);
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const old = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+      for (const id of ['old-1', 'resumed-1', 'new-1']) {
+        put(home, `projects/-wt/${id}.jsonl`);
+        if (id !== 'new-1') utimesSync(join(home, `projects/-wt/${id}.jsonl`), old, old);
+      }
+      const adapter = make(
+        homed(),
+        { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }) },
+        { stateDir: state, repoRoot: join(root, 'repo'), retentionDays: 7 },
+      );
+      const starting = adapter.start({
+        cwd: join(root, 'wt'),
+        resume: { vendorSessionId: 'resumed-1' },
+      });
+      // Claimed before its first await: a discard meanwhile is refused.
+      await expect(adapter.discard('resumed-1', join(root, 'wt'))).rejects.toThrow(/still open/);
+      const h = await starting;
+      expect(existsSync(join(home, 'projects/-wt/old-1.jsonl'))).toBe(false);
+      expect(existsSync(join(home, 'projects/-wt/resumed-1.jsonl'))).toBe(true);
+      expect(existsSync(join(home, 'projects/-wt/new-1.jsonl'))).toBe(true);
+      await adapter.close(h);
     });
   });
 
@@ -374,6 +777,250 @@ describe('AcpAdapter (fake ACP agent)', () => {
     const text = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : [])).join('');
     expect(text).toBe('echo [redacted] [redacted]');
     expect(lines.join('')).toContain('debug: [redacted] and [redacted]');
+  });
+
+  describe('session mode (#145)', () => {
+    const spec = (sessionMode: string): AcpAgentSpec => ({
+      ...customAcpAgent('modes', { command: ['modes'] }),
+      sessionMode,
+    });
+    const select = (currentValue: string) => ({
+      configOptions: [
+        {
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue,
+          options: [
+            { value: 'ask', name: 'Ask' },
+            { value: 'auto', name: 'Auto' },
+          ],
+        },
+      ],
+    });
+    const modes = {
+      currentModeId: 'auto',
+      availableModes: [
+        { id: 'ask', name: 'Ask' },
+        { id: 'auto', name: 'Auto' },
+      ],
+    };
+
+    it('sets it by the mode config option right after the session opens', async () => {
+      const adapter = make(spec('ask'), {
+        FAKE_SESSION: JSON.stringify({ ...select('auto'), modes }),
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      const sent = methods().map((m) => m.method);
+      expect(sent.indexOf('session/set_config_option')).toBe(sent.indexOf('session/new') + 1);
+      expect(methods().find((m) => m.method === 'session/set_config_option')?.params).toEqual({
+        sessionId: 'fake-session-1',
+        configId: 'mode',
+        value: 'ask',
+      });
+      expect(sent).not.toContain('session/set_mode');
+    });
+
+    it('uses session/set_mode when the agent has no mode config option', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+        sessionId: 'fake-session-1',
+        modeId: 'ask',
+      });
+    });
+
+    it('sends nothing when the session is already in the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(select('ask')) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().map((m) => m.method)).not.toContain('session/set_config_option');
+    });
+
+    it('fails to start when the agent does not offer the mode', async () => {
+      for (const session of [{}, { modes }, select('auto')]) {
+        const adapter = make(spec('manual'), { FAKE_SESSION: JSON.stringify(session) });
+        await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+          /offers no session mode "manual"/,
+        );
+      }
+    });
+
+    it('finds the mode among grouped select options', async () => {
+      const grouped = select('auto');
+      const [option] = grouped.configOptions;
+      const opts = option?.options ?? [];
+      Object.assign(option ?? {}, { options: [{ group: 'g', name: 'All', options: opts }] });
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(grouped) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      await adapter.close(h);
+      expect(methods().map((m) => m.method)).toContain('session/set_config_option');
+    });
+
+    it('fails to start when the agent refuses or ignores the switch', async () => {
+      for (const [how, session] of [
+        ['fail', select('auto')],
+        ['fail', { modes }],
+        ['ignore', select('auto')],
+      ] as const) {
+        const adapter = make(spec('ask'), {
+          FAKE_SESSION: JSON.stringify(session),
+          FAKE_SET: how,
+        });
+        await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow(
+          how === 'fail' ? /cannot change that now/ : /did not switch to session mode "ask"/,
+        );
+      }
+    });
+
+    it('fails a resume whose answer does not offer the mode', async () => {
+      // The fake's `session/load` answers `null`: no modes to set.
+      const resumable = spec('ask');
+      resumable.capabilities = { ...resumable.capabilities, resume: true };
+      const adapter = make(resumable, {
+        FAKE_SESSION: JSON.stringify({ modes }),
+        FAKE_CAPS: JSON.stringify({ loadSession: true }),
+      });
+      await expect(
+        adapter.start({ cwd: join(root, 'wt'), resume: { vendorSessionId: 'old' } }),
+      ).rejects.toThrow(/offers no session mode "ask"/);
+    });
+
+    for (const [via, session] of [
+      ['config option', select('auto')],
+      ['session/set_mode', { modes }],
+    ] as const) {
+      it(`cancels the turn, then sets the mode back, when the agent leaves it (${via})`, async () => {
+        const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(session) });
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const tap = new EventTap(adapter.events(h));
+        const isSetter = (m?: string) => /^session\/set_(config_option|mode)$/.test(m ?? '');
+        const before = methods().filter((m) => isSetter(m.method)).length;
+        await adapter.send(h, { text: 'DRIFT' });
+        const end = await tap.waitFor(
+          (e) => e.t === 'status' && (e.state === 'idle' || e.state === 'cancelled'),
+          5000,
+          1,
+        );
+        expect(end.event).toMatchObject({ state: 'cancelled' });
+        await until(() => methods().filter((m) => isSetter(m.method)).length === before + 1);
+        const sent = methods();
+        const cancelAt = sent.findIndex((m) => m.method === 'session/cancel');
+        const setAt = sent.findLastIndex((m) => isSetter(m.method));
+        expect(cancelAt).toBeGreaterThan(-1);
+        expect(cancelAt).toBeLessThan(setAt);
+        expect(JSON.stringify(sent[setAt]?.params)).toContain('"ask"');
+        await tap.waitFor(
+          (e) =>
+            e.t === 'status' &&
+            /left session mode "ask" for "auto".*set back/.test(e.message ?? ''),
+          5000,
+        );
+        await adapter.close(h);
+      });
+    }
+
+    it('ends the session when the mode is not set back', async () => {
+      const adapter = make(spec('ask'), {
+        FAKE_SESSION: JSON.stringify(select('ask')),
+        FAKE_SET: 'ignore',
+      });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'DRIFT' });
+      const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+      expect(err.event).toMatchObject({ message: expect.stringMatching(/did not switch back/) });
+      await expect(adapter.send(h, { text: 'more' })).rejects.toThrow();
+    });
+
+    it('ends the session when the agent keeps leaving the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify(select('ask')) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      for (let i = 1; i <= 2; i++) {
+        await adapter.send(h, { text: 'DRIFT' });
+        await until(
+          () =>
+            tap.events.filter((e) => e.t === 'status' && /set back/.test(e.message ?? ''))
+              .length === i,
+        );
+      }
+      await adapter.send(h, { text: 'DRIFT' });
+      const err = await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+      expect(err.event).toMatchObject({ message: expect.stringMatching(/3 times/) });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'done', 5000, err.index);
+    });
+
+    it('reports a session it ends itself only once its processes are gone (macOS CI)', async () => {
+      const adapter = make(
+        spec('ask'),
+        { FAKE_SESSION: JSON.stringify(select('ask')), FAKE_CHILD: '1' },
+        { killTimeoutMs: 300 },
+      );
+      const childPid = () =>
+        received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+      try {
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        const tap = new EventTap(adapter.events(h));
+        for (let i = 1; i <= 3; i++) {
+          await adapter.send(h, { text: 'DRIFT' });
+          if (i < 3) {
+            await until(
+              () =>
+                tap.events.filter((e) => e.t === 'status' && /set back/.test(e.message ?? ''))
+                  .length === i,
+            );
+          }
+        }
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'error', 5000);
+        // The SIGTERM-ignoring child is gone by the time the error is seen, not just after.
+        const pid = childPid();
+        expect(pid).toBeTypeOf('number');
+        expect(running(pid as number)).toBe(false);
+      } finally {
+        const p = childPid();
+        if (p !== undefined && running(p)) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {}
+        }
+      }
+    });
+
+    it('answers an open permission cancelled when the agent leaves the mode', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'ASK_DRIFT' });
+      await tap.waitFor((e) => e.t === 'approval.request', 5000);
+      await until(() =>
+        received().some((l) => JSON.stringify(l.received ?? {}).includes('"outcome":"cancelled"')),
+      );
+      await adapter.close(h);
+    });
+
+    it('answers "always" once when the mode is pinned', async () => {
+      const adapter = make(spec('ask'), { FAKE_SESSION: JSON.stringify({ modes }) });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      await adapter.send(h, { text: 'ASK_ALWAYS' });
+      const req = await tap.waitFor((e) => e.t === 'approval.request', 5000);
+      if (req.event.t !== 'approval.request') throw new Error('no approval request');
+      // Not offered: it would be answered once.
+      expect(req.event.options).not.toContain('allow_always');
+      await adapter.respond(h, req.event.id, { kind: 'allow_always', persist: true });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, req.index);
+      await adapter.close(h);
+      const answer = received().find(
+        (l) => l.received !== undefined && JSON.stringify(l.received).includes('"optionId"'),
+      );
+      expect(JSON.stringify(answer?.received)).toContain('"optionId":"once"');
+    });
   });
 
   it('keeps the error type when a profile is refused at start', async () => {
@@ -428,7 +1075,17 @@ describe('ACP agent registry', () => {
   });
 
   it('registers only agents whose API-key-only auth was verified live', () => {
-    expect(Object.keys(BUILTIN_ACP_AGENTS)).toEqual(['gemini']);
+    expect(Object.keys(BUILTIN_ACP_AGENTS)).toEqual(['gemini', 'claude-acp', 'codex-acp']);
     expect(GEMINI_AGENT.apiKeyEnv).toEqual(['GEMINI_API_KEY']);
+    // Each has a home of its own, so the user's login is never used or changed (#145).
+    for (const spec of Object.values(BUILTIN_ACP_AGENTS)) expect(spec.home).toBeDefined();
+    // codex-acp never logs in: its api-key login overwrites the user's Codex login.
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.apiKeyAuthMethods).toEqual([]);
+    // Both start in a mode that runs tools unasked; Workers use one that asks (#145).
+    expect(BUILTIN_ACP_AGENTS['claude-acp']?.sessionMode).toBe('default');
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.sessionMode).toBe('workspace-write');
+    // No subscription or second key route, whatever the user passes through.
+    expect(BUILTIN_ACP_AGENTS['claude-acp']?.envDeny).toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.envDeny).toEqual(['CODEX_API_KEY']);
   });
 });

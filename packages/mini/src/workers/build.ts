@@ -3,6 +3,7 @@ import {
   type AcpAdapterOptions,
   type AcpAgentSpec,
   BUILTIN_ACP_AGENTS,
+  claudeAcpWorkerSpec,
   customAcpAgent,
 } from '@tacet/adapter-acp';
 import { ClaudeSdkAdapter, type ClaudeSdkAdapterOptions } from '@tacet/adapter-claude-sdk';
@@ -14,8 +15,9 @@ import {
   type PtyCliAdapterOptions,
 } from '@tacet/adapter-pty';
 import { type AgentAdapter, type TacetConfig, workerEnvPolicy } from '@tacet/core';
-import { resolveSecretRef, SecretRefError } from '@tacet/core/node';
+import { type KeychainOptions, resolveSecretRef, SecretRefError } from '@tacet/core/node';
 import type { WorkerAdapter } from '../daemon/ports.js';
+import { reviewConfigProblem } from '../review/config.js';
 
 /** The config cannot be turned into Workers. Names the config path, never a secret value. */
 export class WorkerConfigError extends Error {
@@ -23,7 +25,10 @@ export class WorkerConfigError extends Error {
 }
 
 export interface BuildWorkerAdaptersOptions {
-  /** The repo the Workers work on: keys per-repo adapter state (Claude PTY sessions, #153; ACP agent homes, #150). */
+  /**
+   * The repo the Workers work on: keys per-repo adapter state (Claude PTY sessions, #153; ACP
+   * agent homes, #150; Codex's `CODEX_HOME`, #186). Codex Workers in a git checkout need it.
+   */
   repoRoot?: string;
   /**
    * The user's environment: what Workers get an allowlist of, and where `{ env }` secret
@@ -35,14 +40,34 @@ export interface BuildWorkerAdaptersOptions {
    * on every session start, so a caller that logs it should log each adapter's names once.
    */
   onEnvDropped?: (adapterId: string, names: string[]) => void;
+  /** How `{ keychain }` secret references are read (#160); replaced in tests. */
+  keychain?: KeychainOptions;
   /** Passed through to the adapters as they are built; for tests and the entry point. */
-  claude?: Pick<ClaudeSdkAdapterOptions, 'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions'>;
-  codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs'>;
+  claude?: Pick<
+    ClaudeSdkAdapterOptions,
+    'query' | 'mcpConfigDir' | 'onSweep' | 'sdkOptions' | 'stateDir' | 'subprocessScrub'
+  >;
+  codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs' | 'stateDir'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
   /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
   ptyCli?: Pick<PtyCliAdapterOptions, 'spawn' | 'quietMs' | 'startTimeoutMs' | 'killTimeoutMs'>;
+  /**
+   * Also build the planner's adapter (`tiers.mini`, #21), with the same checks, when that tier is
+   * set. It is keyed by its id like the others; the standalone entry point hands it to the
+   * `AdapterPlanner`.
+   */
+  withPlanner?: boolean;
+}
+
+/**
+ * The ACP agent spec a Worker runs on: a Claude Worker over ACP gets the file tools only, no
+ * shell, every read and search asked about, and verbatim prompts, as the SDK adapter's
+ * `fileToolsOnly` does (#206, #214, `claudeAcpWorkerSpec`).
+ */
+function workerSpec(spec: AcpAgentSpec): AcpAgentSpec {
+  return spec.id === 'claude-acp' ? claudeAcpWorkerSpec(spec) : spec;
 }
 
 /** PTY presets built in, by slug; `agents.<slug>` may not reuse these names. */
@@ -66,12 +91,19 @@ export function buildWorkerAdapters(
   config: TacetConfig,
   opts: BuildWorkerAdaptersOptions = {},
 ): Record<string, WorkerAdapter> {
+  // A keychain item two agents reference is read once: each read may block (it is synchronous,
+  // up to its timeout) or wait on a prompt.
+  const fromKeychain = new Map<string, string>();
+
   const tiers = config.tiers ?? {};
   if (!tiers.worker) throw new WorkerConfigError('config has no tiers.worker');
+  // Cross-vendor review (#19) is checked before anything is built or any secret is read.
+  const reviewProblem = reviewConfigProblem(config);
+  if (reviewProblem) throw new WorkerConfigError(reviewProblem);
   const baseEnv = opts.baseEnv ?? process.env;
   const envPolicy = workerEnvPolicy(config);
   const out: Record<string, WorkerAdapter> = {};
-  for (const name of WORKER_TIERS) {
+  for (const name of opts.withPlanner ? [...WORKER_TIERS, 'mini' as const] : WORKER_TIERS) {
     const tier = tiers[name];
     if (!tier) continue;
     const id = tier.adapter;
@@ -104,15 +136,36 @@ export function buildWorkerAdapters(
     const dropped = (names: string[]) => opts.onEnvDropped?.(id, names);
     const common = { baseEnv, envPolicy, onEnvDropped: dropped };
     if (id === 'claude-sdk') {
-      return new ClaudeSdkAdapter({ ...opts.claude, ...common, authRoute: 'api_key' });
+      // Unattended: file tools only, no shell, reads asked about too (#206; policy #200).
+      // Each session's config dir lives under the repo's state dir, keyed by the main checkout,
+      // and is kept as long as the event log keeps transcripts (#237).
+      const days = config.events?.retention?.transcript_days;
+      return new ClaudeSdkAdapter({
+        ...(days !== undefined ? { retentionDays: days } : {}),
+        ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...opts.claude,
+        ...common,
+        authRoute: 'api_key',
+        fileToolsOnly: true,
+      });
     }
     if (id === 'codex-app-server') {
-      return new CodexAppServerAdapter({ ...opts.codex, ...common, authRoute: 'api_key' });
+      return new CodexAppServerAdapter({
+        // An unattended Codex Worker in a git checkout needs it: its own CODEX_HOME is keyed by
+        // the repo, and its worktree is checked against it before git runs (#116, #186).
+        ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...opts.codex,
+        ...common,
+        authRoute: 'api_key',
+      });
     }
     const slug = ACP_ID.exec(id)?.[1];
     if (slug !== undefined) {
       const { agent, secrets } = acpAgent(slug, where);
+      // Its sessions' files are kept as long as the event log keeps transcripts (#232).
+      const days = config.events?.retention?.transcript_days;
       return new AcpAdapter({
+        ...(days !== undefined ? { retentionDays: days } : {}),
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.acp,
         ...common,
@@ -144,6 +197,7 @@ export function buildWorkerAdapters(
           `${where}: agents.${ptySlug} is of kind ${preset.kind}; use ${preset.kind}:${ptySlug}`,
         );
       }
+      refusePtyForWorkers(ptySlug, where);
       const env = resolveEnv(ptySlug, preset.env);
       return new PtyCliAdapter({
         ...opts.ptyCli,
@@ -154,6 +208,10 @@ export function buildWorkerAdapters(
           env,
           secrets: Object.values(env),
           ...(preset.ready_prompt !== undefined ? { readyPrompt: preset.ready_prompt } : {}),
+          ...(preset.resume_flag !== undefined ? { resumeArgs: [preset.resume_flag].flat() } : {}),
+          // Gemini CLI reads an `@path` in a prompt unasked, or after a Yes-by-default question
+          // (#245): its prompts are typed with every `@` escaped.
+          ...(runs(preset.command, runsGemini) ? { escapeAt: true } : {}),
         },
       });
     }
@@ -170,7 +228,7 @@ export function buildWorkerAdapters(
     }
   }
 
-  /** The agent's secret references, resolved from `baseEnv`. */
+  /** The agent's secret references, resolved from `baseEnv` or the keychain. */
   function resolveEnv(
     slug: string,
     refs: NonNullable<TacetConfig['agents']>[string]['env'],
@@ -178,7 +236,13 @@ export function buildWorkerAdapters(
     const env: Record<string, string> = {};
     for (const [name, ref] of Object.entries(refs ?? {})) {
       try {
-        env[name] = resolveSecretRef(ref, `agents.${slug}.env.${name}`, baseEnv).reveal();
+        const known = 'keychain' in ref ? fromKeychain.get(ref.keychain) : undefined;
+        env[name] =
+          known ??
+          resolveSecretRef(ref, `agents.${slug}.env.${name}`, baseEnv, {
+            ...(opts.keychain ? { keychain: opts.keychain } : {}),
+          }).reveal();
+        if ('keychain' in ref) fromKeychain.set(ref.keychain, env[name]);
       } catch (err) {
         if (err instanceof SecretRefError) throw new WorkerConfigError(err.message, { cause: err });
         throw err;
@@ -191,7 +255,8 @@ export function buildWorkerAdapters(
     const preset = config.agents?.[slug];
     const builtin = BUILTIN_ACP_AGENTS[slug];
     noShadow(slug, builtin !== undefined, 'acp', 'ACP agent');
-    if (builtin) return { agent: builtin, secrets: [] };
+    refuseForWorkers(slug, where);
+    if (builtin) return { agent: workerSpec(builtin), secrets: [] };
     if (!preset) {
       throw new WorkerConfigError(
         `${where}: no ACP agent "${slug}" (built in: ${Object.keys(BUILTIN_ACP_AGENTS).join(', ')}; or add agents.${slug} with kind: acp)`,
@@ -209,11 +274,62 @@ export function buildWorkerAdapters(
     };
   }
 
+  /**
+   * Throws for an ACP agent unattended Workers may not use (`AcpAgentSpec.workerRefused`): a
+   * built-in one, or a custom `agents.<slug>` whose command runs it (e.g. codex-acp through `npx`,
+   * #183). A wrapper script can still hide the command; the reason is documented.
+   */
+  function refuseForWorkers(slug: string, where: string): void {
+    const builtin = BUILTIN_ACP_AGENTS[slug];
+    const preset = builtin ? undefined : config.agents?.[slug];
+    const runs =
+      preset?.kind === 'acp'
+        ? Object.values(BUILTIN_ACP_AGENTS).find(
+            (a) =>
+              a.workerRefused &&
+              // Each word of each argument, so `sh -c "exec codex-acp"` is caught too.
+              preset.command
+                .flatMap((arg) => arg.split(/\s+/))
+                .some((w) => runsAgent(w, a.command[0] ?? '', a.id)),
+          )
+        : undefined;
+    const refused = builtin?.workerRefused ?? runs?.workerRefused;
+    if (refused) {
+      throw new WorkerConfigError(`${where}: acp:${slug} is refused for Workers: ${refused}`);
+    }
+    // A custom preset running claude-agent-acp would get none of the built-in's Worker hardening
+    // (no settings isolation, no pinned mode, a shell, unasked reads; #214): use the built-in.
+    if (
+      preset?.kind === 'acp' &&
+      preset.command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).some(runsClaudeAcp)
+    ) {
+      throw new WorkerConfigError(
+        `${where}: agents.${slug} runs claude-agent-acp; use acp:claude-acp for Workers, which runs it with the Worker hardening (#214)`,
+      );
+    }
+  }
+
+  /**
+   * Throws for a custom PTY preset that runs interactive Claude Code: it would get none of
+   * `pty:claude`'s Worker hardening (hooks asking Tacet about every tool, isolated settings, and
+   * no `@path` read into a prompt unasked, #226), so Workers use the built-in (#245).
+   */
+  function refusePtyForWorkers(slug: string, where: string): void {
+    const preset = config.agents?.[slug];
+    if (preset?.kind === 'pty' && runs(preset.command, runsClaudeCode)) {
+      throw new WorkerConfigError(
+        `${where}: agents.${slug} runs Claude Code; use pty:claude for Workers, which runs it with the Worker hardening (#245)`,
+      );
+    }
+  }
+
   /** Throws unless `id` names an adapter this function can build. */
   function buildable(id: string, where: string): void {
     if (id === 'claude-sdk' || id === 'codex-app-server') return;
     const acp = ACP_ID.exec(id)?.[1];
     if (acp !== undefined && (BUILTIN_ACP_AGENTS[acp] || config.agents?.[acp]?.kind === 'acp')) {
+      // A cap on an agent Workers may not use would silently cap nothing, too.
+      refuseForWorkers(acp, where);
       return;
     }
     if (acp !== undefined) {
@@ -221,6 +337,7 @@ export function buildWorkerAdapters(
     }
     const pty = PTY_ID.exec(id)?.[1];
     if (pty !== undefined && (BUILTIN_PTY.includes(pty) || config.agents?.[pty]?.kind === 'pty')) {
+      if (!BUILTIN_PTY.includes(pty)) refusePtyForWorkers(pty, where);
       return;
     }
     if (pty !== undefined) {
@@ -230,4 +347,132 @@ export function buildWorkerAdapters(
       `${where}: no Worker adapter "${id}" yet (available: claude-sdk, codex-app-server, acp:<agent>, pty:<preset>)`,
     );
   }
+}
+
+/**
+ * Whether a command word runs claude-agent-acp: its bin, its npm package (current, or the old
+ * `@zed-industries/claude-code-acp`, renamed to it), or a path into its package directory
+ * (`node .../claude-agent-acp/dist/index.js`). A wrapper script that hides it is not caught.
+ */
+function runsClaudeAcp(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return (
+    ['claude-agent-acp', 'claude-code-acp'].includes(base) ||
+    /(^|\/)(claude-agent-acp|claude-code-acp)(\/|@|$)/.test(word)
+  );
+}
+
+/** Options whose value names a model, config or profile, never what a command runs. */
+const VALUE_OPTIONS = /^--?(m|model|config|profile|agent|provider)$/;
+
+/**
+ * Whether `command` may run what `test` recognises, failing closed (#245 review): any word of it,
+ * split at shell separators, unless it is the value of an option that names a model, config or
+ * profile (`aider --model claude`, `opencode --config ~/.config/claude`). So a launcher or wrapper
+ * Tacet does not model (`timeout 60 claude`, `caffeinate -i claude`, `bash -lc claude`) is still
+ * caught; `sh -c 'cd ~/claude && aider'` is too, a loud false positive in the safe direction. A
+ * wrapper script that hides the CLI is not caught.
+ */
+export function runs(command: string[], test: (word: string) => boolean): boolean {
+  if (commandWords(command).some(test)) return true;
+  const words = command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).filter(Boolean);
+  return words.some((w, i) => {
+    const eq = w.indexOf('=');
+    // `--model=claude`: the value after `=` of a value option.
+    if (eq > 0 && VALUE_OPTIONS.test(w.slice(0, eq))) return false;
+    const word = eq > 0 && !w.startsWith('-') ? w.slice(eq + 1) : w;
+    return test(word) && !VALUE_OPTIONS.test(words[i - 1] ?? '');
+  });
+}
+
+const LAUNCHERS = new Set(['env', 'npx', 'bunx', 'pnpx', 'node', 'deno', 'exec', 'nohup']);
+const RUNNERS = new Set(['npm', 'pnpm', 'yarn']);
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
+
+/**
+ * The words of a command line that name what it runs (#245 review): the executable, what a
+ * launcher runs (`env`, `npx`, `node`, `exec`, `pnpm dlx`: the first word that is not an option
+ * or a `NAME=value`), and each command of a `sh -c` script. Arguments are not, so
+ * `aider --model claude` runs aider. A wrapper script that hides the CLI is not seen through.
+ */
+export function commandWords(argv: string[], depth = 0): string[] {
+  const [head, ...rest] = argv;
+  if (head === undefined || depth > 5) return [];
+  const base = head.split('/').pop() ?? head;
+  if (SHELLS.has(base)) {
+    // `-c`, or combined short options that include it (`-lc`, `-ec`).
+    const c = rest.findIndex((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+    const script = c < 0 ? undefined : rest[c + 1];
+    if (script === undefined) return [head];
+    return [
+      head,
+      ...script.split(/[;&|()\n]+/).flatMap((cmd) =>
+        commandWords(
+          cmd
+            .trim()
+            .split(/\s+/)
+            .map((w) => w.replace(/^["'`]+|["'`]+$/g, ''))
+            .filter(Boolean),
+          depth + 1,
+        ),
+      ),
+    ];
+  }
+  let args = rest;
+  if (RUNNERS.has(base)) {
+    const sub = args.findIndex((a) => !a.startsWith('-'));
+    if (sub < 0 || !['dlx', 'exec', 'x'].includes(args[sub] ?? '')) return [head];
+    args = args.slice(sub + 1);
+  } else if (!LAUNCHERS.has(base)) {
+    return [head];
+  }
+  const next = args.findIndex((a) => !a.startsWith('-') && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(a));
+  return next < 0 ? [head] : [head, ...commandWords(args.slice(next), depth + 1)];
+}
+
+/**
+ * Whether a command word runs Claude Code: the `claude` bin (by name or path), its npm package
+ * `@anthropic-ai/claude-code`, or the binary the Agent SDK bundles
+ * (`@anthropic-ai/claude-agent-sdk-<platform>-<arch>/claude`). A wrapper script that hides it is
+ * not caught.
+ */
+function runsClaudeCode(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return (
+    base === 'claude' ||
+    /(^|\/)@anthropic-ai\/claude-code(\/|@|$)/.test(word) ||
+    /(^|\/)@anthropic-ai\/claude-agent-sdk-[^/]+\/claude$/.test(word)
+  );
+}
+
+/**
+ * Whether a command word runs Gemini CLI: the `gemini` bin (by name or path) or its npm package
+ * `@google/gemini-cli` (`npx @google/gemini-cli`, `node .../@google/gemini-cli/bundle/gemini.js`).
+ * A wrapper script that hides it is not caught.
+ */
+export function runsGemini(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return base === 'gemini' || /(^|\/)@google\/gemini-cli(\/|@|$)/.test(word);
+}
+
+/** Whether one word of a command runs `bin` (by name, path or npm package). */
+function runsAgent(word: string, bin: string, id: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return base === bin || word.includes(`/${id}`) || base === id;
 }
