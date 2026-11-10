@@ -1234,6 +1234,13 @@ describe('WorktreeManager', () => {
     });
   });
 
+  it('reports the checked-out branch and commit, or only the commit on a detached HEAD (#219)', async () => {
+    const commit = (await git(repository, ['rev-parse', 'HEAD'])).trim();
+    expect(await manager.head()).toEqual({ branch: 'main', commit });
+    await git(repository, ['checkout', '--detach']);
+    expect(await manager.head()).toEqual({ commit });
+  });
+
   it('ignores busy markers left by a manager that died', async () => {
     const worktree = await manager.create('orphaned-marker-worker');
     const child = execFile(process.execPath, ['-e', '']);

@@ -172,7 +172,7 @@ export async function applyState(
     );
   }
   const { withStoppedMini, WorktreeKeptError } = await import('@tacet/mini');
-  let locked: { result: void; errors: unknown[] };
+  let locked: { errors: unknown[] };
   try {
     locked = await withStoppedMini(paths.lock, async () => {
       if (existsSync(paths.worktrees)) {

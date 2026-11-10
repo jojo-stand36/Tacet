@@ -349,6 +349,12 @@ export class WorktreeManager implements Workspaces {
     return this.createWorktree(workerId, base, options, this.newId(workerId));
   }
 
+  /** The repo's checked-out branch (absent when HEAD is detached) and its commit (#219). */
+  async head(): Promise<{ branch?: string; commit: string }> {
+    const { baseBranch, baseCommit } = await this.resolveBase(undefined);
+    return { ...(baseBranch !== undefined ? { branch: baseBranch } : {}), commit: baseCommit };
+  }
+
   /** The registered checkouts that are on disk where the manager put them. */
   async list(): Promise<WorktreeInfo[]> {
     const { root } = await this.paths();
