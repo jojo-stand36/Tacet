@@ -61,6 +61,21 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Resume in-flight handoffs after a Mini-conductor restart** — `feature` `P2` `either`
+- [ ] **ACP: verify API-key-only auth for claude-agent-acp and codex-acp, then register them** — `feature` `P2` `claude`
+- [ ] **ACP: offer fork when the agent advertises sessionCapabilities.fork** — `feature` `P2` `claude`
+- [ ] **Adapters: launch Workers with an environment allowlist** — `feature` `P2` `either`
+- [ ] **Mini-conductor: build Worker adapters from the effective config at startup** — `feature` `P1` `either`
+- [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
+- [ ] **PTY adapter: clean up per-session Claude config directories** — `feature` `P2` `either`
+- [ ] **PTY presets: use resume_flag and process_name, or drop them** — `feature` `P2` `either`
+- [ ] **Core: modelSwitch 'none' for adapters that cannot choose a model** — `feature` `P2` `claude + human`
+- [ ] **Resolve keychain secret references in config** — `feature` `P2` `claude`
+- [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
+- [ ] **PTY adapters: don't leave a CLI's detached background processes running** — `feature` `P2` `claude`
+- [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
+- [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
+- [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
+- [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 
 ## M2 · Conductor & escalation
 

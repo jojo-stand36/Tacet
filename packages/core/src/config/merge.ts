@@ -1,3 +1,4 @@
+import { passesSecret } from '../adapter/env.js';
 import { DEFAULT_CONFIG, TacetConfig, validateEffective } from './schema.js';
 
 /** Config layers, lowest precedence first (ARCHITECTURE.md §4). */
@@ -15,7 +16,12 @@ export interface ConfigLayer {
  * Arrays that are combined across layers instead of replaced, so a higher layer cannot drop a
  * safety rule set lower down. Every other array is replaced by the higher layer.
  */
-export const UNION_PATHS: ReadonlySet<string> = new Set(['policies', 'escalation.always_ask']);
+export const UNION_PATHS: ReadonlySet<string> = new Set([
+  'policies',
+  'escalation.always_ask',
+  // A local file adds to the repo's Worker passthrough instead of dropping it (#147).
+  'workers.env.pass',
+]);
 
 /**
  * Objects that a higher layer replaces whole instead of merging key by key: secret references
@@ -102,7 +108,36 @@ export function mergeConfig(
   };
   const layerErrors: string[] = [];
   for (const layer of all) {
-    if (layer.name === 'task') layerErrors.push(...taskRaisesWorkers(merged, layer));
+    if (layer.name === 'task') {
+      layerErrors.push(...taskRaisesWorkers(merged, layer), ...taskSetsTierBounds(layer));
+    }
+    layerErrors.push(...workerEnvErrors(layer));
+    if (layer.name === 'task' && layer.data.verify !== undefined) {
+      // A task could otherwise turn every check off (`[]`) or run shell outside any Worker (#19).
+      layerErrors.push(
+        `verify: the task layer (${layer.origin}) may not change the verify commands`,
+      );
+    }
+    if (layer.name === 'task') {
+      // Nor weaken it: choose the reviewer, waive cross-vendor review, or claim a vendor (#19).
+      const tiers = layer.data.tiers ?? {};
+      if (tiers.review !== undefined) {
+        layerErrors.push(
+          `tiers.review: the task layer (${layer.origin}) may not change the reviewer`,
+        );
+      }
+      for (const [name, tier] of Object.entries(tiers)) {
+        if (tier?.vendor !== undefined) {
+          layerErrors.push(
+            `tiers.${name}.vendor: the task layer (${layer.origin}) may not declare a vendor`,
+          );
+        }
+      }
+    }
+    if (layer.name === 'task' && layer.data.review?.enabled === false) {
+      // A task may ask for review, never skip one the repo or the user asked for (#19).
+      layerErrors.push(`review.enabled: the task layer (${layer.origin}) may not turn review off`);
+    }
     apply(merged, layer.data as Plain, layer, '', []);
   }
 
@@ -133,6 +168,19 @@ export function mergeConfig(
   };
 }
 
+/** Tier bounds (#110) are the user's and the repo's to set: a task may not set them, to widen or to narrow. */
+function taskSetsTierBounds(layer: ConfigLayer): string[] {
+  const errors: string[] = [];
+  for (const [role, t] of Object.entries(layer.data.tiers ?? {})) {
+    for (const key of ['models', 'max_effort', 'max_context_window'] as const) {
+      if (t[key] !== undefined) {
+        errors.push(`tiers.${role}.${key}: the task layer (${layer.origin}) may not set it`);
+      }
+    }
+  }
+  return errors;
+}
+
 /**
  * The Worker pool is repo-wide, so a task may only lower `workers.*`, never raise it (owner
  * decision on #125, 2026-11-09). A raise is an error. A `per_adapter` cap the layers below do not
@@ -152,13 +200,40 @@ function taskRaisesWorkers(merged: Plain, layer: ConfigLayer): string[] {
       );
     }
   };
-  for (const key of ['max', 'stuck_after_s', 'nudge_grace_s', 'max_attempts'] as const) {
+  for (const key of [
+    'max',
+    'stuck_after_s',
+    'nudge_grace_s',
+    'max_attempts',
+    'verify_timeout_s',
+    'verify_fix_attempts',
+  ] as const) {
     check(key, w[key], below[key]);
   }
   for (const [id, cap] of Object.entries(w.per_adapter ?? {})) {
     check(`per_adapter.${id}`, cap, below.per_adapter?.[id] ?? below.max);
   }
   return errors;
+}
+
+/**
+ * Who may widen a Worker's environment (#147): not the task layer at all, and not the committed
+ * repo layer with a secret-looking name, which other people write. Prefixes are fine anywhere a
+ * pass is allowed: they never let a secret-looking name through.
+ */
+function workerEnvErrors(layer: ConfigLayer): string[] {
+  const pass = layer.data.workers?.env?.pass;
+  if (!layer.data.workers?.env) return [];
+  if (layer.name === 'task') {
+    return [`workers.env: the task layer (${layer.origin}) may not change a Worker's environment`];
+  }
+  if (layer.name !== 'repo') return [];
+  return (pass ?? [])
+    .filter(passesSecret)
+    .map(
+      (p) =>
+        `workers.env.pass: ${p} looks like a secret; the repo layer (${layer.origin}) may not pass it to Workers. Name it in your user or local config instead.`,
+    );
 }
 
 /** Human-readable `tacet config explain` output: one line per value with its source. */

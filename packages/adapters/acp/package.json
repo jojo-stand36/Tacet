@@ -13,6 +13,11 @@
       "@tacet/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@tacet/source": "./src/testing/mock-gemini-api.ts",
+      "types": "./dist/testing/mock-gemini-api.d.ts",
+      "default": "./dist/testing/mock-gemini-api.js"
     }
   },
   "files": [
@@ -23,6 +28,15 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@tacet/core": "workspace:*"
+    "@agentclientprotocol/sdk": "2.4.0",
+    "@tacet/core": "workspace:*",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.101.0",
+    "@agentclientprotocol/codex-acp": "2.6.0",
+    "@google/gemini-cli": "0.67.0",
+    "@tacet/adapter-claude-sdk": "workspace:*",
+    "@tacet/adapter-codex-app-server": "workspace:*"
   }
 }

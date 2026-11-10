@@ -1121,6 +1121,180 @@
         "agent:either"
       ],
       "body": "Follow-up from #17 (architect review). A `handoff.requested` with no later `worker.started` for that sub-task means the daemon stopped between accepting a HandoffPacket and starting the successor session. On restart the successor must start from the packet instead of resuming the old vendor session.\n\n### Tasks\n- [ ] Detect pending handoffs when rebuilding state\n- [ ] Start the successor seeded from the packet (`read_task` already returns the latest packet), with `previousSessionId` and `worker.ended {reason: handoff}` for the old one\n\n### Acceptance criteria\n- Crash after `handoff.requested`, restart: the successor session starts from the packet and the old session is not resumed (test)\n\n_See docs/ARCHITECTURE.md §2.3._"
+    },
+    {
+      "title": "ACP: verify API-key-only auth for claude-agent-acp and codex-acp, then register them",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "`@tacet/adapter-acp` (#13) ships specs for `@agentclientprotocol/claude-agent-acp` (`--hide-claude-auth`, `ANTHROPIC_API_KEY`) and `@agentclientprotocol/codex-acp` (`NO_BROWSER=1`, `api-key` method), but keeps them out of `BUILTIN_ACP_AGENTS`: neither was run live, and with the user's real `~/.claude` and `~/.codex` present it is not verified that they use the API key and leave the user's own login alone. Codex app-server's built-in provider ignores `OPENAI_API_KEY` (capability matrix §2), so what codex-acp's `authenticate {methodId: \"api-key\"}` does (and whether it writes `auth.json`) needs checking.\n\n### Tasks\n- [ ] Run both adapters live against local API mocks, with an existing subscription login present in the home directory\n- [ ] Record which credential each request used and every file the run wrote under the home directory\n- [ ] If needed, give each an isolated home (as the native Codex adapter does with `CODEX_HOME`, #116)\n- [ ] Add both to `BUILTIN_ACP_AGENTS` with conformance tests; record the facts in the capability matrix\n\n### Acceptance criteria\n- Conformance passes for both over ACP against mocks\n- A test shows the user's existing login files are unchanged and unused after a Worker run\n\n_See docs/adapters/capability-matrix.md §4, docs/adapters/spikes/62-acp-adapters and #13._"
+    },
+    {
+      "title": "ACP: offer fork when the agent advertises sessionCapabilities.fork",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "`@tacet/adapter-acp` (#13) declares `fork: 'none'` for every agent and refuses `resume.fork`. ACP has an unstable `session/fork` behind `sessionCapabilities.fork` (spike #61); codex-acp and claude-agent-acp pass it through (spike #62). Gemini CLI 0.67.0 does not offer it.\n\n### Tasks\n- [ ] Verify the current `session/fork` request and response in the pinned ACP SDK\n- [ ] Negotiate fork per session from `initialize` and report it honestly (static `capabilities()` vs per-session support)\n- [ ] Fake-agent tests for fork offered and not offered\n\n### Acceptance criteria\n- A fork is only attempted when the agent advertised it; otherwise it is refused, as today\n\n_See docs/adapters/spikes/61-acp and docs/adapters/capability-matrix.md §4._"
+    },
+    {
+      "title": "Adapters: launch Workers with an environment allowlist",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "The build-adapter skill asks for Worker processes to start with an environment allowlist, but the adapters pass the user's whole environment (plus their own additions). A Worker for one vendor, or any `acp:<slug>` agent, therefore also receives other vendors' API keys and unrelated secrets.\n\n### Tasks\n- [ ] Define the allowlist in `@tacet/core` (system variables, proxy and locale settings, plus each adapter's own key variables and config overrides)\n- [ ] Apply it in every adapter that spawns a process (Claude, Codex app-server, ACP, OpenCode, PTY)\n- [ ] Tests that a variable outside the allowlist does not reach the Worker\n\n### Acceptance criteria\n- No adapter passes another vendor's key variable to a Worker (test per adapter)\n\n_See .claude/skills/build-adapter/SKILL.md and docs/ARCHITECTURE.md._"
+    },
+    {
+      "title": "Mini-conductor: build Worker adapters from the effective config at startup",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p1",
+        "agent:either"
+      ],
+      "body": "`MiniConductorOptions.adapters` takes ready-made adapter instances, and only tests construct them today.\n\nAt startup (`tacet up` or the Mini-conductor entry point), each adapter has to be built from the effective config:\n- the auth route (`auth.*`);\n- `agents.*` presets, as `acp:<slug>` or `pty:<slug>` agents with their `env` secret references resolved;\n- the Worker environment policy (`workerEnvPolicy(config)` from `@tacet/core`, #147).\n\n### Tasks\n- [ ] Composition root that builds the Claude, Codex and ACP adapters from `TacetConfig`\n- [ ] Pass `workers.env.pass` to every adapter as `envPolicy`; log dropped variable names at debug level only\n- [ ] Resolve `agents.*.env` secret references into the agent's fixed environment without logging values\n- [ ] Build `agents.*` presets of kind `pty` as `PtyCliAdapter` (`pty:<slug>`, #156): `command`, `env`, `ready_prompt` → `readyPrompt`, and the values resolved from secret references passed as `PtyPreset.secrets` so they are scrubbed from events\n\n### Acceptance criteria\n- A test starts a Mini-conductor from a config file and shows a Worker gets exactly the allowlisted environment plus `workers.env.pass`\n- A `kind: pty` preset with a secret reference yields a `pty:<slug>` adapter whose events never contain the resolved value\n\n_See docs/ARCHITECTURE.md §4 and §6, #147 and #15._"
+    },
+    {
+      "title": "Keep vendor keys out of Workers' tool subprocesses",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "The Worker environment allowlist (#147) keeps other vendors' keys out of a Worker, but each vendor still hands its own key to the commands it runs: Claude Code's Bash tool inherits `ANTHROPIC_API_KEY`, Codex's `shell_environment_policy` defaults to `inherit = all` with the key filter off, and Gemini CLI's environment redaction is off by default (capability matrix §1, §2, §5, \"Worker environment\"). A test suite or script the Worker runs can therefore print the key into logs.\n\n### Tasks\n- [ ] Claude: verify `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` live on the pinned version, including the Linux `bubblewrap` requirement, and set it for unattended Workers\n- [ ] Codex: verify whether `thread/start` config accepts `shell_environment_policy` (or use `-c`), and set `inherit = \"core\"` plus the needed variables with `ignore_default_excludes = false`\n- [ ] Gemini: verify `security.environmentVariableRedaction.enabled` and how to set it for an ACP session without the user's settings file\n- [ ] Gemini: it loads a `.env` from the working directory, its parents or `~/.env`, past the Worker environment allowlist; find a way to turn that off for Workers (or document it as accepted)\n- [ ] A test per adapter: a tool command the Worker runs does not see the vendor key\n\n### Acceptance criteria\n- For each adapter, a live or mock-API test shows the tool subprocess environment has no API key\n\n_See docs/adapters/capability-matrix.md and #147._"
+    },
+    {
+      "title": "PTY adapter: clean up per-session Claude config directories",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "The PTY adapter (#15) gives every Claude Code session its own `CLAUDE_CONFIG_DIR` under `~/.tacet/state/<repo-hash>/claude-pty/<session id>`, which holds the session's transcript (needed to resume it) and Claude Code's `.claude.json`. Nothing removes these directories, also when `start()` fails.\n\n### Tasks\n- [ ] Remove a session's directory when its sub-task is finished and it can no longer be resumed (Mini-conductor decides), and when `start()` fails before the session existed\n- [ ] Sweep directories older than the event log's transcript retention (`events.retention.transcript_days`)\n- [ ] Tests for both\n\n### Acceptance criteria\n- After a failed start or a finished sub-task, no `claude-pty/<id>` directory remains; resume of a live session still works\n\n_See docs/ARCHITECTURE.md §6 (PTY hook tokens) and #15._"
+    },
+    {
+      "title": "PTY presets: use resume_flag and process_name, or drop them",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "Follow-up from #15 (#156). The `agents.<slug>` preset schema for `kind: pty` accepts `resume_flag` and `process_name` (after Gas Town's agent presets), but `PtyCliAdapter` uses neither: generic presets report `resume: false` and refuse `start({ resume })`.\n\n### Tasks\n- [ ] Decide per field whether it is useful for a generic CLI; verify the flags of at least one real CLI first (`verify-vendor-facts`)\n- [ ] Either support resume through `resume_flag` (and report `resume` in the capabilities only when it is set), or remove the field from the schema and the docs\n- [ ] Either use `process_name` (e.g. to tell a CLI's own exit from a wrapper's), or remove it\n\n### Acceptance criteria\n- `resume_flag` and `process_name` are each either used by `PtyCliAdapter` (with a test) or gone from the schema and docs\n- If resume is supported, a test resumes a fake CLI's session through `resume_flag`\n\n_See packages/adapters/pty/src/cli-adapter.ts, packages/core/src/config/schema.ts and docs/ARCHITECTURE.md §3._"
+    },
+    {
+      "title": "Core: modelSwitch 'none' for adapters that cannot choose a model",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Follow-up from #15 (#156). `AdapterCapabilities.modelSwitch` has no value for an adapter that cannot choose a model at all. Generic PTY presets (`pty:<slug>`) report `launch-only` as an interim: the preset's command fixes the model, and `start({ model })` is refused with `ProfileRefusedError`, never ignored. A router reading `launch-only` may still believe it can pick a model. Human decision: add `'none'` to core, or keep `launch-only` and document the refusal.\n\n### Tasks\n- [ ] Decision recorded on this issue\n- [ ] If `'none'`: add it to the core type and schema, set it for `PTY_CLI_CAPABILITIES`, and make routing skip model choice for such adapters\n- [ ] Conformance probe: an adapter with `modelSwitch: 'none'` refuses `start({ model })` with `ProfileRefusedError`\n\n### Acceptance criteria\n- If `'none'` is adopted: the probe passes for `pty:<slug>` and fails for an adapter that ignores the model\n- If `launch-only` stays: `PTY_CLI_CAPABILITIES` documents that `start({ model })` is refused\n\n_See packages/core/src/adapter/types.ts, packages/core/src/testing/conformance.ts and docs/ARCHITECTURE.md §3._"
+    },
+    {
+      "title": "Resolve keychain secret references in config",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #149. Config accepts `{ keychain: \"service/account\" }` secret references (`SecretRef`), but `resolveSecretRef` (`@tacet/core/node`) resolves only `{ env: NAME }`: a keychain reference used by a Worker's agent is a startup error naming its config path. Resolve them from the OS keychain without the value touching disk, argv of long-lived processes, logs or events.\n\n### Tasks\n- [ ] Verify the platform tools and their exact invocation and exit codes (`verify-vendor-facts`): macOS `security find-generic-password`, Linux Secret Service (`secret-tool lookup`, libsecret); decide what `service/account` maps to on each\n- [ ] Resolve keychain references in `resolveSecretRef`, returning a `Secret`; a missing item, a locked keychain or a missing tool is an error naming the config path, never a value\n- [ ] Keep `{ env }` behaviour unchanged; update ARCHITECTURE.md §4\n\n### Acceptance criteria\n- Unit tests with the platform tool replaced by a fake cover found, missing, locked and tool-not-installed\n- No resolved value appears in errors, logs or events (test)\n\n_See packages/core/src/node/config/secret-ref.ts, docs/ARCHITECTURE.md §4 and §6._"
+    },
+    {
+      "title": "Verify live how Codex and Gemini CLI scope resume to a worktree",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #157. A `pty:<slug>` preset's `resume_flag` continues the CLI's last session in the Worker's checkout. That is only safe if the CLI's resume picks among the sessions of its working directory: a wider scope (a project root shared by sibling worktrees) would let a Worker continue another Worker's session. From help text only: codex-cli 0.167.0 `resume --last` is cwd-filtered (`--all` disables it); Gemini CLI 0.67.0 `--resume latest` is per \"project\", and whether a git worktree is its own project is unknown. Gemini is therefore not given as a `resume_flag` example.\n\n### Tasks\n- [ ] Live, against the local mock APIs: two sibling git worktrees of one repo, a session in each, then resume in one with `codex resume --last` and with `gemini --resume latest`; record which session each continues\n- [ ] Record what each CLI does when asked to resume with no saved session in that directory (exit code, message, or a fresh session)\n- [ ] Update capability matrix §1 (\"Generic PTY presets: resume\") and, if Gemini scopes to the worktree, add it back as an example\n\n### Acceptance criteria\n- Both behaviours recorded with versions and the commands used; each UNVERIFIED mark in that row is resolved or kept with a reason\n- If a CLI scopes wider than the worktree, the docs say not to set `resume_flag` for it\n\n_See packages/adapters/pty/src/cli-adapter.ts (`resumeArgs`) and docs/adapters/capability-matrix.md._"
+    },
+    {
+      "title": "PTY adapters: don't leave a CLI's detached background processes running",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #168. On Linux, interactive codex-cli 0.167.0 starts a managed daemon (`codex app-server --listen unix:// --analytics-default-enabled --managed-daemon`, plus `codex app-server daemon pid-update-loop`; feature `daemon_auto_start`, stable and on by default) that outlives the PTY session: after `PtyCliAdapter.close` it keeps running, re-parented to PID 1. That breaks the adapters rule \"never leave orphaned PTYs/processes\". `-c features.daemon_auto_start=false` prevents it for Codex (verified live, `docs/adapters/spikes/168-resume-scope/`), but any CLI run as a `pty:<slug>` preset could detach a helper the same way.\n\n### Tasks\n- [ ] Recommend `-c features.daemon_auto_start=false` in Codex preset examples, and say why\n- [ ] Decide how the adapter limits detached processes: its own process group or session for the CLI and signalling the group on close (a `setsid` child escapes that), a cgroup or `prctl(PR_SET_CHILD_SUBREAPER)`-style subreaper, or documenting it per preset; verify what node-pty already does (the PTY child is a session leader)\n- [ ] Check whether the Codex daemon sends telemetry during a run (`--analytics-default-enabled`)\n\n### Acceptance criteria\n- A test or recorded live run shows no process a preset's CLI started is left running after `close()`, or the docs state the limit per platform\n\n_See packages/adapters/pty/src/cli-adapter.ts, .github/instructions/adapters.instructions.md and docs/adapters/capability-matrix.md (\"Generic PTY presets: resume\")._"
+    },
+    {
+      "title": "Codex fork keeps the source thread's model",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Found in #110 slice 2 (spike `docs/adapters/spikes/110-codex-effort/`, Codex 0.167.0, mock Responses API): `thread/fork` sent without a `model` came back on the catalog's default model (`gpt-6.1-sol`) with `reasoningEffort: null`, not on the source thread's model. The Codex adapter adopts the reported model, so its own state is consistent, but a forked Worker silently changes model and loses its effort unless the adapter sends them.\n\n### Tasks\n- [ ] Verify on the pinned Codex whether `thread/fork` honours `model` (and the thread config's `model_reasoning_effort`) in its params (`verify-vendor-facts`).\n- [ ] When forking without `SessionOptions.model`, send the source thread's model (and its effort, checked against `model/list`) so the fork continues on what the source ran.\n- [ ] Record the behaviour in the capability matrix Codex Resume/fork row.\n\n### Acceptance criteria\n- Against the mock Responses API, a fork of a thread that ran on `gpt-5.5` at `low`, started without a model or effort, sends its first request with model `gpt-5.5` and effort `low`.\n- A fork with an explicit `model` or `effort` still uses those, and an effort the model does not list is refused (`ProfileRefusedError`).\n\n_See docs/adapters/capability-matrix.md (Codex) and #110._"
+    },
+    {
+      "title": "buildWorkerAdapters: pass repoRoot to the Codex adapter",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:adapters",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Found in the review of #181 (PR #185). `buildWorkerAdapters` (`packages/mini/src/workers/build.ts`) passes `opts.repoRoot` to the ACP and PTY adapters but not to `CodexAppServerAdapter`. An unattended Codex Worker in a git checkout needs it (`workerRepoRoot`, #116): it keys the Worker's own `CODEX_HOME`, checks the worktree against the repo root before any git command, and is where #181 marks the repo untrusted. Without it, every `codex-app-server` Worker built from config refuses to start in a git checkout (\"unattended Codex Workers in a git checkout need the repoRoot option\"). It fails closed, but Codex Workers cannot run.\n\n### Tasks\n- [ ] Pass `opts.repoRoot` to the Codex adapter in `buildWorkerAdapters`.\n- [ ] Test that a Codex Worker built from config starts in a git worktree of the repo.\n\n### Acceptance criteria\n- A `codex-app-server` Worker built by `buildWorkerAdapters` with `repoRoot` starts a session in a linked worktree of that repo (real Codex against the mock Responses API), and its `CODEX_HOME` is keyed by the repo root.\n\n_See packages/mini/src/workers/build.ts, docs/ARCHITECTURE.md §6 (Codex Worker isolation) and #116._"
+    },
+    {
+      "title": "codex-acp Workers trust the checkout: refuse, accept or patch",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Found in #181 (verified live on codex-acp 2.6.0 with Codex 0.166.0, mock Responses API): `createSessionConfig` sets `trust_level: \"trusted\"` for every session root after merging any config Tacet can pass (`CODEX_CONFIG`, its own `CODEX_HOME/config.toml`). So a checkout's `.codex/config.toml` (an `[mcp_servers]` command ran, `developer_instructions` reached the model) and `AGENTS.md` apply to an `acp:codex-acp` Worker: files any Worker can write. Native `codex-app-server` Workers are fixed in #181 (an explicit `untrusted` entry); codex-acp overrides that.\n\nAlso noted: the `CODEX_` prefix allowlist passes the user's own `CODEX_CONFIG` and `CODEX_PATH` into codex-acp; set or deny them in the spec.\n\n### Tasks\n- [ ] Owner decision: refuse `acp:codex-acp` for unattended Workers, drop it from the built-in agents, accept the risk, or patch or ask upstream for a way to keep a session root untrusted.\n- [ ] Implement the decision (e.g. `buildWorkerAdapters` refuses it in a Worker tier) and update ARCHITECTURE §6 and the capability matrix.\n- [ ] Set or deny `CODEX_CONFIG` and `CODEX_PATH` in the codex-acp spec.\n\n### Acceptance criteria\n- Either an unattended Worker cannot run on `acp:codex-acp`, or a test against the real agent with a hostile checkout shows its `.codex/config.toml` and `AGENTS.md` do not load.\n- The user's `CODEX_CONFIG` and `CODEX_PATH` never reach codex-acp unless the spec sets them.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (codex-acp, #181)._"
+    },
+    {
+      "title": "Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Found in #181 (verified live on Gemini CLI 0.67.0 over ACP): a Gemini Worker's checkout is untrusted (Tacet never passes `GEMINI_CLI_TRUST_WORKSPACE`, folder trust is on), which keeps the checkout's `.gemini/settings.json`, `GEMINI.md`, skills, agents and `.gemini/.env` out. But in an untrusted folder Gemini also never contacts the MCP server Tacet passes in `session/new` (no request at all; one once trusted), so Gemini Workers cannot use `escalate`, `report_progress` or the other Mini-conductor tools. Trusting the checkout would load everything above; no flag trusts a folder for MCP only.\n\n### Tasks\n- [ ] Owner decision: Gemini Workers without Mini-conductor tools (escalation through ACP permission requests only), trust the checkout and accept what it loads, or find or ask upstream for an MCP-only trust.\n- [ ] Implement it, with a test against the real CLI, and update ARCHITECTURE §6 and the capability matrix.\n\n### Acceptance criteria\n- A Gemini Worker either reaches Tacet's MCP server with none of the checkout's project files loaded (real-CLI test with a hostile checkout), or its missing tools are declared and handled so a Gemini Worker never waits on a tool it cannot call.\n\n_See docs/ARCHITECTURE.md §6 and docs/adapters/capability-matrix.md (Gemini, #181)._"
     }
   ]
 }

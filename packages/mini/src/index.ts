@@ -13,7 +13,12 @@ export { WorktreeManager } from './worktree.js';
 
 export const packageName = '@tacet/mini' as const;
 
-export { isOwnMcpTool, MiniConductor, type MiniConductorOptions } from './daemon/daemon.js';
+export {
+  isOwnMcpTool,
+  MiniConductor,
+  type MiniConductorOptions,
+  VERIFY_CODEX_WORKERS,
+} from './daemon/daemon.js';
 export {
   AdapterPlanner,
   type AdapterPlannerOptions,
@@ -24,7 +29,13 @@ export type {
   Integrator,
   Planner,
   ProposedSubtask,
+  ReviewContext,
+  Reviewer,
+  ReviewFinding,
+  ReviewResult,
   Verifier,
+  VerifyContext,
+  VerifyResult,
   WorkerAdapter,
   WorkerMcp,
   Workspace,
@@ -37,6 +48,7 @@ export {
   pickReady,
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
+export { type ReviewDiff, type ReviewDiffOptions, reviewDiff } from './git/diff.js';
 export {
   GitIntegrator,
   type Integration,
@@ -64,3 +76,17 @@ export {
   type ToolOutput,
   ToolSchemas,
 } from './mcp/tools.js';
+export {
+  AdapterReviewer,
+  type AdapterReviewerOptions,
+  parseReview,
+  REVIEWER_SYSTEM_PROMPT,
+  reviewerPrompt,
+  reviewFeedback,
+} from './review/adapter-reviewer.js';
+export { REVIEW_WITH_CODEX, reviewConfigProblem } from './review/config.js';
+export {
+  CommandVerifier,
+  type CommandVerifierOptions,
+  commandVerifierFromConfig,
+} from './verify/command-verifier.js';

@@ -47,6 +47,10 @@
               "minLength": 1,
               "maxLength": 256
             }
+          },
+          "indivisible": {
+            "description": "The work cannot be handed off cleanly part-way (e.g. one long read), so a larger context window may be used where config allows it (#110)",
+            "type": "boolean"
           }
         },
         "required": [

@@ -9,6 +9,12 @@
   "references": [
     {
       "path": "../../core"
+    },
+    {
+      "path": "../claude-sdk"
+    },
+    {
+      "path": "../codex-app-server"
     }
   ]
 }

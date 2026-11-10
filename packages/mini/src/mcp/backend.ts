@@ -55,6 +55,11 @@ export interface MiniBackend {
     b: WorkerBinding,
     i: ToolInput<'search_decisions'>,
   ): Promise<ToolOutput<'search_decisions'>>;
+  /**
+   * The Worker's token was revoked (its session ended): drop whatever is kept in memory for it
+   * (#122). Anything needed later is in the event log.
+   */
+  forget?(workerSessionId: string): void;
 }
 
 export interface EventLogBackendOptions {
@@ -72,6 +77,11 @@ export interface EventLogBackendOptions {
   onHandoff?: (b: WorkerBinding, packet: HandoffPacket, reason: string) => void;
   /** Minimum interval between stored progress reports per worker. Default 1000 ms. */
   progressIntervalMs?: number;
+  /**
+   * Per-Worker limits on the tools that ask a person for something (#121): at most `max` calls
+   * per `windowMs`. Defaults: `escalate` 6 and `record_decision` 30 per 10 minutes.
+   */
+  limits?: Partial<Record<LimitedTool, ToolLimit>>;
   /** Extra task constraints for `read_task`, e.g. from repo policy. */
   constraints?: (taskId: string) => string[];
   now?: () => Date;
@@ -79,12 +89,47 @@ export interface EventLogBackendOptions {
 
 const ANSWER_SOURCES = new Set(['policy', 'precedent', 'mini', 'user']);
 
+export type LimitedTool = 'escalate' | 'record_decision';
+export interface ToolLimit {
+  max: number;
+  windowMs: number;
+}
+
+/**
+ * A Worker that escalates more than this in ten minutes is looping, not asking: each escalation
+ * lands in the user's queue. Decisions are cheaper, so the bar is higher.
+ */
+export const DEFAULT_TOOL_LIMITS: Readonly<Record<LimitedTool, ToolLimit>> = {
+  escalate: { max: 6, windowMs: 600_000 },
+  record_decision: { max: 30, windowMs: 600_000 },
+};
+
+/** What the rate limits keep per Worker: recent call times, and when it was last throttled. */
+interface WorkerCalls {
+  calls: Map<LimitedTool, number[]>;
+  throttled: Map<LimitedTool, number>;
+}
+
 /** The MCP tools over the append-only event log (ADR-003 §1); all state changes are events. */
 export class EventLogBackend implements MiniBackend {
   readonly #o: EventLogBackendOptions;
+  /** When each Worker's last progress report was stored: only for the rate limit. */
   readonly #lastProgress = new Map<string, number>();
+  /** Recent calls to the limited tools, per Worker (#121). */
+  readonly #calls = new Map<string, WorkerCalls>();
 
   constructor(opts: EventLogBackendOptions) {
+    for (const [tool, lim] of Object.entries(opts.limits ?? {})) {
+      if (
+        !lim ||
+        !Number.isInteger(lim.max) ||
+        lim.max < 1 ||
+        !Number.isInteger(lim.windowMs) ||
+        lim.windowMs < 1
+      ) {
+        throw new Error(`limits.${tool}: max and windowMs must be positive integers`);
+      }
+    }
     this.#o = opts;
   }
 
@@ -152,11 +197,78 @@ export class EventLogBackend implements MiniBackend {
     };
   }
 
+  forget(workerSessionId: string): void {
+    this.#lastProgress.delete(workerSessionId);
+    this.#calls.delete(workerSessionId);
+  }
+
+  /** @internal Tests only: how many Workers the backend keeps state for. */
+  get workersWithState(): number {
+    return new Set([...this.#lastProgress.keys(), ...this.#calls.keys()]).size;
+  }
+
+  #limitFor(tool: LimitedTool): ToolLimit {
+    return this.#o.limits?.[tool] ?? DEFAULT_TOOL_LIMITS[tool];
+  }
+
+  /**
+   * Count a call that uses the limited `tools`, or refuse it (#121). Over any of its limits, the
+   * Worker gets a tool error it can read, nothing is created, and nothing is counted. A
+   * `worker.throttled` is recorded at most once per window from the first refusal (a Worker that
+   * gets under the limit and hits it again within that window gets no second one). Limits are per
+   * Worker and kept in memory only: a restarted Mini-conductor starts them afresh.
+   */
+  #limit(b: WorkerBinding, ...tools: LimitedTool[]): void {
+    const now = this.#now().getTime();
+    // Calls older than their window limit nothing: drop them, for every Worker, so state for a
+    // Worker whose token was never revoked does not stay forever.
+    for (const [id, w] of this.#calls) {
+      for (const [t, times] of w.calls) {
+        const recent = times.filter((x) => now - x < this.#limitFor(t).windowMs);
+        if (recent.length > 0) w.calls.set(t, recent);
+        else w.calls.delete(t);
+      }
+      for (const [t, at] of w.throttled) {
+        if (now - at >= this.#limitFor(t).windowMs) w.throttled.delete(t);
+      }
+      if (w.calls.size === 0 && w.throttled.size === 0) this.#calls.delete(id);
+    }
+    const w = this.#calls.get(b.workerSessionId) ?? { calls: new Map(), throttled: new Map() };
+    for (const tool of tools) {
+      const lim = this.#limitFor(tool);
+      const times = w.calls.get(tool) ?? [];
+      if (times.length < lim.max) continue;
+      this.#calls.set(b.workerSessionId, w);
+      if (!w.throttled.has(tool)) {
+        w.throttled.set(tool, now);
+        this.#append(
+          b,
+          'worker.throttled',
+          { sessionId: b.workerSessionId, tool, limit: lim.max, windowMs: lim.windowMs },
+          'mini',
+        );
+      }
+      const retryAfterMs = Math.max(1, lim.windowMs - (now - (times[0] ?? now)));
+      throw new ToolError(
+        `${tool} is rate-limited for this Worker: at most ${lim.max} per ${duration(lim.windowMs)}, and the limit is reached. Do not call it again before ${duration(retryAfterMs)} from now; continue with what you have, or end your turn with a summary of what blocks you.`,
+        { tool, limit: lim.max, windowMs: lim.windowMs, retryAfterMs },
+      );
+    }
+    for (const tool of tools) w.calls.set(tool, [...(w.calls.get(tool) ?? []), now]);
+    this.#calls.set(b.workerSessionId, w);
+  }
+
   async reportProgress(b: WorkerBinding, i: ToolInput<'report_progress'>) {
     const now = this.#now().getTime();
+    const interval = this.#o.progressIntervalMs ?? 1000;
+    // An entry older than the interval limits nothing: drop it. This also bounds what a call
+    // still in flight when its token was revoked can leave behind.
+    for (const [id, at] of this.#lastProgress) {
+      if (now - at >= interval) this.#lastProgress.delete(id);
+    }
     const last = this.#lastProgress.get(b.workerSessionId) ?? Number.NEGATIVE_INFINITY;
     // Rate limit (ADR-003 §6): reports inside the interval are acknowledged but not stored.
-    if (now - last >= (this.#o.progressIntervalMs ?? 1000)) {
+    if (now - last >= interval) {
       this.#lastProgress.set(b.workerSessionId, now);
       this.#append(b, 'worker.progress', i, 'worker');
     }
@@ -190,6 +302,7 @@ export class EventLogBackend implements MiniBackend {
   }
 
   async escalate(b: WorkerBinding, i: ToolInput<'escalate'>): Promise<ToolOutput<'escalate'>> {
+    this.#limit(b, 'escalate');
     const escalation = this.#raise(b, i);
     const gate = this.#o.gate;
     if (!gate) return { escalationId: escalation.id, status: 'pending' };
@@ -321,8 +434,13 @@ export class EventLogBackend implements MiniBackend {
     b: WorkerBinding,
     i: ToolInput<'record_decision'>,
   ): Promise<ToolOutput<'record_decision'>> {
+    const needsApproval = i.scope === 'repo' && !(this.#o.allowRepoDecision?.(b, i) ?? false);
+    // A proposal that needs approval lands in the user's queue like an escalation, so it counts
+    // against both limits.
+    if (needsApproval) this.#limit(b, 'record_decision', 'escalate');
+    else this.#limit(b, 'record_decision');
     const decisionId = newUlid(this.#now().getTime());
-    if (i.scope === 'repo' && !(this.#o.allowRepoDecision?.(b, i) ?? false)) {
+    if (needsApproval) {
       // Repo-wide precedent needs approval: it becomes an escalation instead (ADR-003 §6). It
       // never goes through the gate, which could otherwise approve it on its own; only repo
       // policy (`allowRepoDecision`) or the user may. The proposal travels with the escalation,
@@ -391,4 +509,11 @@ function summary(d: Decision): DecisionSummary {
     scope: d.scope,
     source: d.source,
   };
+}
+
+/** A duration for a model to read: seconds below two minutes, minutes above. */
+function duration(ms: number): string {
+  const s = Math.ceil(ms / 1000);
+  if (s < 120) return s === 1 ? '1 second' : `${s} seconds`;
+  return `${Math.ceil(s / 60)} minutes`;
 }

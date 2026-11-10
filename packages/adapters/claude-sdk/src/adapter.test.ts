@@ -1,4 +1,12 @@
-import { existsSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -13,6 +21,7 @@ import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ClaudeSdkAdapter, toPermissionResult } from './adapter.js';
 import { AuthRoutingError } from './auth.js';
+import { ownOwnerDirName } from './mcp-config.js';
 
 // Fake values only.
 const FAKE_KEY = 'fake-key-for-tests';
@@ -113,7 +122,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     const opts = stub.calls[0];
     expect(opts?.mcpServers).toBeUndefined();
     const path = opts?.extraArgs?.['mcp-config'];
-    expect(path).toBe(join(root, 'mcp', `${h.id}.json`));
+    expect(path).toBe(join(root, 'mcp', ownOwnerDirName(), `${h.id}.json`));
     expect(existsSync(path as string)).toBe(true);
     expect(opts?.includePartialMessages).toBe(true);
     expect(opts?.sessionId).toBe(h.vendorSessionId);
@@ -121,6 +130,22 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(existsSync(path as string)).toBe(false);
     expect(stub.isClosed()).toBe(true);
     expect(adapter.status(h)).toBe('done');
+  });
+
+  it('sweeps the MCP files of a dead Mini-conductor once, at its first session (#108)', async () => {
+    const ns = ownOwnerDirName().split('-')[0];
+    const stale = join(root, 'mcp', `${ns}-999999999-000000000000`);
+    mkdirSync(stale, { recursive: true });
+    writeFileSync(join(stale, 'old.json'), '{"token":"leftover"}');
+    const swept: unknown[] = [];
+    const stub = stubQuery();
+    const adapter = make(stub, { onSweep: (n: number) => swept.push(n) });
+    const h1 = await adapter.start({ cwd: join(root, 'wt') });
+    const h2 = await adapter.start({ cwd: join(root, 'wt') });
+    expect(swept).toEqual([1]);
+    expect(existsSync(stale)).toBe(false);
+    await adapter.close(h1);
+    await adapter.close(h2);
   });
 
   it('routes auth through the environment without storing anything', async () => {
@@ -140,6 +165,93 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     ).rejects.toThrow(AuthRoutingError);
     expect(existsSync(join(root, 'mcp'))).toBe(false);
     expect(h1.id).not.toBe(h2.id);
+  });
+
+  it('gives the Worker an allowlist of the environment, not all of it (#147)', async () => {
+    const user = {
+      PATH: '/bin',
+      HOME: '/home/u',
+      JAVA_HOME: '/opt/jdk',
+      ANTHROPIC_API_KEY: FAKE_KEY,
+      ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
+      OPENAI_API_KEY: 'sk-other-vendor',
+      GEMINI_API_KEY: 'other-vendor',
+      GITHUB_TOKEN: 'ghp_x',
+      GITHUB_ACTIONS: 'true',
+      AWS_SECRET_ACCESS_KEY: 'aws-x',
+      MYAPP_HOME: '/opt/myapp',
+    };
+    const dropped: string[][] = [];
+    const stub = stubQuery();
+    const adapter = make(stub, {
+      baseEnv: user,
+      envPolicy: { pass: ['MYAPP_*'] },
+      onEnvDropped: (n: string[]) => dropped.push(n),
+    });
+    await adapter.start({ cwd: root, env: { TACET_WORKER_MARKER: 'm-1' } });
+    const env = stub.calls[0]?.env ?? {};
+    expect(Object.keys(env).sort()).toEqual([
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_BASE_URL',
+      'CLAUDE_AGENT_SDK_CLIENT_APP',
+      'HOME',
+      'JAVA_HOME',
+      'MYAPP_HOME',
+      'PATH',
+      'TACET_WORKER_MARKER',
+    ]);
+    expect(dropped).toEqual([
+      [
+        'AWS_SECRET_ACCESS_KEY',
+        'GEMINI_API_KEY',
+        'GITHUB_ACTIONS',
+        'GITHUB_TOKEN',
+        'OPENAI_API_KEY',
+      ],
+    ]);
+    // A cloud route the user chose brings its credential chain; interactive may inherit all.
+    await make(stub, {
+      baseEnv: { ...user, ANTHROPIC_API_KEY: undefined, CLAUDE_CODE_USE_BEDROCK: '1' },
+    }).start({ cwd: root });
+    expect(stub.calls[1]?.env?.AWS_SECRET_ACCESS_KEY).toBe('aws-x');
+    expect(stub.calls[1]?.env?.OPENAI_API_KEY).toBeUndefined();
+    await make(stub, { baseEnv: user, envPolicy: { inherit: 'all' } }).start({ cwd: root });
+    expect(stub.calls[2]?.env?.OPENAI_API_KEY).toBe('sk-other-vendor');
+    // Vertex brings the Google project and credentials file, not other Google keys.
+    await make(stub, {
+      baseEnv: {
+        ...user,
+        ANTHROPIC_API_KEY: undefined,
+        CLAUDE_CODE_USE_VERTEX: '1',
+        CLOUD_ML_REGION: 'us-east5',
+        GOOGLE_APPLICATION_CREDENTIALS: '/home/u/adc.json',
+        GOOGLE_API_KEY: 'google-other-product',
+        GEMINI_API_KEY: 'gemini-other-vendor',
+        CLAUDE_CODE_SOME_LOGIN_TOKEN: 'login',
+      },
+    }).start({ cwd: root });
+    const vertex = stub.calls[3]?.env ?? {};
+    expect(vertex).toMatchObject({
+      CLOUD_ML_REGION: 'us-east5',
+      GOOGLE_APPLICATION_CREDENTIALS: '/home/u/adc.json',
+    });
+    for (const k of ['GOOGLE_API_KEY', 'GEMINI_API_KEY', 'AWS_SECRET_ACCESS_KEY']) {
+      expect(vertex[k]).toBeUndefined();
+    }
+    // A vendor prefix never carries a secret-looking name along: only the named key variables.
+    expect(vertex.CLAUDE_CODE_SOME_LOGIN_TOKEN).toBeUndefined();
+  });
+
+  it('loads no filesystem settings unless the caller opts in (#181)', async () => {
+    const stub = stubQuery();
+    await make(stub).start({ cwd: root });
+    await make(stub, { sdkOptions: { permissionMode: 'default' } }).start({ cwd: root });
+    // Other SDK options do not drop the default, and a resume keeps it too.
+    await make(stub).start({ cwd: root, resume: { vendorSessionId: 'v-1' } });
+    expect(stub.calls.map((c) => c.settingSources)).toEqual([[], [], []]);
+    expect(stub.calls.every((c) => c.strictMcpConfig === true)).toBe(true);
+    await make(stub, { sdkOptions: { settingSources: ['project'] } }).start({ cwd: root });
+    expect(stub.calls[3]?.settingSources).toEqual(['project']);
   });
 
   it('maps resume and fork to the SDK options', async () => {
@@ -207,6 +319,37 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(usage.map((u) => (u.t === 'usage' ? u.costUsd : 0))).toEqual([0.5, 0.25]);
     // Result events carry cost only; tokens come per model call.
     expect(usage[0]).toMatchObject({ inputTokens: 0, outputTokens: 0, source: 'estimated' });
+  });
+
+  it('scrubs a Worker token the model echoes split across two deltas (#109)', async () => {
+    const token = 'w0rkerT0ken-abcdef123456';
+    for (const cut of [1, 7, 12, token.length - 1]) {
+      const stub = stubQuery();
+      const { adapter, h, tap } = await session(stub, {
+        mcpServers: [
+          {
+            name: 'tacet',
+            url: 'http://127.0.0.1:1/mcp',
+            headers: { authorization: `Bearer ${token}` },
+          },
+        ],
+      });
+      const text = (t: string) =>
+        stub.out.push({
+          type: 'stream_event',
+          parent_tool_use_id: null,
+          event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: t } },
+        });
+      text(`my token is ${token.slice(0, cut)}`);
+      text(`${token.slice(cut)} ok`);
+      stub.out.push(result(0));
+      // The turn's usage comes after its text, and flushes the held-back tail first.
+      await usages(tap, 1);
+      const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+      expect(JSON.stringify(tap.events)).not.toContain(token);
+      expect(deltas.join('')).toBe('my token is [redacted] ok');
+      await adapter.close(h);
+    }
   });
 
   it('reports tokens, model and context per top-level model call', async () => {

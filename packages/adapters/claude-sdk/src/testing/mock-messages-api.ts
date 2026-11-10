@@ -7,6 +7,11 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
+ *   without asking for a file in its working directory.
+ * - `BACKGROUND_TOOL`: asks for a background Bash tool call (`run_in_background`) that writes
+ *   its shell's pid to `background.pid` and then becomes `sleep 600`; with `ESCALATE` in the same first message,
+ *   it then escalates as below.
  * - `ESCALATE`: calls the Tacet MCP `escalate` tool with a fixed question: the offered tool whose
  *   name ends in `escalate`, else `mcp__tacet__escalate` (Claude Code defers MCP tools behind
  *   ToolSearch, so they are usually not offered by name).
@@ -19,12 +24,23 @@ export interface MockRequest {
   model: string | undefined;
   text: string;
   messages: number;
+  /** Ids of the `tool_use` blocks in the conversation sent, so a resumed one can be recognised. */
+  toolUseIds: string[];
   /** `output_config.effort` as sent, if any. */
   effort?: unknown;
   /** The `anthropic-beta` header values. */
   betas: string[];
   /** Names of the tools offered. */
   tools: string[];
+  /** Which known credential authenticated it (see `startMockMessagesApi`); `none` if none. */
+  credential: string;
+  /** The request body as sent, to check that some text never reached the model (#181). */
+  raw: string;
+}
+
+export interface MockMessagesApiOptions {
+  /** Test credentials by label: each request records the label of the one it carried. */
+  credentials?: Record<string, string>;
 }
 
 export interface MockMessagesApi {
@@ -41,7 +57,7 @@ interface Body {
   model?: string;
   output_config?: { effort?: unknown };
   stream?: boolean;
-  messages?: { role: string; content: string | { type: string; text?: string }[] }[];
+  messages?: { role: string; content: string | { type: string; text?: string; id?: string }[] }[];
   tools?: { name?: string }[];
 }
 
@@ -58,11 +74,61 @@ function lastUser(body: Body): { text: string; toolResult: boolean } {
   };
 }
 
+/**
+ * Which of the known test credentials a request carried (#145): the label of the one in its
+ * `x-api-key` header or `Authorization: Bearer` token, `other` for an unknown one, or `none`.
+ * Values are compared, never kept.
+ */
+function credentialOf(req: IncomingMessage, known: Record<string, string>): string {
+  const bearer = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? '')?.[1];
+  const xKey = req.headers['x-api-key'];
+  const sent = typeof xKey === 'string' ? xKey : bearer;
+  if (sent === undefined) return 'none';
+  return Object.entries(known).find(([, v]) => v === sent)?.[0] ?? 'other';
+}
+
 let n = 0;
+
+function firstUserText(body: Body): string {
+  const m = (body.messages ?? []).find((x) => x.role === 'user');
+  if (!m) return '';
+  return typeof m.content === 'string'
+    ? m.content
+    : m.content.map((b) => (b.type === 'text' ? (b.text ?? '') : '')).join('\n');
+}
 
 function plan(body: Body): Block[] {
   const { text, toolResult } = lastUser(body);
+  const first = firstUserText(body);
+  if (toolResult && /BACKGROUND_TOOL/.test(first) && /ESCALATE/.test(first)) {
+    const done = JSON.stringify(body.messages ?? []).includes('Which queue should');
+    if (!done) {
+      const offered = (body.tools ?? []).map((t) => t.name ?? '');
+      return [
+        {
+          type: 'tool_use',
+          id: `toolu_mock_${++n}`,
+          name: offered.find((t) => /tacet.*escalate$/.test(t)) ?? 'mcp__tacet__escalate',
+          input: { question: 'Which queue should the jobs use?', urgency: 'normal' },
+        },
+      ];
+    }
+  }
   if (toolResult) return [{ type: 'text', text: 'Tool finished.' }];
+  if (/BACKGROUND_TOOL/.test(text)) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Bash',
+        input: {
+          command: 'echo $$ > background.pid; exec sleep 600',
+          description: 'start a background job',
+          run_in_background: true,
+        },
+      },
+    ];
+  }
   if (/RUN_TOOL/.test(text)) {
     return [
       {
@@ -71,6 +137,12 @@ function plan(body: Body): Block[] {
         name: 'Bash',
         input: { command: 'touch tool-ran.txt', description: 'create a file' },
       },
+    ];
+  }
+  const read = /READ_TOOL (\S+)/.exec(text);
+  if (read) {
+    return [
+      { type: 'tool_use', id: `toolu_mock_${++n}`, name: 'Read', input: { file_path: read[1] } },
     ];
   }
   if (/ESCALATE/.test(text)) {
@@ -96,6 +168,7 @@ async function handle(
   req: IncomingMessage,
   res: ServerResponse,
   log: MockMessagesApi['requests'],
+  known: Record<string, string>,
 ): Promise<void> {
   let raw = '';
   for await (const c of req) raw += c;
@@ -115,9 +188,16 @@ async function handle(
   }
   const beta = req.headers['anthropic-beta'];
   log.push({
+    raw,
+    credential: credentialOf(req, known),
     model: body.model,
     text: lastUser(body).text,
     messages: body.messages?.length ?? 0,
+    toolUseIds: (body.messages ?? []).flatMap((m) =>
+      typeof m.content === 'string'
+        ? []
+        : m.content.flatMap((b) => (b.type === 'tool_use' && b.id ? [b.id] : [])),
+    ),
     ...(body.output_config?.effort !== undefined ? { effort: body.output_config.effort } : {}),
     betas: (Array.isArray(beta) ? beta.join(',') : (beta ?? ''))
       .split(',')
@@ -190,10 +270,12 @@ async function handle(
   res.end();
 }
 
-export async function startMockMessagesApi(): Promise<MockMessagesApi> {
+export async function startMockMessagesApi(
+  opts: MockMessagesApiOptions = {},
+): Promise<MockMessagesApi> {
   const requests: MockMessagesApi['requests'] = [];
   const server: Server = createServer((req, res) => {
-    handle(req, res, requests).catch(() => res.destroy());
+    handle(req, res, requests, opts.credentials ?? {}).catch(() => res.destroy());
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as AddressInfo;

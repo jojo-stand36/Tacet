@@ -1,5 +1,7 @@
 import { z } from 'zod';
-import { Id, openEnum } from './common.js';
+import { Id, openEnum, TokenCount } from './common.js';
+import { ReviewStatus, VerifyCommandStatus } from './handoff.js';
+import { Effort } from './profile.js';
 
 /**
  * Worker lifecycle events (`worker.*`, ARCHITECTURE.md §3). They are summary-grade: retention
@@ -23,8 +25,50 @@ export const WorkerStarted = z.object({
   previousSessionId: Id.optional().describe(
     'The session this one replaces (restart, handoff or retry), like AG-UI parentRunId',
   ),
+  baseCommit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/)
+    .optional()
+    .describe(
+      "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
+    ),
 });
 export type WorkerStarted = z.infer<typeof WorkerStarted>;
+
+/** A part of a session profile. Unknown values fall back to `model`, the one a retry cannot fix. */
+export const ProfileField = openEnum(['model', 'effort', 'contextWindow'], 'model');
+export type ProfileField = z.infer<typeof ProfileField>;
+
+/**
+ * Why each part of a profile was chosen, keyed by part so a reader never parses free text: the
+ * config path or rule it came from, or why a part was left at the vendor's default.
+ */
+export const ProfileReasons = z.object({
+  model: z.string().min(1),
+  effort: z.string().min(1),
+  contextWindow: z.string().min(1),
+});
+export type ProfileReasons = z.infer<typeof ProfileReasons>;
+
+/**
+ * Payload of `worker.profile`: the session profile the Mini-conductor's policy chose for a Worker
+ * session, and why (#110). Written with `worker.started`, before the session starts. If the
+ * adapter refuses it, it is written again with `refused`, and the profile the session then runs
+ * on gets its own event: the last one for a session is the one in force, unless it is the
+ * refused one, when no session ran (a refused model fails the sub-task).
+ */
+export const WorkerProfile = z.object({
+  sessionId: Id,
+  model: z.string().min(1).optional(),
+  effort: Effort.optional(),
+  contextWindow: TokenCount.positive().optional(),
+  reasons: ProfileReasons,
+  refused: z
+    .object({ field: ProfileField, message: z.string() })
+    .optional()
+    .describe('The adapter refused this profile (ProfileRefusedError)'),
+});
+export type WorkerProfile = z.infer<typeof WorkerProfile>;
 
 /** Payload of `worker.vendor_session`: the vendor's own session or thread id, once known. */
 export const WorkerVendorSession = z.object({
@@ -79,3 +123,61 @@ export const WorkerIntegrated = z.object({
   ref: z.string().regex(/^refs\/heads\/\S+$/, 'expected a branch ref'),
 });
 export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;
+
+/**
+ * Payload of `worker.verification`: one `verify` command finished on a Worker's sub-task (#19).
+ * Summary-grade: never the command's output (it is in the Worker's feedback and, short and
+ * redacted, in `SummaryPacket.verification.notes`). `round` counts the fix rounds of the session:
+ * 0 for the first check, then one more each time the failure went back to the Worker.
+ */
+export const WorkerVerification = z.object({
+  sessionId: Id,
+  round: z.number().int().nonnegative(),
+  command: z.string().min(1),
+  status: VerifyCommandStatus,
+  exitCode: z.number().int().optional(),
+  signal: z.string().min(1).optional(),
+  durationMs: z.number().int().nonnegative(),
+  commit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .optional()
+    .describe('The integrated commit the checkout was verified at'),
+});
+export type WorkerVerification = z.infer<typeof WorkerVerification>;
+
+/**
+ * Payload of `worker.review`: a reviewer agent judged a Worker's sub-task (#19). Summary-grade:
+ * counts only, never the findings' text, which goes to the Worker as its feedback. `round` is
+ * shared with `worker.verification`: the check the review belongs to.
+ */
+export const WorkerReview = z.object({
+  sessionId: Id.describe("The author Worker's session"),
+  reviewerSessionId: Id.optional(),
+  round: z.number().int().nonnegative(),
+  adapter: z.string().min(1),
+  model: z.string().min(1).optional(),
+  status: ReviewStatus,
+  blockers: z.number().int().nonnegative(),
+  majors: z.number().int().nonnegative(),
+  minors: z.number().int().nonnegative(),
+  durationMs: z.number().int().nonnegative(),
+  commit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .optional()
+    .describe('The integrated commit that was reviewed'),
+});
+export type WorkerReview = z.infer<typeof WorkerReview>;
+
+/**
+ * Payload of `worker.throttled`: a Worker went over the Mini-conductor's limit for an MCP tool
+ * (#121). Written once per window; the calls over the limit get a tool error and change nothing.
+ */
+export const WorkerThrottled = z.object({
+  sessionId: Id,
+  tool: z.string().min(1),
+  limit: z.number().int().positive().describe('Calls allowed per window'),
+  windowMs: z.number().int().positive(),
+});
+export type WorkerThrottled = z.infer<typeof WorkerThrottled>;

@@ -35,6 +35,11 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 256
+    },
+    "baseCommit": {
+      "description": "Commit a new checkout started at: its dependencies' combined work (#134); absent for the main branch",
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$"
     }
   },
   "required": [

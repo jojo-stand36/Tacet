@@ -18,6 +18,11 @@
       "@tacet/source": "./src/testing/mock-messages-api.ts",
       "types": "./dist/testing/mock-messages-api.d.ts",
       "default": "./dist/testing/mock-messages-api.js"
+    },
+    "./launch": {
+      "@tacet/source": "./src/launch.ts",
+      "types": "./dist/launch.d.ts",
+      "default": "./dist/launch.js"
     }
   },
   "files": [

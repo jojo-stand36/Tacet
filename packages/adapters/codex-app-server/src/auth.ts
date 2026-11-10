@@ -1,3 +1,5 @@
+import type { EnvAllow } from '@tacet/core';
+
 /**
  * Auth routing for Codex Workers (owner policy, 2026-11-09; docs/RESEARCH.md §7):
  * - `api_key`: parallel or unattended Workers use the user's own OpenAI API key from the
@@ -19,7 +21,8 @@ export const API_KEY_PROVIDER_ID = 'tacet-openai-api-key';
 /** Codex's default Responses API base URL for API-key auth (model-provider-info, 0.167.0). */
 export const OPENAI_API_BASE_URL = 'https://api.openai.com/v1';
 
-const KEY_VARS = ['OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
+/** The variables that hold a Codex API key; kept from the commands a Worker runs (#150). */
+export const KEY_VARS = ['OPENAI_API_KEY', 'CODEX_API_KEY'] as const;
 /**
  * Debug logging for the Rust binary. At trace level it may write protocol traffic (including the
  * thread config with MCP headers) to its logs; whether it does is unverified, so Workers never
@@ -94,3 +97,12 @@ export function codexLaunch(
     ],
   };
 }
+
+/**
+ * The variables a Codex Worker needs beyond the common base set (#147), verified on Codex
+ * 0.167.0 (capability matrix §2, "Worker environment"): the key variables the provider's
+ * `env_key` may name, and the non-secret `CODEX_*` and `OPENAI_*` settings (home, CA
+ * certificate, organization, project). Other secret-looking `CODEX_*` names, such as
+ * `CODEX_ACCESS_TOKEN`, stay out. Codex does not read `OPENAI_BASE_URL`.
+ */
+export const CODEX_ENV_ALLOW: EnvAllow = { names: KEY_VARS, prefixes: ['CODEX_', 'OPENAI_'] };

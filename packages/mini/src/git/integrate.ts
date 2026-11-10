@@ -22,6 +22,7 @@ import {
   workerWorktree,
 } from '@tacet/core/node';
 import { type Integrator, type Workspace, WorktreeRefusedError } from '../daemon/ports.js';
+import { combineCommits, setTaskBranch } from './merge.js';
 
 export { WorktreeRefusedError };
 
@@ -49,6 +50,11 @@ export interface IntegrateOptions {
   timeoutMs?: number;
   /** Most bytes of Worker objects copied for one integration. Default 512 MiB. */
   maxBytes?: number;
+  /**
+   * The commit the checkout started at (#134), when not a branch: a HEAD still there is no work
+   * of its own, and its objects are already in the repo.
+   */
+  base?: string;
 }
 
 /**
@@ -107,6 +113,8 @@ export async function integrateWorktree(opts: IntegrateOptions): Promise<Integra
   const head = await workerHead(wt, git);
   if (!head) return undefined;
   const { commit } = head;
+  if (opts.base !== undefined && !COMMIT_ID.test(opts.base)) throw new Error('bad base commit');
+  if (commit === opts.base) return undefined;
   const current = await git(['rev-parse', '--verify', '-q', opts.ref]).catch(() => '');
   if (current === commit) return { commit, ref: opts.ref };
   // No commit of its own: the HEAD is something a branch or tag of the repo already has (its
@@ -122,7 +130,15 @@ export async function integrateWorktree(opts: IntegrateOptions): Promise<Integra
   const others = containing.split('\n').filter((r) => r && r !== opts.ref && r !== head.branch);
   if (others.length > 0) return undefined;
 
-  const reachable = ['rev-list', '--objects', commit, '--not', '--branches', '--tags'];
+  const reachable = [
+    'rev-list',
+    '--objects',
+    commit,
+    '--not',
+    '--branches',
+    '--tags',
+    ...(opts.base !== undefined ? [opts.base] : []),
+  ];
   if (!(await ok(reachable))) {
     // Inside the shared .git, which the Worker cannot write: a snapshot in a temp dir the
     // sandbox can write could be given an `info/alternates` of the Worker's choosing.
@@ -445,6 +461,14 @@ export function taskBranch(taskId: string): string {
   return `${TASK_REF_PREFIX}${taskId.replace(/[^A-Za-z0-9/_-]/g, '_').replace(/\/+/g, '/')}`;
 }
 
+/**
+ * `refs/heads/tacet/<task>/result`: a task's combined result (#134). Not `tacet/<task>` itself,
+ * which git cannot have next to the sub-task branches `tacet/<task>/<n>`.
+ */
+export function resultBranch(taskId: string): string {
+  return `${taskBranch(taskId)}/result`;
+}
+
 /** The Mini-conductor's `Integrator` for git worktrees of `repoRoot`. */
 export class GitIntegrator implements Integrator {
   readonly #repoRoot: string;
@@ -455,12 +479,27 @@ export class GitIntegrator implements Integrator {
     this.#env = env;
   }
 
-  integrate(subtaskId: string, workspace: Workspace): Promise<Integration | undefined> {
+  integrate(
+    subtaskId: string,
+    workspace: Workspace,
+    base?: string,
+  ): Promise<Integration | undefined> {
     return integrateWorktree({
       cwd: workspace.path,
       repoRoot: this.#repoRoot,
       ref: taskBranch(subtaskId),
       env: this.#env,
+      ...(base !== undefined ? { base } : {}),
     });
+  }
+
+  combine(commits: readonly string[]): Promise<string | undefined> {
+    return combineCommits(commits, { repoRoot: this.#repoRoot, env: this.#env });
+  }
+
+  async publish(taskId: string, commit: string): Promise<string> {
+    const ref = resultBranch(taskId);
+    await setTaskBranch(ref, commit, { repoRoot: this.#repoRoot, env: this.#env });
+    return ref;
   }
 }

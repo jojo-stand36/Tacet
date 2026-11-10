@@ -132,6 +132,8 @@ describe('loadConfig', () => {
       stuck_after_s: 300,
       nudge_grace_s: 900,
       max_attempts: 3,
+      verify_timeout_s: 600,
+      verify_fix_attempts: 2,
     });
     write(
       join(repoRoot, '.tacet', 'tacet.yaml'),
@@ -192,6 +194,100 @@ describe('loadConfig', () => {
     });
   });
 
+  it('unions workers.env.pass across layers; the repo layer may not pass a secret by name', () => {
+    write(join(userDir, 'config.yaml'), 'workers: { env: { pass: [NPM_TOKEN, JDK_*] } }\n');
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [MYAPP_*, JDK_*] } }\n');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [ROLLUP_CACHE] } }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.workers?.env?.pass).toEqual([
+      'NPM_TOKEN',
+      'JDK_*',
+      'MYAPP_*',
+      'ROLLUP_CACHE',
+    ]);
+    // Each value shows every layer that added to it.
+    expect(formatExplain(loadConfig({ userDir, repoRoot }))).toMatch(
+      /^workers\.env\.pass = .*# user \(.*\) \+ repo \(.*\) \+ local \(.*\)$/m,
+    );
+    // The local layer, which is the user's own, may name a secret.
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [GITHUB_TOKEN] } }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.workers?.env?.pass).toContain('GITHUB_TOKEN');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'workers: { env: { pass: [ROLLUP_CACHE] } }\n');
+    // A prefix is fine in the repo layer: it never lets a secret-looking name through.
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [AWS_*] } }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).not.toThrow();
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { env: { pass: [GITHUB_TOKEN] } }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/GITHUB_TOKEN looks like a secret/);
+    for (const bad of ['"*"', '"A-B"', '"*_X"']) {
+      write(join(repoRoot, '.tacet', 'tacet.yaml'), `workers: { env: { pass: [${bad}] } }\n`);
+      expect(() => loadConfig({ userDir, repoRoot })).toThrow(/workers.env.pass/);
+    }
+  });
+
+  it('never lets a task change the Worker environment', () => {
+    expect(() =>
+      loadConfig({ userDir, repoRoot, task: { workers: { env: { pass: ['MYAPP_*'] } } } }),
+    ).toThrow(/task layer .* may not change a Worker's environment/);
+  });
+
+  it('never lets a task change the verify commands, and lets it only lower their limits (#19)', () => {
+    for (const verify of [[], ['true']]) {
+      expect(() => loadConfig({ userDir, repoRoot, task: { verify } })).toThrow(
+        /verify: the task layer .* may not change the verify commands/,
+      );
+    }
+    const defaults = loadConfig({ userDir, repoRoot }).config.workers;
+    expect(defaults).toMatchObject({ verify_timeout_s: 600, verify_fix_attempts: 2 });
+    expect(
+      loadConfig({ userDir, repoRoot, task: { workers: { verify_fix_attempts: 0 } } }).config
+        .workers?.verify_fix_attempts,
+    ).toBe(0);
+    expect(() =>
+      loadConfig({ userDir, repoRoot, task: { workers: { verify_timeout_s: 3600 } } }),
+    ).toThrow(/workers\.verify_timeout_s: the task layer .* may only lower it/);
+  });
+
+  it('lets a task turn review on but never off (#19)', () => {
+    expect(loadConfig({ userDir, repoRoot }).config.review).toBeUndefined();
+    expect(
+      loadConfig({ userDir, repoRoot, task: { review: { enabled: true } } }).config.review,
+    ).toEqual({ enabled: true });
+    expect(() => loadConfig({ userDir, repoRoot, task: { review: { enabled: false } } })).toThrow(
+      /review\.enabled: the task layer .* may not turn review off/,
+    );
+    // Nor weaken it through the tiers (review re-review S6).
+    expect(() =>
+      loadConfig({
+        userDir,
+        repoRoot,
+        task: { tiers: { review: { adapter: 'claude-sdk', cross_vendor: false } } },
+      }),
+    ).toThrow(/tiers\.review: the task layer .* may not change the reviewer/);
+    expect(() =>
+      loadConfig({
+        userDir,
+        repoRoot,
+        task: { tiers: { worker: { adapter: 'opencode', vendor: 'google' } } },
+      }),
+    ).toThrow(/tiers\.worker\.vendor: the task layer .* may not declare a vendor/);
+    // The user's own local layer may.
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'review: { enabled: true }\n');
+    write(join(repoRoot, '.tacet', 'local.yaml'), 'review: { enabled: false }\n');
+    expect(loadConfig({ userDir, repoRoot }).config.review).toEqual({ enabled: false });
+  });
+
+  it('takes a vendor on a tier, and refuses an unknown one (#19)', () => {
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'tiers: { review: { adapter: opencode, vendor: google } }\n',
+    );
+    expect(loadConfig({ userDir, repoRoot }).config.tiers?.review?.vendor).toBe('google');
+    write(
+      join(repoRoot, '.tacet', 'tacet.yaml'),
+      'tiers: { review: { adapter: opencode, vendor: acme } }\n',
+    );
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(/tiers\.review\.vendor/);
+  });
+
   it('reports every problem with file, line and column', () => {
     write(
       join(repoRoot, '.tacet', 'tacet.yaml'),
@@ -243,6 +339,16 @@ describe('loadConfig', () => {
     expect(config.agents?.goose?.env).toEqual({ GOOSE_API_KEY: { env: 'GOOSE_API_KEY' } });
     expect(config.agents?.aider?.kind).toBe('pty');
     expect(config.secrets?.webhook).toEqual({ keychain: 'tacet/webhook' });
+  });
+
+  it('refuses empty resume arguments and the removed process_name (#157)', () => {
+    for (const bad of ['resume_flag: []', 'resume_flag: ""', 'process_name: aider']) {
+      write(
+        join(userDir, 'config.yaml'),
+        `agents:\n  aider:\n    kind: pty\n    command: [aider]\n    ${bad}\n`,
+      );
+      expect(() => loadConfig({ userDir }), bad).toThrow(ConfigError);
+    }
   });
 
   it('replaces a secret reference whole when a higher layer switches its kind', () => {
@@ -317,6 +423,95 @@ describe('loadConfig', () => {
       'A.B': { keychain: 'tacet/ab' },
       '': { keychain: 'tacet/empty' },
     });
+  });
+
+  it('checks tier bounds on the merged config, and keeps them from the task layer (#110)', () => {
+    const user = {
+      tiers: {
+        worker: {
+          adapter: 'claude-sdk',
+          model: 'claude-sonnet-4-6',
+          models: ['claude-sonnet-4-6', 'claude-opus-4-6'],
+          effort: 'medium' as const,
+          max_effort: 'high' as const,
+        },
+      },
+    };
+    const ok = mergeConfig([{ name: 'user', origin: 'u', data: user }]);
+    expect(ok.errors).toEqual([]);
+    // The task layer may pick within the bounds...
+    const within = mergeConfig([
+      { name: 'user', origin: 'u', data: user },
+      {
+        name: 'task',
+        origin: 't',
+        data: { tiers: { worker: { adapter: 'claude-sdk', effort: 'high' } } },
+      },
+    ]);
+    expect(within.errors).toEqual([]);
+    // ...but not outside them, and not move them.
+    const outside = mergeConfig([
+      { name: 'user', origin: 'u', data: user },
+      {
+        name: 'task',
+        origin: 't',
+        data: { tiers: { worker: { adapter: 'claude-sdk', model: 'gpt-5.5', effort: 'max' } } },
+      },
+    ]);
+    expect(outside.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/tiers\.worker\.model: gpt-5\.5 is not in tiers\.worker\.models/),
+        expect.stringMatching(/tiers\.worker\.effort: max is above tiers\.worker\.max_effort/),
+      ]),
+    );
+    const widened = mergeConfig([
+      { name: 'user', origin: 'u', data: user },
+      {
+        name: 'task',
+        origin: 't',
+        data: {
+          tiers: {
+            worker: { adapter: 'claude-sdk', max_effort: 'max', max_context_window: 1_000_000 },
+          },
+        },
+      },
+    ]);
+    expect(widened.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/tiers\.worker\.max_effort: the task layer .* may not set it/),
+        expect.stringMatching(
+          /tiers\.worker\.max_context_window: the task layer .* may not set it/,
+        ),
+      ]),
+    );
+    // Raising effort needs a ceiling; the planner's tier takes no bounds.
+    const noCeiling = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: {
+          tiers: {
+            worker: { adapter: 'x', effort: 'low', escalate_effort_on_retry: true },
+            mini: { adapter: 'x', max_effort: 'high' },
+          },
+        },
+      },
+    ]);
+    expect(noCeiling.errors).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/escalate_effort_on_retry: needs tiers\.worker\.max_effort/),
+        expect.stringMatching(/tiers\.mini\.max_effort: only Worker tiers take bounds/),
+      ]),
+    );
+    // Effort names outside the known levels are a config error, as for any enum in config.
+    const typo = mergeConfig([
+      {
+        name: 'user',
+        origin: 'u',
+        data: { tiers: { worker: { adapter: 'x', effort: 'hgih' } } } as never,
+      },
+    ]);
+    expect(typo.errors.some((e) => e.startsWith('tiers.worker.effort'))).toBe(true);
   });
 
   it('reports a merged config that no longer matches the schema', () => {

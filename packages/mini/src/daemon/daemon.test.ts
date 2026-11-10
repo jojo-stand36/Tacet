@@ -1,12 +1,30 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { type EventEnvelope, newUlid, type TacetConfig, tasksProjection } from '@tacet/core';
+import {
+  type EventEnvelope,
+  newUlid,
+  ProfileRefusedError,
+  type SessionOptions,
+  type TacetConfig,
+  tasksProjection,
+} from '@tacet/core';
 import { type EventStore, openEventStore } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { MiniConductor, type MiniConductorOptions } from './daemon.js';
+import { EventLogBackend } from '../mcp/backend.js';
+import { MiniConductor, type MiniConductorOptions, VERIFY_CODEX_WORKERS } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
-import type { Planner, ProposedSubtask, WorkerMcp } from './ports.js';
+import type {
+  Integrator,
+  Planner,
+  ProposedSubtask,
+  ReviewContext,
+  Reviewer,
+  ReviewResult,
+  Verifier,
+  VerifyContext,
+  WorkerMcp,
+} from './ports.js';
 import { type Script, ScriptedAdapter, TempWorkspaces } from './testing.js';
 
 const CONFIG: TacetConfig = {
@@ -53,7 +71,8 @@ const mcp: WorkerMcp = {
       config: {
         name: 'tacet',
         url: 'http://127.0.0.1:1/mcp',
-        headers: { authorization: 'Bearer x' },
+        // One token per Worker session, so a test can tell which minting a session got.
+        headers: { authorization: `Bearer token-for-${b.workerSessionId}` },
       },
       revoke: () => revoked.push(b.workerSessionId),
     };
@@ -106,6 +125,466 @@ afterEach(async () => {
 });
 
 describe('MiniConductor', () => {
+  describe('review (#19)', () => {
+    const COMMIT = 'c'.repeat(40);
+    /** Every turn's end integrates a commit, so there is something to review. */
+    const integrator: Integrator = {
+      integrate: async (subtaskId) => ({ commit: COMMIT, ref: `refs/heads/tacet/${subtaskId}` }),
+      combine: async () => undefined,
+      publish: async (taskId) => `refs/heads/tacet/result/${taskId}`,
+    };
+    const REVIEW: TacetConfig = {
+      ...CONFIG,
+      tiers: {
+        worker: { adapter: 'fake', model: 'cheap' },
+        review: { adapter: 'other', model: 'x', cross_vendor: false },
+      },
+      review: { enabled: true },
+      workers: { ...CONFIG.workers, max_attempts: 1, verify_fix_attempts: 1 },
+    };
+    /** A reviewer that answers from `results`, in turn, recording what it was given. */
+    function scriptedReviewer(results: ReviewResult['status'][]) {
+      const calls: ReviewContext[] = [];
+      const reviewer: Reviewer = {
+        async review(_task, ctx) {
+          calls.push(ctx);
+          const status = results[Math.min(calls.length - 1, results.length - 1)] ?? 'passed';
+          return {
+            status,
+            adapter: 'other',
+            model: 'x',
+            sessionId: `rev-${calls.length}`,
+            findings:
+              status === 'failed'
+                ? [{ severity: 'blocker', file: 'a.ts', line: 2, message: 'wrong answer' }]
+                : [{ severity: 'minor', message: 'style' }],
+            ...(status === 'error' ? { notes: 'the reviewer timed out' } : {}),
+            usage: { inputTokens: 10, outputTokens: 2, model: 'x' },
+          };
+        },
+      };
+      return { reviewer, calls };
+    }
+    const reviews = () =>
+      ofType('worker.review').map(
+        (e) => e.data as { round: number; status: string; sessionId: string; blockers: number },
+      );
+    const result = (id: string) =>
+      ofType('task.result', `${id}/1`).map(
+        (e) =>
+          e.data as {
+            outcome: string;
+            verification: {
+              status: string;
+              notes?: string;
+              review?: { status: string; blocking: number };
+            };
+          },
+      );
+
+    it("completes approved work, recording the verdict and the reviewer's usage", async () => {
+      const { reviewer, calls } = scriptedReviewer(['passed']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.commit).toBe(COMMIT);
+      // No checkout is made for it (it gets the change in its prompt), and it has a marker of its
+      // own.
+      expect(ws.created).toHaveLength(1);
+      expect(calls[0]?.marker).toMatch(/\S/);
+      expect(reviews()).toEqual([
+        expect.objectContaining({ round: 0, status: 'passed', blockers: 0, minors: 1 }),
+      ]);
+      expect(JSON.stringify(ofType('worker.review'))).not.toContain('style');
+      expect(result(id)[0]?.verification).toMatchObject({
+        status: 'passed',
+        review: { status: 'passed', adapter: 'other', blocking: 0 },
+      });
+      expect(ofType('agent.usage', `${id}/1`).length).toBeGreaterThan(0);
+    });
+
+    it('sends blocking findings back to the same session, then completes', async () => {
+      const { reviewer } = scriptedReviewer(['failed', 'passed']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(fake.sessions).toHaveLength(1);
+      const fix = fake.sessions[0]?.inputs.at(-1) ?? '';
+      expect(fix).toMatch(/^Review failed:/);
+      expect(fix).toContain('[blocker] a.ts:2: wrong answer');
+      expect(reviews().map((r) => [r.round, r.status])).toEqual([
+        [0, 'failed'],
+        [1, 'passed'],
+      ]);
+    });
+
+    it('caps review rounds without verify commands, and fails the attempt with the findings', async () => {
+      const { reviewer, calls } = scriptedReviewer(['failed']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      // One check, one fix round (verify_fix_attempts: 1), then the attempt fails.
+      expect(calls).toHaveLength(2);
+      const r = result(id)[0];
+      expect(r?.outcome).toBe('failed');
+      expect(r?.verification.status).toBe('failed');
+      expect(r?.verification.review).toMatchObject({ status: 'failed', blocking: 1 });
+      expect(r?.verification.notes).toBe(
+        'Review requested changes: 1 blocking finding(s), 0 minor.',
+      );
+      expect(Object.keys(r?.verification ?? {})).not.toContain('feedback');
+    });
+
+    it('keeps the findings out of every event: only the Worker sees them (coordinator requirement)', async () => {
+      const SECRET = 'sk-ant-reviewfinding0123456789';
+      const TEXT = 'FINDING-TEXT-7f3a';
+      const reviewer: Reviewer = {
+        async review() {
+          return {
+            status: 'failed',
+            adapter: 'other',
+            findings: [
+              {
+                severity: 'blocker',
+                file: 'secret/path.ts',
+                line: 9,
+                message: `${TEXT} leaks ${SECRET}`,
+              },
+              { severity: 'minor', message: `${TEXT} minor` },
+            ],
+          };
+        },
+      };
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      // The Worker got them, redacted.
+      const fix = fake.sessions[0]?.inputs.find((x) => x.startsWith('Review failed')) ?? '';
+      expect(fix).toContain(TEXT);
+      expect(fix).toContain('secret/path.ts:9');
+      expect(fix).not.toContain(SECRET);
+      // Nothing in the log carries their text, the file they name, or the secret: counts only.
+      const log = JSON.stringify(store.query({}).map((e) => e.envelope));
+      expect(log).not.toContain(TEXT);
+      expect(log).not.toContain('secret/path.ts');
+      expect(log).not.toContain(SECRET);
+      expect(reviews()[0]).toMatchObject({ blockers: 1, majors: 0, minors: 1 });
+      expect(JSON.stringify(d.errors)).not.toContain(TEXT);
+    });
+
+    it('does not review work whose commands failed', async () => {
+      const { reviewer, calls } = scriptedReviewer(['passed']);
+      const verifier: Verifier = {
+        async verify(_t, _w, ctx) {
+          ctx.onCommand?.({ command: 'pnpm test', status: 'failed', exitCode: 1, durationMs: 1 });
+          return {
+            status: 'failed',
+            commands: ['pnpm test'],
+            notes: 'red',
+            feedback: 'tests failed',
+          };
+        },
+      };
+      const d = make({
+        config: { ...REVIEW, verify: ['pnpm test'] },
+        reviewer,
+        verifier,
+        integrator,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      expect(calls).toHaveLength(0);
+    });
+
+    it('leaves the work partial when the reviewer gives no verdict', async () => {
+      const { reviewer } = scriptedReviewer(['error']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(result(id)[0]?.verification).toMatchObject({
+        status: 'partial',
+        notes: 'Review did not finish: the reviewer timed out.',
+        review: { status: 'error' },
+      });
+    });
+
+    it('reviews a commit whatever the sub-task kind (review, explore)', async () => {
+      const { reviewer, calls } = scriptedReviewer(['passed']);
+      const d = make({
+        config: REVIEW,
+        reviewer,
+        integrator,
+        planner: new FixedPlanner([
+          { key: 'r', goal: 'Review it', acceptanceCriteria: ['ok'], kind: 'review' },
+          { key: 'e', goal: 'Explore it', acceptanceCriteria: ['ok'], kind: 'explore' },
+        ]),
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      // The planner chooses the kind: a code-writing "explore" sub-task gets no pass on it.
+      expect(calls).toHaveLength(2);
+    });
+
+    it('has nothing to review when no commit was integrated', async () => {
+      const { reviewer, calls } = scriptedReviewer(['failed']);
+      const d = make({ config: REVIEW, reviewer });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(calls).toHaveLength(0);
+    });
+
+    it('aborts a review in progress when the Mini-conductor stops, its marker recorded meanwhile', async () => {
+      let fileHadIt = false;
+      let aborted = false;
+      let marker = '';
+      const reviewer: Reviewer = {
+        review: (_t, ctx) =>
+          new Promise((resolve) => {
+            marker = ctx.marker;
+            fileHadIt = readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8').includes(
+              ctx.marker,
+            );
+            ctx.signal.addEventListener('abort', () => {
+              aborted = true;
+              resolve({
+                status: 'error',
+                adapter: 'other',
+                findings: [],
+                notes: 'the review was stopped',
+              });
+            });
+          }),
+      };
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await expect.poll(() => fileHadIt).toBe(true);
+      await d.stop();
+      expect(aborted).toBe(true);
+      expect(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8')).not.toContain(marker);
+      // A stopped review judged nothing: no verdict recorded, so the restart keeps its fix round.
+      expect(reviews()).toEqual([]);
+    });
+
+    it('refuses to start with review on and no reviewer, or a reviewer of the same vendor', () => {
+      expect(() => make({ config: REVIEW })).toThrow(/no reviewer was given/);
+      const { reviewer } = scriptedReviewer(['passed']);
+      expect(() =>
+        make({
+          config: {
+            ...REVIEW,
+            tiers: {
+              worker: { adapter: 'fake', model: 'cheap', vendor: 'anthropic' },
+              review: { adapter: 'other', model: 'x', vendor: 'anthropic' },
+            },
+          },
+          reviewer,
+        }),
+      ).toThrow(/runs anthropic models like the Worker/);
+    });
+  });
+
+  describe('verification (#19)', () => {
+    const VERIFY: TacetConfig = {
+      ...CONFIG,
+      verify: ['pnpm test'],
+      workers: { ...CONFIG.workers, verify_fix_attempts: 1 },
+    };
+    /** A verifier that answers from `results`, in turn, recording what it was given. */
+    function scripted(results: ('passed' | 'failed')[]) {
+      const calls: VerifyContext[] = [];
+      const verifier: Verifier = {
+        async verify(_task, _ws, ctx) {
+          calls.push(ctx);
+          const status = results[Math.min(calls.length - 1, results.length - 1)] ?? 'passed';
+          ctx.onCommand?.({
+            command: 'pnpm test',
+            status,
+            exitCode: status === 'passed' ? 0 : 1,
+            durationMs: 5,
+          });
+          return status === 'failed'
+            ? {
+                status,
+                commands: ['pnpm test'],
+                notes: 'tests failed',
+                feedback: `Verification failed (call ${calls.length}).`,
+              }
+            : { status, commands: ['pnpm test'] };
+        },
+      };
+      return { verifier, calls };
+    }
+    const verifications = () =>
+      ofType('worker.verification').map(
+        (e) => e.data as { round: number; status: string; sessionId: string },
+      );
+
+    it('sends a failure back to the same session to fix, then completes', async () => {
+      const { verifier, calls } = scripted(['failed', 'passed']);
+      const d = make({ config: VERIFY, verifier });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(fake.sessions).toHaveLength(1);
+      expect(fake.sessions[0]?.inputs.at(-1)).toBe('Verification failed (call 1).');
+      expect(calls).toHaveLength(2);
+      expect(verifications().map((v) => [v.round, v.status])).toEqual([
+        [0, 'failed'],
+        [1, 'passed'],
+      ]);
+      // Rounds go to the log; a failed round is not a failed attempt.
+      expect(
+        ofType('task.result', `${id}/1`).map((e) => (e.data as { outcome: string }).outcome),
+      ).toEqual(['completed']);
+    });
+
+    it('fails the attempt once its fix rounds are used, and retries afresh', async () => {
+      const { verifier } = scripted(['failed']);
+      const d = make({
+        config: { ...VERIFY, workers: { ...VERIFY.workers, max_attempts: 2 } },
+        verifier,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      // Two attempts (sessions), each with one fix round: two checks each.
+      expect(fake.sessions).toHaveLength(2);
+      for (const s of fake.sessions) {
+        expect(s.inputs.filter((x) => x.startsWith('Verification failed'))).toHaveLength(1);
+      }
+      const bySession = Map.groupBy(verifications(), (v) => v.sessionId);
+      expect([...bySession.values()].map((vs) => vs.map((v) => v.round))).toEqual([
+        [0, 1],
+        [0, 1],
+      ]);
+      const results = ofType('task.result', `${id}/1`).map(
+        (e) => e.data as { outcome: string; verification: { notes?: string } },
+      );
+      expect(results.map((r) => r.outcome)).toEqual(['failed', 'failed']);
+      expect(results[0]?.verification.notes).toBe('tests failed');
+      // The feedback meant for the Worker never goes up (review B2).
+      for (const e of ofType('task.result', `${id}/1`)) {
+        expect(Object.keys((e.data as { verification: object }).verification)).not.toContain(
+          'feedback',
+        );
+      }
+      // The fresh attempt is told why the last one failed (review S3).
+      expect(fake.sessions[1]?.inputs[0]).toContain('Verification of that attempt: tests failed');
+    });
+
+    it('keeps the fix-round budget across a restart in the middle of a fix (review S2)', async () => {
+      const { verifier } = scripted(['failed']);
+      // The fix turn holds, so the Mini-conductor restarts while the Worker is fixing.
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Verification failed') ? { do: 'hold' } : script(input),
+      );
+      const RETRY = { ...VERIFY, workers: { ...VERIFY.workers, max_attempts: 2 } };
+      const d1 = make({ config: RETRY, verifier });
+      await d1.start();
+      const id = d1.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await expect
+        .poll(() => fake.sessions[0]?.inputs.some((x) => x.startsWith('Verification failed')))
+        .toBe(true);
+      await d1.stop();
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('The Mini-conductor restarted')
+          ? { do: 'reply', text: 'fixed' }
+          : script(input),
+      );
+      const d2 = make({ config: RETRY, verifier });
+      await d2.start();
+      await d2.settled();
+      // One fix round in all (verify_fix_attempts: 1): the resumed session's failure fails the
+      // attempt instead of buying another round.
+      const resumed = fake.sessions.find((s) => s.opts.resume);
+      expect(resumed).toBeDefined();
+      expect(resumed?.inputs.filter((x) => x.startsWith('Verification failed'))).toEqual([]);
+      expect(
+        ofType('task.result', `${id}/1`).map((e) => (e.data as { outcome: string }).outcome)[0],
+      ).toBe('failed');
+      // The next attempt reuses the checkout but not the spent budget (re-review S2).
+      const retry = fake.sessions.find((s) => s !== resumed && !s.opts.resume);
+      expect(retry?.inputs.filter((x) => x.startsWith('Verification failed'))).toHaveLength(1);
+    });
+
+    it('records the process marker while it runs, and stops a run when the Mini-conductor stops', async () => {
+      let markerSeen: string | undefined;
+      let fileHadIt = false;
+      let aborted = false;
+      const verifier: Verifier = {
+        verify: (_task, _ws, ctx) =>
+          new Promise((resolve) => {
+            markerSeen = ctx.marker;
+            fileHadIt = readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8').includes(
+              ctx.marker,
+            );
+            ctx.signal.addEventListener('abort', () => {
+              aborted = true;
+              resolve({ status: 'not_run', commands: ['pnpm test'] });
+            });
+          }),
+      };
+      const d = make({ config: VERIFY, verifier });
+      await d.start();
+      d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await expect.poll(() => markerSeen).toBeDefined();
+      expect(fileHadIt).toBe(true);
+      await d.stop();
+      expect(aborted).toBe(true);
+      // Stopped, not failed: nothing counts against the sub-task, and the marker is dropped.
+      expect(ofType('task.result')).toEqual([]);
+      expect(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8')).not.toContain(markerSeen);
+    });
+
+    it('does not verify Codex Workers until the sandbox decision, and says so', async () => {
+      expect(VERIFY_CODEX_WORKERS).toBe(false);
+      const { verifier, calls } = scripted(['passed']);
+      const codex = new ScriptedAdapter('codex-app-server', script);
+      const d = make({
+        config: {
+          ...VERIFY,
+          tiers: { ...CONFIG.tiers, worker: { adapter: 'codex-app-server', model: 'm' } },
+        },
+        adapters: {
+          'codex-app-server': { adapter: codex, authRoute: 'api_key' },
+          other: { adapter: other, authRoute: 'api_key' },
+        },
+        verifier,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'], priority: 'p1' });
+      await d.settled();
+      expect(calls).toHaveLength(0);
+      const result = ofType('task.result', `${id}/1`)[0]?.data as {
+        verification: { status: string; notes?: string };
+      };
+      expect(result.verification).toMatchObject({
+        status: 'not_run',
+        notes: 'codex verify pending sandbox decision',
+      });
+    });
+  });
+
   it('plans, runs sub-tasks in dependency order, and rolls the result up', async () => {
     const d = make({
       planner: new FixedPlanner([
@@ -251,6 +730,168 @@ describe('MiniConductor', () => {
     expect(all[id]?.result?.outcome).toBe('failed');
   });
 
+  it('chooses each session profile within the tier bounds and logs it as worker.profile (#110)', async () => {
+    let first = true;
+    fake = new ScriptedAdapter('fake', (input) => {
+      if (input.includes('flaky') && first) {
+        first = false;
+        return { do: 'error', message: 'transient' };
+      }
+      return script(input);
+    });
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: {
+          worker: {
+            adapter: 'fake',
+            model: 'cheap',
+            effort: 'medium',
+            max_effort: 'high',
+            escalate_effort_on_retry: true,
+            max_context_window: 1_000_000,
+          },
+        },
+      },
+      planner: new FixedPlanner([
+        { key: 'flaky', goal: 'flaky step', acceptanceCriteria: ['ok'] },
+        { key: 'read', goal: 'one long read', acceptanceCriteria: ['ok'], indivisible: true },
+      ]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'profiles', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    const opts = (goal: string) =>
+      fake.sessions
+        .filter((x) => x.inputs.some((i) => i.includes(goal)))
+        .map(({ opts: o }) => ({
+          model: o.model,
+          effort: o.effort,
+          contextWindow: o.contextWindow,
+        }));
+    // The retry runs one effort level higher; only the indivisible sub-task gets the large window.
+    expect(opts('flaky step')).toEqual([
+      { model: 'cheap', effort: 'medium', contextWindow: undefined },
+      { model: 'cheap', effort: 'high', contextWindow: undefined },
+    ]);
+    expect(opts('one long read')).toEqual([
+      { model: 'cheap', effort: 'medium', contextWindow: 1_000_000 },
+    ]);
+    // Every session has its profile, with the reasons, in the log, after its worker.started.
+    const profiles = ofType('worker.profile', `${id}/2`);
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0]?.data).toMatchObject({
+      contextWindow: 1_000_000,
+      reasons: { contextWindow: expect.stringMatching(/cannot be handed off cleanly/) },
+    });
+    expect(
+      ofType('worker.profile', `${id}/1`).map((e) => (e.data as { effort: string }).effort),
+    ).toEqual(['medium', 'high']);
+  });
+
+  it('runs at the default effort, and logs why, when the adapter refuses the effort (#110)', async () => {
+    class NoHigh extends ScriptedAdapter {
+      override async start(opts: SessionOptions) {
+        if (opts.effort === 'high') throw new ProfileRefusedError('effort', 'no high here');
+        return super.start(opts);
+      }
+    }
+    fake = new NoHigh('fake', script);
+    const d = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap', effort: 'high' } } },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'refused effort', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(fake.sessions.map((x) => x.opts.effort)).toEqual([undefined]);
+    const profiles = ofType('worker.profile').map((e) => e.data as Record<string, unknown>);
+    // Chosen, then the same profile marked refused, then the one the session ran on.
+    expect(profiles).toHaveLength(3);
+    expect(profiles[0]).toMatchObject({ effort: 'high' });
+    expect(profiles[0]).not.toHaveProperty('refused');
+    expect(profiles[1]).toMatchObject({
+      effort: 'high',
+      refused: { field: 'effort', message: 'no high here' },
+    });
+    expect(profiles[2]).not.toHaveProperty('effort');
+    expect(profiles[2]).toMatchObject({
+      reasons: { effort: expect.stringMatching(/^the model's default; the adapter refused high/) },
+    });
+    // Not a failed attempt.
+    expect(ofType('worker.ended').map((e) => (e.data as { reason: string }).reason)).not.toContain(
+      'failed',
+    );
+  });
+
+  it('drops a refused context window and fails at once on a refused model (#110)', async () => {
+    class Picky extends ScriptedAdapter {
+      starts = 0;
+      override async start(opts: SessionOptions) {
+        this.starts++;
+        if (opts.model === 'nope') throw new ProfileRefusedError('model', 'no such model');
+        if (opts.contextWindow !== undefined) {
+          throw new ProfileRefusedError('contextWindow', 'not for this model');
+        }
+        return super.start(opts);
+      }
+    }
+    const picky = new Picky('fake', script);
+    fake = picky;
+    const window = make({
+      config: {
+        ...CONFIG,
+        tiers: { worker: { adapter: 'fake', model: 'cheap', max_context_window: 1_000_000 } },
+      },
+      planner: new FixedPlanner([
+        { key: 'read', goal: 'one long read', acceptanceCriteria: ['ok'], indivisible: true },
+      ]),
+    });
+    await window.start();
+    const id = window.submit({ goal: 'window', acceptanceCriteria: ['ok'] });
+    await window.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(picky.sessions.map((x) => x.opts.contextWindow)).toEqual([undefined]);
+    const last = ofType('worker.profile').at(-1)?.data as { reasons: { contextWindow: string } };
+    expect(last.reasons.contextWindow).toMatch(/refused 1000000; hand off at the threshold/);
+    await window.stop();
+
+    // A refused model: one start, then the sub-task fails without using up its retries.
+    picky.starts = 0;
+    const model = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'nope' } } },
+    });
+    await model.start();
+    const id2 = model.submit({ goal: 'bad model', acceptanceCriteria: ['ok'] });
+    await model.settled();
+    expect(picky.starts).toBe(1);
+    expect(tasks()[`${id2}/1`]?.state).toBe('failed');
+    expect(ofType('task.status', `${id2}/1`).at(-1)?.data).toMatchObject({
+      message: expect.stringMatching(/session profile refused: the adapter refused the model/),
+    });
+    expect(
+      ofType('worker.profile', `${id2}/1`).map((e) => (e.data as { refused?: unknown }).refused),
+    ).toEqual([undefined, { field: 'model', message: 'no such model' }]);
+  });
+
+  it('fails a sub-task whose profile is outside the bounds, before any session (#110)', async () => {
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: { worker: { adapter: 'fake', effort: 'max', max_effort: 'high' } },
+      },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'out of bounds', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[`${id}/1`]?.state).toBe('failed');
+    expect(ofType('task.status', `${id}/1`).at(-1)?.data).toMatchObject({
+      message: expect.stringMatching(/session profile refused: effort max is above/),
+    });
+    expect(fake.sessions).toHaveLength(0);
+  });
+
   it('marks a Worker that ends its turn on an open escalation input_required, then delivers the answer', async () => {
     const escId = newUlid();
     fake = new ScriptedAdapter('fake', (input, s) => {
@@ -347,6 +988,61 @@ describe('MiniConductor', () => {
     ]);
   });
 
+  it('discards a session stopped for a restart that is then not resumed (#153)', async () => {
+    const d1 = make({
+      planner: new FixedPlanner([{ key: 'long', goal: 'long [hold]', acceptanceCriteria: ['ok'] }]),
+    });
+    await d1.start();
+    const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('worker.vendor_session', `${id}/1`).length, { timeout: 5000 })
+      .toBe(1);
+    const vendor = (
+      ofType('worker.vendor_session', `${id}/1`)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
+    d1.crashForTest();
+    expect(fake.discarded).toEqual([]);
+    // Restarted with Workers on another adapter: the old session is never resumed.
+    const oldFake = fake;
+    other = new ScriptedAdapter('other', () => ({ do: 'reply', text: 'done elsewhere' }));
+    const d2 = make({
+      config: { ...CONFIG, tiers: { worker: { adapter: 'other', model: 'x' } } },
+      adapters: {
+        fake: { adapter: oldFake, authRoute: 'api_key' },
+        other: { adapter: other, authRoute: 'api_key' },
+      },
+    });
+    await d2.start();
+    await d2.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    expect(oldFake.discarded.map((x) => x.vendorSessionId)).toEqual([vendor]);
+    expect(other.sessions.some((s) => s.opts.resume)).toBe(false);
+  });
+
+  it('discards a session whose resume failed (#153)', async () => {
+    const d1 = make({
+      planner: new FixedPlanner([{ key: 'long', goal: 'long [hold]', acceptanceCriteria: ['ok'] }]),
+    });
+    await d1.start();
+    const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('worker.vendor_session', `${id}/1`).length, { timeout: 5000 })
+      .toBe(1);
+    const vendor = (
+      ofType('worker.vendor_session', `${id}/1`)[0]?.data as { vendorSessionId: string } | undefined
+    )?.vendorSessionId;
+    d1.crashForTest();
+    fake = new ScriptedAdapter('fake', () => ({ do: 'reply', text: 'done afresh' }));
+    fake.failResumes = true;
+    const d2 = make();
+    await d2.start();
+    await d2.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    // The failed resume's session, then the fresh one once it finished. (This scripted adapter
+    // numbers its sessions afresh, so the fresh one reuses the id: count both.)
+    expect(fake.discarded.map((x) => x.vendorSessionId)).toEqual([vendor, vendor]);
+  });
+
   it('resumes after a crash mid-task without redoing finished work', async () => {
     const d1 = make({
       planner: new FixedPlanner([
@@ -391,6 +1087,19 @@ describe('MiniConductor', () => {
     // It resumed the same vendor session in the same checkout, told that it restarted.
     const resumed = fake.sessions.find((s) => s.opts.resume);
     expect(resumed?.opts.resume?.vendorSessionId).toBe(vendor);
+    // Once it finished, it will never be resumed again: discarded (#153), the crash's restart not.
+    // (This scripted adapter numbers its sessions afresh, so match the checkout too.)
+    expect(
+      fake.discarded.filter((x) => x.vendorSessionId === vendor && x.cwd === resumed?.opts.cwd),
+    ).toHaveLength(1);
+    // With the restarted Mini-conductor's MCP config: a token minted for the new session (#128).
+    const resumedSession = (
+      ofType('worker.started', `${id}/2`).at(-1)?.data as { sessionId: string } | undefined
+    )?.sessionId;
+    expect(resumedSession).not.toBe(crashed);
+    expect(resumed?.opts.mcpServers?.[0]?.headers).toEqual({
+      authorization: `Bearer token-for-${resumedSession}`,
+    });
     const firstWs = ofType('worker.started', `${id}/2`)[0]?.data as
       | { workspaceId: string }
       | undefined;
@@ -456,6 +1165,23 @@ describe('MiniConductor', () => {
     await make().start();
   });
 
+  it('refuses an adapter that may not run Workers, here or in the planner (#183)', () => {
+    const refusing = Object.assign(new ScriptedAdapter('fake', script), {
+      workerRefused: 'not for Workers (#183)',
+    });
+    expect(() => make({ adapters: { fake: { adapter: refusing, authRoute: 'api_key' } } })).toThrow(
+      /adapter fake: refused for Workers: not for Workers \(#183\)/,
+    );
+    expect(
+      () =>
+        new AdapterPlanner({
+          worker: { adapter: refusing, authRoute: 'api_key' },
+          adapterId: 'acp:codex-acp',
+          cwd: dir,
+        }),
+    ).toThrow(/refused for the planner: not for Workers/);
+  });
+
   it('refuses a Worker adapter that is not on the api_key route', () => {
     expect(() =>
       make({
@@ -475,6 +1201,12 @@ describe('planning', () => {
       ).subtasks.map((s) => s.key),
     ).toEqual(['a', 'b']);
     expect(() => parseProposal('Here is my plan')).toThrow(/not JSON/);
+    // `indivisible` is kept only when true (#110).
+    expect(
+      parseProposal(
+        '{"subtasks":[{"key":"a","goal":"g","acceptanceCriteria":["c"],"indivisible":true},{"key":"b","goal":"h","acceptanceCriteria":["d"],"indivisible":false}]}',
+      ).subtasks.map((s) => s.indivisible),
+    ).toEqual([true, undefined]);
     expect(() =>
       parseProposal(
         '{"subtasks":[{"key":"a","goal":"g","acceptanceCriteria":["c"],"dependsOn":["a"]}]}',
@@ -847,5 +1579,172 @@ describe('MiniConductor review fixes', () => {
     // The session that finished starting was given back, and its token revoked.
     expect(fake.open).toBe(0);
     expect(revoked.sort()).toEqual(minted.sort());
+  });
+
+  describe('Worker health', () => {
+    let t = Date.parse('2026-11-09T12:00:00.000Z');
+    const now = () => new Date(t);
+    const advance = (seconds: number) => {
+      t += seconds * 1000;
+    };
+    const health = {
+      ...CONFIG,
+      workers: { max: 4, max_attempts: 3, stuck_after_s: 300, nudge_grace_s: 900 },
+    };
+
+    it('nudges a silent Worker, then replaces it, and the retry carries on', async () => {
+      let sessions = 0;
+      fake = new ScriptedAdapter('fake', (input) => {
+        if (input.startsWith('Sub-task')) {
+          sessions += 1;
+          if (sessions === 1) return { do: 'hold' };
+        }
+        return script(input);
+      });
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect
+        .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
+        .toBe(1);
+      advance(299);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      advance(2);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
+      // Recorded, not sent: real adapters would queue it as the next turn.
+      expect(fake.sessions[0]?.inputs).toHaveLength(1);
+      advance(899);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ofType('worker.ended', sub)).toHaveLength(0);
+      advance(2);
+      await d.settled();
+      expect(ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason)).toEqual(
+        ['stuck', 'finished'],
+      );
+      expect(tasks()[sub]?.state).toBe('completed');
+      expect(
+        ofType('worker.started', sub).map((e) => (e.data as { attempt: number }).attempt),
+      ).toEqual([1, 2]);
+    });
+
+    it('takes progress reports as signs of life, whatever the backend clock says', async () => {
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Sub-task') ? { do: 'hold' } : script(input),
+      );
+      // The MCP backend's clock runs an hour ahead of the daemon's.
+      const backend = new EventLogBackend({ store, now: () => new Date(t + 3_600_000) });
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect
+        .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
+        .toBe(1);
+      const binding = { workerSessionId: minted[0] ?? '', taskId: sub };
+      for (let i = 0; i < 4; i++) {
+        advance(200);
+        await backend.reportProgress(binding, { summary: `step ${i}` });
+        await new Promise((r) => setTimeout(r, 60));
+      }
+      expect(ofType('worker.progress', sub)).toHaveLength(4);
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      // Then silence: the skewed timestamps must not push the heartbeat into the future.
+      advance(301);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
+    });
+
+    it('leaves a Worker in a long tool call alone, but not forever', async () => {
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Sub-task') ? { do: 'tool-hold' } : script(input),
+      );
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => ofType('agent.tool.call', sub).length, { timeout: 5000 }).toBe(1);
+      advance(1199);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      // Open for stuck_after_s + nudge_grace_s: a hung watcher or prompt, not a long test run.
+      advance(2);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
+      advance(901);
+      await expect
+        .poll(() => ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason), {
+          timeout: 5000,
+        })
+        .toEqual(['stuck']);
+      await expect.poll(() => ofType('worker.started', sub).length, { timeout: 5000 }).toBe(2);
+    });
+
+    it('leaves a Worker waiting on an answer alone', async () => {
+      const escId = newUlid();
+      fake = new ScriptedAdapter('fake', (_input, sess) => {
+        if (sess.inputs.length === 1) {
+          const started = ofType('worker.started').at(-1);
+          store.append({
+            v: 1,
+            id: newUlid(t),
+            ts: now().toISOString(),
+            source: { kind: 'worker', id: 'w' },
+            taskId: started?.taskId as string,
+            sessionId: (started?.data as { sessionId: string } | undefined)?.sessionId ?? '',
+            type: 'escalation.raised',
+            data: {
+              id: escId,
+              taskId: started?.taskId,
+              question: 'q?',
+              urgency: 'normal',
+              createdAt: now().toISOString(),
+              status: 'pending',
+            },
+          } as EventEnvelope);
+          return { do: 'reply', text: 'waiting' };
+        }
+        // The answer starts a long, quiet turn.
+        return { do: 'hold' };
+      });
+      const d = make({ config: health, now });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+      advance(3600);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      // The answer after an hour starts a new turn: the wait is not silence.
+      store.append(env(sub, 'escalation.resolved', { escalationId: escId, answer: 'yes' }));
+      await expect
+        .poll(() => ofType('escalation.delivered', sub).length, { timeout: 5000 })
+        .toBe(1);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+      advance(301);
+      await expect.poll(() => ofType('worker.nudged', sub).length, { timeout: 5000 }).toBe(1);
+    });
+
+    it('starts the heartbeat afresh after a restart', async () => {
+      fake = new ScriptedAdapter('fake', (input) =>
+        input.startsWith('Sub-task') ? { do: 'hold' } : script(input),
+      );
+      const d1 = make({ config: health, now });
+      await d1.start();
+      const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect
+        .poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 })
+        .toBe(1);
+      d1.crashForTest();
+      // Hours pass before the Mini-conductor comes back.
+      advance(5 * 3600);
+      fake = new ScriptedAdapter('fake', () => ({ do: 'hold' }));
+      const d2 = make({ config: health, now });
+      await d2.start();
+      await expect.poll(() => ofType('worker.started', sub).length, { timeout: 5000 }).toBe(2);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(ofType('worker.nudged', sub)).toHaveLength(0);
+    });
   });
 });

@@ -1,11 +1,25 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, configArgs, grantSubset, toCodexDecision } from './adapter.js';
+import {
+  CodexAppServerAdapter,
+  configArgs,
+  grantSubset,
+  toCodexDecision,
+  untrustProjects,
+} from './adapter.js';
 import { API_KEY_PROVIDER_ID, AuthRoutingError, chooseAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, RpcError } from './jsonrpc.js';
 
@@ -108,6 +122,41 @@ describe('toCodexDecision', () => {
   });
 });
 
+describe('untrustProjects (#181)', () => {
+  it('marks the paths untrusted, replacing what Codex wrote and keeping the rest', () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-codex-trust-')));
+    try {
+      const file = join(dir, 'config.toml');
+      writeFileSync(
+        file,
+        `model = "x"\n\n[projects.${JSON.stringify(dir)}]\ntrust_level = "trusted"\n\n[projects."/other"]\ntrust_level = "trusted"\n`,
+      );
+      untrustProjects(file, [dir]);
+      const text = readFileSync(file, 'utf8');
+      expect(text).toContain('model = "x"');
+      expect(text).toContain('[projects."/other"]\ntrust_level = "trusted"');
+      expect(text).toContain(`[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"`);
+      expect(text.split(`[projects.${JSON.stringify(dir)}]`)).toHaveLength(2);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      // Idempotent, and a missing file is created.
+      untrustProjects(file, [dir]);
+      expect(readFileSync(file, 'utf8')).toBe(text);
+      rmSync(file);
+      untrustProjects(file, [dir]);
+      expect(readFileSync(file, 'utf8')).toBe(
+        `[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"\n`,
+      );
+      // Any read error but a missing file fails closed, leaving the path as it was.
+      const asDir = join(dir, 'is-a-dir');
+      mkdirSync(asDir);
+      expect(() => untrustProjects(asDir, [dir])).toThrow();
+      expect(statSync(asDir).isDirectory()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('configArgs', () => {
   it('turns plain settings into -c overrides', () => {
     expect(configArgs({ 'features.plugins': false, model_verbosity: 'low' })).toEqual([
@@ -201,6 +250,8 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
   const make = (mode: string, extra: object = {}) =>
     new CodexAppServerAdapter({
       codexPath: FAKE,
+      // The fake app-server is steered by FAKE_* variables (#147: passed through on purpose).
+      envPolicy: { pass: ['FAKE_*'] },
       killTimeoutMs: 1000,
       baseEnv: {
         PATH: process.env.PATH,
@@ -217,6 +268,125 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
       .split('\n')
       .map((l) => JSON.parse(l));
 
+  const turnTexts = () =>
+    clientLog()
+      .filter((m) => m.method === 'turn/start')
+      .map((m) => m.params.input[0].text);
+
+  it('keeps send order when an earlier send waits on the effort check', async () => {
+    const adapter = make('models-slow');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    // Not awaited one by one: live input from a caller that fires and forgets.
+    const a = adapter.send(h, { text: 'A' }, { effort: 'low' });
+    const b = adapter.send(h, { text: 'B' });
+    await Promise.all([a, b]);
+    // Both turns run to the end.
+    const idle = (e: { t: string; state?: string }) => e.t === 'status' && e.state === 'idle';
+    const first = await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const end1 = await tap.waitFor(idle, 5000, first.index + 1);
+    await tap.waitFor(idle, 5000, end1.index + 1);
+    expect(turnTexts()).toEqual(['A', 'B']);
+    expect(clientLog().find((m) => m.method === 'turn/start')?.params.effort).toBe('low');
+    await adapter.close(h);
+  });
+
+  it('does not cache a failed model/list read, and refuses unlisted levels', async () => {
+    const adapter = make('models-fail-once');
+    const h = await adapter.start({ cwd: root });
+    await expect(adapter.send(h, { text: 'A' }, { effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    await expect(adapter.send(h, { text: 'B' }, { effort: 'xhigh' })).rejects.toMatchObject({
+      field: 'effort',
+      message: expect.stringMatching(/does not support/),
+    });
+    await adapter.send(h, { text: 'C' }, { effort: 'high' });
+    expect(clientLog().filter((m) => m.method === 'model/list')).toHaveLength(2);
+    await adapter.close(h);
+    expect(turnTexts()).toEqual(['C']);
+  });
+
+  it('refuses, without an unhandled rejection, when model/list fails at start', async () => {
+    // No model named: the catalog is read after thread/start, against the thread's model.
+    const adapter = make('models-fail-once');
+    await expect(adapter.start({ cwd: root, effort: 'low' })).rejects.toMatchObject({
+      name: 'ProfileRefusedError',
+      message: expect.stringMatching(/model\/list/),
+    });
+    // Named model: checked before thread/start, which then never runs.
+    rmSync(join(root, 'log.jsonl'), { force: true });
+    await expect(
+      make('models-fail-once').start({ cwd: root, model: 'fake-model', effort: 'low' }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError' });
+    expect(clientLog().some((m) => m.method === 'thread/start')).toBe(false);
+  });
+
+  it('lists a send still waiting on the effort check in the interrupt receipt', async () => {
+    const adapter = make('slow-both');
+    const h = await adapter.start({ cwd: root });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'A' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'running', 5000, 0);
+    const b = adapter.send(h, { text: 'B' }, { effort: 'low' });
+    expect(await adapter.interrupt(h)).toEqual({ stillQueued: ['B'] });
+    await b;
+    await adapter.close(h);
+  });
+
+  it('stops paging model/list when the cursor repeats', async () => {
+    const adapter = make('models-loop');
+    const h = await adapter.start({ cwd: root, model: 'fake-model', effort: 'low' });
+    expect(clientLog().filter((m) => m.method === 'model/list')).toHaveLength(2);
+    await adapter.close(h);
+  });
+
+  it('gives unattended Workers an allowlist of the environment, interactive ones all of it', async () => {
+    const envLog = join(root, 'env.json');
+    const user = {
+      PATH: process.env.PATH,
+      HOME: root,
+      OPENAI_API_KEY: FAKE_KEY,
+      OPENAI_ORGANIZATION: 'org-1',
+      ANTHROPIC_API_KEY: 'sk-ant-other-vendor',
+      CODEX_ACCESS_TOKEN: 'login',
+      GITHUB_TOKEN: 'ghp_x',
+      RUST_LOG: 'trace',
+      FAKE_ENV_LOG: envLog,
+    };
+    const dropped: string[][] = [];
+    const run = async (extra: object) => {
+      rmSync(envLog, { force: true });
+      const adapter = make('normal', { baseEnv: user, ...extra });
+      const h = await adapter.start({ cwd: root, env: { TACET_WORKER_MARKER: 'm-1' } });
+      await adapter.close(h);
+      return JSON.parse(readFileSync(envLog, 'utf8')) as string[];
+    };
+    const names = await run({ onEnvDropped: (n: string[]) => dropped.push(n) });
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'OPENAI_API_KEY',
+        'OPENAI_ORGANIZATION',
+        'CODEX_HOME',
+        'TACET_WORKER_MARKER',
+      ]),
+    );
+    for (const n of ['ANTHROPIC_API_KEY', 'CODEX_ACCESS_TOKEN', 'GITHUB_TOKEN', 'RUST_LOG'])
+      expect(names).not.toContain(n);
+    expect(dropped).toEqual([
+      ['ANTHROPIC_API_KEY', 'CODEX_ACCESS_TOKEN', 'GITHUB_TOKEN', 'RUST_LOG'],
+    ]);
+    const interactive = await run({
+      mode: 'interactive',
+      authRoute: 'subscription',
+      envPolicy: undefined,
+    });
+    expect(interactive).toContain('GITHUB_TOKEN');
+    // The key never reaches an interactive session on the login route, filter or not.
+    expect(interactive).not.toContain('OPENAI_API_KEY');
+  });
+
   it('reports a crash during a turn as error and refuses further input', async () => {
     const adapter = make('crash');
     const h = await adapter.start({ cwd: root });
@@ -227,6 +397,41 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
     await expect(adapter.send(h, { text: 'again' })).rejects.toThrow(/has ended/);
     await adapter.close(h);
     expect(adapter.status(h)).toBe('done');
+  });
+
+  it('scrubs a Worker token split across two deltas (#109)', async () => {
+    const token = 'w0rkerT0ken-abcdef123456';
+    const adapter = new CodexAppServerAdapter({
+      codexPath: FAKE,
+      // The fake app-server is steered by FAKE_* variables (#147: passed through on purpose).
+      envPolicy: { pass: ['FAKE_*'] },
+      killTimeoutMs: 1000,
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: root,
+        OPENAI_API_KEY: FAKE_KEY,
+        FAKE_MODE: 'split-delta',
+        FAKE_DELTAS: JSON.stringify([`echo ${token.slice(0, 9)}`, `${token.slice(9)} done`]),
+        FAKE_LOG: join(root, 'log.jsonl'),
+      },
+    });
+    const h = await adapter.start({
+      cwd: root,
+      mcpServers: [
+        {
+          name: 'tacet',
+          url: 'http://127.0.0.1:1/mcp',
+          headers: { authorization: `Bearer ${token}` },
+        },
+      ],
+    });
+    const tap = new EventTap(adapter.events(h));
+    await adapter.send(h, { text: 'go' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    const deltas = tap.events.flatMap((e) => (e.t === 'message.delta' ? [e.text] : []));
+    expect(JSON.stringify(tap.events)).not.toContain(token.slice(0, 9));
+    expect(deltas.join('')).toBe('echo [redacted] done');
+    await adapter.close(h);
   });
 
   it('maps a failed turn to error with its message', async () => {
@@ -305,6 +510,51 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
         }
       };
       await expect.poll(state, { timeout: 5000 }).toBe('gone');
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'close() returns only once the whole process group is gone, SIGTERM or not (#191)',
+    async () => {
+      const adapter = make('child-term', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        await adapter.close(h);
+        // Gone when close() returns: no polling on Linux, where /proc shows a zombie init has yet
+        // to reap. Elsewhere `kill(pid, 0)` also finds a zombie, so allow launchd a moment.
+        if (process.platform !== 'linux') {
+          for (let i = 0; i < 20; i++) {
+            try {
+              process.kill(childPid, 0);
+            } catch {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        }
+        const running = (() => {
+          try {
+            const stat = readFileSync(`/proc/${childPid}/stat`, 'utf8');
+            return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+          } catch {
+            try {
+              process.kill(childPid as number, 0);
+              return process.platform !== 'linux';
+            } catch {
+              return false;
+            }
+          }
+        })();
+        expect(running).toBe(false);
+      } finally {
+        // Never leave the SIGTERM-ignoring child running on the test machine.
+        try {
+          if (childPid) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
     },
   );
 

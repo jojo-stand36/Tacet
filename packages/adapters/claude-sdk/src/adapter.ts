@@ -17,19 +17,21 @@ import {
   type AgentEvent,
   type ApprovalDecision,
   AsyncQueue,
+  DeltaScrubber,
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
-  redactSecrets,
   type SendOptions,
   type SessionHandle,
   type SessionOptions,
   type SessionState,
-  scrubLiterals,
+  scrubbedEvents,
   type UserInput,
+  type WorkerEnvPolicy,
+  workerEnv,
 } from '@tacet/core';
-import { authEnv, type ClaudeAuthRoute } from './auth.js';
-import { removeMcpConfig, writeMcpConfig } from './mcp-config.js';
+import { authEnv, type ClaudeAuthRoute, claudeEnvAllow } from './auth.js';
+import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
 
 const CONTEXT_1M = 1_000_000;
 
@@ -61,11 +63,32 @@ export interface ClaudeSdkAdapterOptions {
    * policy for parallel or unattended Workers.
    */
   authRoute?: ClaudeAuthRoute;
-  /** The user's environment the Worker inherits. Default `process.env`. */
+  /** The user's environment, which the Worker gets an allowlist of. Default `process.env`. */
   baseEnv?: Record<string, string | undefined>;
+  /**
+   * Which of `baseEnv` the Worker gets (#147). Default: the allowlist (`workerEnv`), with no
+   * passthrough. Interactive sessions may pass `{ inherit: 'all' }`.
+   */
+  envPolicy?: WorkerEnvPolicy;
+  /** Told the names (never values) of the variables left out of each session's environment. */
+  onEnvDropped?: (names: string[]) => void;
   /** Directory for per-session MCP config files. Default `~/.tacet/run/mcp`. */
   mcpConfigDir?: string;
-  /** SDK options passed through unchanged, e.g. `settingSources` or `pathToClaudeCodeExecutable`. */
+  /**
+   * Told how many stale MCP config files (of Mini-conductors no longer running) were removed when
+   * this adapter started its first session (#108). Only the count: never names or contents.
+   */
+  onSweep?: (removedFiles: number) => void;
+  /**
+   * SDK options passed through unchanged, e.g. `pathToClaudeCodeExecutable`.
+   *
+   * `settingSources` defaults to `[]` (#181): no user, project or local settings and no CLAUDE.md,
+   * so a checkout a Worker wrote cannot add hooks, permissions, environment or instructions to a
+   * later session. Passing it here is the explicit opt-in, e.g. `['project']` for an interactive
+   * session in the user's own repo. Never opt in for a session in a Worker's checkout. MCP servers
+   * come only from Tacet's config either way (`strictMcpConfig` is always on), never from the
+   * user's or the project's settings or `.mcp.json`.
+   */
   sdkOptions?: Pick<
     Options,
     'settingSources' | 'pathToClaudeCodeExecutable' | 'permissionMode' | 'allowedTools'
@@ -94,6 +117,8 @@ interface Session {
   ended: boolean;
   /** Literal secrets of this session (MCP header values), scrubbed from every event. */
   secrets: string[];
+  /** Scrubs message text across delta boundaries (#109); made on the first event. */
+  deltas?: DeltaScrubber;
   model: string | undefined;
   /** Effort requested for this session (launch or the last `send`), if any. */
   effort: EffortLevel | undefined;
@@ -147,6 +172,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
   readonly #sessions = new Map<string, Session>();
   /** Last cumulative cost seen per vendor session, so resume and fork report deltas. */
   readonly #costTotals = new Map<string, number>();
+  #swept = false;
 
   constructor(opts: ClaudeSdkAdapterOptions = {}) {
     this.#opts = opts;
@@ -168,8 +194,16 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       check1m(opts.model);
     }
     const id = randomUUID();
+    const base = this.#opts.baseEnv ?? process.env;
+    const filtered = workerEnv(
+      base,
+      claudeEnvAllow({ ...base, ...opts.env }),
+      this.#opts.envPolicy,
+    );
+    this.#opts.onEnvDropped?.(filtered.dropped);
+    // The SDK's `env` replaces the child's environment (verified, 0.3.319): only this reaches it.
     const env = authEnv(this.#opts.authRoute ?? 'api_key', {
-      ...(this.#opts.baseEnv ?? process.env),
+      ...filtered.env,
       ...opts.env,
       CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     });
@@ -195,6 +229,17 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       sessionOpts.sessionId = vendorSessionId;
     }
 
+    if (!this.#swept) {
+      // Once per adapter, which lives as long as its Mini-conductor: files a crashed one left.
+      this.#swept = true;
+      // Cleanup never stands in the way of a session.
+      try {
+        const removed = sweepStaleMcpConfigs(this.#opts.mcpConfigDir);
+        this.#opts.onSweep?.(removed);
+      } catch {
+        // Tried again by the next Mini-conductor that starts.
+      }
+    }
     const mcpConfigPath = opts.mcpServers?.length
       ? writeMcpConfig(opts.mcpServers, {
           sessionId: id,
@@ -216,6 +261,11 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         prompt: inbox,
         options: {
           ...this.#opts.sdkOptions,
+          // SDK isolation mode unless the caller opted in (#181); see `sdkOptions`.
+          settingSources: this.#opts.sdkOptions?.settingSources ?? [],
+          // Only Tacet's MCP config (the `--mcp-config` file below): never a checkout's `.mcp.json`
+          // or a plugin's servers, whatever the setting sources (#181).
+          strictMcpConfig: true,
           ...sessionOpts,
           cwd: opts.cwd,
           env,
@@ -391,9 +441,14 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     return s;
   }
 
-  /** Every event leaves through here: known key formats and this session's secrets are scrubbed. */
+  /**
+   * Every event leaves through here: known key formats and this session's secrets are scrubbed.
+   * Message text is scrubbed across delta boundaries too (#109): a tail that could still be the
+   * start of a secret is held back, and goes out before the next event of any other kind.
+   */
   #emit(s: Session, e: AgentEvent): void {
-    s.events.push(scrubLiterals(redactSecrets(e), s.secrets));
+    s.deltas ??= new DeltaScrubber(s.secrets);
+    for (const out of scrubbedEvents(s.deltas, s.secrets, e)) s.events.push(out);
   }
 
   #setState(s: Session, state: SessionState, message?: string): void {

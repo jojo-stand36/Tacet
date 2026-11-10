@@ -67,6 +67,8 @@ ACP v2 (schema `2.0.0-alpha.14`, Active RFD group) is a consolidation release. I
 
 The migration guide tells implementers to support v1 and v2 side by side and negotiate the version per connection.
 
+Status, live agent support and the go/no-go: [spike #85](../85-acp-v2/README.md) (2026-11-10).
+
 ## Implications for the generic ACP adapter (#13)
 
 - Implement **v1** now: newline-delimited JSON-RPC over stdio, with stderr captured to the Worker log.

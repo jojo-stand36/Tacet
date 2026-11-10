@@ -129,4 +129,34 @@ export interface AgentAdapter {
   status(h: SessionHandle): SessionState;
   /** Add context to the running session without starting a turn. */
   injectContext?(h: SessionHandle, text: string): Promise<void>;
+  /**
+   * The closed session `vendorSessionId` will never be resumed (#153): delete what this adapter
+   * keeps to resume it, such as its own transcript copy. `cwd` is the session's working directory,
+   * used only to find where that state lives; it may no longer exist. Never touches the vendor's
+   * own stores (e.g. `~/.claude`), the worktree or the event log. Adapters that keep nothing leave
+   * it out.
+   */
+  discard?(vendorSessionId: string, cwd: string): Promise<void>;
+  /**
+   * The session's terminal, for adapters that run one (PTY, #15): what `tacet attach` shows.
+   * Read-only: typed keys would bypass `send` and `respond`, and so the event log. Its bytes
+   * travel on their own channel, never as events (ADR-003), and are never persisted.
+   */
+  terminal?(h: SessionHandle): AgentTerminal;
+}
+
+/** A read-only view of a session's terminal (`AgentAdapter.terminal`). */
+export interface AgentTerminal {
+  readonly cols: number;
+  readonly rows: number;
+  /** The most recent output (bounded), so a viewer can redraw the screen when it attaches. */
+  scrollback(): string;
+  /**
+   * Output from now on, until the session ends. Each call is its own stream. A reader that falls
+   * too far behind sees its stream end early; check `status()` before taking that as the end of
+   * the session, and call `output()` again (with `scrollback()` to redraw) to go on watching.
+   */
+  // Neither stream is scrubbed of secrets: it is the Worker's own terminal, shown to its user.
+  // Never log it or write it to the event log.
+  output(): AsyncIterable<string>;
 }
