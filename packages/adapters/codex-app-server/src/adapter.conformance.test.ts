@@ -72,12 +72,16 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
 
   it('passes the P0 probes', { timeout: 300_000 }, async () => {
     const results = await runConformance(adapter, {
-      session: { cwd: worktree, model: 'gpt-mock-1' },
+      // Models from Codex's bundled catalog, so effort levels can be checked against model/list.
+      session: { cwd: worktree, model: 'gpt-5.5' },
       replyPrompt: 'SAY hello',
       approvalPrompt: 'RUN_TOOL',
       slowPrompt: 'SLOW',
       echoPrompt: 'WHO',
-      altModel: 'gpt-mock-2',
+      altModel: 'gpt-6-luna',
+      // gpt-5.5 runs at `medium` by default, so `low` shows the change.
+      altEffort: 'low',
+      sentEffort: (p) => api.requests.findLast((r) => r.text === p)?.effort,
       timeoutMs: 60_000,
     });
     console.log(formatResults(results));
@@ -85,15 +89,21 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     const p1 = Object.fromEntries(
       results.filter((r) => r.priority === 'P1').map((r) => [r.id, r.verdict]),
     );
-    expect(p1).toMatchObject({ 'live-input': 'pass', resume: 'pass', 'model-switch': 'pass' });
+    expect(p1).toMatchObject({
+      'live-input': 'pass',
+      resume: 'pass',
+      'model-switch': 'pass',
+      effort: 'pass',
+      'context-sizes': 'pass',
+    });
     expect(api.requests.every((r) => r.authorized)).toBe(true);
-    expect(api.requests.some((r) => r.model === 'gpt-mock-2')).toBe(true);
+    expect(api.requests.some((r) => r.model === 'gpt-6-luna')).toBe(true);
   });
 
   it('sends effort per turn, and resume and fork keep the history', {
     timeout: 120_000,
   }, async () => {
-    const h1 = await adapter.start({ cwd: worktree, model: 'gpt-mock-1' });
+    const h1 = await adapter.start({ cwd: worktree, model: 'gpt-5.5' });
     const tap1 = new EventTap(adapter.events(h1));
     expect(await turn(h1, tap1, 'SAY first', 'low')).toBe('You said first.');
     expect(await turn(h1, tap1, 'SAY second', 'high')).toBe('You said second.');
@@ -111,6 +121,43 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     expect(h3.vendorSessionId).not.toBe(id);
     expect(await turn(h3, new EventTap(adapter.events(h3)), 'SAY fourth')).toBe('You said fourth.');
     await adapter.close(h3);
+  });
+
+  it('refuses effort levels and context windows it cannot honour', {
+    timeout: 120_000,
+  }, async () => {
+    // Codex would lower `ultra` to the model's highest level and pass unlisted names through.
+    await expect(
+      adapter.start({ cwd: worktree, model: 'gpt-5.5', effort: 'ultra' }),
+    ).rejects.toMatchObject({ name: 'ProfileRefusedError', field: 'effort' });
+    await expect(
+      adapter.start({ cwd: worktree, model: 'gpt-5.5', effort: 'none' }),
+    ).rejects.toMatchObject({ field: 'effort' });
+    // A model outside the catalog: its levels cannot be confirmed.
+    await expect(
+      adapter.start({ cwd: worktree, model: 'gpt-mock-1', effort: 'low' }),
+    ).rejects.toMatchObject({ field: 'effort' });
+    await expect(
+      adapter.start({ cwd: worktree, model: 'gpt-5.5', contextWindow: 1_000_000 }),
+    ).rejects.toMatchObject({ field: 'contextWindow' });
+
+    // Launch effort reaches the API, and stays valid across a model switch.
+    const h = await adapter.start({ cwd: worktree, model: 'gpt-5.5', effort: 'xhigh' });
+    const tap = new EventTap(adapter.events(h));
+    expect(await turn(h, tap, 'SAY xhigh')).toBe('You said xhigh.');
+    expect(api.requests.findLast((r) => r.text === 'SAY xhigh')?.effort).toBe('xhigh');
+    await expect(adapter.send(h, { text: 'SAY x' }, { effort: 'ultra' })).rejects.toMatchObject({
+      field: 'effort',
+    });
+    // xhigh is in force; gpt-6-luna lists it, a model outside the catalog cannot be confirmed.
+    await expect(adapter.send(h, { text: 'SAY x' }, { model: 'gpt-mock-2' })).rejects.toMatchObject(
+      { field: 'effort' },
+    );
+    await adapter.send(h, { text: 'SAY luna' }, { model: 'gpt-6-luna' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, tap.events.length);
+    const luna = api.requests.findLast((r) => r.text === 'SAY luna');
+    expect(luna).toMatchObject({ model: 'gpt-6-luna', effort: 'xhigh' });
+    await adapter.close(h);
   });
 
   it('keeps the Worker MCP token off the command line and off disk', {

@@ -15,6 +15,7 @@ import {
   findSecrets,
   type InterruptResult,
   mcpHeaderSecrets,
+  ProfileRefusedError,
   redactSecrets,
   type SendOptions,
   type SessionHandle,
@@ -62,7 +63,12 @@ export const CODEX_CAPABILITIES: AdapterCapabilities = {
   usage: { live: true, context: true, cost: 'none' },
   modelSwitch: 'per-turn',
   injectContext: false,
+  // `turn/start.effort` applies to that turn and later ones (verified on 0.167.0, #110). Codex
+  // lowers a level the model lacks to its highest one and passes unlisted names through, so the
+  // adapter checks each level against `model/list` first.
   effortSwitch: 'per-turn',
+  // No window can be chosen: `model_context_window` only shrinks the model's window (#110).
+  contextSizes: [],
 };
 
 export interface CodexAdapterOptions {
@@ -118,6 +124,14 @@ export interface CodexAdapterOptions {
 
 type Queued = { text: string; model?: string; effort?: string };
 
+/** The part of a `model/list` entry the effort check reads (schema checked by schema.test.ts). */
+interface CodexModel {
+  id: string;
+  model: string;
+  isDefault: boolean;
+  supportedReasoningEfforts: { reasoningEffort: string }[];
+}
+
 interface PendingApproval {
   kind: 'command' | 'fileChange' | 'permissions' | 'elicitation';
   params: Record<string, unknown>;
@@ -139,6 +153,10 @@ interface Session {
   closing: boolean;
   ended: boolean;
   model: string | undefined;
+  /** Model and effort the queued turns leave in force, for checking the next `send()`. */
+  planned: { model: string | undefined; effort: string | undefined };
+  /** The `model/list` catalog, fetched once when an effort first needs checking. */
+  models: Promise<CodexModel[]> | undefined;
   secrets: string[];
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
@@ -159,6 +177,38 @@ const TOOL_ITEMS = new Set([
   'imageGeneration',
 ]);
 const ALL_OPTIONS: ApprovalOption[] = ['allow_once', 'allow_always', 'reject', 'cancel'];
+
+/** The whole `model/list` catalog, hidden models included. */
+async function listModels(rpc: JsonRpcPeer): Promise<CodexModel[]> {
+  const out: CodexModel[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await rpc.request<Obj>('model/list', {
+      includeHidden: true,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (Array.isArray(page.data)) out.push(...(page.data as CodexModel[]));
+    cursor = str(page.nextCursor);
+  } while (cursor);
+  return out;
+}
+
+/**
+ * Refuse an effort the model does not list. Codex lowers an unsupported level such as `ultra`
+ * to the model's highest one and passes unknown names through (#110), so neither is left to it.
+ * A model the catalog does not cover is refused too: its levels cannot be confirmed.
+ */
+function checkEffort(models: CodexModel[], model: string | undefined, effort: string): void {
+  const m =
+    model === undefined
+      ? models.find((x) => x.isDefault)
+      : models.find((x) => x.id === model || x.model === model);
+  const name = model ?? 'the default model';
+  if (!m) throw new ProfileRefusedError('effort', `cannot confirm effort support for ${name}`);
+  if (!m.supportedReasoningEfforts.some((e) => e.reasoningEffort === effort)) {
+    throw new ProfileRefusedError('effort', `${name} does not support effort ${effort}`);
+  }
+}
 
 function defaultCodexPath(): string {
   const require = createRequire(import.meta.url);
@@ -188,6 +238,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
   }
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
+    if (opts.contextWindow !== undefined) {
+      throw new ProfileRefusedError(
+        'contextWindow',
+        `Codex has no context-window choice; ${opts.contextWindow} cannot be honoured`,
+      );
+    }
     const route = this.#opts.authRoute ?? 'api_key';
     const unattended = (this.#opts.mode ?? 'unattended') === 'unattended';
     if (unattended && route !== 'api_key') {
@@ -302,9 +358,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
     // EPIPE when Codex closed its input: fail the peer instead of crashing the host process.
     proc.stdin?.on('error', (err) => rpc.fail(err));
 
+    let models: Promise<CodexModel[]> | undefined;
     try {
       await rpc.request('initialize', { clientInfo: CLIENT_INFO, capabilities: null });
       rpc.notify('initialized');
+      // Checked before the thread starts, since `thread/start` takes any level without a word.
+      if (opts.effort !== undefined) {
+        models = listModels(rpc);
+        checkEffort(await models, opts.model, opts.effort);
+      }
       const threadParams = {
         cwd: opts.cwd,
         approvalPolicy: this.#opts.approvalPolicy ?? 'on-request',
@@ -356,6 +418,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
         closing: false,
         ended: false,
         model: str(result.model) ?? opts.model,
+        planned: { model: str(result.model) ?? opts.model, effort: opts.effort },
+        models,
         secrets,
         exited,
         get exit() {
@@ -366,6 +430,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
         `codex app-server failed to start the session: ${scrubLiterals(redactSecrets(errorMessage(err)), secrets)}`,
@@ -390,6 +455,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   async send(h: SessionHandle, input: UserInput, opts?: SendOptions): Promise<void> {
     const s = this.#live(h);
+    const model = opts?.model ?? s.planned.model;
+    const effort = opts?.effort ?? s.planned.effort;
+    // Effort stays in force across turns, so a model switch must keep it valid too.
+    if (effort !== undefined && (opts?.effort !== undefined || model !== s.planned.model)) {
+      s.models ??= listModels(s.rpc);
+      checkEffort(await s.models, model, effort);
+    }
+    s.planned = { model, effort };
     s.queue.push({
       text: input.text,
       ...(opts?.model !== undefined ? { model: opts.model } : {}),
