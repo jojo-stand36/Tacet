@@ -63,7 +63,7 @@ Install the vendor CLIs inside the distro, as on Linux.
   sudo apt-get install -y bubblewrap socat
   ```
 
-  On Ubuntu, AppArmor can stop bubblewrap from creating user namespaces. `sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1` when it is restricted. The fixes are in [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing). Whether default Ubuntu on WSL2 restricts it is UNVERIFIED.
+  On Ubuntu, AppArmor can stop bubblewrap from creating user namespaces. `sysctl kernel.apparmor_restrict_unprivileged_userns` prints `1` when it is restricted. The fixes are in [Claude Code sandboxing](https://code.claude.com/docs/en/sandboxing). On the experimental CI job's Ubuntu 24.04 under WSL2 (GitHub's windows-2025 runner, 2026-11-10), bubblewrap 0.9.0 created its sandbox (`bwrap --unshare-all`) and the Claude Worker tests passed; neither AppArmor userns sysctl exists on that WSL2 kernel. The job runs as the distro's default user, which the job log now names; whether an unprivileged user on a default WSL2 install is restricted is otherwise unverified.
 - **Codex.** Its Linux sandbox uses bubblewrap, from `PATH` or bundled, and works on WSL2 ([codex-rs/linux-sandbox README](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/README.md)).
 - **Gemini CLI.** It sandboxes with containers (Docker or Podman) and its sandbox page says nothing about WSL ([Gemini CLI sandbox](https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/sandbox.md)).
 
