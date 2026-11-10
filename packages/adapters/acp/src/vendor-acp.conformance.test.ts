@@ -20,6 +20,7 @@ import { AcpAdapter } from './adapter.js';
 import {
   type AcpAgentSpec,
   CLAUDE_ACP_AGENT,
+  CLAUDE_ACP_WORKER_OPTIONS,
   CODEX_ACP_AGENT,
   claudeAcpWorkerSpec,
   codexAcpConfig,
@@ -219,10 +220,11 @@ for (const c of CASES) {
         const req = (api.requests as { text?: string; tools?: string[] }[]).findLast(
           (r) => r.text === 'SAY tools206',
         );
-        expect(req?.tools).toEqual(expect.arrayContaining(['Read', 'Write', 'Edit']));
-        for (const t of ['Bash', 'PowerShell', 'Monitor', 'WebFetch', 'Glob', 'Grep']) {
-          expect(req?.tools).not.toContain(t);
-        }
+        // Exactly the allowlist (MCP tools and the SDK's placeholder aside).
+        const builtins = (req?.tools ?? []).filter(
+          (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
+        );
+        expect(builtins.sort()).toEqual([...CLAUDE_ACP_WORKER_OPTIONS.tools].sort());
       },
     );
 

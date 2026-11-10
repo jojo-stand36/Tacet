@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { ProfileRefusedError, type SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { ClaudeSdkAdapter } from './adapter.js';
+import { ClaudeSdkAdapter, FILE_TOOLS } from './adapter.js';
 import { type MockMessagesApi, startMockMessagesApi } from './testing/mock-messages-api.js';
 
 /**
@@ -95,10 +95,12 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
     // What the model is offered: the file tools, and no shell of any kind.
     const offered = api.requests.findLast((r) => r.text === 'SAY tools')?.tools ?? [];
-    expect(offered).toEqual(expect.arrayContaining(['Read', 'Write', 'Edit', 'Glob', 'Grep']));
-    for (const shell of ['Bash', 'PowerShell', 'Monitor', 'WebFetch', 'WebSearch', 'Agent']) {
-      expect(offered).not.toContain(shell);
-    }
+    // Exactly the allowlist: a built-in a later SDK adds must fail here, not slip in. The SDK
+    // also offers an inert `DeferredToolPlaceholder` (UNVERIFIED what it does).
+    const builtins = offered.filter(
+      (n) => !n.startsWith('mcp__') && n !== 'DeferredToolPlaceholder',
+    );
+    expect(builtins.sort()).toEqual([...FILE_TOOLS].sort());
 
     // A read inside the working directory, which the SDK would otherwise run unasked.
     const from = tap.events.length;

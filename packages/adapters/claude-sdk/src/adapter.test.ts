@@ -306,6 +306,25 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     await expect(refused).resolves.toMatchObject({
       hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'outside' },
     });
+    expect(await refused).not.toHaveProperty('continue');
+    // A rewritten input is what runs; a cancel stops the turn.
+    const rewritten = call('Read', { file_path: 'a' }, 'toolu_c');
+    const req3 = await tap.waitFor((e) => e.t === 'approval.request', 5000, req2.index + 1);
+    await adapter.respond(h, (req3.event as { id: string }).id, {
+      kind: 'allow_once',
+      persist: false,
+      updatedInput: { file_path: 'b' },
+    });
+    await expect(rewritten).resolves.toMatchObject({
+      hookSpecificOutput: { permissionDecision: 'allow', updatedInput: { file_path: 'b' } },
+    });
+    const cancelled = call('Read', { file_path: 'a' }, 'toolu_d');
+    const req4 = await tap.waitFor((e) => e.t === 'approval.request', 5000, req3.index + 1);
+    await adapter.respond(h, (req4.event as { id: string }).id, { kind: 'cancel', persist: false });
+    await expect(cancelled).resolves.toMatchObject({
+      continue: false,
+      hookSpecificOutput: { permissionDecision: 'deny' },
+    });
     await adapter.close(h);
   });
 

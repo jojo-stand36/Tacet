@@ -294,11 +294,24 @@ export class ClaudeSdkAdapter implements AgentAdapter {
             requestId: `hook-${input.tool_use_id}`,
           })
         : deny('session not ready');
+      if (r.behavior === 'allow') {
+        // The whole decision, as `canUseTool` would take it: a rewritten input runs, never the
+        // original one the decision was not about.
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            ...(r.updatedInput !== undefined ? { updatedInput: r.updatedInput } : {}),
+          },
+        };
+      }
       return {
+        // A cancel stops the turn, as `canUseTool`'s `interrupt` does.
+        ...(r.interrupt ? { continue: false, stopReason: r.message } : {}),
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
-          permissionDecision: r.behavior === 'allow' ? 'allow' : 'deny',
-          ...(r.behavior === 'deny' ? { permissionDecisionReason: r.message } : {}),
+          permissionDecision: 'deny',
+          permissionDecisionReason: r.message,
         },
       };
     };

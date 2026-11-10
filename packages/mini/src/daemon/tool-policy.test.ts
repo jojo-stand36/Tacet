@@ -334,6 +334,42 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     expect(ask('Write', { file_path: 'src/~notes.md', content: '' }).allow).toBe(true);
   });
 
+  it('judges only names inside the checkout, not its parents, and follows links to odd names', () => {
+    // A checkout under a Windows short name (WSL2 on /mnt/c) still works by absolute path.
+    const odd = join(root, 'JOHNSM~1 proj.', 'wt');
+    mkdirSync(join(odd, 'src'), { recursive: true });
+    writeFileSync(join(odd, 'src', 'a.ts'), 'x');
+    const r = decideToolRequest(
+      { adapterId: 'claude-sdk', toolName: 'Read', input: { file_path: join(odd, 'src', 'a.ts') } },
+      odd,
+    );
+    expect(r).toMatchObject({ allow: true });
+    // A symlink to a name NTFS reads as protected config is refused like the name itself.
+    mkdirSync(join(wt, 'CLAUDE~1'));
+    symlinkSync(join(wt, 'CLAUDE~1'), join(wt, 'cfg'));
+    expect(ask('Write', { file_path: 'cfg/settings.json', content: '' }).allow).toBe(false);
+  });
+
+  it('protects every lefthook config name (lefthook docs, checked 2026-11-10)', () => {
+    for (const p of [
+      'lefthook.yaml',
+      '.lefthook.yaml',
+      'lefthook.toml',
+      '.lefthook.json',
+      'lefthook.jsonc',
+      'lefthook-local.yml',
+      '.lefthook-local.toml',
+      '.config/lefthook.yml',
+      '.config/lefthook.json',
+    ]) {
+      expect({ p, allow: ask('Write', { file_path: p, content: '' }).allow }).toEqual({
+        p,
+        allow: false,
+      });
+    }
+    expect(ask('Write', { file_path: 'docs/lefthook.md', content: '' }).allow).toBe(true);
+  });
+
   it('checks the literal directory of a glob like a path', () => {
     symlinkSync(outside, join(wt, 'out'));
     expect(ask('Glob', { pattern: 'out/**' }).allow).toBe(false);

@@ -76,9 +76,10 @@ export interface AdapterPlannerOptions {
 }
 
 /**
- * Plans with one session on the `mini` tier. The session is read-only by instruction and every
- * approval request (a tool that would change something) is refused. An invalid reply is retried
- * once with the validation error.
+ * Plans with one session on the `mini` tier. The session is read-only by instruction. Its
+ * approval requests are refused, except reads and searches the Worker policy (#200) allows
+ * inside its own checkout (`cwd`, a throwaway checkout in standalone mode): an unattended Claude
+ * adapter asks about those too (#206). An invalid reply is retried once with the validation error.
  */
 export class AdapterPlanner implements Planner {
   readonly #o: AdapterPlannerOptions;
