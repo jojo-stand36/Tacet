@@ -100,7 +100,11 @@ export function mergeConfig(
       }
     }
   };
-  for (const layer of all) apply(merged, layer.data as Plain, layer, '', []);
+  const layerErrors: string[] = [];
+  for (const layer of all) {
+    if (layer.name === 'task') layerErrors.push(...taskRaisesWorkers(merged, layer));
+    apply(merged, layer.data as Plain, layer, '', []);
+  }
 
   const explain: ExplainEntry[] = [];
   const walk = (value: unknown, path: string, segments: readonly string[]) => {
@@ -122,7 +126,39 @@ export function mergeConfig(
   const shapeErrors = parsed.success
     ? []
     : parsed.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`);
-  return { config, explain, errors: [...shapeErrors, ...validateEffective(config)] };
+  return {
+    config,
+    explain,
+    errors: [...layerErrors, ...shapeErrors, ...validateEffective(config)],
+  };
+}
+
+/**
+ * The Worker pool is repo-wide, so a task may only lower `workers.*`, never raise it (owner
+ * decision on #125, 2026-11-09). A raise is an error. A `per_adapter` cap the layers below do not
+ * set is compared with `workers.max`.
+ */
+function taskRaisesWorkers(merged: Plain, layer: ConfigLayer): string[] {
+  const w = layer.data.workers;
+  if (!w) return [];
+  const below = (isPlain(merged.workers) ? merged.workers : {}) as NonNullable<
+    TacetConfig['workers']
+  >;
+  const errors: string[] = [];
+  const check = (path: string, value: number | undefined, limit: number | undefined) => {
+    if (value !== undefined && limit !== undefined && value > limit) {
+      errors.push(
+        `workers.${path}: the task layer (${layer.origin}) may only lower it, not raise it to ${value} (currently ${limit})`,
+      );
+    }
+  };
+  for (const key of ['max', 'stuck_after_s', 'nudge_grace_s', 'max_attempts'] as const) {
+    check(key, w[key], below[key]);
+  }
+  for (const [id, cap] of Object.entries(w.per_adapter ?? {})) {
+    check(`per_adapter.${id}`, cap, below.per_adapter?.[id] ?? below.max);
+  }
+  return errors;
 }
 
 /** Human-readable `tacet config explain` output: one line per value with its source. */

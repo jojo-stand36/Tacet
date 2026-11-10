@@ -233,6 +233,13 @@ export class EventLogBackend implements MiniBackend {
     clearTimeout(timer);
     if (result && !timedOut) {
       resolve(result);
+      // The Worker gets this answer in the tool result itself: the daemon must not send it again.
+      this.#append(
+        b,
+        'escalation.delivered',
+        { escalationId: escalation.id, sessionId: b.workerSessionId, inline: true },
+        'mini',
+      );
       return {
         escalationId: escalation.id,
         status: 'resolved',

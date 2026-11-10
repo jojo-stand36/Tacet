@@ -1,0 +1,5 @@
+{
+  "model": "claude-sonnet-4-6",
+  "effort": "medium",
+  "contextWindow": 1000000
+}
