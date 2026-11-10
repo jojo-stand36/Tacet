@@ -366,19 +366,26 @@ function runsClaudeAcp(word: string): boolean {
   );
 }
 
+/** Options whose value names a model, config or profile, never what a command runs. */
+const VALUE_OPTIONS = /^--?(m|model|config|profile|agent|provider)$/;
+
 /**
- * Whether `command` may run what `test` recognises, failing closed (#245 review): a word that
- * names what it runs (`commandWords`), or any other word of it that is not an option's value, so a
- * launcher `commandWords` does not model (`timeout 60 claude`, `env -u X claude`, `mise exec --
- * gemini`) is still caught. `aider --model claude` is not; `sh -c 'cd ~/claude && aider'` is (a
- * loud false positive is the safe direction).
+ * Whether `command` may run what `test` recognises, failing closed (#245 review): any word of it,
+ * split at shell separators, unless it is the value of an option that names a model, config or
+ * profile (`aider --model claude`, `opencode --config ~/.config/claude`). So a launcher or wrapper
+ * Tacet does not model (`timeout 60 claude`, `caffeinate -i claude`, `bash -lc claude`) is still
+ * caught; `sh -c 'cd ~/claude && aider'` is too, a loud false positive in the safe direction. A
+ * wrapper script that hides the CLI is not caught.
  */
 export function runs(command: string[], test: (word: string) => boolean): boolean {
   if (commandWords(command).some(test)) return true;
-  const words = command.flatMap((arg) => arg.split(/[\s;&|"'`()<>=]+/)).filter(Boolean);
+  const words = command.flatMap((arg) => arg.split(/[\s;&|"'`()<>]+/)).filter(Boolean);
   return words.some((w, i) => {
-    const prev = words[i - 1];
-    return test(w) && (prev === undefined || prev === '--' || !prev.startsWith('-'));
+    const eq = w.indexOf('=');
+    // `--model=claude`: the value after `=` of a value option.
+    if (eq > 0 && VALUE_OPTIONS.test(w.slice(0, eq))) return false;
+    const word = eq > 0 && !w.startsWith('-') ? w.slice(eq + 1) : w;
+    return test(word) && !VALUE_OPTIONS.test(words[i - 1] ?? '');
   });
 }
 

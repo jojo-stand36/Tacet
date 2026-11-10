@@ -186,6 +186,14 @@ describe('buildWorkerAdapters', () => {
       ['direnv', 'exec', '.', 'claude'],
       ['mise', 'exec', '--', 'claude'],
       ['pnpm', 'claude'],
+      ['caffeinate', '-i', 'claude'],
+      ['sudo', '-E', 'claude'],
+      ['xvfb-run', '-a', 'claude'],
+      ['stdbuf', '-oL', 'claude'],
+      ['firejail', '--quiet', 'claude'],
+      ['systemd-run', '--user', '--pty', 'claude'],
+      ['script', '-qc', 'claude', '/dev/null'],
+      ['sh', '-c', 'stdbuf -oL claude'],
       // A false positive, refused loudly: the safe direction.
       ['sh', '-c', 'cd ~/claude && aider'],
     ]) {
@@ -194,6 +202,8 @@ describe('buildWorkerAdapters', () => {
     for (const command of [
       ['aider', '--model', 'claude'],
       ['opencode', '--config', '/home/me/.config/claude'],
+      ['aider', '--model=claude'],
+      ['aider', '-m', 'claude'],
       ['aider'],
     ]) {
       expect(runs(command, claude), command.join(' ')).toBe(false);
