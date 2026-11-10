@@ -9,7 +9,7 @@ export type {
   WorktreeInfo,
   WorktreeSetup,
 } from './worktree.js';
-export { WorktreeKeptError, WorktreeManager } from './worktree.js';
+export { targetRef, WorktreeKeptError, WorktreeManager } from './worktree.js';
 
 export const packageName = '@tacet/mini' as const;
 

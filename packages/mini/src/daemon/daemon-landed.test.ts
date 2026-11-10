@@ -334,6 +334,8 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       branch: 'main',
       commit: mainTip,
     });
+    // Held by a ref of the task's, so git gc never prunes it (#236).
+    expect(git(repo, ['rev-parse', `refs/tacet/${id}/target`])).toBe(mainTip);
   });
 
   describe('the pinned target (#219)', () => {
@@ -455,6 +457,25 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(status.at(-1)).toMatchObject({
         state: 'failed',
         message: expect.stringContaining('cannot tell which branch the task targets'),
+      });
+    });
+
+    it('fails planning, with no target recorded, when it cannot hold the pinned commit (#236)', async () => {
+      const failing: Workspaces = {
+        ...withoutHead(),
+        head: manager.head.bind(manager),
+        pin: () => Promise.reject(new Error('ref locked')),
+      };
+      await expect(
+        runTask(commitWork, undefined, undefined, { workspaces: failing }),
+      ).rejects.toThrow('the task published no result');
+      expect(store.query({ typePrefix: 'task.target' })).toEqual([]);
+      const status = store
+        .query({ typePrefix: 'task.status' })
+        .map((e) => e.envelope.data as { state: string; message?: string });
+      expect(status.at(-1)).toMatchObject({
+        state: 'failed',
+        message: expect.stringContaining("cannot hold the task's target commit: ref locked"),
       });
     });
 
