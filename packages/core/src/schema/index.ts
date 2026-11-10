@@ -10,6 +10,7 @@ import { SessionProfile } from './profile.js';
 import { SummaryPacket } from './summary.js';
 import { Task, TaskExt, TaskLanded } from './task.js';
 import {
+  WorkerApproval,
   WorkerEnded,
   WorkerIntegrated,
   WorkerNudged,
@@ -74,6 +75,7 @@ export const jsonSchemas = {
   'worker-profile': { schema: WorkerProfile, title: 'Tacet worker.profile payload' },
   'worker-integrated': { schema: WorkerIntegrated, title: 'Tacet worker.integrated payload' },
   'worker-throttled': { schema: WorkerThrottled, title: 'Tacet worker.throttled payload' },
+  'worker-approval': { schema: WorkerApproval, title: 'Tacet worker.approval payload' },
   'worker-verification': {
     schema: WorkerVerification,
     title: 'Tacet worker.verification payload',

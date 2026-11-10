@@ -51,6 +51,7 @@ import {
 import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
 import { RESUME_PROMPT, safePrompt, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
+import { decideToolRequest } from './tool-policy.js';
 
 export interface MiniConductorOptions {
   store: EventStore;
@@ -1298,18 +1299,47 @@ export class MiniConductor {
         else if (e.t === 'tool.result') run.openTools.delete(e.id);
         else if (e.t === 'status' && e.state !== 'running') run.openTools.clear();
         if (e.t === 'approval.request') {
-          // Calls to the Mini-conductor's own MCP tools are what a Worker is for; anything else
-          // is refused until policies exist (#25). A refused Worker can escalate.
+          // Calls to the Mini-conductor's own MCP tools are what a Worker is for. Otherwise the
+          // interim policy until #25 (#200): file tools inside the Worker's own checkout only;
+          // everything else is refused, and a refused Worker can escalate.
+          const own = isOwnMcpTool(e, run.mcpServerName);
+          const d = own
+            ? undefined
+            : decideToolRequest(
+                {
+                  adapterId: run.adapterId,
+                  toolName: e.toolName,
+                  input: (e.requestedGrant as { input?: unknown } | undefined)?.input,
+                },
+                run.workspace.path,
+              );
+          if (d) {
+            // Owner decision on #200: refusals are summary-grade (kept and forwarded), allows are
+            // transcript-grade (`agent.approval.decision`, dropped by retention).
+            this.#o.store.append(
+              this.#env(
+                run.subtaskId,
+                d.allow ? 'agent.approval.decision' : 'worker.approval',
+                {
+                  sessionId: run.sessionId,
+                  requestId: e.id.slice(0, 200),
+                  ...(e.toolName ? { toolName: e.toolName.slice(0, 200) } : {}),
+                  decision: d.allow ? 'allowed' : 'refused',
+                  reason: d.reason.slice(0, 2000),
+                },
+                run.sessionId,
+              ),
+            );
+          }
           await worker.adapter.respond(
             run.handle,
             e.id,
-            isOwnMcpTool(e, run.mcpServerName)
+            own || d?.allow
               ? { kind: 'allow_once', persist: false }
               : {
                   kind: 'reject',
                   persist: false,
-                  message:
-                    'Not approved: unattended Worker. Use the escalate tool if you need this.',
+                  message: `Not approved: ${d?.reason ?? 'unattended Worker'}. Unattended Workers may only use file tools inside their own checkout; use the escalate tool if you need more.`,
                 },
           );
         } else if (e.t === 'status') {

@@ -82,12 +82,13 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **PTY tests time out under full-suite load, and fail locally without node-gyp** — `chore` `P1` `claude`
 - [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
 - [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
-- [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude + human`
+- [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude`
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 - [ ] **ReDoS: quadratic fence-stripping regex on reviewer and planner replies** — `feature` `P1` `claude`
 - [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
+- [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 
 ## M2 · Conductor & escalation
 
