@@ -1121,6 +1121,39 @@
         "agent:either"
       ],
       "body": "Follow-up from #17 (architect review). A `handoff.requested` with no later `worker.started` for that sub-task means the daemon stopped between accepting a HandoffPacket and starting the successor session. On restart the successor must start from the packet instead of resuming the old vendor session.\n\n### Tasks\n- [ ] Detect pending handoffs when rebuilding state\n- [ ] Start the successor seeded from the packet (`read_task` already returns the latest packet), with `previousSessionId` and `worker.ended {reason: handoff}` for the old one\n\n### Acceptance criteria\n- Crash after `handoff.requested`, restart: the successor session starts from the packet and the old session is not resumed (test)\n\n_See docs/ARCHITECTURE.md §2.3._"
+    },
+    {
+      "title": "ACP: verify API-key-only auth for claude-agent-acp and codex-acp, then register them",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "`@tacet/adapter-acp` (#13) ships specs for `@agentclientprotocol/claude-agent-acp` (`--hide-claude-auth`, `ANTHROPIC_API_KEY`) and `@agentclientprotocol/codex-acp` (`NO_BROWSER=1`, `api-key` method), but keeps them out of `BUILTIN_ACP_AGENTS`: neither was run live, and with the user's real `~/.claude` and `~/.codex` present it is not verified that they use the API key and leave the user's own login alone. Codex app-server's built-in provider ignores `OPENAI_API_KEY` (capability matrix §2), so what codex-acp's `authenticate {methodId: \"api-key\"}` does (and whether it writes `auth.json`) needs checking.\n\n### Tasks\n- [ ] Run both adapters live against local API mocks, with an existing subscription login present in the home directory\n- [ ] Record which credential each request used and every file the run wrote under the home directory\n- [ ] If needed, give each an isolated home (as the native Codex adapter does with `CODEX_HOME`, #116)\n- [ ] Add both to `BUILTIN_ACP_AGENTS` with conformance tests; record the facts in the capability matrix\n\n### Acceptance criteria\n- Conformance passes for both over ACP against mocks\n- A test shows the user's existing login files are unchanged and unused after a Worker run\n\n_See docs/adapters/capability-matrix.md §4, docs/adapters/spikes/62-acp-adapters and #13._"
+    },
+    {
+      "title": "ACP: offer fork when the agent advertises sessionCapabilities.fork",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "`@tacet/adapter-acp` (#13) declares `fork: 'none'` for every agent and refuses `resume.fork`. ACP has an unstable `session/fork` behind `sessionCapabilities.fork` (spike #61); codex-acp and claude-agent-acp pass it through (spike #62). Gemini CLI 0.67.0 does not offer it.\n\n### Tasks\n- [ ] Verify the current `session/fork` request and response in the pinned ACP SDK\n- [ ] Negotiate fork per session from `initialize` and report it honestly (static `capabilities()` vs per-session support)\n- [ ] Fake-agent tests for fork offered and not offered\n\n### Acceptance criteria\n- A fork is only attempted when the agent advertised it; otherwise it is refused, as today\n\n_See docs/adapters/spikes/61-acp and docs/adapters/capability-matrix.md §4._"
+    },
+    {
+      "title": "Adapters: launch Workers with an environment allowlist",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "The build-adapter skill asks for Worker processes to start with an environment allowlist, but the adapters pass the user's whole environment (plus their own additions). A Worker for one vendor, or any `acp:<slug>` agent, therefore also receives other vendors' API keys and unrelated secrets.\n\n### Tasks\n- [ ] Define the allowlist in `@tacet/core` (system variables, proxy and locale settings, plus each adapter's own key variables and config overrides)\n- [ ] Apply it in every adapter that spawns a process (Claude, Codex app-server, ACP, OpenCode, PTY)\n- [ ] Tests that a variable outside the allowlist does not reach the Worker\n\n### Acceptance criteria\n- No adapter passes another vendor's key variable to a Worker (test per adapter)\n\n_See .claude/skills/build-adapter/SKILL.md and docs/ARCHITECTURE.md._"
     }
   ]
 }
