@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
-import { openEventStore } from '@tacet/core/node';
+import { A2ATask, STATUS_EXT_URI, StatusExt } from '@tacet/core';
+import { openEventStore, type RpcClient } from '@tacet/core/node';
+import { liveControl } from '../control.js';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
 import { repoRootFrom, statePaths } from '../state.js';
@@ -11,10 +13,10 @@ export interface CancelOptions {
 }
 
 /**
- * `tacet cancel <task>` (#202): cancel a task and its unfinished sub-tasks while no `tacet run` is
- * live for the repo (the log has one writer). It ends Worker processes a crashed run left behind,
- * records each as canceled, and `tacet run --resume` no longer picks the task up. During a run,
- * interrupt it first (Ctrl-C); the run's own control port (#201) will make that step unneeded.
+ * `tacet cancel <task>` (#202): cancel a task and its unfinished sub-tasks. During a run, the run
+ * does it, asked over its control port (#201), so the log keeps one writer. With no run live, this
+ * process takes the Mini-conductor's lock, ends Worker processes a crashed run left behind and
+ * records each as canceled. Either way `tacet run --resume` no longer picks the task up.
  */
 export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
@@ -26,8 +28,10 @@ export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<
   const { cancelStopped, miniLockHolder } = await import('@tacet/mini');
   const pid = miniLockHolder(paths.lock);
   if (pid !== undefined) {
+    const client = await liveControl(io, repoRoot, paths, 'cannot cancel through it');
+    if (client) return cancelLive(io, client, taskId, o);
     io.err(
-      `a run is live for this repo (pid ${pid}): interrupt it (Ctrl-C), then tacet cancel ${terminalSafe(taskId)}`,
+      `a run is live for this repo (pid ${pid}) but its control port did not answer: interrupt it (Ctrl-C), then tacet cancel ${terminalSafe(taskId)}`,
     );
     return 1;
   }
@@ -50,5 +54,40 @@ export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<
     return 1;
   } finally {
     store.close();
+  }
+}
+
+/** The task's unfinished parts, from `GetTask`'s status extension. */
+async function openParts(client: RpcClient, taskId: string): Promise<Map<string, string>> {
+  const task = A2ATask.parse(await client.call('GetTask', { id: taskId, historyLength: 0 }));
+  const ext = StatusExt.parse(task.metadata?.[STATUS_EXT_URI]);
+  return new Map([[task.id, ext.state], ...ext.subtasks.map((x) => [x.id, x.state] as const)]);
+}
+
+const ENDED = new Set(['completed', 'failed', 'canceled', 'rejected']);
+
+/** Cancel through the live run (`CancelTask`); prints what it canceled, as the offline path does. */
+async function cancelLive(
+  io: Io,
+  client: RpcClient,
+  taskId: string,
+  o: CancelOptions,
+): Promise<number> {
+  try {
+    const before = await openParts(client, taskId);
+    // Ending the task's Worker sessions can take a while.
+    await client.call('CancelTask', { id: taskId }, { timeoutMs: 120_000 });
+    const after = await openParts(client, taskId);
+    const canceled = [...before]
+      .filter(([id, state]) => !ENDED.has(state) && after.get(id) === 'canceled')
+      .map(([id]) => id);
+    if (o.json) io.out(safeJson({ canceled }));
+    else for (const id of canceled) io.out(`${terminalSafe(id)} canceled`);
+    return 0;
+  } catch (err) {
+    io.err(terminalSafe(err instanceof Error ? err.message : String(err)));
+    return 1;
+  } finally {
+    await client.close();
   }
 }

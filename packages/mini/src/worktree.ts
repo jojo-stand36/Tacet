@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   link,
+  lstat,
   mkdir,
   readdir,
   readFile,
@@ -12,7 +13,21 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import path from 'node:path';
-import { readWorkerFile, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
+import {
+  type EventEnvelope,
+  newUlid,
+  type WorkspaceCreated,
+  type WorkspaceRemoved,
+  type WorkspacesState,
+  workspacesProjection,
+} from '@tacet/core';
+import {
+  type EventStore,
+  readWorkerFile,
+  SAFE_GIT_ARGS,
+  trustedGitEnv,
+  workerWorktree,
+} from '@tacet/core/node';
 import { MergeConflictError, type Workspaces } from './daemon/ports.js';
 import { integrateWorktree, looseCommits, taskBranch } from './git/integrate.js';
 import { combineCommits } from './git/merge.js';
@@ -26,6 +41,11 @@ export interface WorktreeSetup {
 
 export interface CreateWorktreeOptions {
   setup?: WorktreeSetup;
+  /**
+   * A throwaway checkout (a planner's, #238): it holds nothing of value, so one a crash left
+   * registered is force-removed by the next `reconcile`, and `gc` leaves it to its owner.
+   */
+  scratch?: boolean;
 }
 
 export interface RemoveWorktreeOptions {
@@ -53,8 +73,10 @@ export interface WorktreeInfo {
   /** The local branch the checkout started from; absent when it started at a commit. */
   baseBranch?: string;
   baseCommit: string;
+  /** When it was registered (ms since the epoch). */
   createdAt: number;
-  lastActivityAt: number;
+  /** A throwaway checkout (#238): see `CreateWorktreeOptions.scratch`. */
+  scratch?: true;
 }
 
 export type MergeStrategy = 'pr' | 'squash-to-branch' | 'manual';
@@ -73,6 +95,12 @@ export interface MergeResult {
 export interface WorktreeGcOptions {
   olderThanMs: number;
   activeWorktreeIds?: readonly string[];
+  /**
+   * When each worktree was last used (ms since the epoch, by id), e.g. its Worker sessions' newest
+   * `worker.*` event (#238). A worktree is stale once both this and its creation are older than
+   * `olderThanMs`.
+   */
+  lastActivity?: ReadonlyMap<string, number>;
   now?: number;
 }
 
@@ -81,7 +109,27 @@ export interface WorktreeGcResult {
   skipped: Array<{ id: string; reason: string }>;
 }
 
+/**
+ * Where the worktree registry lives (#126): the Mini-conductor's event log, as `workspace.*`
+ * events. The manager appends only from `create`, `remove` and `reconcile`, and only while its
+ * process holds the Mini-conductor lock; `readonly` (a log opened read-only, e.g. a preview)
+ * refuses those before any git command runs.
+ */
+export interface WorktreeLog {
+  store: EventStore;
+  /** Repo id stamped on events. */
+  repo?: string;
+  /** The Mini-conductor's id: the events' source. */
+  miniId: string;
+  readonly?: boolean;
+}
+
 export interface WorktreeManagerOptions {
+  /**
+   * The event log that holds the registry. Without one, the registry is this instance's memory:
+   * nothing about worktrees is ever written to a file.
+   */
+  log?: WorktreeLog;
   /** PATH, HOME and setup-command variables are taken from here. Default: `process.env`. */
   env?: Readonly<Record<string, string | undefined>>;
   /** @internal Test seam: runs once a squash's staging worktree exists, before it is filled. */
@@ -365,20 +413,14 @@ export class WorktreeManager implements Workspaces {
     return { ...(baseBranch !== undefined ? { branch: baseBranch } : {}), commit: baseCommit };
   }
 
+  /** The registered checkouts that are on disk where the manager put them. */
   async list(): Promise<WorktreeInfo[]> {
     const { root } = await this.paths();
-    const entries = await readdir(root, { withFileTypes: true });
     const result: WorktreeInfo[] = [];
-
-    for (const entry of entries) {
-      const match = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name);
-      if (!entry.isFile() || !match) continue;
-      const id = match[1];
-      if (!id || !worktreeIdPattern.test(id)) continue;
-      const info = await this.readInfo(root, id);
-      if (!info || info.path !== path.join(root, id)) continue;
-      const actualPath = await realpath(info.path).catch(() => undefined);
-      if (actualPath === info.path) result.push(info);
+    for (const info of (await this.registry()).values()) {
+      const expected = path.join(root, info.id);
+      const actualPath = await realpath(expected).catch(() => undefined);
+      if (actualPath === expected) result.push(info);
     }
     return result;
   }
@@ -388,16 +430,6 @@ export class WorktreeManager implements Workspaces {
     return (await this.list()).find(({ id }) => id === worktreeId);
   }
 
-  async touch(worktreeId: string, now = Date.now()): Promise<WorktreeInfo> {
-    const info = await this.requireWorktree(worktreeId);
-    if (!Number.isSafeInteger(now) || now < 0)
-      throw new Error('now must be a non-negative safe integer');
-    const updated = { ...info, lastActivityAt: now };
-    const { root } = await this.paths();
-    await this.writeInfo(root, updated);
-    return updated;
-  }
-
   /**
    * Remove a checkout and its `tacet/<id>` branch. Throws `WorktreeKeptError` instead when that
    * would lose work (see the class comment) or a merge is using it, unless `force` is given. An
@@ -405,6 +437,7 @@ export class WorktreeManager implements Workspaces {
    * is left (its Git admin directory and branch), then only that admin directory is deleted.
    */
   async remove(worktreeId: string, options: RemoveWorktreeOptions = {}): Promise<void> {
+    this.requireWritable();
     const found = await this.registeredEntry(worktreeId);
     if (!found) return;
     await this.removeWorktree(found.info, options.force === true, found.missing, false, {
@@ -475,15 +508,77 @@ export class WorktreeManager implements Workspaces {
    * `list()` leaves out. For a full cleanup (#211).
    */
   async registered(): Promise<Array<WorktreeInfo & { missing: boolean }>> {
-    const { root } = await this.paths();
+    const ids = new Set([...(await this.registry()).keys(), ...(await this.legacyIds())]);
     const result: Array<WorktreeInfo & { missing: boolean }> = [];
-    for (const entry of await readdir(root, { withFileTypes: true })) {
-      const id = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name)?.[1];
-      if (!entry.isFile() || !id) continue;
+    for (const id of ids) {
       const found = await this.registeredEntry(id).catch(() => undefined);
       if (found) result.push({ ...found.info, missing: found.missing });
     }
     return result;
+  }
+
+  /**
+   * Bring the registry up to date with the disk, once the Mini-conductor holds its lock (#126):
+   * import each pre-#126 `.tacet-<id>.json` file as `workspace.created` (then delete the file),
+   * and record as gone each registered workspace with neither its checkout nor its git admin
+   * directory left (a crash around creation or removal). A checkout deleted by hand, whose admin
+   * directory is still there, stays registered: `remove` checks what is left of it.
+   */
+  async reconcile(): Promise<void> {
+    this.requireWritable();
+    const { root } = await this.paths();
+    for (const id of await this.legacyIds()) {
+      const known = (await this.registry()).has(id) || (await this.removedIds()).has(id);
+      if (!known) {
+        const info = await this.readLegacy(root, id);
+        // Unreadable or no longer where the manager put it: left as it is, never adopted.
+        if (!info || info.path !== path.join(root, id)) continue;
+        await this.record('workspace.created', {
+          workspaceId: id,
+          workerId: info.workerId,
+          baseCommit: info.baseCommit,
+          ...(info.baseBranch !== undefined ? { baseBranch: info.baseBranch } : {}),
+          migrated: true,
+        });
+      }
+      // Only once it is in the log: a crash in between leaves the file for the next start.
+      await rm(this.legacyPath(root, id), { force: true });
+    }
+    for (const id of (await this.registry()).keys()) {
+      // Being created right now: its intent is recorded and git is still at work.
+      if (this.#pending.has(id)) continue;
+      const left = await this.leftOnDisk(id);
+      if (left === false)
+        await this.record('workspace.removed', { workspaceId: id, reason: 'gone' });
+    }
+    // A throwaway checkout a crash left registered (#238): nothing in it is kept.
+    const failed: string[] = [];
+    for (const info of (await this.registry()).values()) {
+      if (!info.scratch || this.#pending.has(info.id)) continue;
+      await this.remove(info.id, { force: true }).catch(() => failed.push(info.id));
+    }
+    if (failed.length > 0) {
+      throw new Error(`could not remove leftover planner checkouts: ${failed.join(', ')}`);
+    }
+  }
+
+  /**
+   * Whether anything of a workspace is on disk: its checkout or its git admin directory.
+   * Undefined when that cannot be told (an error other than "no such file"): never "gone" then.
+   */
+  private async leftOnDisk(id: string): Promise<boolean | undefined> {
+    const { root } = await this.paths();
+    const commonDirectory = await this.commonGitDirectory();
+    for (const at of [path.join(root, id), path.join(commonDirectory, 'worktrees', id)]) {
+      try {
+        await lstat(at);
+        return true;
+      } catch (error) {
+        const code = errorCode(error);
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') return undefined;
+      }
+    }
+    return false;
   }
 
   private async registeredEntry(
@@ -491,7 +586,8 @@ export class WorktreeManager implements Workspaces {
   ): Promise<{ info: WorktreeInfo; missing: boolean } | undefined> {
     if (!worktreeIdPattern.test(worktreeId)) throw new Error('invalid worktree id');
     const { root } = await this.paths();
-    const info = await this.readInfo(root, worktreeId);
+    const info =
+      (await this.registry()).get(worktreeId) ?? (await this.readLegacy(root, worktreeId));
     if (!info || info.path !== path.join(root, worktreeId)) return undefined;
     let missing = false;
     try {
@@ -507,6 +603,7 @@ export class WorktreeManager implements Workspaces {
   }
 
   async gc(options: WorktreeGcOptions): Promise<WorktreeGcResult> {
+    this.requireWritable();
     if (!Number.isSafeInteger(options.olderThanMs) || options.olderThanMs < 0) {
       throw new Error('olderThanMs must be a non-negative safe integer');
     }
@@ -522,7 +619,17 @@ export class WorktreeManager implements Workspaces {
         result.skipped.push({ id: info.id, reason: 'active' });
         continue;
       }
-      if (now - info.lastActivityAt < options.olderThanMs) {
+      // Its planner removes it; a crash leaves it to the next `reconcile` (#238).
+      if (info.scratch) {
+        result.skipped.push({ id: info.id, reason: 'scratch' });
+        continue;
+      }
+      // The newest of its creation and its last use (#238): an old checkout in use is kept.
+      // An unreadable time reads as now: kept.
+      const at = (t: number | undefined) =>
+        t === undefined || Number.isFinite(t) ? (t ?? 0) : now;
+      const used = Math.max(at(info.createdAt), at(options.lastActivity?.get(info.id)));
+      if (now - used < options.olderThanMs) {
         result.skipped.push({ id: info.id, reason: 'not stale' });
         continue;
       }
@@ -588,6 +695,8 @@ export class WorktreeManager implements Workspaces {
     strategy: MergeStrategy,
     targetBranch: string,
   ): Promise<MergeResult> {
+    // It integrates (writes refs and objects) and may create a staging worktree.
+    this.requireWritable();
     await this.requireWorktree(worktreeId);
     await this.requireLocalBranch(targetBranch);
     const release = await this.hold([worktreeId]);
@@ -698,39 +807,60 @@ export class WorktreeManager implements Workspaces {
         throw new Error('setup timeoutMs must be a positive safe integer');
       }
     }
+    this.requireWritable();
     const { root } = await this.paths();
     const { baseBranch, baseCommit } = await this.resolveBase(base);
 
     const branchName = taskBranch(id).slice('refs/heads/'.length);
     const worktreePath = path.join(root, id);
-    await this.worktreeGit(['worktree', 'add', '--detach', worktreePath, baseCommit]);
-
-    const timestamp = Date.now();
-    const info: WorktreeInfo = {
-      id,
-      workerId,
-      branch: branchName,
-      branchName,
-      path: worktreePath,
-      ...(baseBranch !== undefined ? { baseBranch } : {}),
-      baseCommit,
-      createdAt: timestamp,
-      lastActivityAt: timestamp,
-    };
+    // Intent first: a crash from here on leaves a record that `reconcile` settles.
+    this.#pending.add(id);
     try {
+      return await this.makeWorktree(id, workerId, baseBranch, baseCommit, worktreePath, options);
+    } finally {
+      this.#pending.delete(id);
+    }
+  }
+
+  private async makeWorktree(
+    id: string,
+    workerId: string,
+    baseBranch: string | undefined,
+    baseCommit: string,
+    worktreePath: string,
+    options: CreateWorktreeOptions,
+  ): Promise<WorktreeInfo> {
+    await this.record('workspace.created', {
+      workspaceId: id,
+      workerId,
+      baseCommit,
+      ...(baseBranch !== undefined ? { baseBranch } : {}),
+      ...(options.scratch ? { scratch: true } : {}),
+    });
+    try {
+      await this.worktreeGit(['worktree', 'add', '--detach', worktreePath, baseCommit]);
       const commonDirectory = await this.commonGitDirectory();
       await mkdir(path.join(commonDirectory, 'worktrees', id, 'objects'), {
         recursive: true,
         mode: 0o700,
       });
-      await this.writeInfo(root, info);
     } catch (error) {
       try {
         await this.worktreeGit(['worktree', 'remove', '--force', worktreePath]);
       } catch {
-        // Keep the original metadata error; Git may still need manual cleanup.
+        // Keep the original error; Git may still need manual cleanup.
+      }
+      // Gone only if nothing of it is left: otherwise it stays registered, for remove or purge.
+      if ((await this.leftOnDisk(id).catch(() => undefined)) === false) {
+        await this.record('workspace.removed', { workspaceId: id, reason: 'gone' }).catch(() => {});
       }
       throw error;
+    }
+    const info = (await this.registry()).get(id);
+    if (!info) {
+      // Recorded as gone meanwhile: nothing may be left on disk that the registry does not know.
+      await this.worktreeGit(['worktree', 'remove', '--force', worktreePath]).catch(() => {});
+      throw new Error(`worktree ${id} is missing from the registry`);
     }
 
     if (options.setup) {
@@ -850,7 +980,12 @@ export class WorktreeManager implements Workspaces {
       if (branchTip && !options.keepBranch) {
         await this.git(['update-ref', '-d', branchRef, branchTip]).catch(() => {});
       }
-      await rm(this.infoPath(root, info.id), { force: true });
+      await this.record('workspace.removed', {
+        workspaceId: info.id,
+        reason: force ? 'forced' : 'removed',
+      });
+      // A pre-#126 file for it, if it was never imported.
+      await rm(this.legacyPath(root, info.id), { force: true });
     } finally {
       await release();
     }
@@ -1344,41 +1479,155 @@ export class WorktreeManager implements Workspaces {
     await this.git(['rev-parse', '--verify', `refs/heads/${branch}^{commit}`]);
   }
 
-  private infoPath(root: string, id: string): string {
+  // ---- the registry (#126) -----------------------------------------------------------------
+
+  /** In-memory registry, when there is no event log: never written anywhere. */
+  readonly #memory = new Map<string, WorktreeInfo>();
+  readonly #memoryRemoved = new Set<string>();
+  #view: { seq: number; state: WorkspacesState } | undefined;
+  /** Ids between their recorded intent and the end of `git worktree add`: never reconciled. */
+  readonly #pending = new Set<string>();
+
+  private requireWritable(): void {
+    if (this.options.log?.readonly) {
+      throw new Error(
+        'the worktree registry was opened read-only: nothing can be created or removed',
+      );
+    }
+  }
+
+  private workspacesState(): WorkspacesState | undefined {
+    const log = this.options.log;
+    if (!log) return undefined;
+    // Folded on from the last event seen: `workspace.*` is never compacted, so this stays exact.
+    let view = this.#view ?? { seq: 0, state: workspacesProjection.initial() };
+    const fresh = log.store.query({ typePrefix: 'workspace', afterSeq: view.seq });
+    if (fresh.length > 0 || !this.#view) {
+      let state = view.state;
+      for (const e of fresh) state = workspacesProjection.apply(state, e.envelope);
+      view = { seq: fresh.at(-1)?.seq ?? view.seq, state };
+      this.#view = view;
+    }
+    return view.state;
+  }
+
+  /** Every registered workspace, by id, in creation order. */
+  private async registry(): Promise<Map<string, WorktreeInfo>> {
+    const state = this.workspacesState();
+    if (!state) return new Map(this.#memory);
+    const { root } = await this.paths();
+    const branchOf = (id: string) => taskBranch(id).slice('refs/heads/'.length);
+    return new Map(
+      Object.values(state.live)
+        .filter((w) => worktreeIdPattern.test(w.workspaceId))
+        .map((w) => [
+          w.workspaceId,
+          {
+            id: w.workspaceId,
+            workerId: w.workerId,
+            branch: branchOf(w.workspaceId),
+            branchName: branchOf(w.workspaceId),
+            path: path.join(root, w.workspaceId),
+            ...(w.baseBranch !== undefined ? { baseBranch: w.baseBranch } : {}),
+            baseCommit: w.baseCommit,
+            createdAt: Date.parse(w.createdAt),
+            ...(w.scratch ? { scratch: true as const } : {}),
+          },
+        ]),
+    );
+  }
+
+  private async removedIds(): Promise<Set<string>> {
+    const state = this.workspacesState();
+    return state ? new Set(Object.keys(state.removed)) : new Set(this.#memoryRemoved);
+  }
+
+  private async record(
+    ...[type, data]:
+      | ['workspace.created', WorkspaceCreated]
+      | ['workspace.removed', WorkspaceRemoved]
+  ): Promise<void> {
+    const log = this.options.log;
+    const id = data.workspaceId;
+    if (!log) {
+      if (type === 'workspace.created') {
+        if (this.#memoryRemoved.has(id) || this.#memory.has(id)) return;
+        const { root } = await this.paths();
+        const branchName = taskBranch(id).slice('refs/heads/'.length);
+        const created = data as WorkspaceCreated;
+        this.#memory.set(id, {
+          id,
+          workerId: created.workerId,
+          branch: branchName,
+          branchName,
+          path: path.join(root, id),
+          ...(created.baseBranch !== undefined ? { baseBranch: created.baseBranch } : {}),
+          baseCommit: created.baseCommit,
+          createdAt: Date.now(),
+          ...(created.scratch ? { scratch: true as const } : {}),
+        });
+      } else {
+        this.#memory.delete(id);
+        this.#memoryRemoved.add(id);
+      }
+      return;
+    }
+    this.requireWritable();
+    const now = new Date();
+    const envelope: EventEnvelope = {
+      v: 1,
+      id: newUlid(now.getTime()),
+      ts: now.toISOString(),
+      source: { kind: 'mini', id: log.miniId },
+      ...(log.repo !== undefined ? { repo: log.repo } : {}),
+      type,
+      data,
+    };
+    log.store.append(envelope);
+  }
+
+  // ---- pre-#126 registry files: read to migrate or clean up, never written ------------------
+
+  private legacyPath(root: string, id: string): string {
     if (!worktreeIdPattern.test(id)) throw new Error('invalid worktree id');
     return path.join(root, `.tacet-${id}.json`);
   }
 
-  private async writeInfo(root: string, info: WorktreeInfo): Promise<void> {
-    const destination = this.infoPath(root, info.id);
-    const temporary = `${destination}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(temporary, JSON.stringify(info), { flag: 'wx', mode: 0o600 });
-      await rename(temporary, destination);
-    } catch (error) {
-      await rm(temporary, { force: true });
-      throw error;
+  private async legacyIds(): Promise<string[]> {
+    const { root } = await this.paths();
+    const ids: string[] = [];
+    for (const entry of await readdir(root, { withFileTypes: true })) {
+      const id = /^\.tacet-([a-z0-9-]+)\.json$/.exec(entry.name)?.[1];
+      if (entry.isFile() && id && worktreeIdPattern.test(id)) ids.push(id);
     }
+    return ids;
   }
 
-  private async readInfo(root: string, id: string): Promise<WorktreeInfo | undefined> {
+  private async readLegacy(root: string, id: string): Promise<WorktreeInfo | undefined> {
     try {
-      const info = JSON.parse(await readFile(this.infoPath(root, id), 'utf8')) as WorktreeInfo;
+      const info = JSON.parse(await readFile(this.legacyPath(root, id), 'utf8')) as WorktreeInfo;
       if (
         info.id !== id ||
         typeof info.workerId !== 'string' ||
-        typeof info.branchName !== 'string' ||
         typeof info.path !== 'string' ||
         (info.baseBranch !== undefined && typeof info.baseBranch !== 'string') ||
         typeof info.baseCommit !== 'string' ||
         !commitIdPattern.test(info.baseCommit) ||
-        !Number.isSafeInteger(info.createdAt) ||
-        !Number.isSafeInteger(info.lastActivityAt)
+        !Number.isSafeInteger(info.createdAt)
       ) {
         return undefined;
       }
       const branchName = taskBranch(id).slice('refs/heads/'.length);
-      return { ...info, branch: branchName, branchName };
+      return {
+        id,
+        workerId: info.workerId,
+        branch: branchName,
+        branchName,
+        path: info.path,
+        ...(info.baseBranch !== undefined ? { baseBranch: info.baseBranch } : {}),
+        baseCommit: info.baseCommit,
+        createdAt: info.createdAt,
+      };
     } catch {
       return undefined;
     }

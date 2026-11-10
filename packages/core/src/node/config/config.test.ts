@@ -230,7 +230,10 @@ describe('loadConfig', () => {
   });
 
   it('turns merged-worktree cleanup on by default, lets the repo or local layer set it, never a task (#210)', () => {
-    expect(loadConfig({ userDir, repoRoot }).config.worktrees).toEqual({ remove_merged: true });
+    expect(loadConfig({ userDir, repoRoot }).config.worktrees).toEqual({
+      remove_merged: true,
+      idle_days: 7,
+    });
     write(join(repoRoot, '.tacet', 'tacet.yaml'), 'worktrees: { remove_merged: false }\n');
     expect(loadConfig({ userDir, repoRoot }).config.worktrees?.remove_merged).toBe(false);
     write(join(repoRoot, '.tacet', 'local.yaml'), 'worktrees: { remove_merged: true }\n');

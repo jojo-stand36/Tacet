@@ -7,6 +7,7 @@ import { HandoffPacket } from './handoff.js';
 import { HelloParams, HelloResult } from './hello.js';
 import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
+import { StatusExt } from './status-ext.js';
 import { SummaryPacket } from './summary.js';
 import { Task, TaskExt, TaskLanded, TaskTarget } from './task.js';
 import {
@@ -21,7 +22,9 @@ import {
   WorkerVendorSession,
   WorkerVerification,
 } from './worker.js';
+import { WorkspaceCreated, WorkspaceRemoved } from './workspace.js';
 
+export * from './a2a.js';
 export * from './agent-event.js';
 export * from './common.js';
 export * from './decision.js';
@@ -31,9 +34,11 @@ export * from './handoff.js';
 export * from './hello.js';
 export * from './plan.js';
 export * from './profile.js';
+export * from './status-ext.js';
 export * from './summary.js';
 export * from './task.js';
 export * from './worker.js';
+export * from './workspace.js';
 
 /** Schema major version; JSON Schemas live in `schema/v1/`. */
 export const SCHEMA_VERSION = 1;
@@ -59,6 +64,10 @@ export const jsonSchemas = {
     schema: DecisionExt,
     title: 'Tacet A2A decision extension (urn:tacet:a2a-ext:decision:v1)',
   },
+  'status-ext': {
+    schema: StatusExt,
+    title: 'Tacet A2A status extension (urn:tacet:a2a-ext:status:v1)',
+  },
   'handoff-packet': { schema: HandoffPacket, title: 'Tacet HandoffPacket' },
   'hello-params': { schema: HelloParams, title: 'Tacet tacet/hello request params' },
   'hello-result': { schema: HelloResult, title: 'Tacet tacet/hello result' },
@@ -82,6 +91,8 @@ export const jsonSchemas = {
     title: 'Tacet worker.verification payload',
   },
   'worker-review': { schema: WorkerReview, title: 'Tacet worker.review payload' },
+  'workspace-created': { schema: WorkspaceCreated, title: 'Tacet workspace.created payload' },
+  'workspace-removed': { schema: WorkspaceRemoved, title: 'Tacet workspace.removed payload' },
 } satisfies Record<string, { schema: z.ZodType; title: string }>;
 
 export type JsonSchemaName = keyof typeof jsonSchemas;

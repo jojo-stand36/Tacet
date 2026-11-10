@@ -3,7 +3,14 @@ import { existsSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { authEnv, claudeEnvAllow, writeMcpConfig } from '@tacet/adapter-claude-sdk/launch';
+import {
+  authEnv,
+  claudeEnvAllow,
+  removeClaudeConfigDir,
+  repoOf,
+  sweepClaudeConfigDirs,
+  writeMcpConfig,
+} from '@tacet/adapter-claude-sdk/launch';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -11,6 +18,7 @@ import {
   type AgentTerminal,
   type ApprovalDecision,
   AsyncQueue,
+  ForkRefusedError,
   type InterruptResult,
   mcpHeaderSecrets,
   ProfileRefusedError,
@@ -42,7 +50,6 @@ import {
   prepareClaudeConfigDir,
   preToolUseDecision,
 } from './claude.js';
-import { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
@@ -239,7 +246,9 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.contextWindow !== undefined) {
       throw new ProfileRefusedError('contextWindow', 'the PTY adapter does not set a context size');
     }
-    if (opts.resume?.fork) throw new Error('the PTY adapter does not fork sessions');
+    if (opts.resume?.fork) {
+      throw new ForkRefusedError(this.id, 'the PTY adapter does not fork sessions');
+    }
     // It names a directory and goes on the command line: only a session id Claude Code made.
     if (opts.resume && !UUID.test(opts.resume.vendorSessionId)) {
       throw new Error('a PTY session to resume is named by its UUID');
@@ -361,6 +370,13 @@ export class PtyAdapter implements AgentAdapter {
       const ptyEnv: Record<string, string> = {
         ...env,
         CLAUDE_CONFIG_DIR: configDir,
+        // Prompts are typed verbatim: Claude Code would otherwise read an `@path` mention into
+        // the prompt, outside the working directory too, with no hook or permission request, and
+        // a Worker's prompt can carry text a Worker wrote (a `verify` command's output). Verified
+        // live on 2.1.319, inline, at a line start and in a code fence; documented from 2.1.299
+        // (code.claude.com/docs/en/env-vars, checked 2026-11-10). Set here, last, so no base
+        // environment can unset it; Claude Code ignores it in project settings anyway (#226).
+        CLAUDE_CODE_DISABLE_FILE_MENTIONS: '1',
         TERM: env.TERM ?? 'xterm-256color',
         // The hook endpoint is local: never through a proxy the user has set.
         NO_PROXY: [env.NO_PROXY, '127.0.0.1'].filter(Boolean).join(','),

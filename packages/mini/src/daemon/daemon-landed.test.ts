@@ -1,11 +1,12 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newUlid, type SummaryPacket, type TacetConfig, type TaskLanded } from '@tacet/core';
 import { type EventStore, openEventStore, workerGitEnv, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GitIntegrator } from '../git/integrate.js';
+import { CheckoutPlanner } from '../standalone.js';
 import { CommandVerifier } from '../verify/command-verifier.js';
 import { WorktreeManager } from '../worktree.js';
 import { MiniConductor } from './daemon.js';
@@ -56,7 +57,10 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     git(repo, ['add', 'README']);
     git(repo, ['commit', '-qm', 'init']);
     store = openEventStore(':memory:');
-    manager = new WorktreeManager(repo, join(root, 'worktrees'), { env });
+    manager = new WorktreeManager(repo, join(root, 'worktrees'), {
+      env,
+      log: { store, miniId: 'mini' },
+    });
   });
 
   afterEach(async () => {
@@ -277,6 +281,49 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       await severalSweeps();
       expect(await manager.list()).toHaveLength(1);
     });
+  });
+
+  it('finds every live checkout from the event log after a restart, with no state files (#126)', async () => {
+    const { id } = await runTask(commitWork, { remove_merged: false });
+    const started = store
+      .query({ taskId: `${id}/1`, typePrefix: 'worker.started' })
+      .map((e) => (e.envelope.data as { workspaceId: string }).workspaceId);
+    await daemon?.stop();
+    daemon = undefined;
+    expect(
+      readdirSync(join(root, 'worktrees')).filter(
+        (n) => n !== '.tacet-locks' && !started.includes(n),
+      ),
+    ).toEqual([]);
+
+    const restarted = new WorktreeManager(repo, join(root, 'worktrees'), {
+      env,
+      log: { store, miniId: 'mini' },
+    });
+    await restarted.reconcile();
+    for (const workspaceId of started) {
+      expect(await restarted.get(workspaceId)).toMatchObject({ id: workspaceId });
+    }
+  });
+
+  it('reconciles the worktree registry when it starts (#126)', async () => {
+    // A checkout whose creation a crashed Mini-conductor never finished.
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'mini', id: 'mini' },
+      type: 'workspace.created',
+      data: {
+        workspaceId: 'crashed-1',
+        workerId: 'w',
+        baseCommit: git(repo, ['rev-parse', 'HEAD']),
+      },
+    });
+    await runTask(commitWork, { remove_merged: false });
+    expect(
+      store.query({ typePrefix: 'workspace.removed' }).map((e) => e.envelope.data),
+    ).toContainEqual({ workspaceId: 'crashed-1', reason: 'gone' });
   });
 
   it('starts every sub-task from the target pinned when the task started (#219)', async () => {
@@ -543,6 +590,161 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(startedAt).toBe(pinned);
     });
   });
+  describe('idle checkouts and leftover planner checkouts (#238)', () => {
+    type GcOptions = Parameters<NonNullable<Workspaces['gc']>>[0];
+    const recording = (calls: GcOptions[]): Workspaces => ({
+      create: (workerId, base, o) => manager.create(workerId, base, o),
+      get: (id) => manager.get(id),
+      remove: (id, o) => manager.remove(id, o),
+      head: () => manager.head(),
+      reconcile: () => manager.reconcile(),
+      gc: (o) => {
+        calls.push(o);
+        return manager.gc(o);
+      },
+    });
+
+    it("passes each checkout its sessions' newest worker event as its last activity", async () => {
+      const calls: GcOptions[] = [];
+      const { published } = await runTask(commitWork, undefined, undefined, {
+        workspaces: recording(calls),
+      });
+      // A sweep after the task settled, so after its last worker event.
+      const before = calls.length;
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(before), { timeout: 3_000 });
+      const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as {
+        sessionId: string;
+        workspaceId: string;
+      };
+      const newest = Math.max(
+        ...store
+          .query({ typePrefix: 'worker' })
+          .filter(
+            (e) =>
+              (e.envelope.data as { sessionId?: string }).sessionId === started.sessionId ||
+              e.envelope.sessionId === started.sessionId,
+          )
+          .map((e) => Date.parse(e.envelope.ts)),
+      );
+      const last = calls.at(-1);
+      expect(last?.olderThanMs).toBe(7 * 86_400_000);
+      expect(last?.lastActivity?.get(started.workspaceId)).toBe(newest);
+      // Its task is done and no session runs in it: not held as active.
+      expect(last?.activeWorktreeIds).not.toContain(started.workspaceId);
+      // Used recently: kept.
+      expect(await manager.get(started.workspaceId)).toBeDefined();
+      // Eight days on, with its work on a branch outside tacet/* (so nothing is lost): removed.
+      git(repo, ['branch', 'kept-elsewhere', published.commit]);
+      const later = await manager.gc({
+        ...last,
+        olderThanMs: 7 * 86_400_000,
+        now: newest + 8 * 86_400_000,
+      });
+      expect(later.removed).toEqual([started.workspaceId]);
+    });
+
+    it('holds the checkouts of completed tasks as active with remove_merged off', async () => {
+      const calls: GcOptions[] = [];
+      await runTask(commitWork, { remove_merged: false }, undefined, {
+        workspaces: recording(calls),
+      });
+      const before = calls.length;
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(before), { timeout: 3_000 });
+      const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as {
+        workspaceId: string;
+      };
+      expect(calls.at(-1)?.activeWorktreeIds).toContain(started.workspaceId);
+    });
+
+    it("holds an unfinished task's checkout as active, however long it has been idle", async () => {
+      const calls: GcOptions[] = [];
+      const old = await manager.create('old');
+      // Planning never ends until the Mini-conductor stops: the task stays unfinished.
+      const planner: Planner = {
+        plan: (_task, opts) =>
+          new Promise((_, reject) =>
+            opts?.signal?.addEventListener('abort', () => reject(new Error('stopped'))),
+          ),
+      };
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: recording(calls),
+        integrator: new GitIntegrator(repo, env),
+        planner,
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        pollMs: 20,
+        landedSweepMs: 50,
+      });
+      await daemon.start();
+      const id = daemon.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      // A session of this task ran in `old` thirty days ago, and stopped for a restart.
+      const longAgo = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      const envelope = (type: string, data: unknown) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: longAgo,
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId: id,
+        type,
+        data,
+      });
+      store.append([
+        envelope('worker.started', { sessionId: 's-old', adapter: 'fake', workspaceId: old.id }),
+        envelope('worker.ended', { sessionId: 's-old', reason: 'restart' }),
+      ]);
+      const before = calls.length;
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(before), { timeout: 3_000 });
+      const last = calls.at(-1);
+      expect(last?.lastActivity?.get(old.id)).toBe(Date.parse(longAgo));
+      expect(last?.activeWorktreeIds).toContain(old.id);
+      expect(await manager.get(old.id)).toBeDefined();
+    });
+
+    it('runs no gc with idle_days 0', async () => {
+      const calls: GcOptions[] = [];
+      await runTask(commitWork, { remove_merged: false, idle_days: 0 }, undefined, {
+        workspaces: recording(calls),
+      });
+      await severalSweeps();
+      expect(calls).toEqual([]);
+    });
+
+    it('removes at start the planner checkout a crash left, and marks new ones scratch', async () => {
+      // What a crash mid-plan leaves: a registered planner checkout the planner never removed.
+      const left = await manager.create('plan-crashed-1234abcd', undefined, { scratch: true });
+      writeFileSync(join(left.path, 'notes.txt'), 'planner scribbles\n');
+      const planner = new CheckoutPlanner(manager, () => new SingleStepPlanner());
+      await runTask(commitWork, { remove_merged: false }, undefined, { planner });
+      expect(await manager.get(left.id)).toBeUndefined();
+      expect(
+        store
+          .query({ typePrefix: 'workspace.removed' })
+          .map((e) => e.envelope.data as { workspaceId: string; reason: string }),
+      ).toContainEqual({ workspaceId: left.id, reason: 'forced' });
+      const plannerCheckouts = store
+        .query({ typePrefix: 'workspace.created' })
+        .map((e) => e.envelope.data as { workerId: string; scratch?: boolean })
+        .filter((d) => d.workerId.startsWith('plan-'));
+      expect(plannerCheckouts).toHaveLength(2);
+      expect(plannerCheckouts.every((d) => d.scratch === true)).toBe(true);
+      // The Worker's checkout is untouched.
+      expect(await manager.list()).toHaveLength(1);
+    });
+  });
+
   describe("deleting a finished task's pin ref (#247)", () => {
     const pinOf = (id: string) => {
       try {
