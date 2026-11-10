@@ -21,9 +21,43 @@ export interface Workspace {
 export interface Workspaces {
   /**
    * A fresh checkout for the Worker session `workerId`; never an existing one. It starts at
-   * `base`, a commit in the repo (#134: its dependencies' work), or at the main branch.
+   * `base`, a commit in the repo (#134: its dependencies' work; #219: the task's pinned target),
+   * or, without one, where the main checkout is now. `scratch` marks a throwaway checkout (the
+   * planner's, #238): one a crash leaves registered is force-removed by the next `reconcile`.
    */
-  create(workerId: string, base?: string): Promise<Workspace>;
+  create(workerId: string, base?: string, options?: { scratch?: boolean }): Promise<Workspace>;
+  /**
+   * Bring the checkout registry up to date with the disk (#126): called once at start, while the
+   * Mini-conductor holds its lock, before any checkout is looked up.
+   */
+  reconcile?(): Promise<void>;
+  /**
+   * Remove checkouts not used for `olderThanMs` (#238): judged by the newest of their creation and
+   * `lastActivity` (by id), skipping `activeWorktreeIds`. Never loses work: a checkout with local
+   * files or unintegrated commits is kept.
+   */
+  gc?(options: {
+    olderThanMs: number;
+    activeWorktreeIds?: readonly string[];
+    lastActivity?: ReadonlyMap<string, number>;
+  }): Promise<{ removed: string[] }>;
+  /**
+   * The repo's checked-out branch (absent when its HEAD is detached) and commit right now: where a
+   * new task's sub-tasks start (#219). Without it, each sub-task starts at the main branch as it is
+   * when the sub-task starts.
+   */
+  head?(): Promise<{ branch?: string; commit: string }>;
+  /**
+   * Hold `commit` with a ref of the task's (`refs/tacet/<task>/target`), so git gc never prunes
+   * the commit a task's sub-tasks start from (#236).
+   */
+  pin?(taskId: string, commit: string): Promise<void>;
+  /**
+   * Delete each task's pin ref that still holds its `commit` (#247): once a task is finished, no
+   * new checkout starts there. Refs gone or holding another commit are left; throws when the refs
+   * cannot be read, so the caller tries again.
+   */
+  unpin?(pins: ReadonlyArray<{ taskId: string; commit: string }>): Promise<void>;
   /** An existing checkout, or undefined if it is gone. */
   get(id: string): Promise<Workspace | undefined>;
   /**
@@ -171,8 +205,11 @@ export interface PlanResult {
 }
 
 export interface Planner {
-  /** `signal` aborts when the Mini-conductor stops; the planner should end its session. */
-  plan(task: Task, opts?: { signal?: AbortSignal }): Promise<PlanResult>;
+  /**
+   * `signal` aborts when the Mini-conductor stops; the planner should end its session. `base` is
+   * the commit the task's sub-tasks start from (#219): a planner that reads the code reads it there.
+   */
+  plan(task: Task, opts?: { signal?: AbortSignal; base?: string }): Promise<PlanResult>;
 }
 
 /**

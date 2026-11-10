@@ -37,7 +37,37 @@ function claudeBinary(): string {
  * Runs the real, interactive Claude Code binary in a PTY against a local mock of the Messages
  * API (#15): no credentials, no network. State comes from Claude Code's hooks.
  */
-describe.skipIf(!gate.ok)(
+/**
+ * On Linux, interactive Claude Workers refuse to start until #164: Claude Code's sandbox (needed so
+ * the commands they run never see the API key, #150) blocks the hooks that report back to Tacet.
+ * There the refusal is what is tested; the real sessions run on macOS.
+ */
+const linux = process.platform === 'linux';
+
+describe.runIf(linux && gate.ok)('PtyAdapter on Linux (#164)', () => {
+  it('refuses to start an interactive Claude Worker, saying why', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-pty-linux-')));
+    try {
+      const adapter = new PtyAdapter({
+        command: [claudeBinary()],
+        stateDir: join(root, 'state'),
+        sessionFileDir: join(root, 'run'),
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: root,
+          ANTHROPIC_API_KEY: 'sk-ant-placeholder-not-a-real-key-0123456789',
+        },
+      });
+      await expect(adapter.start({ cwd: root })).rejects.toThrow(
+        /can't run on Linux yet.*#164.*claude-sdk/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.skipIf(!gate.ok || linux)(
   gatedTitle('PtyAdapter conformance (interactive Claude Code in a PTY, mock Messages API)', gate),
   () => {
     let api: MockMessagesApi;
@@ -92,6 +122,19 @@ describe.skipIf(!gate.ok)(
       for (const [i, t] of screens.entries()) {
         if (i >= screens.length - 3) console.log(`--- screen of session ${i}:\n${plain(t)}`);
       }
+      // What reached the model: tells a prompt never sent from hooks that never came back.
+      console.log(
+        `--- last mock API requests:\n${api.requests
+          .slice(-6)
+          .map((r) =>
+            JSON.stringify({
+              text: r.text.slice(0, 80),
+              tools: r.tools.length,
+              out: r.toolOutput?.slice(0, 300),
+            }),
+          )
+          .join('\n')}`,
+      );
       if (process.env.TACET_PTY_SCREENS) {
         writeFileSync(process.env.TACET_PTY_SCREENS, JSON.stringify(screens));
       }
@@ -125,6 +168,41 @@ describe.skipIf(!gate.ok)(
       });
       console.log(formatResults(results));
       assertConformance(results);
+    });
+
+    it('reads no @path mention into a Worker prompt (#226)', { timeout: 180_000 }, async () => {
+      const cwd = join(root, 'wt-at');
+      mkdirSync(cwd);
+      writeFileSync(join(cwd, 'note.txt'), 'INSIDE-AT-CONTENT\n');
+      const outside = join(root, 'outside-at.txt');
+      writeFileSync(outside, 'OUTSIDE-AT-CONTENT\n');
+      // A directory mention lists its entries (verified live without the variable).
+      const dir = join(root, 'outside-at-dir');
+      mkdirSync(dir);
+      writeFileSync(join(dir, 'OUTSIDE-DIR-ENTRY.txt'), '');
+      // Inline, at the start of a line, and inside a fence: each was read in before (verified live).
+      for (const text of [
+        `SAY inline see @${outside} and @note.txt`,
+        `SAY line\n@${outside}`,
+        `SAY dir @${dir}/`,
+        `SAY fenced\n\`\`\`\nsee @${outside} and @note.txt\n\`\`\``,
+      ]) {
+        const h = await adapter.start({ cwd });
+        const tap = new EventTap(adapter.events(h));
+        const { end, events } = await turn(h, tap, text);
+        expect(end).toEqual({ t: 'status', state: 'idle' });
+        expect(events.some((e) => e.t === 'approval.request')).toBe(false);
+        const raw = api.requests.at(-1)?.raw ?? '';
+        // The typed text is kept as typed (Claude Code adds a note per mention telling the model
+        // to read it with its tools, which the policy then decides), and nothing is read in.
+        expect(api.requests.at(-1)?.text).toContain(
+          text.includes('dir @') ? `@${dir}` : `@${outside}`,
+        );
+        expect(raw).not.toContain('OUTSIDE-DIR-ENTRY');
+        expect(raw).not.toContain('OUTSIDE-AT-CONTENT');
+        expect(raw).not.toContain('INSIDE-AT-CONTENT');
+        await adapter.close(h);
+      }
     });
 
     it('reports running, waiting and idle from the hooks', { timeout: 120_000 }, async () => {

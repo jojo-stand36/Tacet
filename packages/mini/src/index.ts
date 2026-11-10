@@ -9,7 +9,12 @@ export type {
   WorktreeInfo,
   WorktreeSetup,
 } from './worktree.js';
-export { WorktreeManager } from './worktree.js';
+export {
+  targetRef,
+  WorktreeKeptError,
+  type WorktreeLog,
+  WorktreeManager,
+} from './worktree.js';
 
 export const packageName = '@tacet/mini' as const;
 
@@ -21,6 +26,7 @@ export {
   type MiniConductorOptions,
   miniLockHolder,
   VERIFY_CODEX_WORKERS,
+  withStoppedMini,
 } from './daemon/daemon.js';
 export {
   AdapterPlanner,

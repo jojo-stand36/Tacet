@@ -1,6 +1,7 @@
 import { parseArgs } from 'node:util';
 import { formatExplain } from '@tacet/core';
 import { ConfigError, loadConfig, StateDirError } from '@tacet/core/node';
+import { answer } from './commands/answer.js';
 import { cancel } from './commands/cancel.js';
 import { init, uninstall } from './commands/init.js';
 import { attach, logs, status } from './commands/read.js';
@@ -13,14 +14,18 @@ const USAGE = `usage:
   tacet init [--worker ADAPTER] [--model MODEL] [--keep-merged-worktrees] [--json]
                                  set up .tacet/ in this repo (never overwrites a file); Worker
                                  checkouts are removed once their work is merged, unless kept
-  tacet uninstall [--apply] [--purge] [--json]
+  tacet uninstall [--apply] [--purge [--force]] [--json]
                                  preview, then remove what init wrote (--purge: all of .tacet/,
-                                 after a backup to ~/.tacet/backups)
+                                 after a backup to ~/.tacet/backups, and the repo's run state:
+                                 event log and Worker checkouts; --force: even checkouts holding
+                                 unintegrated work; tacet/* branches are kept)
   tacet run [--accept TEXT]... [--single] [--json] "<task>"
                                  run a task in this repo until it is done (standalone)
   tacet run --resume [--answer ID=TEXT]...
                                  carry on with unfinished tasks, answering escalations
-  tacet cancel <task> [--json]   cancel a task and its sub-tasks (interrupt a live run first)
+  tacet cancel <task> [--json]   cancel a task and its sub-tasks (in the live run, if any)
+  tacet answer <escalation> <text> [--json]
+                                 answer an open escalation in the live run
   tacet status [--json]          tasks, sub-tasks, open escalations; whether a run is live
   tacet logs <task> [--transcript] [--json] [--follow]
                                  a task's events (--transcript adds the Workers' own)
@@ -44,7 +49,12 @@ const OPTIONS = {
     model: { type: 'string' },
     'keep-merged-worktrees': { type: 'boolean' },
   },
-  uninstall: { ...COMMON, apply: { type: 'boolean' }, purge: { type: 'boolean' } },
+  uninstall: {
+    ...COMMON,
+    apply: { type: 'boolean' },
+    purge: { type: 'boolean' },
+    force: { type: 'boolean' },
+  },
   run: {
     ...COMMON,
     accept: { type: 'string', multiple: true },
@@ -53,6 +63,7 @@ const OPTIONS = {
     answer: { type: 'string', multiple: true },
   },
   cancel: COMMON,
+  answer: COMMON,
   status: COMMON,
   logs: { ...COMMON, transcript: { type: 'boolean' }, follow: { type: 'boolean', short: 'f' } },
   attach: COMMON,
@@ -93,7 +104,7 @@ export async function main(argv: string[], io: Io): Promise<number> {
         return await init(io, v);
       case 'uninstall':
         if (positionals.length > 0) return usage(io);
-        return uninstall(io, v);
+        return await uninstall(io, v);
       case 'run':
         if (positionals.length > 0 && values.resume) {
           io.err('give a task or --resume, not both');
@@ -103,6 +114,9 @@ export async function main(argv: string[], io: Io): Promise<number> {
       case 'cancel':
         if (positionals.length !== 1) return usage(io);
         return await cancel(io, positionals[0] as string, v);
+      case 'answer':
+        if (positionals.length < 2) return usage(io);
+        return await answer(io, positionals[0] as string, positionals.slice(1).join(' '), v);
       case 'status':
         if (positionals.length > 0) return usage(io);
         return await status(io, v);

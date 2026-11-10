@@ -1,0 +1,22 @@
+{
+  "goal": "Add rate limiting to the API",
+  "state": "input_required",
+  "target": { "branch": "main", "commit": "4b825dc642cb6eb9a060e54bf8d69288fbee4904" },
+  "usage": { "inputTokens": 1200, "outputTokens": 300, "costUsd": 0.0123 },
+  "subtasks": [
+    {
+      "id": "01JCX5Z9Q4W8E7R6T5Y4V3K2M1/1",
+      "goal": "Add the limiter middleware",
+      "state": "working",
+      "activeWorkers": ["01JCX5ZB0000000000000000S1"],
+      "usage": { "inputTokens": 5000, "outputTokens": 900, "costUsd": 0.05 }
+    }
+  ],
+  "escalations": [
+    {
+      "id": "01JCX5Z9Q4W8E7R6T5Y4V3K2M2",
+      "taskId": "01JCX5Z9Q4W8E7R6T5Y4V3K2M1/1",
+      "question": "Which store should the limiter use?"
+    }
+  ]
+}

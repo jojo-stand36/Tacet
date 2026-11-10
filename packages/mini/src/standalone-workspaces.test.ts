@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { workerWorktree } from '@tacet/core/node';
+import { type EventStore, openEventStore, workerWorktree } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { CheckoutPlanner } from './standalone.js';
 import { WorktreeManager } from './worktree.js';
@@ -14,7 +14,12 @@ describe('WorktreeManager as standalone Workspaces', () => {
   let env: Record<string, string>;
   const git = (cwd: string, args: string[]) =>
     execFileSync('git', ['-C', cwd, ...args], { env, encoding: 'utf8' }).trim();
-  const make = () => new WorktreeManager(repo, join(root, 'state', 'worktrees'));
+  let store: EventStore;
+  /** A new manager on the same event log each time: the registry lives in the log (#126). */
+  const make = () =>
+    new WorktreeManager(repo, join(root, 'state', 'worktrees'), {
+      log: { store, miniId: 'test' },
+    });
 
   beforeEach(() => {
     root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-workspaces-')));
@@ -30,6 +35,7 @@ describe('WorktreeManager as standalone Workspaces', () => {
       GIT_COMMITTER_NAME: 'Tacet Test',
       GIT_COMMITTER_EMAIL: 'test@example.invalid',
     };
+    store = openEventStore(':memory:');
     mkdirSync(repo);
     git(repo, ['init', '-q', '-b', 'main']);
     writeFileSync(join(repo, 'README'), 'one\n');

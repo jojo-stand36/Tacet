@@ -1,14 +1,22 @@
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 import type { TacetConfig, Task } from '@tacet/core';
 import {
+  defaultRunDir,
   type EventStore,
   loadConfig,
+  miniRuntimePath,
   openEventStore,
   type RepoStatePaths,
+  type RpcServer,
+  randomToken,
+  removeRuntimeFile,
   repoStatePaths,
   resolveStateDir,
   WorkerTokens,
+  writeRuntimeFile,
 } from '@tacet/core/node';
+import { startMiniControl } from './control/server.js';
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
@@ -42,6 +50,11 @@ export interface StandaloneOptions {
   workers?: Pick<BuildWorkerAdaptersOptions, 'acp' | 'codex' | 'claude' | 'ptyCli' | 'keychain'>;
   /** Tests only: these adapters instead of building them from config. */
   adapters?: Record<string, WorkerAdapter>;
+  /**
+   * Where the control port's runtime file goes (#201): `<runDir>/minis/<repo-hash>.json`. Default
+   * `<home>/.tacet/run` when `home` is given, else `~/.tacet/run`.
+   */
+  runDir?: string;
 }
 
 /** A running standalone Mini-conductor and what it owns. */
@@ -50,7 +63,12 @@ export interface Standalone {
   store: EventStore;
   config: TacetConfig;
   paths: RepoStatePaths;
-  /** Stop the Mini-conductor (open sessions recorded as `restart`), then the MCP server and log. */
+  /** The control port (#201) and its runtime file, which holds the port's token (mode 0600). */
+  control: { port: number; runtimeFile: string };
+  /**
+   * Remove the runtime file and close the control port, then stop the Mini-conductor (open
+   * sessions recorded as `restart`), then the MCP server and log.
+   */
   close(): Promise<void>;
 }
 
@@ -79,45 +97,69 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
       codex: { ...o.workers?.codex, stateDir },
       acp: { ...o.workers?.acp, stateDir },
+      claude: { ...o.workers?.claude, stateDir },
     });
   const tiers = config.tiers ?? {};
-  const workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, { env: baseEnv });
+  // First: the worktree registry lives in the log (#126). The manager writes to it only once
+  // `mini.start()` holds the lock.
+  const store = openEventStore(paths.events);
+  let workspaces: WorktreeManager;
   let planner: Planner = new SingleStepPlanner();
-  const mini = tiers.mini;
-  if (!o.singleStep && mini) {
-    const worker = adapters[mini.adapter];
-    if (!worker) throw new Error(`tiers.mini.adapter ${mini.adapter} was not built`);
-    // Never in the user's checkout: some adapters write without asking (Codex's sandbox).
-    planner = new CheckoutPlanner(
-      workspaces,
-      (cwd) =>
-        new AdapterPlanner({
-          worker,
-          adapterId: mini.adapter,
-          ...(mini.model !== undefined ? { model: mini.model } : {}),
-          ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
-          cwd,
-        }),
-    );
-  }
   let reviewer: Reviewer | undefined;
-  if (config.review?.enabled && tiers.review) {
-    const worker = adapters[tiers.review.adapter];
-    if (!worker) throw new Error(`tiers.review.adapter ${tiers.review.adapter} was not built`);
-    reviewer = new AdapterReviewer({
-      worker,
-      adapterId: tiers.review.adapter,
-      ...(tiers.review.model !== undefined ? { model: tiers.review.model } : {}),
-      ...(tiers.review.effort !== undefined ? { effort: tiers.review.effort } : {}),
-      diff: { repoRoot: o.repoRoot, env: baseEnv },
+  try {
+    workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, {
+      env: baseEnv,
+      log: { store, repo: paths.repoId, miniId: 'standalone' },
     });
+    const mini = tiers.mini;
+    if (!o.singleStep && mini) {
+      const worker = adapters[mini.adapter];
+      if (!worker) throw new Error(`tiers.mini.adapter ${mini.adapter} was not built`);
+      // Never in the user's checkout: some adapters write without asking (Codex's sandbox).
+      planner = new CheckoutPlanner(
+        workspaces,
+        (cwd) =>
+          new AdapterPlanner({
+            worker,
+            adapterId: mini.adapter,
+            ...(mini.model !== undefined ? { model: mini.model } : {}),
+            ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
+            cwd,
+          }),
+      );
+    }
+    if (config.review?.enabled && tiers.review) {
+      const worker = adapters[tiers.review.adapter];
+      if (!worker) throw new Error(`tiers.review.adapter ${tiers.review.adapter} was not built`);
+      reviewer = new AdapterReviewer({
+        worker,
+        adapterId: tiers.review.adapter,
+        ...(tiers.review.model !== undefined ? { model: tiers.review.model } : {}),
+        ...(tiers.review.effort !== undefined ? { effort: tiers.review.effort } : {}),
+        diff: { repoRoot: o.repoRoot, env: baseEnv },
+      });
+    }
+  } catch (err) {
+    store.close();
+    throw err;
   }
 
-  const store = openEventStore(paths.events);
   let server: MiniMcpServer | undefined;
+  let control: RpcServer | undefined;
+  let runtimeFile: string | undefined;
+  let started: MiniConductor | undefined;
+  const token = randomToken();
   try {
     server = await MiniMcpServer.start({
-      backend: new EventLogBackend({ store, repo: paths.repoId, miniId: 'standalone' }),
+      backend: new EventLogBackend({
+        store,
+        repo: paths.repoId,
+        miniId: 'standalone',
+        // A Worker's handoff (#129): the Mini-conductor, made below, decides and reseeds.
+        canHandoff: (b) =>
+          started ? started.handoffRefusal(b.workerSessionId) : 'not running yet',
+        onHandoff: (b) => started?.handoff(b.workerSessionId),
+      }),
       tokens: new WorkerTokens(),
       ...(o.onError ? { onError: o.onError } : {}),
     });
@@ -136,16 +178,41 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       miniId: 'standalone',
     });
     await mini.start();
+    started = mini;
+    // The control port (#201), only once the Mini-conductor holds its lock: the runtime file
+    // tells a CLI which process to talk to, and its token rotates with every run.
+    control = await startMiniControl({
+      mini,
+      store,
+      contextId: paths.repoId,
+      token,
+      ...(o.onError ? { onError: (m) => o.onError?.(`control: ${m}`) } : {}),
+    });
+    runtimeFile = miniRuntimePath(
+      o.repoRoot,
+      o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
+    );
+    writeRuntimeFile({ path: runtimeFile, port: control.port, protocolVersions: [1], token });
     const mcp = server;
+    const port = control;
+    const file = runtimeFile;
     let closed: Promise<void> | undefined;
     return {
       mini,
       store,
       config,
       paths,
+      control: { port: port.port, runtimeFile: file },
       close: () => {
         closed ??= (async () => {
           try {
+            try {
+              removeRuntimeFile(file, token);
+            } catch (err) {
+              // Changed under us (mode, owner): left in place, and the run still stops cleanly.
+              o.onError?.(`control: ${(err as Error).message}`);
+            }
+            await port.close();
             await mini.stop();
           } finally {
             await mcp.close();
@@ -156,6 +223,14 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       },
     };
   } catch (err) {
+    if (runtimeFile) {
+      try {
+        removeRuntimeFile(runtimeFile, token);
+      } catch {}
+    }
+    await control?.close();
+    // Started but not handed back: nobody else would stop it or release its lock.
+    await started?.stop().catch(() => {});
     await server?.close();
     store.close();
     throw err;
@@ -174,9 +249,13 @@ export class CheckoutPlanner implements Planner {
     private readonly make: (cwd: string) => Planner,
   ) {}
 
-  async plan(task: Task, opts: { signal?: AbortSignal } = {}): Promise<PlanResult> {
+  async plan(task: Task, opts: { signal?: AbortSignal; base?: string } = {}): Promise<PlanResult> {
+    // At the task's pinned target, where its Workers start (#219), not where the user is now.
     const ws = await this.workspaces.create(
       `plan-${task.id.replace(/\//g, '_')}-${randomUUID().slice(0, 8)}`,
+      opts.base,
+      // A crash mid-plan leaves it registered: the next start removes it (#238).
+      { scratch: true },
     );
     try {
       return await this.make(ws.path).plan(task, opts);

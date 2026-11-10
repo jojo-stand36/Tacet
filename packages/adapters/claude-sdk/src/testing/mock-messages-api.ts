@@ -7,6 +7,8 @@ import type { AddressInfo } from 'node:net';
  * Scripted by the last user text:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: asks for a Bash tool call (`touch tool-ran.txt`).
+ * - `ENV_TOOL`: asks for a Bash tool call that writes its environment to `tool-env.txt` (#150).
+ * - `RUN_CMD <shell command>`: asks for a Bash tool call running the rest of the line.
  * - `READ_TOOL <absolute path>`: asks to `Read` that file, which Claude Code would normally do
  *   without asking for a file in its working directory.
  * - `GLOB_TOOL <path> <pattern>`: asks for `Glob` with that `path` and `pattern`.
@@ -35,6 +37,8 @@ export interface MockRequest {
   betas: string[];
   /** Names of the tools offered. */
   tools: string[];
+  /** The text of the tool result this request carries, if any (what the tool printed). */
+  toolOutput?: string;
   /** Which known credential authenticated it (see `startMockMessagesApi`); `none` if none. */
   credential: string;
   /** The request body as sent, to check that some text never reached the model (#181). */
@@ -60,7 +64,10 @@ interface Body {
   model?: string;
   output_config?: { effort?: unknown };
   stream?: boolean;
-  messages?: { role: string; content: string | { type: string; text?: string; id?: string }[] }[];
+  messages?: {
+    role: string;
+    content: string | { type: string; text?: string; id?: string; content?: unknown }[];
+  }[];
   tools?: { name?: string }[];
 }
 
@@ -106,6 +113,22 @@ function credentialOf(req: IncomingMessage, known: Record<string, string>): stri
 
 let n = 0;
 
+/** The text of the last user message's tool results (a string, or text blocks). */
+function toolOutput(body: Body): string | undefined {
+  const m = [...(body.messages ?? [])].reverse().find((x) => x.role === 'user');
+  if (!m || typeof m.content === 'string') return undefined;
+  const parts = m.content
+    .filter((b) => b.type === 'tool_result')
+    .map((b) =>
+      typeof b.content === 'string'
+        ? b.content
+        : Array.isArray(b.content)
+          ? (b.content as { text?: string }[]).map((c) => c.text ?? '').join('')
+          : '',
+    );
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
 function firstUserText(body: Body): string {
   const m = (body.messages ?? []).find((x) => x.role === 'user');
   if (!m) return '';
@@ -143,6 +166,27 @@ function plan(body: Body): Block[] {
           description: 'start a background job',
           run_in_background: true,
         },
+      },
+    ];
+  }
+  const cmd = /RUN_CMD (.+)$/m.exec(text);
+  if (cmd) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Bash',
+        input: { command: cmd[1], description: 'run a command' },
+      },
+    ];
+  }
+  if (/ENV_TOOL/.test(text)) {
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: 'Bash',
+        input: { command: 'env > tool-env.txt', description: 'record the environment' },
       },
     ];
   }
@@ -230,7 +274,9 @@ async function handle(
     return json(404, { type: 'error', error: { type: 'not_found_error', message: 'mock' } });
   }
   const beta = req.headers['anthropic-beta'];
+  const output = toolOutput(body);
   log.push({
+    ...(output !== undefined ? { toolOutput: output } : {}),
     raw,
     credential: credentialOf(req, known),
     model: body.model,

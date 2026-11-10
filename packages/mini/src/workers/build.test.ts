@@ -10,7 +10,9 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CLAUDE_ACP_AGENT, claudeAcpWorkerSpec } from '@tacet/adapter-acp';
 import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
+import { PtyCliAdapter } from '@tacet/adapter-pty';
 import { gatedTitle, ptyGate } from '@tacet/adapter-pty/testing';
 import type { TacetConfig } from '@tacet/core';
 import {
@@ -26,7 +28,7 @@ import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
 import { TempWorkspaces } from '../daemon/testing.js';
-import { buildWorkerAdapters, WorkerConfigError } from './build.js';
+import { buildWorkerAdapters, commandWords, runs, runsGemini, WorkerConfigError } from './build.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
@@ -121,7 +123,8 @@ describe('buildWorkerAdapters', () => {
     }) as never;
     const built = buildWorkerAdapters(config({}), {
       baseEnv: { ANTHROPIC_API_KEY: 'placeholder-not-a-key' },
-      claude: { query },
+      // A stub replaces the binary: no sandbox to need (#150).
+      claude: { query, subprocessScrub: false },
     });
     const dir = mkdtempSync(join(tmpdir(), 'tacet-build-206-'));
     try {
@@ -133,6 +136,182 @@ describe('buildWorkerAdapters', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('recognises a PTY preset running Gemini CLI, whose prompts get every @ escaped (#245)', () => {
+    for (const w of [
+      'gemini',
+      '/usr/local/bin/gemini',
+      '@google/gemini-cli',
+      '@google/gemini-cli@0.67.0',
+      '/x/node_modules/@google/gemini-cli/bundle/gemini.js',
+    ]) {
+      expect(runsGemini(w), w).toBe(true);
+    }
+    for (const w of ['gemini-helper', 'my-gemini', 'codex', 'aider', '@google/genai']) {
+      expect(runsGemini(w), w).toBe(false);
+    }
+    // The Worker build sets it for a preset that runs Gemini, and only then.
+    const escapes = (command: string[]) => {
+      const { adapter } =
+        buildWorkerAdapters(
+          {
+            tiers: { worker: { adapter: 'pty:mine' } },
+            agents: { mine: { kind: 'pty', command } },
+          },
+          { baseEnv: {} },
+        )['pty:mine'] ?? {};
+      if (!(adapter instanceof PtyCliAdapter)) throw new Error('not a PTY CLI adapter');
+      return adapter.preset.escapeAt === true;
+    };
+    expect(escapes(['gemini'])).toBe(true);
+    expect(escapes(['npx', '-y', '@google/gemini-cli@0.67.0'])).toBe(true);
+    expect(escapes(['env', 'X=1', 'gemini', '-m', 'm'])).toBe(true);
+    expect(escapes(['sh', '-c', 'cd x && exec gemini'])).toBe(true);
+    expect(escapes(['aider'])).toBe(false);
+    expect(escapes(['aider', '--model', 'gemini'])).toBe(false);
+  });
+
+  it('catches a CLI behind launchers it does not model, failing closed (#245 review)', () => {
+    const claude = (w: string) => w.split('/').pop() === 'claude';
+    for (const command of [
+      ['bash', '-lc', 'claude'],
+      ['sh', '-ec', 'exec claude'],
+      ['sh', '-c', 'FOO=1 claude'],
+      ['bash', '-c', 'if true; then claude; fi'],
+      ['sh', '-c', 'echo `claude`'],
+      ['env', '-u', 'FOO', 'claude'],
+      ['env', '-C', '/w', 'claude'],
+      ['timeout', '3600', 'claude'],
+      ['nice', '-n', '5', 'claude'],
+      ['direnv', 'exec', '.', 'claude'],
+      ['mise', 'exec', '--', 'claude'],
+      ['pnpm', 'claude'],
+      ['caffeinate', '-i', 'claude'],
+      ['sudo', '-E', 'claude'],
+      ['xvfb-run', '-a', 'claude'],
+      ['stdbuf', '-oL', 'claude'],
+      ['firejail', '--quiet', 'claude'],
+      ['systemd-run', '--user', '--pty', 'claude'],
+      ['script', '-qc', 'claude', '/dev/null'],
+      ['sh', '-c', 'stdbuf -oL claude'],
+      // A false positive, refused loudly: the safe direction.
+      ['sh', '-c', 'cd ~/claude && aider'],
+    ]) {
+      expect(runs(command, claude), command.join(' ')).toBe(true);
+    }
+    for (const command of [
+      ['aider', '--model', 'claude'],
+      ['opencode', '--config', '/home/me/.config/claude'],
+      ['aider', '--model=claude'],
+      ['aider', '-m', 'claude'],
+      ['aider'],
+    ]) {
+      expect(runs(command, claude), command.join(' ')).toBe(false);
+    }
+  });
+
+  it('reads only the words of a command that name what it runs (#245 review)', () => {
+    expect(commandWords(['aider', '--model', 'claude'])).toEqual(['aider']);
+    expect(commandWords(['opencode', '--config', '/home/me/.config/claude'])).toEqual(['opencode']);
+    expect(commandWords(['sh', '-c', 'cd ~/claude && aider'])).toEqual(['sh', 'cd', 'aider']);
+    expect(commandWords(['env', '-i', 'A=1', 'npx', '-y', 'pkg', '--flag'])).toEqual([
+      'env',
+      'npx',
+      'pkg',
+    ]);
+    expect(commandWords(['pnpm', 'dlx', '@google/gemini-cli'])).toEqual([
+      'pnpm',
+      '@google/gemini-cli',
+    ]);
+    expect(commandWords(['pnpm', 'run', 'gemini'])).toEqual(['pnpm']);
+  });
+
+  it('refuses a custom PTY preset running Claude Code for Workers: pty:claude is hardened (#245)', () => {
+    for (const command of [
+      ['claude'],
+      ['/usr/local/bin/claude', '--model', 'x'],
+      ['npx', '-y', '@anthropic-ai/claude-code@2.1.319'],
+      ['sh', '-c', 'exec claude'],
+      ['sh', '-c', 'claude;'],
+      ['/x/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude'],
+      ['node', '/x/node_modules/@anthropic-ai/claude-code/cli.js'],
+    ]) {
+      const config = {
+        tiers: { worker: { adapter: 'pty:mine' } },
+        agents: { mine: { kind: 'pty' as const, command } },
+      };
+      expect(() => buildWorkerAdapters(config, { baseEnv: {} }), command.join(' ')).toThrow(
+        /agents\.mine runs Claude Code; use pty:claude/,
+      );
+    }
+    // Other CLIs, names that only contain the word, and the word as an argument, still build.
+    for (const command of [
+      ['aider'],
+      ['codex'],
+      ['claude-helper'],
+      ['my-claude'],
+      ['gemini'],
+      ['aider', '--model', 'claude'],
+      ['opencode', '--config', '/home/me/.config/claude'],
+    ]) {
+      const built = buildWorkerAdapters(
+        { tiers: { worker: { adapter: 'pty:mine' } }, agents: { mine: { kind: 'pty', command } } },
+        { baseEnv: {} },
+      );
+      expect(Object.keys(built)).toEqual(['pty:mine']);
+    }
+  });
+
+  it('refuses a custom preset running claude-agent-acp for Workers: the built-in is hardened (#214)', () => {
+    for (const command of [
+      ['claude-agent-acp'],
+      ['/opt/bin/claude-agent-acp', '--x'],
+      ['npx', '-y', '@agentclientprotocol/claude-agent-acp@0.101.0'],
+      ['sh', '-c', 'exec claude-agent-acp'],
+      ['node', '/x/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js'],
+      ['npx', '@zed-industries/claude-code-acp'],
+      ['claude-code-acp'],
+      ['sh', '-c', 'claude-agent-acp;'],
+      ['sh', '-c', '"claude-agent-acp"'],
+    ]) {
+      expect(() =>
+        buildWorkerAdapters(
+          {
+            tiers: { worker: { adapter: 'acp:mine' } },
+            agents: { mine: { kind: 'acp', command } },
+          },
+          { baseEnv: {} },
+        ),
+      ).toThrow(/agents\.mine runs claude-agent-acp; use acp:claude-acp/);
+    }
+    // The built-in builds, with the Worker options: file tools, no shell, reads asked about.
+    const ok = buildWorkerAdapters(
+      { tiers: { worker: { adapter: 'acp:claude-acp' } } },
+      { baseEnv: {} },
+    );
+    expect(Object.keys(ok)).toEqual(['acp:claude-acp']);
+    const options = (
+      claudeAcpWorkerSpec(CLAUDE_ACP_AGENT).sessionMeta as {
+        claudeCode: { options: Record<string, unknown> };
+      }
+    ).claudeCode.options;
+    expect(options).toMatchObject({
+      settingSources: [],
+      settings: { permissions: { ask: ['Read', 'Glob', 'Grep'] } },
+      verbatimPrompts: true,
+      disallowedTools: ['Bash', 'PowerShell', 'Monitor'],
+    });
+    // A command that only mentions the name in passing is not refused.
+    expect(() =>
+      buildWorkerAdapters(
+        {
+          tiers: { worker: { adapter: 'acp:other' } },
+          agents: { other: { kind: 'acp', command: ['my-agent', '--note=claude-agent-acp-like'] } },
+        },
+        { baseEnv: {} },
+      ),
+    ).not.toThrow(/claude-agent-acp/);
   });
 
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {

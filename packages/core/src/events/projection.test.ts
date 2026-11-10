@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { EventEnvelope } from '../schema/envelope.js';
-import { project, tasksProjection } from './projection.js';
+import { project, tasksProjection, workspacesProjection } from './projection.js';
 
 const st = (id: string, dependsOn: string[] = []) => ({
   id,
@@ -94,5 +94,64 @@ describe('tasks projection: plans and results', () => {
     expect(state.tasks.p?.result).toBeUndefined();
     // The invalid plan and the mismatched result are skipped, not applied.
     expect(state.skipped).toHaveLength(2);
+  });
+});
+
+describe('workspaces projection (#126)', () => {
+  const commit = 'a'.repeat(40);
+  const ws = (n: number, type: string, data: unknown): EventEnvelope => ({
+    v: 1,
+    id: `01J00000000000000000000${String(n).padStart(3, '0')}`,
+    ts: `2026-11-10T12:00:0${n}.000Z`,
+    source: { kind: 'mini', id: 'mini' },
+    type,
+    data,
+  });
+  const events = [
+    ws(1, 'workspace.created', {
+      workspaceId: 'w-1',
+      workerId: 's-1',
+      baseCommit: commit,
+      baseBranch: 'main',
+      extra: 1,
+    }),
+    ws(2, 'workspace.created', {
+      workspaceId: 'w-2',
+      workerId: 's-2',
+      baseCommit: commit,
+      migrated: true,
+    }),
+    ws(3, 'workspace.removed', { workspaceId: 'w-1', reason: 'gone' }),
+    // A late duplicate never brings a removed workspace back; malformed ones are skipped.
+    ws(4, 'workspace.created', { workspaceId: 'w-1', workerId: 's-1', baseCommit: commit }),
+    ws(5, 'workspace.created', { workspaceId: 'w-3', workerId: 's-3', baseCommit: 'nope' }),
+    ws(6, 'workspace.removed', { workspaceId: 'w-2', reason: 'something new' }),
+    ws(7, 'workspace.created', { workspaceId: 'w-4', workerId: 's-4', baseCommit: commit }),
+  ];
+
+  it('keeps the created and not removed, deterministically', () => {
+    const state = project(workspacesProjection, events);
+    expect(state).toEqual(project(workspacesProjection, events));
+    expect(state.live).toEqual({
+      'w-4': {
+        workspaceId: 'w-4',
+        workerId: 's-4',
+        baseCommit: commit,
+        createdAt: '2026-11-10T12:00:07.000Z',
+      },
+    });
+    expect(Object.keys(state.removed).sort()).toEqual(['w-1', 'w-2']);
+  });
+
+  it('records the base, branch and migration of a live workspace, never a path', () => {
+    const state = project(workspacesProjection, events.slice(0, 2));
+    expect(state.live['w-1']).toEqual({
+      workspaceId: 'w-1',
+      workerId: 's-1',
+      baseCommit: commit,
+      baseBranch: 'main',
+      createdAt: '2026-11-10T12:00:01.000Z',
+    });
+    expect(state.live['w-2']?.migrated).toBe(true);
   });
 });

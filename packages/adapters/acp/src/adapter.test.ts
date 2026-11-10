@@ -8,12 +8,14 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  utimesSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { AgentEvent } from '@tacet/core';
-import { ProfileRefusedError } from '@tacet/core';
-import { mcpAuthHeaders, Secret } from '@tacet/core/node';
+import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
+import { mcpAuthHeaders, repoStateDir, Secret } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AcpAdapter, AuthRoutingError } from './adapter.js';
@@ -553,6 +555,203 @@ describe('AcpAdapter (fake ACP agent)', () => {
       await expect(
         gemini().start({ cwd: join(root, 'wt'), resume: { vendorSessionId: 'x' } }),
       ).rejects.toThrow(/neither session\/resume nor session\/load/);
+    });
+
+    describe('fork (#146)', () => {
+      // As a built-in spec declares it: custom agents may not declare fork.
+      const forking = (fork: 'native' | 'none'): AcpAgentSpec => {
+        const base = customAcpAgent('forker', { command: ['forker'] });
+        return { ...base, capabilities: { ...base.capabilities, resume: true, fork } };
+      };
+      const fork = { vendorSessionId: 'src-1', fork: true };
+
+      it('forks by session/fork when the spec declares it and the agent advertises it', async () => {
+        const adapter = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+        });
+        expect(adapter.capabilities().fork).toBe('native');
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork });
+        expect(h.vendorSessionId).toBe('src-1-fork');
+        const sent = methods().find((m) => m.method === 'session/fork');
+        expect(sent?.params).toMatchObject({ sessionId: 'src-1', cwd: join(root, 'wt') });
+        expect(methods().map((m) => m.method)).not.toContain('session/resume');
+        await adapter.close(h);
+      });
+
+      it('gives a fork the same MCP servers, _meta and mode pin as a new session (#181, #145)', async () => {
+        const meta = { claudeCode: { options: { settingSources: [] } } };
+        const spec: AcpAgentSpec = { ...forking('native'), sessionMeta: meta, sessionMode: 'ask' };
+        const adapter = make(spec, {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_SESSION: JSON.stringify({
+            modes: {
+              currentModeId: 'auto',
+              availableModes: [
+                { id: 'ask', name: 'Ask' },
+                { id: 'auto', name: 'Auto' },
+              ],
+            },
+          }),
+        });
+        const mcp = { name: 'tacet', url: 'http://127.0.0.1:1/mcp', headers: { 'x-t': 'v' } };
+        const h = await adapter.start({ cwd: join(root, 'wt'), resume: fork, mcpServers: [mcp] });
+        await adapter.close(h);
+        expect(methods().find((m) => m.method === 'session/fork')?.params).toMatchObject({
+          mcpServers: [
+            { type: 'http', name: 'tacet', url: mcp.url, headers: [{ name: 'x-t', value: 'v' }] },
+          ],
+          _meta: meta,
+        });
+        expect(methods().find((m) => m.method === 'session/set_mode')?.params).toEqual({
+          sessionId: 'src-1-fork',
+          modeId: 'ask',
+        });
+      });
+
+      it('refuses a fork the agent did not advertise, or the spec did not declare', async () => {
+        // An agent with a child that ignores SIGTERM: the refusal leaves none of it running.
+        const quiet = make(
+          forking('native'),
+          { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }), FAKE_CHILD: '1' },
+          { killTimeoutMs: 300 },
+        );
+        // Typed, so a caller can fall back to a HandoffPacket (#228); not "failed to start".
+        const refused = await quiet.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        const child = received()
+          .map((l) => (l as { childPid?: number }).childPid)
+          .find((p) => p !== undefined);
+        const alive = child !== undefined && running(child);
+        if (alive) process.kill(child, 'SIGKILL');
+        expect(child).toBeTypeOf('number');
+        expect(alive).toBe(false);
+        expect(refused).toBeInstanceOf(ForkRefusedError);
+        expect(refused).toMatchObject({ adapterId: 'acp:forker' });
+        expect((refused as Error).message).toMatch(/did not advertise session\/fork/);
+        expect((refused as Error).message).not.toMatch(/failed to start/);
+        const undeclared = make(forking('none'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+        });
+        await expect(undeclared.start({ cwd: join(root, 'wt'), resume: fork })).rejects.toThrow(
+          ForkRefusedError,
+        );
+        // Gemini declares no fork: refused before anything starts, as before.
+        const before = methods().length;
+        const declined = await gemini()
+          .start({ cwd: join(root, 'wt'), resume: fork })
+          .catch((e) => e);
+        expect(declined).toBeInstanceOf(ForkRefusedError);
+        expect((declined as Error).message).toMatch(/does not fork sessions/);
+        expect(methods()).toHaveLength(before);
+        expect(methods().map((m) => m.method)).not.toContain('session/fork');
+      });
+
+      it('refuses a fork answered without a new session id', async () => {
+        const adapter = make(forking('native'), {
+          FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {}, fork: {} } }),
+          FAKE_FORK_ID: 'same',
+        });
+        // The agent forked, badly: a start failure, not a refusal to fall back from.
+        const err = await adapter.start({ cwd: join(root, 'wt'), resume: fork }).catch((e) => e);
+        expect((err as Error).message).toMatch(/without a new session id/);
+        expect(err).not.toBeInstanceOf(ForkRefusedError);
+      });
+
+      it('never declares fork without resume, nor an emulated one', () => {
+        const base = customAcpAgent('x', { command: ['x'] });
+        const spec = (resume: boolean, fork: 'native' | 'emulated'): AcpAgentSpec => ({
+          ...base,
+          capabilities: { ...base.capabilities, resume, fork },
+        });
+        expect(() => make(spec(false, 'native'))).toThrow(/fork 'native' needs resume/);
+        expect(() => make(spec(true, 'emulated'))).toThrow(/not offered over ACP/);
+      });
+    });
+  });
+
+  describe('discard (#232)', () => {
+    // A spec with a home and the claude-acp layout, on the fake agent (sessions `fake-session-1`).
+    const homed = (): AcpAgentSpec => {
+      const base = customAcpAgent('homed', { command: ['homed'] });
+      return {
+        ...base,
+        capabilities: { ...base.capabilities, resume: true },
+        home: { env: 'HOMED_HOME', files: {} },
+        sessionFiles: CLAUDE_ACP_AGENT.sessionFiles as readonly string[],
+      };
+    };
+    const homeOf = (state: string) => join(repoStateDir(join(root, 'repo'), state), 'acp-homed');
+    const put = (dir: string, rel: string) => {
+      mkdirSync(dirname(join(dir, rel)), { recursive: true });
+      writeFileSync(join(dir, rel), 'transcript');
+    };
+
+    it("removes a closed session's files from the agent's home, refusing an open one", async () => {
+      const state = join(root, 'state');
+      const adapter = make(homed(), {}, { stateDir: state, repoRoot: join(root, 'repo') });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      expect(h.vendorSessionId).toBe('fake-session-1');
+      const home = homeOf(state);
+      put(home, 'projects/-wt/fake-session-1.jsonl');
+      put(home, 'file-history/fake-session-1/f@v1');
+      put(home, 'projects/-wt/other-session.jsonl');
+      await expect(adapter.discard('fake-session-1', join(root, 'wt'))).rejects.toThrow(
+        /still open/,
+      );
+      expect(existsSync(join(home, 'projects/-wt/fake-session-1.jsonl'))).toBe(true);
+      await adapter.close(h);
+      await adapter.discard('fake-session-1', join(root, 'wt'));
+      expect(existsSync(join(home, 'projects/-wt/fake-session-1.jsonl'))).toBe(false);
+      expect(existsSync(join(home, 'file-history/fake-session-1'))).toBe(false);
+      expect(existsSync(join(home, 'projects/-wt/other-session.jsonl'))).toBe(true);
+      // The cwd may be gone; the home is found by the repo, and a bad id is refused.
+      await adapter.discard('other-session', join(root, 'gone'));
+      expect(existsSync(join(home, 'projects/-wt/other-session.jsonl'))).toBe(false);
+      await expect(adapter.discard('../x', join(root, 'wt'))).rejects.toThrow(/not a session id/);
+    });
+
+    it('never makes a home just to discard, and keeps sessions of agents without a layout', async () => {
+      const state = join(root, 'state');
+      await make(homed(), {}, { stateDir: state, repoRoot: join(root, 'repo') }).discard(
+        'fake-session-1',
+        join(root, 'wt'),
+      );
+      expect(existsSync(homeOf(state))).toBe(false);
+      const { sessionFiles, ...bare } = homed();
+      expect(sessionFiles).toBeDefined();
+      mkdirSync(homeOf(state), { recursive: true, mode: 0o700 });
+      put(homeOf(state), 'projects/-wt/s1.jsonl');
+      await make(bare, {}, { stateDir: state, repoRoot: join(root, 'repo') }).discard(
+        's1',
+        join(root, 'wt'),
+      );
+      expect(existsSync(join(homeOf(state), 'projects/-wt/s1.jsonl'))).toBe(true);
+    });
+
+    it('sweeps sessions older than the retention when it first prepares the home, never the one resumed', async () => {
+      const state = join(root, 'state');
+      const home = homeOf(state);
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const old = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+      for (const id of ['old-1', 'resumed-1', 'new-1']) {
+        put(home, `projects/-wt/${id}.jsonl`);
+        if (id !== 'new-1') utimesSync(join(home, `projects/-wt/${id}.jsonl`), old, old);
+      }
+      const adapter = make(
+        homed(),
+        { FAKE_CAPS: JSON.stringify({ sessionCapabilities: { resume: {} } }) },
+        { stateDir: state, repoRoot: join(root, 'repo'), retentionDays: 7 },
+      );
+      const starting = adapter.start({
+        cwd: join(root, 'wt'),
+        resume: { vendorSessionId: 'resumed-1' },
+      });
+      // Claimed before its first await: a discard meanwhile is refused.
+      await expect(adapter.discard('resumed-1', join(root, 'wt'))).rejects.toThrow(/still open/);
+      const h = await starting;
+      expect(existsSync(join(home, 'projects/-wt/old-1.jsonl'))).toBe(false);
+      expect(existsSync(join(home, 'projects/-wt/resumed-1.jsonl'))).toBe(true);
+      expect(existsSync(join(home, 'projects/-wt/new-1.jsonl'))).toBe(true);
+      await adapter.close(h);
     });
   });
 

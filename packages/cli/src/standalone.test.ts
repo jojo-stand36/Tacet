@@ -1,9 +1,25 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { newUlid } from '@tacet/core';
-import { openEventStore, repoStatePaths, workerGitEnv, workerWorktree } from '@tacet/core/node';
+import {
+  miniRuntimePath,
+  openEventStore,
+  repoStatePaths,
+  workerGitEnv,
+  workerWorktree,
+} from '@tacet/core/node';
 import { type Script, ScriptedAdapter } from '@tacet/mini/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Io } from './io.js';
@@ -35,11 +51,16 @@ describe('tacet standalone (#21)', () => {
   };
 
   let script: (cwd: string, input: string) => Script | undefined;
-  const fake = () =>
-    new ScriptedAdapter(
+  /** Every scripted adapter made, to check what the Workers were started with. */
+  const made: ScriptedAdapter[] = [];
+  const fake = () => {
+    const a = new ScriptedAdapter(
       'claude-sdk',
       (input, s) => script(s.opts.cwd, input) ?? { do: 'reply', text: 'done' },
     );
+    made.push(a);
+    return a;
+  };
 
   const tacet = async (argv: string[], more: Partial<Io> = {}) => {
     const out: string[] = [];
@@ -117,7 +138,13 @@ describe('tacet standalone (#21)', () => {
     expect(status.tasks).toMatchObject([
       { id, state: 'completed', subtasks: [{ id: `${id}/1`, state: 'completed' }] },
     ]);
-    expect((await tacet(['status', ...user()])).out).toContain('Mini-conductor not running');
+    // The branch the task targets, pinned when it started (#219).
+    const branch = git(repo, ['symbolic-ref', '--short', 'HEAD']);
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    expect((status.tasks[0] as { target?: unknown }).target).toEqual({ branch, commit: head });
+    const text = (await tacet(['status', ...user()])).out;
+    expect(text).toContain('Mini-conductor not running');
+    expect(text).toContain(`targets ${branch} (started at ${head.slice(0, 12)})`);
 
     const l = await tacet(['logs', ...user(), id]);
     expect(l.code).toBe(0);
@@ -403,12 +430,217 @@ describe('tacet standalone (#21)', () => {
     expect(await escalations()).toEqual([]);
   });
 
+  describe("the live run's control port (#201)", () => {
+    const runtimeFile = () => miniRuntimePath(repo, join(root, 'home', '.tacet', 'run'));
+    type Status = {
+      running: number | null;
+      source: string;
+      tasks: { id: string; state: string; escalations: { id: string; taskId: string }[] }[];
+    };
+    const status = async () =>
+      JSON.parse((await tacet(['status', ...user(), '--json'])).out) as Status;
+
+    it('answers status and takes an answer while the run waits, writing the log from the run only', async () => {
+      const paths = repoStatePaths(repo, state);
+      let escId = '';
+      script = (cwd, input) => {
+        if (input.includes('Answer to your escalation')) {
+          commit(cwd, `${input.split(': ').at(-1)}\n`);
+          return undefined;
+        }
+        escId = raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      const seen: { live?: Status; human?: string; wrong?: number; answer?: number } = {};
+      const r = await tacet(['run', ...user(), 'pick a database'], {
+        prompt: async () => {
+          seen.live = await status();
+          seen.human = (await tacet(['status', ...user()])).out;
+          seen.wrong = (await tacet(['answer', ...user(), '01JCX5Z9Q4W8E7R6T5Y4V3K2M9', 'x'])).code;
+          seen.answer = (await tacet(['answer', ...user(), escId, 'Postgres'])).code;
+          // Left on the terminal: it was answered over the port meanwhile.
+          return '';
+        },
+      });
+      expect(seen.live?.source).toBe('run');
+      expect(seen.live?.running).toBe(process.pid);
+      expect(seen.live?.tasks[0]?.escalations.map((x) => x.id)).toEqual([escId]);
+      expect(seen.human).toContain(`escalation ${escId}`);
+      expect(seen.human).not.toContain('read from the log');
+      expect(seen.wrong).toBe(1);
+      expect(seen.answer).toBe(0);
+      // The run carried on with the answer given over the port, and finished.
+      expect(r.code).toBe(0);
+      const id = /task (\S+) submitted/.exec(r.err)?.[1] as string;
+      const branch = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/tacet/'])
+        .split('\n')
+        .find((b) => b.includes(id)) as string;
+      expect(git(repo, ['show', `${branch}:work.txt`])).toBe('Postgres');
+      // Answered once, by the user, as the run recorded it.
+      const store = openEventStore(paths.events);
+      const resolved = store
+        .query({ typePrefix: 'escalation.resolved' })
+        .map((e) => e.envelope.data);
+      store.close();
+      expect(resolved).toEqual([expect.objectContaining({ escalationId: escId, source: 'user' })]);
+      // The port is gone with the run: status reads the log again.
+      expect(existsSync(runtimeFile())).toBe(false);
+      expect(await status()).toMatchObject({ running: null, source: 'log' });
+      expect((await tacet(['answer', ...user(), escId, 'again'])).code).toBe(1);
+    });
+
+    it('cancels a task in the live run', async () => {
+      const paths = repoStatePaths(repo, state);
+      script = () => {
+        raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      let canceled: { code: number; out: string } | undefined;
+      let id = '';
+      const r = await tacet(['run', ...user(), 'pick a database'], {
+        prompt: async () => {
+          id = (await status()).tasks[0]?.id as string;
+          canceled = await tacet(['cancel', ...user(), id]);
+          return '';
+        },
+      });
+      expect(canceled?.code).toBe(0);
+      expect(canceled?.out).toContain(`${id} canceled`);
+      expect(canceled?.out).toContain(`${id}/1 canceled`);
+      expect(r.code).not.toBe(3);
+      expect((await status()).tasks[0]?.state).toBe('canceled');
+    });
+
+    it("keeps the port's token in its 0600 runtime file only, new for every run", async () => {
+      const paths = repoStatePaths(repo, state);
+      script = () => {
+        raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      const tokens: string[] = [];
+      const outputs: string[] = [];
+      const runOnce = async () => {
+        const r = await tacet(['run', ...user(), 'pick a database'], {
+          prompt: async () => {
+            const file = runtimeFile();
+            expect(statSync(file).mode & 0o777).toBe(0o600);
+            expect(statSync(join(file, '..')).mode & 0o777).toBe(0o700);
+            expect(statSync(join(file, '..', '..')).mode & 0o777).toBe(0o700);
+            tokens.push((JSON.parse(readFileSync(file, 'utf8')) as { token: string }).token);
+            for (const argv of [
+              ['status', '--json'],
+              ['status'],
+              ['logs', '--transcript', '--json'],
+            ]) {
+              const out = await tacet([
+                ...argv.slice(0, 1),
+                ...user(),
+                ...argv.slice(1),
+                ...(argv[0] === 'logs' ? [(await status()).tasks[0]?.id as string] : []),
+              ]);
+              outputs.push(out.out, out.err);
+            }
+            return '';
+          },
+        });
+        outputs.push(r.out, r.err);
+      };
+      await runOnce();
+      await tacet(['cancel', ...user(), (await status()).tasks[0]?.id as string]);
+      await runOnce();
+      expect(tokens).toHaveLength(2);
+      expect(tokens[0]).not.toBe(tokens[1]);
+      expect(tokens[0]).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      // In no output, no event of the log, nothing a Worker was started with.
+      const store = openEventStore(paths.events);
+      const log = JSON.stringify(store.query({}).map((e) => e.envelope));
+      store.close();
+      const workers = JSON.stringify(made.flatMap((a) => a.sessions.map((x) => x.opts)));
+      for (const token of tokens) {
+        expect(outputs.join('\n')).not.toContain(token);
+        expect(log).not.toContain(token);
+        expect(workers).not.toContain(token);
+      }
+    });
+
+    it('uses the port only when the runtime file names the run holding the lock', async () => {
+      const paths = repoStatePaths(repo, state);
+      script = () => {
+        raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      const sources: Record<string, string> = {};
+      const notes: string[] = [];
+      await tacet(['run', ...user(), 'pick a database'], {
+        prompt: async () => {
+          const file = runtimeFile();
+          const real = readFileSync(file, 'utf8');
+          sources.real = (await status()).source;
+          // The live port and token, but another process's pid: not the lock holder.
+          writeFileSync(file, JSON.stringify({ ...JSON.parse(real), pid: process.pid + 100_000 }), {
+            mode: 0o600,
+          });
+          sources.otherPid = (await status()).source;
+          // Readable by others: refused, with a note.
+          writeFileSync(file, real, { mode: 0o600 });
+          chmodSync(file, 0o644);
+          const loose = await tacet(['status', ...user(), '--json']);
+          sources.loose = (JSON.parse(loose.out) as Status).source;
+          notes.push(loose.err);
+          chmodSync(file, 0o600);
+          sources.restored = (await status()).source;
+          return '';
+        },
+      });
+      expect(sources).toEqual({ real: 'run', otherPid: 'log', loose: 'log', restored: 'run' });
+      expect(notes[0]).toContain('expected 600');
+    });
+
+    it('stops cleanly and leaves no file when the port cannot be set up', async () => {
+      script = () => ({ do: 'reply', text: 'done' });
+      // Where the run directory should be, a file: the runtime file cannot be written.
+      mkdirSync(join(root, 'home', '.tacet'), { recursive: true });
+      writeFileSync(join(root, 'home', '.tacet', 'run'), '');
+      const r = await tacet(['run', ...user(), 'a task']);
+      expect(r.code).toBe(1);
+      // The Mini-conductor was stopped: its lock is free and a new run can start.
+      expect(await status()).toMatchObject({ running: null });
+      rmSync(join(root, 'home', '.tacet', 'run'));
+      expect((await tacet(['run', ...user(), '--resume'])).code).not.toBe(1);
+    });
+
+    it('falls back to the log when the runtime file is stale or broken', async () => {
+      const paths = repoStatePaths(repo, state);
+      script = () => {
+        raise(paths.events, 'Which database?');
+        return { do: 'reply', text: 'waiting' };
+      };
+      expect((await tacet(['run', ...user(), 'pick a database'])).code).toBe(3);
+      // A crashed run's file: its pid holds no lock.
+      mkdirSync(join(runtimeFile(), '..'), { recursive: true, mode: 0o700 });
+      writeFileSync(
+        runtimeFile(),
+        JSON.stringify({
+          pid: 999999,
+          port: 1,
+          token: 'stale-token-0000000000000000000000000000000',
+          protocolVersions: [1],
+          startedAt: new Date().toISOString(),
+        }),
+        { mode: 0o600 },
+      );
+      expect(await status()).toMatchObject({ running: null, source: 'log' });
+      expect((await tacet(['answer', ...user(), 'x', 'y'])).code).toBe(1);
+    });
+  });
+
   it('says so when the repo has no Tacet state, and refuses usage errors', async () => {
     expect((await tacet(['status', ...user()])).out).toContain('no Tacet state');
     expect((await tacet(['logs', ...user(), 'x'])).code).toBe(1);
     expect((await tacet(['run', ...user()])).code).toBe(2);
     expect((await tacet(['run', ...user(), '--resume', 'task'])).code).toBe(2);
     expect((await tacet(['attach', ...user()])).code).toBe(2);
+    expect((await tacet(['answer', ...user(), 'only-an-id'])).code).toBe(2);
     // A config that cannot run Workers is reported, and leaves no lock behind.
     writeFileSync(
       join(repo, '.tacet', 'tacet.yaml'),

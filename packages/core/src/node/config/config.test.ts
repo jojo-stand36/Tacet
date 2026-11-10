@@ -132,6 +132,7 @@ describe('loadConfig', () => {
       stuck_after_s: 300,
       nudge_grace_s: 900,
       max_attempts: 3,
+      max_handoffs: 3,
       verify_timeout_s: 600,
       verify_fix_attempts: 2,
     });
@@ -145,6 +146,8 @@ describe('loadConfig', () => {
       max_attempts: 3,
     });
     write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max: 0, maximum: 3 }\n');
+    expect(() => loadConfig({ userDir, repoRoot })).toThrow(ConfigError);
+    write(join(repoRoot, '.tacet', 'tacet.yaml'), 'workers: { max_handoffs: 0 }\n');
     expect(() => loadConfig({ userDir, repoRoot })).toThrow(ConfigError);
     // A typo in an adapter id is an error, not a silent no-op.
     write(
@@ -230,7 +233,10 @@ describe('loadConfig', () => {
   });
 
   it('turns merged-worktree cleanup on by default, lets the repo or local layer set it, never a task (#210)', () => {
-    expect(loadConfig({ userDir, repoRoot }).config.worktrees).toEqual({ remove_merged: true });
+    expect(loadConfig({ userDir, repoRoot }).config.worktrees).toEqual({
+      remove_merged: true,
+      idle_days: 7,
+    });
     write(join(repoRoot, '.tacet', 'tacet.yaml'), 'worktrees: { remove_merged: false }\n');
     expect(loadConfig({ userDir, repoRoot }).config.worktrees?.remove_merged).toBe(false);
     write(join(repoRoot, '.tacet', 'local.yaml'), 'worktrees: { remove_merged: true }\n');

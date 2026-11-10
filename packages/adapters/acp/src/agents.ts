@@ -38,7 +38,8 @@ export interface AcpAgentSpec {
   /**
    * What this agent supports through this adapter. Declared, not negotiated: a declared resume
    * still fails at start if the agent's `initialize` offers neither `session/resume` nor
-   * `session/load`.
+   * `session/load`, and a declared `fork: 'native'` (which needs `resume`) is only attempted when
+   * the agent's `initialize` advertises `sessionCapabilities.fork` (unstable ACP, #146).
    */
   capabilities: AdapterCapabilities;
   /** Version the spec was verified against, for the capability matrix. */
@@ -49,6 +50,14 @@ export interface AcpAgentSpec {
    * written there before every session. Used to give the agent settings without the user's.
    */
   home?: { env: string; files: Readonly<Record<string, string>> };
+  /**
+   * Where in `home` the agent keeps a session's own files (#232): paths relative to it, `/`
+   * separated, where `{id}` is the session id and `*` any run of characters within one segment.
+   * The first pattern names the session's transcript. `discard()` removes them all once the
+   * session will never be resumed, and sessions untouched for `retentionDays` are swept. Without
+   * it the agent's sessions are kept.
+   */
+  sessionFiles?: readonly string[];
   /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
   envDeny?: readonly string[];
   /**
@@ -61,7 +70,7 @@ export interface AcpAgentSpec {
    */
   sessionMode?: string;
   /**
-   * `_meta` sent with `session/new`, `session/load` and `session/resume`, for agent-specific
+   * `_meta` sent with `session/new`, `session/load`, `session/resume` and `session/fork`, for agent-specific
    * session options (e.g. claude-agent-acp's `claudeCode.options`, #181).
    */
   sessionMeta?: Readonly<Record<string, unknown>>;
@@ -159,9 +168,22 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   envAllow: { prefixes: ['ANTHROPIC_', 'CLAUDE_'] },
   apiKeyEnv: ['ANTHROPIC_API_KEY'],
   apiKeyAuthMethods: [],
-  capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  // Resume (`session/resume`, its transcripts in the repo's CLAUDE_CONFIG_DIR) and fork (unstable
+  // `session/fork`) keep the Worker restrictions: verified live on 0.101.0 (#224).
+  capabilities: {
+    ...ACP_BASE,
+    resume: true,
+    fork: 'native',
+    usage: { live: true, context: true, cost: 'none' },
+  },
   verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
   home: { env: 'CLAUDE_CONFIG_DIR', files: {} },
+  // A session's own files in its config dir (#232), read from the Agent SDK 0.3.318 binary that
+  // claude-agent-acp 0.101.0 pins: the transcript `projects/<encoded cwd>/<id>.jsonl` (seen live),
+  // its subagent and tool-result directory `projects/<encoded cwd>/<id>/`, and the per-session
+  // `file-history/<id>/` and `debug/<id>.txt`. The project directory is matched, not computed:
+  // its encoding of the cwd is Claude Code's own.
+  sessionFiles: ['projects/*/{id}.jsonl', 'projects/*/{id}', 'file-history/{id}', 'debug/{id}.txt'],
   // Never a subscription or gateway token, whatever the user passes through (#145).
   envDeny: ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
   // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`
@@ -176,12 +198,20 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
 /**
  * claude-agent-acp session options for an unattended Worker (#206), merged into
  * `_meta.claudeCode.options` (passed to the SDK's `query()`, 0.101.0 `acp-agent.js`): the file
- * tools only and no shell. Not `Glob` or `Grep`: the SDK runs them without asking, and over ACP
- * there is no hook to ask with. Verified against the mock API by the vendor conformance test.
+ * tools only, no shell, every read and search asked about (an ask rule, #214), and prompts taken
+ * verbatim, so an `@path` in text the Worker wrote (a `verify` command's output, say) is not read
+ * into the prompt unasked (`verbatimPrompts`, SDK 0.3.318). Verified against the mock API by the
+ * vendor conformance test.
  */
 export const CLAUDE_ACP_WORKER_OPTIONS = {
-  tools: ['Read', 'Write', 'Edit', 'NotebookEdit'],
+  tools: ['Read', 'Write', 'Edit', 'NotebookEdit', 'Glob', 'Grep'],
   disallowedTools: ['Bash', 'PowerShell', 'Monitor'],
+  // Ask rules come before a tool's own approval of a read inside its working directory, so every
+  // read and search reaches `canUseTool`, which claude-agent-acp turns into
+  // `session/request_permission` (#214). Inline: the flag layer, which `settingSources: []` does
+  // not drop; never a path, which would resolve inside the Worker's checkout.
+  settings: { permissions: { ask: ['Read', 'Glob', 'Grep'] } },
+  verbatimPrompts: true,
 } as const;
 
 /** `spec` with `CLAUDE_ACP_WORKER_OPTIONS` merged into its `_meta.claudeCode.options`. */
@@ -197,6 +227,10 @@ export function claudeAcpWorkerSpec(spec: AcpAgentSpec): AcpAgentSpec {
           ...meta.claudeCode?.options,
           tools: [...CLAUDE_ACP_WORKER_OPTIONS.tools],
           disallowedTools: [...CLAUDE_ACP_WORKER_OPTIONS.disallowedTools],
+          settings: {
+            permissions: { ask: [...CLAUDE_ACP_WORKER_OPTIONS.settings.permissions.ask] },
+          },
+          verbatimPrompts: CLAUDE_ACP_WORKER_OPTIONS.verbatimPrompts,
         },
       },
     },
@@ -280,7 +314,8 @@ export interface CustomAcpAgentConfig {
   apiKeyAuthMethods?: string[];
   /**
    * Declared support beyond the ACP baseline. Only what this adapter can deliver for any agent:
-   * resume (by `session/resume` or `session/load`) and usage reporting.
+   * resume (by `session/resume` or `session/load`) and usage reporting. Fork is declared only by
+   * a built-in spec whose agent's fork was verified (#146).
    */
   capabilities?: Partial<Pick<AdapterCapabilities, 'resume' | 'usage'>>;
 }

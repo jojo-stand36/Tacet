@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
@@ -17,6 +25,7 @@ import {
   type TaskInput,
   TaskPlan,
   type TaskState,
+  TaskTarget,
   type TaskView,
   type TierConfig,
   tasksProjection,
@@ -49,7 +58,13 @@ import {
   workerRefusal,
 } from './ports.js';
 import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
-import { RESUME_PROMPT, safePrompt, WORKER_SYSTEM_PROMPT, workerPrompt } from './prompts.js';
+import {
+  HANDOFF_NOTE,
+  RESUME_PROMPT,
+  safePrompt,
+  WORKER_SYSTEM_PROMPT,
+  workerPrompt,
+} from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
 import { decideToolRequest } from './tool-policy.js';
 
@@ -106,6 +121,8 @@ interface SessionRecord {
   baseCommit?: string;
   /** The local branch its checkout started from, when it did: its task's target (#210). */
   baseBranch?: string;
+  /** Its newest `worker.*` event (ms since the epoch): when its checkout was last used (#238). */
+  activeAt?: number;
 }
 
 interface EscalationRecord {
@@ -133,6 +150,13 @@ interface View {
   progress: Map<string, string>;
   /** When each Worker session last reported progress (ms), for the heartbeat. */
   progressAt: Map<string, number>;
+  /**
+   * Per sub-task, the latest handoff not yet taken up by a successor (#129): requested by
+   * `sessionId`, with no `handoff.accepted` after it.
+   */
+  pendingHandoffs: Map<string, { handoffId: string; sessionId: string }>;
+  /** Handoffs requested per sub-task, for `workers.max_handoffs`. */
+  handoffCount: Map<string, number>;
 }
 
 interface Run {
@@ -222,6 +246,8 @@ const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'cancel
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
 const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
+/** Handoffs one sub-task may request when `workers.max_handoffs` is not set (#129). */
+const DEFAULT_MAX_HANDOFFS = 3;
 
 /**
  * The Mini-conductor's core loop (#17): accept a task, plan it into sub-tasks, schedule them
@@ -249,6 +275,8 @@ export class MiniConductor {
   readonly #sweepErrors = new Set<string>();
   /** Checkouts whose session is ending: closed and discarded, but maybe not yet gone (#210). */
   readonly #closing = new Set<string>();
+  /** Finished tasks whose pin ref this process has deleted, or found none for (#247). */
+  readonly #unpinned = new Set<string>();
   #abort = new AbortController();
   /** Bumped by start and stop; work started under an older generation drops its result. */
   #gen = 0;
@@ -300,6 +328,8 @@ export class MiniConductor {
       this.#unlock();
       throw err;
     }
+    // Under the lock, before a checkout is looked up: the registry catches up with the disk.
+    await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#errors.push(err));
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -309,11 +339,13 @@ export class MiniConductor {
     const ended: EventEnvelope[] = [];
     for (const s of v.sessions.values()) {
       if (s.ended === undefined) {
+        // One that had handed off is never resumed: its successor starts from the packet (#129).
+        const handedOff = v.pendingHandoffs.get(s.taskId)?.sessionId === s.sessionId;
         ended.push(
           this.#env(
             s.taskId,
             'worker.ended',
-            { sessionId: s.sessionId, reason: 'restart' },
+            { sessionId: s.sessionId, reason: handedOff ? 'handoff' : 'restart' },
             s.sessionId,
           ),
         );
@@ -355,6 +387,37 @@ export class MiniConductor {
     const view = this.#state().tasks[id];
     if (view) this.#plan(view.task);
     return id;
+  }
+
+  /**
+   * Why the Worker session `sessionId` may not hand off now, or undefined if it may (#129). Asked
+   * by the MCP backend before it records a `request_handoff`, so a refused one leaves no packet:
+   * a session that is not running here, one whose turn is being verified or integrated, a task
+   * that has ended, or a sub-task past `workers.max_handoffs`.
+   */
+  handoffRefusal(sessionId: string): string | undefined {
+    const run = [...this.#runs.values()].find((r) => r.sessionId === sessionId);
+    if (!this.#started || !run) return 'this session is not running';
+    if (this.#ended(run.subtaskId)) return 'the task has ended';
+    if (run.settling) return 'your turn is being checked; wait for its result, then hand off';
+    const max = this.#o.config.workers?.max_handoffs ?? DEFAULT_MAX_HANDOFFS;
+    if ((this.#state().handoffCount.get(run.subtaskId) ?? 0) >= max) {
+      return `handoff limit reached (${max} for this sub-task): finish the sub-task or escalate`;
+    }
+    return undefined;
+  }
+
+  /**
+   * The Worker session `sessionId` handed off (#129, ARCHITECTURE.md §2.3): it is ended
+   * (`worker.ended`, `handoff`) at once, so its turn ending counts for nothing, and a successor
+   * starts in the same checkout, seeded from the packet (`read_task` returns it). The session
+   * that handed off is never resumed. Called by the MCP backend after it recorded the packet.
+   */
+  handoff(sessionId: string): void {
+    const run = [...this.#runs.values()].find((r) => r.sessionId === sessionId);
+    if (!run) return;
+    // `#end` takes the run off before its first await, so nothing of its turn is used.
+    this.#track(this.#end(run, 'handoff', 'handed off to a new session').then(() => this.#kick()));
   }
 
   /**
@@ -498,8 +561,14 @@ export class MiniConductor {
     this.#track(
       (async () => {
         try {
+          if (this.#o.workspaces.head && !this.#target(task.id)) {
+            await this.#pinTarget(task.id, dropped);
+            if (dropped()) return;
+          }
+          const base = this.#target(task.id)?.commit;
           const proposal = await this.#o.planner.plan(task, {
             signal: AbortSignal.any([this.#abort.signal, abort.signal]),
+            ...(base !== undefined ? { base } : {}),
           });
           if (dropped()) return;
           const idOf = new Map(proposal.subtasks.map((s, i) => [s.key, `${task.id}/${i + 1}`]));
@@ -829,6 +898,60 @@ export class MiniConductor {
     }
   }
 
+  // ---- target (#219) --------------------------------------------------------------------
+
+  /**
+   * Record where a task starts and lands, once, before it is planned: the repo's checked-out branch
+   * and commit now. Sub-tasks without dependencies start from that commit, so the user switching
+   * branch mid-task moves none of them. Without `Workspaces.head` nothing is recorded and
+   * sub-tasks start where the main checkout is when they start, as before. If it fails, it throws,
+   * and planning fails with its message: no checkout could be made there either.
+   */
+  async #pinTarget(taskId: string, dropped: () => boolean): Promise<void> {
+    if (this.#target(taskId) || !this.#o.workspaces.head) return;
+    let head: { branch?: string; commit: string };
+    try {
+      head = await this.#o.workspaces.head();
+    } catch (err) {
+      throw new Error(`cannot tell which branch the task targets: ${(err as Error).message}`);
+    }
+    // Canceled, or the Mini-conductor stopped, meanwhile: nothing more is written for it.
+    if (dropped() || this.#target(taskId)) return;
+    const target = TaskTarget.safeParse(head);
+    if (!target.success) throw new Error('cannot tell which branch the task targets');
+    // The ref first (#236): git gc then never prunes the commit, even if the branch is rewritten.
+    try {
+      await this.#o.workspaces.pin?.(taskId, target.data.commit);
+    } catch (err) {
+      throw new Error(`cannot hold the task's target commit: ${(err as Error).message}`);
+    }
+    if (dropped() || this.#target(taskId)) {
+      // Not recorded, so nothing else would find this ref to delete it (#247).
+      if (!this.#target(taskId)) {
+        await this.#o.workspaces
+          .unpin?.([{ taskId, commit: target.data.commit }])
+          .catch((err: unknown) => this.#errors.push(err));
+      }
+      return;
+    }
+    this.#o.store.append(this.#env(taskId, 'task.target', target.data));
+  }
+
+  #target(taskId: string): TaskTarget | undefined {
+    const last = this.#o.store.query({ taskId, typePrefix: 'task.target' }).at(-1)?.envelope.data;
+    const parsed = TaskTarget.safeParse(last);
+    return parsed.success ? parsed.data : undefined;
+  }
+
+  #rootOf(taskId: string): string {
+    const tasks = this.#state().tasks;
+    let id = taskId;
+    for (let parent = tasks[id]?.task.parentId; parent; parent = tasks[id]?.task.parentId) {
+      id = parent;
+    }
+    return id;
+  }
+
   // ---- landed results (#210) ------------------------------------------------------------
 
   #sweep(): void {
@@ -837,9 +960,12 @@ export class MiniConductor {
     const gen = this.#gen;
     this.#sweepingGen = gen;
     this.#track(
-      this.#sweepLanded(gen).finally(() => {
-        if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
-      }),
+      this.#sweepLanded(gen)
+        .then(() => this.#sweepIdle(gen))
+        .then(() => this.#sweepPins(gen))
+        .finally(() => {
+          if (this.#sweepingGen === gen) this.#sweepingGen = undefined;
+        }),
     );
   }
 
@@ -880,12 +1006,18 @@ export class MiniConductor {
       for (const id of workspaceIds) if (await this.#o.workspaces.get(id)) left.push(id);
       if (left.length === 0 || !this.#live(gen)) continue;
 
+      // The target recorded when the task started (#219); older tasks: the one branch their
+      // checkouts agree they started from.
+      const pinned = this.#target(root.task.id);
       const recorded = this.#o.store
         .query({ taskId: root.task.id, typePrefix: 'task.landed' })
         .some((e) => (e.envelope.data as { commit?: unknown }).commit === published.commit);
       if (!recorded) {
-        const branches = new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
-        // No target, or sub-tasks that started from different branches: nothing to compare.
+        const branches = pinned
+          ? new Set(pinned.branch ? [pinned.branch] : [])
+          : new Set(sessions.flatMap((s) => (s.baseBranch ? [s.baseBranch] : [])));
+        // No target (a task started on a detached HEAD), or sub-tasks that started from different
+        // branches: nothing to compare.
         if (branches.size !== 1) continue;
         const target = `refs/heads/${[...branches][0]}`;
         let landed: Awaited<ReturnType<NonNullable<Integrator['landed']>>>;
@@ -920,6 +1052,80 @@ export class MiniConductor {
           .catch(() => {});
       }
     }
+  }
+
+  /**
+   * Delete the pin ref of each finished task (#247): a task's pinned target (#236) is where its new
+   * checkouts start, and a finished task (completed, failed, canceled or rejected) starts none.
+   * Its live checkouts keep their own commits, and its result branch its result. Each task once per
+   * process; a ref moved since (`unpin` deletes only one holding the pinned commit) is kept.
+   */
+  async #sweepPins(gen: number): Promise<void> {
+    const unpin = this.#o.workspaces.unpin?.bind(this.#o.workspaces);
+    if (!unpin || !this.#live(gen)) return;
+    const done: string[] = [];
+    const pins: Array<{ taskId: string; commit: string }> = [];
+    for (const t of Object.values(this.#state().tasks)) {
+      const id = t.task.id;
+      if (t.task.parentId || !TERMINAL.has(t.state) || this.#unpinned.has(id)) continue;
+      done.push(id);
+      const target = this.#target(id);
+      if (target) pins.push({ taskId: id, commit: target.commit });
+    }
+    if (done.length === 0) return;
+    try {
+      // One read of the refs for all of them: a start with many finished tasks stays cheap.
+      await unpin(pins);
+    } catch (err) {
+      // Tried again at the next sweep.
+      const key = `unpin ${(err as Error).message}`;
+      if (!this.#sweepErrors.has(key)) {
+        this.#sweepErrors.add(key);
+        this.#errors.push(err);
+      }
+      return;
+    }
+    for (const id of done) this.#unpinned.add(id);
+  }
+
+  /**
+   * Remove Worker checkouts not used for `worktrees.idle_days` (#238; 0 turns it off), after the
+   * landed sweep. A checkout's last use is its sessions' newest `worker.*` event. Skipped: one in
+   * use (a running or closing session), one whose task is unfinished, and, with
+   * `worktrees.remove_merged: false` (the user keeps finished work's checkouts), one whose task
+   * completed. The worktree manager keeps any with local files or unintegrated work.
+   */
+  async #sweepIdle(gen: number): Promise<void> {
+    const days = this.#o.config.worktrees?.idle_days ?? 7;
+    const gc = this.#o.workspaces.gc?.bind(this.#o.workspaces);
+    if (!gc || days <= 0 || !this.#live(gen)) return;
+    const v = this.#state();
+    const keepCompleted = this.#o.config.worktrees?.remove_merged === false;
+    const lastActivity = new Map<string, number>();
+    const active = new Set([
+      ...[...this.#runs.values()].map((r) => r.workspace.id),
+      ...this.#closing,
+    ]);
+    for (const s of v.sessions.values()) {
+      if (!s.workspaceId) continue;
+      // An unfinished task may still resume in it, however long it waits (an open escalation).
+      const root = v.tasks[this.#rootOf(s.taskId)];
+      if (!root || !TERMINAL.has(root.state)) active.add(s.workspaceId);
+      else if (keepCompleted && root.state === 'completed') active.add(s.workspaceId);
+      if (s.activeAt === undefined) continue;
+      lastActivity.set(s.workspaceId, Math.max(lastActivity.get(s.workspaceId) ?? 0, s.activeAt));
+    }
+    await gc({
+      olderThanMs: days * 86_400_000,
+      activeWorktreeIds: [...active],
+      lastActivity,
+    }).catch((err: unknown) => {
+      const key = `gc ${(err as Error).message}`;
+      if (!this.#sweepErrors.has(key)) {
+        this.#sweepErrors.add(key);
+        this.#errors.push(err);
+      }
+    });
   }
 
   /**
@@ -1014,7 +1220,7 @@ export class MiniConductor {
 
   /**
    * Where a new checkout of `subtaskId` starts (#134): the combined work of the sub-tasks it
-   * depends on, or the main branch. When their work conflicts, the user is asked first
+   * depends on, or the task's pinned target (#219; older tasks: the main branch). When their work conflicts, the user is asked first
    * (undefined: nothing runs). Once they answered, it starts from the first dependency's work,
    * and the Worker is told to merge the rest.
    */
@@ -1026,7 +1232,11 @@ export class MiniConductor {
     const deps = this.#dependencies(subtaskId)
       .map((id) => ({ id, commit: this.#resultCommit(id) }))
       .filter((d): d is { id: string; commit: string } => d.commit !== undefined);
-    if (!integrator || deps.length === 0) return { notes: [] };
+    if (!integrator || deps.length === 0) {
+      // Nothing to combine: the task's pinned target, wherever the main checkout is now (#219).
+      const target = this.#target(this.#rootOf(subtaskId));
+      return { ...(target ? { commit: target.commit } : {}), notes: [] };
+    }
     try {
       const commit = await integrator.combine(deps.map((d) => d.commit));
       this.#combineFailures.delete(subtaskId);
@@ -1158,7 +1368,11 @@ export class MiniConductor {
     // fresh one (its last failed the integrity checks) never collides with its old one.
     const workspace = existing ?? (await this.#o.workspaces.create(sessionId, baseCommit));
     if (!this.#live(gen)) return;
+    // A handoff not yet taken up seeds this session from its packet (#129); the session that
+    // handed off is never resumed.
+    const seed = v.pendingHandoffs.get(subtaskId);
     const resume =
+      seed === undefined &&
       last?.ended === 'restart' &&
       last.vendorSessionId !== undefined &&
       last.adapter === tier.adapter &&
@@ -1167,8 +1381,15 @@ export class MiniConductor {
         ? { vendorSessionId: last.vendorSessionId }
         : undefined;
     // A session stopped for a restart that is not resumed after all (another adapter or
-    // checkout now) never will be: its adapter may drop what it kept for that (#153).
-    if (!resume && last?.ended === 'restart' && last.vendorSessionId && last.adapter) {
+    // checkout now) never will be: its adapter may drop what it kept for that (#153). Nor is
+    // one that handed off (#129); ending it live discards it too, but not when it ended at a
+    // restart, and a second discard is harmless.
+    if (
+      !resume &&
+      (last?.ended === 'restart' || last?.ended === 'handoff') &&
+      last.vendorSessionId &&
+      last.adapter
+    ) {
       // Its own checkout, refused or not, locates its state; the new one only if that is gone.
       const old = last.workspaceId ? await this.#o.workspaces.get(last.workspaceId) : undefined;
       await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
@@ -1326,6 +1547,7 @@ export class MiniConductor {
       const text = resume
         ? safePrompt([RESUME_PROMPT, ...answers.map(answerText)], '\n\n')
         : workerPrompt(view.task, this.#lastFeedback(subtaskId), [
+            ...(seed ? [HANDOFF_NOTE] : []),
             ...(history.length > 0 && v.progress.has(subtaskId)
               ? [`Progress reported before: ${v.progress.get(subtaskId)}`]
               : []),
@@ -1333,7 +1555,21 @@ export class MiniConductor {
             ...answers.map(answerText),
           ]);
       await worker.adapter.send(handle, { text });
-      if (this.#live(gen)) this.#markDelivered(run, answers);
+      if (this.#live(gen)) {
+        this.#markDelivered(run, answers);
+        // Taken up only once its successor has it: a start that fails, or a session that ended
+        // while its first message was on the way, keeps the seed (#129).
+        if (seed && this.#runs.get(subtaskId) === run) {
+          this.#o.store.append(
+            this.#env(
+              subtaskId,
+              'handoff.accepted',
+              { handoffId: seed.handoffId, sessionId },
+              sessionId,
+            ),
+          );
+        }
+      }
     } catch (err) {
       if (!this.#live(gen)) return;
       this.#errors.push(err);
@@ -1908,7 +2144,7 @@ export class MiniConductor {
 
   async #end(
     run: Run,
-    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled',
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff',
     message?: string,
     extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
@@ -1926,7 +2162,7 @@ export class MiniConductor {
 
   async #endRun(
     run: Run,
-    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled',
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff',
     message: string | undefined,
     extra: { workspaceRefused?: boolean },
   ): Promise<void> {
@@ -2191,6 +2427,27 @@ export async function cancelStopped(
   }
 }
 
+/**
+ * Run `fn` while holding the repo's Mini-conductor lock as `tacet run` takes it (a live holder is
+ * refused, a stale lock is taken over), after ending the Worker processes a crashed Mini-conductor
+ * left running (#127), as `cancelStopped` does. For maintenance that must not race a run, such as
+ * `tacet uninstall --purge` (#211). Throws when a run holds the lock; returns `fn`'s result and the
+ * problems met ending stale Workers.
+ */
+export async function withStoppedMini<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+  processFile = `${lockPath}.workers`,
+): Promise<{ result: T; errors: unknown[] }> {
+  takeMiniLock(lockPath);
+  try {
+    const errors = existsSync(processFile) ? await endStaleWorkerProcesses(processFile) : [];
+    return { result: await fn(), errors };
+  } finally {
+    releaseMiniLock(lockPath);
+  }
+}
+
 /** One reading of the log, rebuilt only when it has grown since `prev`. */
 function readView(store: EventStore, prev?: View): View {
   const count = store.count();
@@ -2203,6 +2460,8 @@ function readView(store: EventStore, prev?: View): View {
   const decisions = new Map<string, string>();
   const progress = new Map<string, string>();
   const progressAt = new Map<string, number>();
+  const pendingHandoffs = new Map<string, { handoffId: string; sessionId: string }>();
+  const handoffCount = new Map<string, number>();
   for (const { envelope: e } of store.query({})) {
     const d = (e.data ?? {}) as Record<string, unknown>;
     const str = (k: string) => (typeof d[k] === 'string' ? (d[k] as string) : undefined);
@@ -2210,7 +2469,11 @@ function readView(store: EventStore, prev?: View): View {
       // Written by the MCP backend: the session is on the envelope, the report is the data.
       const summary = str('summary');
       if (summary && e.taskId) progress.set(e.taskId, summary);
-      if (e.sessionId) progressAt.set(e.sessionId, Date.parse(e.ts));
+      if (e.sessionId) {
+        progressAt.set(e.sessionId, Date.parse(e.ts));
+        const s = sessions.get(e.sessionId);
+        if (s) s.activeAt = Math.max(s.activeAt ?? 0, Date.parse(e.ts) || 0);
+      }
     } else if (e.type.startsWith('worker.')) {
       const id = str('sessionId');
       if (!id || !e.taskId) continue;
@@ -2226,10 +2489,12 @@ function readView(store: EventStore, prev?: View): View {
           ...(workspaceId ? { workspaceId } : {}),
           ...(baseCommit ? { baseCommit } : {}),
           ...(baseBranch ? { baseBranch } : {}),
+          activeAt: Date.parse(e.ts) || 0,
         });
       } else {
         const s = sessions.get(id);
         if (!s) continue;
+        s.activeAt = Math.max(s.activeAt ?? 0, Date.parse(e.ts) || 0);
         const vendor = str('vendorSessionId');
         if (e.type === 'worker.vendor_session' && vendor) s.vendorSessionId = vendor;
         else if (e.type === 'worker.ended') {
@@ -2271,6 +2536,17 @@ function readView(store: EventStore, prev?: View): View {
     } else if (e.type === 'escalation.delivered') {
       const x = escalations.get(str('escalationId') ?? '');
       if (x) x.delivered = true;
+    } else if (e.type === 'handoff.requested') {
+      // Written by the MCP backend: the session is on the envelope (#129).
+      const handoffId = str('handoffId');
+      if (handoffId && e.taskId && e.sessionId) {
+        pendingHandoffs.set(e.taskId, { handoffId, sessionId: e.sessionId });
+        handoffCount.set(e.taskId, (handoffCount.get(e.taskId) ?? 0) + 1);
+      }
+    } else if (e.type === 'handoff.accepted') {
+      if (e.taskId && pendingHandoffs.get(e.taskId)?.handoffId === str('handoffId')) {
+        pendingHandoffs.delete(e.taskId);
+      }
     } else if (e.type === 'decision.recorded') {
       const dec = d as Partial<Decision>;
       if (typeof dec.id === 'string' && typeof dec.decision === 'string') {
@@ -2295,6 +2571,8 @@ function readView(store: EventStore, prev?: View): View {
     decisions,
     progress,
     progressAt,
+    pendingHandoffs,
+    handoffCount,
   };
 }
 

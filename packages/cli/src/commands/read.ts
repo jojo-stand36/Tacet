@@ -1,11 +1,18 @@
+import { statusEntries, type TaskStatusEntry, TaskTarget } from '@tacet/core';
 import type { EventStore, StoredEvent } from '@tacet/core/node';
+import { liveControl, liveStatus } from '../control.js';
 import type { Io } from '../io.js';
-import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
+import {
+  formatEvent,
+  formatStatusEntry,
+  isSummaryEvent,
+  safeJson,
+  terminalSafe,
+} from '../render.js';
 import {
   DONE_STATES,
   isSubtaskOf,
   openLog,
-  pendingEscalations,
   readState,
   repoRootFrom,
   rootTasks,
@@ -38,47 +45,61 @@ async function open(
   return { store, live: () => miniLockHolder(paths.lock) !== undefined };
 }
 
-/** `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live. */
+/** Where a task starts and lands, as recorded when it started (#219); undefined for older tasks. */
+function targetOf(store: EventStore, taskId: string): TaskTarget | undefined {
+  const data = store.query({ taskId, typePrefix: 'task.target' }).at(-1)?.envelope.data;
+  const parsed = TaskTarget.safeParse(data);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
+ * `tacet status`: every task with its sub-tasks, open escalations and usage; whether a run is live.
+ * A live run answers over its control port (#201); otherwise the log is read, read-only.
+ */
 export async function status(io: Io, o: Where & { json?: boolean }): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
   const paths = statePaths(repoRoot, o['user-dir'], io.home);
   const { miniLockHolder } = await import('@tacet/mini');
   const pid = miniLockHolder(paths.lock);
-  const store = openLog(paths);
-  if (!store) {
-    if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [] }));
-    else io.out(`no Tacet state for ${repoRoot}`);
-    return 0;
+  let tasks: TaskStatusEntry[] | undefined;
+  let source: 'run' | 'log' = 'log';
+  const client = pid !== undefined ? await liveControl(io, repoRoot, paths) : undefined;
+  if (client) {
+    try {
+      tasks = await liveStatus(client);
+      source = 'run';
+    } catch (err) {
+      const why = terminalSafe((err as Error).message);
+      io.err(`note: the live run did not answer (${why}); reading the log instead`);
+    } finally {
+      await client.close();
+    }
   }
-  try {
-    const state = readState(store);
-    const roots = rootTasks(state);
-    if (o.json) {
-      const tasks = roots.map((t) => ({
-        id: t.task.id,
-        goal: t.task.goal,
-        state: t.state,
-        ...(t.result ? { outcome: t.result.outcome } : {}),
-        usage: t.usage,
-        subtasks: subtasksOf(state, t.task.id).map((s) => ({
-          id: s.task.id,
-          goal: s.task.goal,
-          state: s.state,
-          activeWorkers: s.activeWorkers,
-          usage: s.usage,
-        })),
-        escalations: pendingEscalations(state, t.task.id),
-      }));
-      io.out(safeJson({ running: pid ?? null, tasks }));
+  if (!tasks) {
+    const store = openLog(paths);
+    if (!store) {
+      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [] }));
+      else io.out(`no Tacet state for ${repoRoot}`);
       return 0;
     }
-    io.out(pid ? `Mini-conductor running (pid ${pid})` : 'Mini-conductor not running');
-    if (roots.length === 0) io.out('no tasks');
-    for (const t of roots) io.out(formatTask(t, subtasksOf(state, t.task.id)));
-    return 0;
-  } finally {
-    store.close();
+    try {
+      tasks = statusEntries(readState(store), (id) => targetOf(store, id));
+    } finally {
+      store.close();
+    }
   }
+  if (o.json) {
+    io.out(safeJson({ running: pid ?? null, source, tasks }));
+    return 0;
+  }
+  io.out(
+    pid
+      ? `Mini-conductor running (pid ${pid})${source === 'run' ? '' : '; read from the log'}`
+      : 'Mini-conductor not running',
+  );
+  if (tasks.length === 0) io.out('no tasks');
+  for (const t of tasks) io.out(formatStatusEntry(t));
+  return 0;
 }
 
 /**
