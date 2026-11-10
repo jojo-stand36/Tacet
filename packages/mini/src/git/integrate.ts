@@ -577,6 +577,46 @@ interface RunOptions {
   maxNul?: number;
 }
 
+/**
+ * Which of `paths` `commit` has, as a file, a link or a directory (#263), read from the repo's own
+ * object store: only PATH and HOME from `env`, `SAFE_GIT_ARGS`, literal paths.
+ */
+export async function trackedPaths(opts: {
+  repoRoot: string;
+  commit: string;
+  paths: readonly string[];
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+}): Promise<Set<string>> {
+  if (!COMMIT_ID.test(opts.commit)) throw new Error('bad commit');
+  const env = opts.env ?? process.env;
+  const out = await run(
+    [
+      'git',
+      '--literal-pathspecs',
+      ...SAFE_GIT_ARGS,
+      'ls-tree',
+      '-r',
+      '-t',
+      '-z',
+      '--name-only',
+      `${opts.commit}^{tree}`,
+      '--',
+      ...opts.paths,
+    ],
+    {
+      cwd: opts.repoRoot,
+      env: {
+        ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+        ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      },
+      timeoutMs: opts.timeoutMs ?? 30_000,
+    },
+  );
+  const wanted = new Set(opts.paths);
+  return new Set(out.split('\0').filter((p) => wanted.has(p)));
+}
+
 /** Run a command; resolves with its trimmed stdout, rejects with its stderr or a timeout. */
 function run(argv: string[], o: RunOptions): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -732,6 +772,40 @@ export class GitIntegrator implements Integrator {
 
   combine(commits: readonly string[]): Promise<string | undefined> {
     return combineCommits(commits, { repoRoot: this.#repoRoot, env: this.#env });
+  }
+
+  async tracked(
+    workspace: Workspace,
+    base: string,
+    paths: readonly string[],
+  ): Promise<Set<string> | undefined> {
+    const o = { repoRoot: this.#repoRoot, paths, env: this.#env };
+    const keep = await trackedPaths({ ...o, commit: base });
+    // What its HEAD has too (an earlier session may have committed): read as data, and only a
+    // commit the repo already has; otherwise it cannot tell.
+    let wt: WorkerWorktree | undefined;
+    try {
+      wt = workerWorktree(workspace.path, this.#repoRoot);
+    } catch (err) {
+      throw new WorktreeRefusedError((err as Error).message);
+    }
+    if (!wt) return undefined;
+    const env = {
+      ...(this.#env.PATH !== undefined ? { PATH: this.#env.PATH } : {}),
+      ...(this.#env.HOME !== undefined ? { HOME: this.#env.HOME } : {}),
+    };
+    const git = (args: string[]) =>
+      run(['git', ...SAFE_GIT_ARGS, ...args], { cwd: this.#repoRoot, env, timeoutMs: 30_000 });
+    const head = (await workerHead(wt, git))?.commit;
+    if (head === undefined) return undefined;
+    if (head === base) return keep;
+    const has = await git(['cat-file', '-e', `${head}^{commit}`]).then(
+      () => true,
+      () => false,
+    );
+    if (!has) return undefined;
+    for (const p of await trackedPaths({ ...o, commit: head })) keep.add(p);
+    return keep;
   }
 
   /** Results found not landed, by result and target, with the target tip they were checked at. */

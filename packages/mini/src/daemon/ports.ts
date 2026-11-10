@@ -92,6 +92,16 @@ export interface Integrator {
    */
   combine(commits: readonly string[]): Promise<string | undefined>;
   /**
+   * Which of `paths` the checkout's `base` or its HEAD has, as any kind of entry (#263);
+   * undefined when it cannot tell (its HEAD is a commit the repo does not have, say). Throws
+   * `WorktreeRefusedError` for a checkout that fails the integrity checks.
+   */
+  tracked?(
+    workspace: Workspace,
+    base: string,
+    paths: readonly string[],
+  ): Promise<Set<string> | undefined>;
+  /**
    * What the checkout has that `commit` (a commit already in the repo; without one, the
    * checkout's HEAD, if the repo has it) does not: changed, deleted or new files (#261).
    * Undefined when it cannot tell; throws `WorktreeRefusedError` for a checkout that fails its
