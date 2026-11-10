@@ -1,4 +1,12 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -138,6 +146,11 @@ describe('untrustProjects (#181)', () => {
       expect(readFileSync(file, 'utf8')).toBe(
         `[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"\n`,
       );
+      // Any read error but a missing file fails closed, leaving the path as it was.
+      const asDir = join(dir, 'is-a-dir');
+      mkdirSync(asDir);
+      expect(() => untrustProjects(asDir, [dir])).toThrow();
+      expect(statSync(asDir).isDirectory()).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

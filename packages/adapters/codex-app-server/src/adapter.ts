@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -1033,7 +1034,12 @@ export function untrustProjects(file: string, paths: readonly string[]): void {
   // A fresh name, created exclusively: never a planted file or symlink at a guessable path.
   const tmp = `${file}.${randomUUID()}.tmp`;
   writeFileSync(tmp, `${body ? `${body}\n\n` : ''}${tables}`, { mode: 0o600, flag: 'wx' });
-  renameSync(tmp, file);
+  try {
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Append `-c`-style settings through `GIT_CONFIG_COUNT`, keeping any the caller already set. */
