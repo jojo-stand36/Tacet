@@ -852,7 +852,13 @@ describe('WorktreeManager', () => {
     await writeFile(lock, `${process.pid} 0123abcd-0000\n`);
 
     await expect(manager.remove(worktree.id)).rejects.toThrow('already being removed');
-    await expect(manager.merge(worktree.id, 'pr', 'main')).rejects.toThrow('being removed');
+    // A merge waits for the removal, then gives up while the lock is still live.
+    const waiting = new WorktreeManager(repository, path.join(temporaryDirectory, 'worktrees'), {
+      lockWaitMs: 300,
+    });
+    const started = Date.now();
+    await expect(waiting.merge(worktree.id, 'pr', 'main')).rejects.toThrow('being removed');
+    expect(Date.now() - started).toBeGreaterThanOrEqual(300);
     expect(await readFile(lock, 'utf8')).toBe(`${process.pid} 0123abcd-0000\n`);
 
     await writeFile(lock, '');

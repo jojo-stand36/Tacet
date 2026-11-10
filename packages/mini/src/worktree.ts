@@ -78,6 +78,8 @@ export interface WorktreeManagerOptions {
   env?: Readonly<Record<string, string | undefined>>;
   /** @internal Test seam: runs once a squash's staging worktree exists, before it is filled. */
   onSquashStaging?: (ids: { source: string; staging: string }) => Promise<void>;
+  /** How long a merge waits for a removal that may only be checking its worktree. Default 5 s. */
+  lockWaitMs?: number;
 }
 
 /** `remove` kept the checkout: `reason` says why (also what `gc` reports). */
@@ -112,8 +114,7 @@ const commitIdPattern = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 const locksDirectoryName = '.tacet-locks';
 /** Longer than any merge or removal runs; a holder older than this is taken to be dead. */
 const maxHoldMs = 60 * 60 * 1000;
-/** How long a merge waits for a removal that may only be checking its worktree. */
-const lockWaitMs = 5_000;
+const defaultLockWaitMs = 5_000;
 /** Drafts and stale locks are only ever left by a crash once they are this old. */
 const lockLitterMs = 10 * 60 * 1000;
 const managerGitArgs = [
@@ -886,9 +887,10 @@ export class WorktreeManager implements Workspaces {
       }
       // A removal may only be checking the worktree and then keep it: wait a little for it.
       for (const id of ids) {
+        const deadline = Date.now() + (this.options.lockWaitMs ?? defaultLockWaitMs);
         let delay = 50;
-        for (let waited = 0; await this.removalLocked(directory, id); waited += delay) {
-          if (waited >= lockWaitMs) throw new Error('worktree is being removed');
+        while (await this.removalLocked(directory, id)) {
+          if (Date.now() >= deadline) throw new Error('worktree is being removed');
           await new Promise((resolve) => setTimeout(resolve, delay));
           delay = Math.min(delay * 2, 1_000);
         }
