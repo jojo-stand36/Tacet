@@ -232,8 +232,49 @@ describe('MiniConductor', () => {
       expect(r?.outcome).toBe('failed');
       expect(r?.verification.status).toBe('failed');
       expect(r?.verification.review).toMatchObject({ status: 'failed', blocking: 1 });
-      expect(r?.verification.notes).toContain('reviewer findings, untrusted');
+      expect(r?.verification.notes).toBe(
+        'Review requested changes: 1 blocking finding(s), 0 minor.',
+      );
       expect(Object.keys(r?.verification ?? {})).not.toContain('feedback');
+    });
+
+    it('keeps the findings out of every event: only the Worker sees them (coordinator requirement)', async () => {
+      const SECRET = 'sk-ant-reviewfinding0123456789';
+      const TEXT = 'FINDING-TEXT-7f3a';
+      const reviewer: Reviewer = {
+        async review() {
+          return {
+            status: 'failed',
+            adapter: 'other',
+            findings: [
+              {
+                severity: 'blocker',
+                file: 'secret/path.ts',
+                line: 9,
+                message: `${TEXT} leaks ${SECRET}`,
+              },
+              { severity: 'minor', message: `${TEXT} minor` },
+            ],
+          };
+        },
+      };
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      // The Worker got them, redacted.
+      const fix = fake.sessions[0]?.inputs.find((x) => x.startsWith('Review failed')) ?? '';
+      expect(fix).toContain(TEXT);
+      expect(fix).toContain('secret/path.ts:9');
+      expect(fix).not.toContain(SECRET);
+      // Nothing in the log carries their text, the file they name, or the secret: counts only.
+      const log = JSON.stringify(store.query({}).map((e) => e.envelope));
+      expect(log).not.toContain(TEXT);
+      expect(log).not.toContain('secret/path.ts');
+      expect(log).not.toContain(SECRET);
+      expect(reviews()[0]).toMatchObject({ blockers: 1, majors: 0, minors: 1 });
+      expect(JSON.stringify(d.errors)).not.toContain(TEXT);
     });
 
     it('does not review work whose commands failed', async () => {

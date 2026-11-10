@@ -29,7 +29,7 @@ import {
   WORKER_MARKER_VAR,
 } from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
-import { formatFindings, reviewFeedback } from '../review/adapter-reviewer.js';
+import { reviewFeedback } from '../review/adapter-reviewer.js';
 import { reviewConfigProblem } from '../review/config.js';
 import {
   type Integrator,
@@ -179,11 +179,13 @@ function withReview(v: VerifyResult, r: ReviewResult): VerifyResult {
   };
   const notes = (extra: string) => (v.notes ? `${v.notes}\n${extra}` : extra);
   if (r.status === 'failed') {
+    // Counts only: the findings' text goes to the Worker as its feedback, never into events or
+    // up to the Conductor (coordinator requirement on #19).
     return {
       ...v,
       status: 'failed',
       notes: notes(
-        `Review requested changes (${blocking} blocking; reviewer findings, untrusted):\n${formatFindings(r.findings, 2000)}`,
+        `Review requested changes: ${blocking} blocking finding(s), ${r.findings.length - blocking} minor.`,
       ),
       feedback: reviewFeedback(r.findings),
       review,

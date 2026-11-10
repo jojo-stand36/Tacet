@@ -2,7 +2,13 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AdapterCapabilities, TacetConfig, Task, TierConfig } from '@tacet/core';
+import {
+  type AdapterCapabilities,
+  redactSecrets,
+  type TacetConfig,
+  type Task,
+  type TierConfig,
+} from '@tacet/core';
 import { WORKER_MARKER_VAR } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type Script, ScriptedAdapter } from '../daemon/testing.js';
@@ -147,7 +153,12 @@ describe('reviewDiff and AdapterReviewer', () => {
     const prompt = s?.inputs[0] ?? '';
     expect(prompt).toContain('greet() returns hello');
     expect(prompt).toContain('"hello"');
+    // The diff goes through the same redaction as task results (`redactSecrets`).
     expect(prompt).not.toContain('sk-ant-abcdefghijklmnopqrst');
+    const raw = await reviewDiff(commit, base, { repoRoot: repo });
+    expect(raw.patch).toContain('sk-ant-abcdefghijklmnopqrst');
+    expect(prompt).toContain(redactSecrets(raw.patch));
+    expect(prompt).toContain('[redacted]');
     expect(prompt).toMatch(/<<<DIFF-([0-9a-f]{16})[\s\S]*DIFF-\1>>>/);
     // Closed when done.
     expect(adapter.status(s?.handle ?? { id: '' })).toBe('done');

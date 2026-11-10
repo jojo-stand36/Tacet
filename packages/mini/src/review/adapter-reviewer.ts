@@ -105,7 +105,7 @@ export function reviewerPrompt(
 }
 
 /** Findings as lines, blocking ones first, redacted and cut to `max` characters. */
-export function formatFindings(findings: readonly ReviewFinding[], max: number): string {
+function formatFindings(findings: readonly ReviewFinding[], max: number): string {
   const sorted = [...findings].sort((a, b) => Number(blocks(b)) - Number(blocks(a)));
   const lines = sorted.map((f) => {
     const where = f.file ? ` ${f.file}${f.line !== undefined ? `:${f.line}` : ''}` : '';
