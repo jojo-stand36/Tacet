@@ -33,41 +33,11 @@ export function openLog(paths: RepoStatePaths): EventStore | undefined {
   return openEventStore(paths.events, { readonly: true });
 }
 
-/** Terminal task states: nothing more happens to the task. */
-export const DONE_STATES = new Set(['completed', 'failed', 'canceled', 'rejected']);
-
-export const isSubtaskOf = (id: string, root: string) => id === root || id.startsWith(`${root}/`);
-
-/** Root tasks (not sub-tasks), oldest first. */
-export function rootTasks(state: TasksState) {
-  return Object.values(state.tasks)
-    .filter((t) => t.task.parentId === undefined && !t.task.id.includes('/'))
-    .sort((a, b) => a.task.createdAt.localeCompare(b.task.createdAt));
-}
-
-export function subtasksOf(state: TasksState, root: string) {
-  return Object.values(state.tasks)
-    .filter((t) => t.task.id.startsWith(`${root}/`))
-    .sort((a, b) => a.task.id.localeCompare(b.task.id, undefined, { numeric: true }));
-}
+// Shared with a running Mini-conductor, which answers `tacet status` the same way (#201).
+export { DONE_STATES, isSubtaskOf, pendingEscalations, rootTasks, subtasksOf } from '@tacet/core';
 
 export function readState(store: EventStore): TasksState {
   return store.replay(tasksProjection);
-}
-
-/**
- * Open escalations of a task and its sub-tasks: id, the task it is on, the question. Those of a
- * sub-task or task that has ended (canceled, failed, completed) are left out: an answer to them
- * would never reach a Worker, so nobody waits on it (#202).
- */
-export function pendingEscalations(state: TasksState, root: string) {
-  return Object.values(state.tasks)
-    .filter((t) => isSubtaskOf(t.task.id, root) && !DONE_STATES.has(t.state))
-    .flatMap((t) =>
-      Object.entries(t.escalations)
-        .filter(([, x]) => x.status === 'pending')
-        .map(([id, x]) => ({ id, taskId: t.task.id, question: x.question })),
-    );
 }
 
 /** Wait `ms`, or less if `signal` aborts. */

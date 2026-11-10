@@ -25,7 +25,11 @@ export interface AdapterCapabilities {
   interrupt: 'receipt' | 'turn' | 'tool-boundary' | 'kill' | 'none';
   /** `SessionOptions.resume` continues an earlier vendor session. */
   resume: boolean;
-  /** `native`: the vendor forks. `emulated`: Tacet seeds a new session from a HandoffPacket. */
+  /**
+   * `native`: the vendor forks. `emulated`: Tacet seeds a new session from a HandoffPacket.
+   * `native` may still be refused for one session (an ACP agent that does not advertise
+   * `session/fork` for it): `start()` then throws `ForkRefusedError`, as it does for `none` (#228).
+   */
   fork: 'native' | 'emulated' | 'none';
   usage: {
     /** A `usage` event follows every model call. */
