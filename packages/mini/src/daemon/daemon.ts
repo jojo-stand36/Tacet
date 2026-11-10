@@ -34,6 +34,7 @@ import {
   MergeConflictError,
   type Planner,
   type Verifier,
+  type VerifyResult,
   type WorkerAdapter,
   type WorkerMcp,
   type Workspace,
@@ -138,7 +139,21 @@ interface Run {
   progressSeen?: number | undefined;
   /** The turn's end is being handled, so it is handled once. */
   settling: boolean;
+  /** Aborts a verification in progress when the session ends (#19). */
+  verifyAbort?: AbortController | undefined;
 }
+
+/**
+ * Whether `verify` commands run for Codex Workers (#19). Off until the owner decides: the
+ * commands run code the Worker wrote outside the Codex sandbox, which keeps the shared `.git`
+ * read-only for the Worker itself (ARCHITECTURE.md §6). Off, their sub-tasks are recorded as
+ * not verified, with this reason.
+ */
+export const VERIFY_CODEX_WORKERS = false;
+const CODEX_ADAPTERS: ReadonlySet<string> = new Set(['codex-app-server', 'acp:codex-acp']);
+const CODEX_NOT_VERIFIED = 'codex verify pending sandbox decision';
+/** The command name `worker.verification` records for the clean-checkout check. */
+const CHECKOUT_CHECK = '(checkout clean at the integrated commit)';
 
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
@@ -1102,11 +1117,12 @@ export class MiniConductor {
         ended = true;
         return;
       }
-      const verification = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
-        view.task,
-        run.workspace,
-      );
+      const verification = await this.#verify(run, view.task);
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      if (verification.status === 'failed' && (await this.#sendFix(run, verification))) {
+        // The same session fixes it: its next turn's end verifies again.
+        return;
+      }
       if (verification.status === 'failed') {
         this.#o.store.append(
           this.#env(run.subtaskId, 'task.result', this.#summary(run, 'failed', verification)),
@@ -1200,10 +1216,132 @@ export class MiniConductor {
     }
   }
 
+  /**
+   * Verify a finished turn (#19): with the process marker recorded first (a crash mid-run ends
+   * what the commands started at the next start) and aborted if the session ends meanwhile.
+   * Each command's result becomes a `worker.verification` event; the output never does.
+   */
+  async #verify(run: Run, task: Task): Promise<VerifyResult> {
+    const commands = this.#o.config.verify ?? [];
+    if (CODEX_ADAPTERS.has(run.adapterId) && !VERIFY_CODEX_WORKERS && commands.length > 0) {
+      return { status: 'not_run', commands, notes: CODEX_NOT_VERIFIED };
+    }
+    const round = this.#verifyRounds(run);
+    const abort = new AbortController();
+    run.verifyAbort = abort;
+    const marker = newWorkerMarker();
+    const key = `verify:${run.sessionId}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    let ranCommand = false;
+    try {
+      const result = await (this.#o.verifier ?? this.#defaultVerifier()).verify(
+        task,
+        run.workspace,
+        {
+          ...(run.commit !== undefined ? { commit: run.commit } : {}),
+          signal: AbortSignal.any([abort.signal, this.#abort.signal]),
+          marker,
+          onCommand: (r) => {
+            ranCommand = true;
+            this.#o.store.append(
+              this.#env(
+                run.subtaskId,
+                'worker.verification',
+                {
+                  sessionId: run.sessionId,
+                  round,
+                  command: r.command,
+                  status: r.status,
+                  ...(r.exitCode !== undefined ? { exitCode: r.exitCode } : {}),
+                  durationMs: r.durationMs ?? 0,
+                  ...(run.commit !== undefined ? { commit: run.commit } : {}),
+                },
+                run.sessionId,
+              ),
+            );
+          },
+        },
+      );
+      if (result.status === 'failed' && !ranCommand) {
+        // Failed before any command (the checkout was not clean): still a round, so the fix
+        // loop ends.
+        this.#o.store.append(
+          this.#env(
+            run.subtaskId,
+            'worker.verification',
+            {
+              sessionId: run.sessionId,
+              round,
+              command: CHECKOUT_CHECK,
+              status: 'failed',
+              durationMs: 0,
+              ...(run.commit !== undefined ? { commit: run.commit } : {}),
+            },
+            run.sessionId,
+          ),
+        );
+      }
+      return result;
+    } catch (err) {
+      this.#errors.push(err);
+      return {
+        status: 'failed',
+        commands,
+        notes: `Verification could not run: ${redactSecrets(String((err as Error)?.message ?? err)).slice(0, 500)}`,
+      };
+    } finally {
+      if (run.verifyAbort === abort) run.verifyAbort = undefined;
+      if (this.#markers.get(key) === marker) {
+        this.#markers.delete(key);
+        this.#saveMarkers();
+      }
+    }
+  }
+
+  /** Verification rounds this session already had: each recorded its commands under one round. */
+  #verifyRounds(run: Run): number {
+    const rounds = new Set<number>();
+    for (const e of this.#o.store.query({
+      taskId: run.subtaskId,
+      typePrefix: 'worker.verification',
+    })) {
+      const d = e.envelope.data as { sessionId?: string; round?: number };
+      if (d.sessionId === run.sessionId && typeof d.round === 'number') rounds.add(d.round);
+    }
+    return rounds.size;
+  }
+
+  /**
+   * A failed verification goes back to the same session to fix, while fix rounds are left
+   * (`workers.verify_fix_attempts`). False when it should fail the attempt instead.
+   */
+  async #sendFix(run: Run, verification: VerifyResult): Promise<boolean> {
+    const allowed = this.#o.config.workers?.verify_fix_attempts ?? 2;
+    // The round that just failed is recorded: rounds so far = fix rounds used + 1.
+    if (!verification.feedback || this.#verifyRounds(run) > allowed) return false;
+    const worker = this.#o.adapters[run.adapterId];
+    if (!worker) return false;
+    run.turnActive = true;
+    run.settling = false;
+    run.lastActivity = this.#now().getTime();
+    run.nudgedAt = undefined;
+    try {
+      await worker.adapter.send(run.handle, { text: safePrompt([verification.feedback]) });
+      return true;
+    } catch (err) {
+      run.turnActive = false;
+      run.settling = true;
+      this.#errors.push(err);
+      return false;
+    }
+  }
+
   #defaultVerifier(): Verifier {
     const commands = this.#o.config.verify ?? [];
     return {
       // #19 runs the commands and a reviewer; until then nothing is claimed as verified.
+      // Without a verifier (the entry point passes a `CommandVerifier`), nothing is claimed.
       verify: async () => ({ status: commands.length > 0 ? 'not_run' : 'passed', commands }),
     };
   }
@@ -1241,6 +1379,8 @@ export class MiniConductor {
     extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
     if (this.#runs.get(run.subtaskId) !== run) return;
+    // A verification still running for it stops (its result is not used).
+    run.verifyAbort?.abort();
     this.#runs.delete(run.subtaskId);
     run.revoke();
     this.#o.store.append(

@@ -1,4 +1,10 @@
-import type { AgentAdapter, McpServerConfig, Task, Verification } from '@tacet/core';
+import type {
+  AgentAdapter,
+  McpServerConfig,
+  Task,
+  Verification,
+  VerifyCommandResult,
+} from '@tacet/core';
 import type { WorkerBinding } from '@tacet/core/node';
 
 /**
@@ -60,9 +66,30 @@ export class MergeConflictError extends Error {
   }
 }
 
-/** Checks a finished Worker turn before its sub-task counts as `completed` (#19 replaces it). */
+/** What the Mini-conductor gives a verification run (#19). */
+export interface VerifyContext {
+  /** The integrated commit the checkout must be at, when the Worker's work was integrated. */
+  commit?: string;
+  /** Aborted when the session ends or the Mini-conductor stops: the run ends as `not_run`. */
+  signal: AbortSignal;
+  /**
+   * The process marker (#127) for what the commands start, recorded by the Mini-conductor before
+   * the run, so a crash mid-run still ends them at the next start.
+   */
+  marker: string;
+  /** Told each command's result as it finishes (for `worker.verification`). */
+  onCommand?(result: VerifyCommandResult): void;
+}
+
+/** A verification, and on failure what to tell the Worker so it can fix it. */
+export type VerifyResult = Verification & {
+  /** Sent to the Worker as its next turn when a fix round is left. Redacted, bounded. */
+  feedback?: string;
+};
+
+/** Checks a finished Worker turn before its sub-task counts as `completed` (#19). */
 export interface Verifier {
-  verify(subtask: Task, workspace: Workspace): Promise<Verification>;
+  verify(subtask: Task, workspace: Workspace, ctx: VerifyContext): Promise<VerifyResult>;
 }
 
 /** A sub-task as the planner proposes it; the Mini-conductor assigns ids. */

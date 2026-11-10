@@ -87,6 +87,35 @@ export const WorkerIntegrated = z.object({
 });
 export type WorkerIntegrated = z.infer<typeof WorkerIntegrated>;
 
+/** How one `verify` command ended (#19). Unknown values fall back to `failed`. */
+export const VerifyCommandStatus = openEnum(
+  ['passed', 'failed', 'timed_out', 'aborted', 'not_run'],
+  'failed',
+);
+export type VerifyCommandStatus = z.infer<typeof VerifyCommandStatus>;
+
+/**
+ * Payload of `worker.verification`: one `verify` command finished on a Worker's sub-task (#19).
+ * Summary-grade: never the command's output (it is in the Worker's feedback and, short and
+ * redacted, in `SummaryPacket.verification.notes`). `round` counts the fix rounds of the session:
+ * 0 for the first check, then one more each time the failure went back to the Worker.
+ */
+export const WorkerVerification = z.object({
+  sessionId: Id,
+  round: z.number().int().nonnegative(),
+  command: z.string().min(1),
+  status: VerifyCommandStatus,
+  exitCode: z.number().int().optional(),
+  signal: z.string().min(1).optional(),
+  durationMs: z.number().int().nonnegative(),
+  commit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .optional()
+    .describe('The integrated commit the checkout was verified at'),
+});
+export type WorkerVerification = z.infer<typeof WorkerVerification>;
+
 /**
  * Payload of `worker.throttled`: a Worker went over the Mini-conductor's limit for an MCP tool
  * (#121). Written once per window; the calls over the limit get a tool error and change nothing.
