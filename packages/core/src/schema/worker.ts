@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { Id, openEnum } from './common.js';
-import { VerifyCommandStatus } from './handoff.js';
+import { ReviewStatus, VerifyCommandStatus } from './handoff.js';
 
 /**
  * Worker lifecycle events (`worker.*`, ARCHITECTURE.md §3). They are summary-grade: retention
@@ -109,6 +109,30 @@ export const WorkerVerification = z.object({
     .describe('The integrated commit the checkout was verified at'),
 });
 export type WorkerVerification = z.infer<typeof WorkerVerification>;
+
+/**
+ * Payload of `worker.review`: a reviewer agent judged a Worker's sub-task (#19). Summary-grade:
+ * counts only, never the findings' text, which goes to the Worker as its feedback. `round` is
+ * shared with `worker.verification`: the check the review belongs to.
+ */
+export const WorkerReview = z.object({
+  sessionId: Id.describe("The author Worker's session"),
+  reviewerSessionId: Id.optional(),
+  round: z.number().int().nonnegative(),
+  adapter: z.string().min(1),
+  model: z.string().min(1).optional(),
+  status: ReviewStatus,
+  blockers: z.number().int().nonnegative(),
+  majors: z.number().int().nonnegative(),
+  minors: z.number().int().nonnegative(),
+  durationMs: z.number().int().nonnegative(),
+  commit: z
+    .string()
+    .regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/, 'expected a full commit id')
+    .optional()
+    .describe('The integrated commit that was reviewed'),
+});
+export type WorkerReview = z.infer<typeof WorkerReview>;
 
 /**
  * Payload of `worker.throttled`: a Worker went over the Mini-conductor's limit for an MCP tool

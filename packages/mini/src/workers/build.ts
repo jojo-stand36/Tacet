@@ -16,6 +16,7 @@ import {
 import { type AgentAdapter, type TacetConfig, workerEnvPolicy } from '@tacet/core';
 import { type KeychainOptions, resolveSecretRef, SecretRefError } from '@tacet/core/node';
 import type { WorkerAdapter } from '../daemon/ports.js';
+import { reviewConfigProblem } from '../review/config.js';
 
 /** The config cannot be turned into Workers. Names the config path, never a secret value. */
 export class WorkerConfigError extends Error {
@@ -74,6 +75,9 @@ export function buildWorkerAdapters(
 
   const tiers = config.tiers ?? {};
   if (!tiers.worker) throw new WorkerConfigError('config has no tiers.worker');
+  // Cross-vendor review (#19) is checked before anything is built or any secret is read.
+  const reviewProblem = reviewConfigProblem(config);
+  if (reviewProblem) throw new WorkerConfigError(reviewProblem);
   const baseEnv = opts.baseEnv ?? process.env;
   const envPolicy = workerEnvPolicy(config);
   const out: Record<string, WorkerAdapter> = {};

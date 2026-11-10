@@ -92,6 +92,47 @@ export interface Verifier {
   verify(subtask: Task, workspace: Workspace, ctx: VerifyContext): Promise<VerifyResult>;
 }
 
+/** What a reviewer agent gets for one check (#19). */
+export interface ReviewContext {
+  /** The integrated commit to review. */
+  commit: string;
+  /** The commit the Worker's checkout started at (#134); undefined: the main branch. */
+  base?: string;
+  /** A throwaway checkout of `commit` for the reviewer to work in; never the Worker's. */
+  cwd: string;
+  /** Aborts when the author's session ends or the Mini-conductor stops. */
+  signal: AbortSignal;
+  /** Process marker for the reviewer's session (#127). */
+  marker: string;
+}
+
+export interface ReviewFinding {
+  severity: 'blocker' | 'major' | 'minor';
+  file?: string;
+  line?: number;
+  message: string;
+}
+
+/**
+ * A reviewer's verdict. `failed` means blocking findings (blocker or major); `error` means no
+ * verdict (the reviewer failed, timed out or gave no valid reply).
+ */
+export interface ReviewResult {
+  status: 'passed' | 'failed' | 'error';
+  adapter: string;
+  model?: string;
+  sessionId?: string;
+  findings: ReviewFinding[];
+  /** Why there is no verdict (`error`): no paths, no reply text. */
+  notes?: string;
+  usage?: PlanResult['usage'];
+}
+
+/** Reviews a Worker's integrated change before its sub-task completes (#19). */
+export interface Reviewer {
+  review(subtask: Task, ctx: ReviewContext): Promise<ReviewResult>;
+}
+
 /** A sub-task as the planner proposes it; the Mini-conductor assigns ids. */
 export interface ProposedSubtask {
   key: string;

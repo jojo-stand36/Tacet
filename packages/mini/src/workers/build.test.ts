@@ -79,6 +79,16 @@ describe('buildWorkerAdapters', () => {
     const cases: [Partial<TacetConfig>, RegExp][] = [
       [{ tiers: {} }, /no tiers\.worker/],
       [
+        {
+          review: { enabled: true },
+          tiers: {
+            worker: { adapter: 'claude-sdk', model: 'm' },
+            review: { adapter: 'acp:claude-acp' },
+          },
+        },
+        /tiers\.review: the reviewer runs anthropic models like the Worker/,
+      ],
+      [
         { tiers: { worker: { adapter: 'codex-app-server' } } },
         /tiers\.worker\.model: codex-app-server needs a model/,
       ],

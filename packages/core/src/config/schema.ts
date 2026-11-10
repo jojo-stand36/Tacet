@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ENV_PASS_PATTERN } from '../adapter/env.js';
+import { VENDORS } from '../adapter/vendor.js';
 
 /**
  * Tacet configuration (ARCHITECTURE.md §4). Config is written by people, so enums here are
@@ -18,7 +19,16 @@ export const TierConfig = z.strictObject({
    */
   model: NonEmpty.optional(),
   effort: z.enum(['low', 'medium', 'high']).optional(),
+  /**
+   * `tiers.review`: the reviewer must run a different vendor's models than `tiers.worker` (#19).
+   * Default true.
+   */
   cross_vendor: z.boolean().optional(),
+  /**
+   * Whose models the adapter runs, for cross-vendor review (#19). Built-in adapters are known;
+   * OpenCode and custom `acp:`/`pty:` agents need it to take part.
+   */
+  vendor: z.enum(VENDORS).optional(),
 });
 export type TierConfig = z.infer<typeof TierConfig>;
 
@@ -79,6 +89,11 @@ export const TacetConfig = z.strictObject({
    * as Worker code: the Worker environment, no vendor keys. The task layer may not set it.
    */
   verify: z.array(NonEmpty).optional(),
+  /**
+   * A reviewer agent on `tiers.review` checks each sub-task's diff after its `verify` commands
+   * pass (#19). Off by default. The task layer may turn it on, never off.
+   */
+  review: z.strictObject({ enabled: z.boolean() }).partial().optional(),
   budget: z
     .strictObject({
       per_task_usd: z.number().nonnegative(),

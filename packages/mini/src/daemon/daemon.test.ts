@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type EventEnvelope, newUlid, type TacetConfig, tasksProjection } from '@tacet/core';
@@ -7,7 +7,17 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import { MiniConductor, type MiniConductorOptions, VERIFY_CODEX_WORKERS } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
-import type { Planner, ProposedSubtask, Verifier, VerifyContext, WorkerMcp } from './ports.js';
+import type {
+  Integrator,
+  Planner,
+  ProposedSubtask,
+  ReviewContext,
+  Reviewer,
+  ReviewResult,
+  Verifier,
+  VerifyContext,
+  WorkerMcp,
+} from './ports.js';
 import { type Script, ScriptedAdapter, TempWorkspaces } from './testing.js';
 
 const CONFIG: TacetConfig = {
@@ -108,6 +118,239 @@ afterEach(async () => {
 });
 
 describe('MiniConductor', () => {
+  describe('review (#19)', () => {
+    const COMMIT = 'c'.repeat(40);
+    /** Every turn's end integrates a commit, so there is something to review. */
+    const integrator: Integrator = {
+      integrate: async (subtaskId) => ({ commit: COMMIT, ref: `refs/heads/tacet/${subtaskId}` }),
+      combine: async () => undefined,
+      publish: async (taskId) => `refs/heads/tacet/result/${taskId}`,
+    };
+    const REVIEW: TacetConfig = {
+      ...CONFIG,
+      tiers: {
+        worker: { adapter: 'fake', model: 'cheap' },
+        review: { adapter: 'other', model: 'x', cross_vendor: false },
+      },
+      review: { enabled: true },
+      workers: { ...CONFIG.workers, max_attempts: 1, verify_fix_attempts: 1 },
+    };
+    /** A reviewer that answers from `results`, in turn, recording what it was given. */
+    function scriptedReviewer(results: ReviewResult['status'][]) {
+      const calls: ReviewContext[] = [];
+      const cwdExisted: boolean[] = [];
+      const reviewer: Reviewer = {
+        async review(_task, ctx) {
+          calls.push(ctx);
+          cwdExisted.push(existsSync(ctx.cwd));
+          const status = results[Math.min(calls.length - 1, results.length - 1)] ?? 'passed';
+          return {
+            status,
+            adapter: 'other',
+            model: 'x',
+            sessionId: `rev-${calls.length}`,
+            findings:
+              status === 'failed'
+                ? [{ severity: 'blocker', file: 'a.ts', line: 2, message: 'wrong answer' }]
+                : [{ severity: 'minor', message: 'style' }],
+            ...(status === 'error' ? { notes: 'the reviewer timed out' } : {}),
+            usage: { inputTokens: 10, outputTokens: 2, model: 'x' },
+          };
+        },
+      };
+      return { reviewer, calls, cwdExisted };
+    }
+    const reviews = () =>
+      ofType('worker.review').map(
+        (e) => e.data as { round: number; status: string; sessionId: string; blockers: number },
+      );
+    const result = (id: string) =>
+      ofType('task.result', `${id}/1`).map(
+        (e) =>
+          e.data as {
+            outcome: string;
+            verification: {
+              status: string;
+              notes?: string;
+              review?: { status: string; blocking: number };
+            };
+          },
+      );
+
+    it("completes approved work, recording the verdict and the reviewer's usage", async () => {
+      const { reviewer, calls, cwdExisted } = scriptedReviewer(['passed']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.commit).toBe(COMMIT);
+      // A throwaway checkout of its own, gone afterwards, with a marker of its own.
+      expect(cwdExisted).toEqual([true]);
+      expect(existsSync(calls[0]?.cwd ?? '')).toBe(false);
+      expect(calls[0]?.cwd).not.toBe(fake.sessions[0]?.opts.cwd);
+      expect(calls[0]?.marker).toMatch(/\S/);
+      expect(reviews()).toEqual([
+        expect.objectContaining({ round: 0, status: 'passed', blockers: 0, minors: 1 }),
+      ]);
+      expect(JSON.stringify(ofType('worker.review'))).not.toContain('style');
+      expect(result(id)[0]?.verification).toMatchObject({
+        status: 'passed',
+        review: { status: 'passed', adapter: 'other', blocking: 0 },
+      });
+      expect(ofType('agent.usage', `${id}/1`).length).toBeGreaterThan(0);
+    });
+
+    it('sends blocking findings back to the same session, then completes', async () => {
+      const { reviewer } = scriptedReviewer(['failed', 'passed']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(fake.sessions).toHaveLength(1);
+      const fix = fake.sessions[0]?.inputs.at(-1) ?? '';
+      expect(fix).toMatch(/^Review failed:/);
+      expect(fix).toContain('[blocker] a.ts:2: wrong answer');
+      expect(reviews().map((r) => [r.round, r.status])).toEqual([
+        [0, 'failed'],
+        [1, 'passed'],
+      ]);
+    });
+
+    it('caps review rounds without verify commands, and fails the attempt with the findings', async () => {
+      const { reviewer, calls } = scriptedReviewer(['failed']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      // One check, one fix round (verify_fix_attempts: 1), then the attempt fails.
+      expect(calls).toHaveLength(2);
+      const r = result(id)[0];
+      expect(r?.outcome).toBe('failed');
+      expect(r?.verification.status).toBe('failed');
+      expect(r?.verification.review).toMatchObject({ status: 'failed', blocking: 1 });
+      expect(r?.verification.notes).toContain('reviewer findings, untrusted');
+      expect(Object.keys(r?.verification ?? {})).not.toContain('feedback');
+    });
+
+    it('does not review work whose commands failed', async () => {
+      const { reviewer, calls } = scriptedReviewer(['passed']);
+      const verifier: Verifier = {
+        async verify(_t, _w, ctx) {
+          ctx.onCommand?.({ command: 'pnpm test', status: 'failed', exitCode: 1, durationMs: 1 });
+          return {
+            status: 'failed',
+            commands: ['pnpm test'],
+            notes: 'red',
+            feedback: 'tests failed',
+          };
+        },
+      };
+      const d = make({
+        config: { ...REVIEW, verify: ['pnpm test'] },
+        reviewer,
+        verifier,
+        integrator,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[`${id}/1`]?.state).toBe('failed');
+      expect(calls).toHaveLength(0);
+    });
+
+    it('leaves the work partial when the reviewer gives no verdict', async () => {
+      const { reviewer } = scriptedReviewer(['error']);
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(result(id)[0]?.verification).toMatchObject({
+        status: 'partial',
+        notes: 'Review did not finish: the reviewer timed out.',
+        review: { status: 'error' },
+      });
+    });
+
+    it('skips review and explore sub-tasks', async () => {
+      const { reviewer, calls } = scriptedReviewer(['failed']);
+      const d = make({
+        config: REVIEW,
+        reviewer,
+        integrator,
+        planner: new FixedPlanner([
+          { key: 'r', goal: 'Review it', acceptanceCriteria: ['ok'], kind: 'review' },
+          { key: 'e', goal: 'Explore it', acceptanceCriteria: ['ok'], kind: 'explore' },
+        ]),
+      });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(calls).toHaveLength(0);
+    });
+
+    it('has nothing to review when no commit was integrated', async () => {
+      const { reviewer, calls } = scriptedReviewer(['failed']);
+      const d = make({ config: REVIEW, reviewer });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      expect(calls).toHaveLength(0);
+    });
+
+    it('aborts a review in progress when the Mini-conductor stops, its marker recorded meanwhile', async () => {
+      let fileHadIt = false;
+      let aborted = false;
+      const reviewer: Reviewer = {
+        review: (_t, ctx) =>
+          new Promise((resolve) => {
+            fileHadIt = readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8').includes(
+              ctx.marker,
+            );
+            ctx.signal.addEventListener('abort', () => {
+              aborted = true;
+              resolve({
+                status: 'error',
+                adapter: 'other',
+                findings: [],
+                notes: 'the review was stopped',
+              });
+            });
+          }),
+      };
+      const d = make({ config: REVIEW, reviewer, integrator });
+      await d.start();
+      d.submit({ goal: 'Do it', acceptanceCriteria: ['ok'], priority: 'p1' });
+      await expect.poll(() => fileHadIt).toBe(true);
+      await d.stop();
+      expect(aborted).toBe(true);
+      expect(readFileSync(`${join(dir, 'mini.lock')}.workers`, 'utf8')).not.toMatch(/review:/);
+    });
+
+    it('refuses to start with review on and no reviewer, or a reviewer of the same vendor', () => {
+      expect(() => make({ config: REVIEW })).toThrow(/no reviewer was given/);
+      const { reviewer } = scriptedReviewer(['passed']);
+      expect(() =>
+        make({
+          config: {
+            ...REVIEW,
+            tiers: {
+              worker: { adapter: 'fake', model: 'cheap', vendor: 'anthropic' },
+              review: { adapter: 'other', model: 'x', vendor: 'anthropic' },
+            },
+          },
+          reviewer,
+        }),
+      ).toThrow(/runs anthropic models like the Worker/);
+    });
+  });
+
   describe('verification (#19)', () => {
     const VERIFY: TacetConfig = {
       ...CONFIG,

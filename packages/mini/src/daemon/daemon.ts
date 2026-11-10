@@ -29,10 +29,14 @@ import {
   WORKER_MARKER_VAR,
 } from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
+import { formatFindings, reviewFeedback } from '../review/adapter-reviewer.js';
+import { reviewConfigProblem } from '../review/config.js';
 import {
   type Integrator,
   MergeConflictError,
   type Planner,
+  type Reviewer,
+  type ReviewResult,
   type Verifier,
   type VerifyResult,
   type WorkerAdapter,
@@ -54,6 +58,11 @@ export interface MiniConductorOptions {
   planner: Planner;
   /** Default: passes, with the configured `verify` commands recorded as not run (#19). */
   verifier?: Verifier;
+  /**
+   * Reviews each sub-task's integrated change after its commands pass, when `review.enabled`
+   * (#19): an `AdapterReviewer` on `tiers.review`. Required when review is on.
+   */
+  reviewer?: Reviewer;
   /** Brings Worker commits into the repo after each finished turn (#119). Default: none. */
   integrator?: Integrator;
   mcp: WorkerMcp;
@@ -155,6 +164,42 @@ const CODEX_NOT_VERIFIED = 'codex verify pending sandbox decision';
 /** The command name `worker.verification` records for a failure before any command ran. */
 const CHECKOUT_CHECK = '(verification failed before any command)';
 
+/**
+ * A check's result with the reviewer's verdict folded in (#19). Blocking findings fail it, with
+ * the findings as the Worker's feedback; a reviewer that gave no verdict leaves it `partial`
+ * (owner decision pending: block instead), as do commands that did not run.
+ */
+function withReview(v: VerifyResult, r: ReviewResult): VerifyResult {
+  const blocking = r.findings.filter((f) => f.severity !== 'minor').length;
+  const review = {
+    status: r.status,
+    adapter: r.adapter,
+    ...(r.model !== undefined ? { model: r.model } : {}),
+    blocking,
+  };
+  const notes = (extra: string) => (v.notes ? `${v.notes}\n${extra}` : extra);
+  if (r.status === 'failed') {
+    return {
+      ...v,
+      status: 'failed',
+      notes: notes(
+        `Review requested changes (${blocking} blocking; reviewer findings, untrusted):\n${formatFindings(r.findings, 2000)}`,
+      ),
+      feedback: reviewFeedback(r.findings),
+      review,
+    };
+  }
+  if (r.status === 'error') {
+    return {
+      ...v,
+      status: v.status === 'passed' ? 'partial' : v.status,
+      notes: notes(`Review did not finish: ${r.notes ?? 'no verdict'}.`),
+      review,
+    };
+  }
+  return { ...v, status: v.status === 'not_run' ? 'partial' : v.status, review };
+}
+
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
@@ -201,6 +246,11 @@ export class MiniConductor {
       if (tier && !opts.adapters[tier.adapter]) {
         throw new Error(`no Worker adapter ${tier.adapter} for its tier`);
       }
+    }
+    const problem = reviewConfigProblem(opts.config);
+    if (problem) throw new Error(problem);
+    if (opts.config.review?.enabled && !opts.reviewer) {
+      throw new Error('review.enabled: review is on but no reviewer was given');
     }
     this.#o = opts;
   }
@@ -1117,9 +1167,11 @@ export class MiniConductor {
         ended = true;
         return;
       }
+      // One round per check: the commands and the review of the same commit share it.
+      const round = this.#verifyRounds(run);
       let verification: VerifyResult;
       try {
-        verification = await this.#verify(run, view.task);
+        verification = await this.#verify(run, view.task, round);
       } catch (err) {
         if (!(err instanceof WorktreeRefusedError)) throw err;
         ended = true;
@@ -1127,6 +1179,12 @@ export class MiniConductor {
         return;
       }
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // Review only work whose commands did not fail: a reviewer cannot pass failing tests.
+      if (verification.status !== 'failed') {
+        const review = await this.#review(run, view.task, round);
+        if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+        if (review) verification = withReview(verification, review);
+      }
       if (verification.status === 'failed' && (await this.#sendFix(run, verification))) {
         // The same session fixes it: its next turn's end verifies again.
         return;
@@ -1161,6 +1219,7 @@ export class MiniConductor {
       commands: result.commands,
       ...(result.notes !== undefined ? { notes: result.notes } : {}),
       ...(result.results !== undefined ? { results: result.results } : {}),
+      ...(result.review !== undefined ? { review: result.review } : {}),
     };
     const text = (run.lastMessage ?? run.text).trim();
     return {
@@ -1241,12 +1300,11 @@ export class MiniConductor {
    * what the commands started at the next start) and aborted if the session ends meanwhile.
    * Each command's result becomes a `worker.verification` event; the output never does.
    */
-  async #verify(run: Run, task: Task): Promise<VerifyResult> {
+  async #verify(run: Run, task: Task, round: number): Promise<VerifyResult> {
     const commands = this.#o.config.verify ?? [];
     if (CODEX_ADAPTERS.has(run.adapterId) && !VERIFY_CODEX_WORKERS && commands.length > 0) {
       return { status: 'not_run', commands, notes: CODEX_NOT_VERIFIED };
     }
-    const round = this.#verifyRounds(run);
     const abort = new AbortController();
     run.verifyAbort = abort;
     const marker = newWorkerMarker();
@@ -1324,6 +1382,89 @@ export class MiniConductor {
   }
 
   /**
+   * Review a finished turn's integrated change (#19), when review is on: a throwaway checkout of
+   * the commit for the reviewer, its process marker recorded first, aborted if the session ends.
+   * Undefined when there is nothing to review: review off, no commit, or a review or explore
+   * sub-task. The verdict becomes a `worker.review` event (counts only) and its usage is charged
+   * to the sub-task.
+   */
+  async #review(run: Run, task: Task, round: number): Promise<ReviewResult | undefined> {
+    const reviewer = this.#o.reviewer;
+    if (!this.#o.config.review?.enabled || !reviewer || run.commit === undefined) return undefined;
+    const kind = this.#state().kinds.get(run.subtaskId);
+    if (kind === 'review' || kind === 'explore') return undefined;
+    const tier = this.#o.config.tiers?.review;
+    const commit = run.commit;
+    const abort = new AbortController();
+    run.verifyAbort = abort;
+    const marker = newWorkerMarker();
+    const key = `review:${run.sessionId}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    const started = this.#now().getTime();
+    let checkout: Workspace | undefined;
+    let result: ReviewResult;
+    try {
+      checkout = await this.#o.workspaces.create(`review-${randomUUID()}`, commit);
+      result = await reviewer.review(task, {
+        commit,
+        ...(run.baseCommit !== undefined ? { base: run.baseCommit } : {}),
+        cwd: checkout.path,
+        signal: AbortSignal.any([abort.signal, this.#abort.signal]),
+        marker,
+      });
+    } catch (err) {
+      this.#errors.push(err);
+      result = {
+        status: 'error',
+        adapter: tier?.adapter ?? 'unknown',
+        findings: [],
+        notes: 'the review could not run (see the Mini-conductor log)',
+      };
+    } finally {
+      if (run.verifyAbort === abort) run.verifyAbort = undefined;
+      if (checkout) await this.#o.workspaces.remove(checkout.id).catch((e) => this.#errors.push(e));
+      // Whatever the reviewer's session left running goes with it.
+      await endMarkedProcesses([marker]).catch(() => undefined);
+      if (this.#markers.get(key) === marker) {
+        this.#markers.delete(key);
+        this.#saveMarkers();
+      }
+    }
+    const count = (sev: string) => result.findings.filter((f) => f.severity === sev).length;
+    this.#o.store.append([
+      this.#env(
+        run.subtaskId,
+        'worker.review',
+        {
+          sessionId: run.sessionId,
+          ...(result.sessionId !== undefined ? { reviewerSessionId: result.sessionId } : {}),
+          round,
+          adapter: result.adapter,
+          ...(result.model !== undefined ? { model: result.model } : {}),
+          status: result.status,
+          blockers: count('blocker'),
+          majors: count('major'),
+          minors: count('minor'),
+          durationMs: Math.max(0, this.#now().getTime() - started),
+          commit,
+        },
+        run.sessionId,
+      ),
+      ...(result.usage
+        ? [
+            this.#env(run.subtaskId, 'agent.usage', {
+              t: 'usage',
+              source: 'reported',
+              ...result.usage,
+            }),
+          ]
+        : []),
+    ]);
+    return result;
+  }
+
+  /**
    * Verification rounds this attempt already had (each recorded its commands under one round):
    * those of every session started under the same attempt number, so a restart (which resumes
    * without counting as a failed attempt) does not buy fix rounds, while a retry after a failed
@@ -1340,10 +1481,10 @@ export class MiniConductor {
       if (d.sessionId && attempt !== undefined && d.attempt === attempt) sessions.add(d.sessionId);
     }
     const rounds = new Set<string>();
-    for (const e of this.#o.store.query({
-      taskId: run.subtaskId,
-      typePrefix: 'worker.verification',
-    })) {
+    // Commands and reviews alike: a repo without `verify` commands still has a cap on reviews.
+    for (const e of this.#o.store.query({ taskId: run.subtaskId, typePrefix: 'worker' })) {
+      if (e.envelope.type !== 'worker.verification' && e.envelope.type !== 'worker.review')
+        continue;
       const d = e.envelope.data as { sessionId?: string; round?: number };
       if (d.sessionId && sessions.has(d.sessionId) && typeof d.round === 'number') {
         rounds.add(`${d.sessionId}:${d.round}`);
