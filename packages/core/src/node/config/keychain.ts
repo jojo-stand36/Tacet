@@ -49,6 +49,11 @@ const defaultRun: KeychainToolRunner = (file, args, timeoutMs) => {
   };
 };
 
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point.
+const CONTROL = /[\u0000-\u001f\u007f]/;
+/** Printable ASCII: what API keys are, and all macOS returns unencoded. */
+const PRINTABLE = /^[\u0020-\u007e]+$/;
+
 /** `service/account` → its parts; the account is everything after the first `/`. */
 export function parseKeychainRef(ref: string): { service: string; account: string } {
   const i = ref.indexOf('/');
@@ -57,35 +62,44 @@ export function parseKeychainRef(ref: string): { service: string; account: strin
   if (!service || !account) {
     throw new KeychainError(`keychain reference ${JSON.stringify(ref)} must be "service/account"`);
   }
-  // Both become arguments of the platform tool: one starting with `-` could be read as an option.
-  if (service.startsWith('-') || account.startsWith('-')) {
+  // Both become arguments of the platform tool: one starting with `-` could be read as an option,
+  // and a control character (a NUL) cannot be an argument at all.
+  if (service.startsWith('-') || account.startsWith('-') || CONTROL.test(ref)) {
     throw new KeychainError(
-      `keychain reference ${JSON.stringify(ref)}: service and account may not start with "-"`,
+      `keychain reference ${JSON.stringify(ref)}: service and account may not start with "-" or hold control characters`,
     );
   }
   return { service, account };
 }
 
-/** The first line of a tool's message, for an error (the value is only ever on stdout). */
+/**
+ * The first line of a tool's message, for an error (the value is only ever on stdout), with
+ * anything but printable ASCII dropped so no escape sequence reaches a log.
+ */
 function firstLine(text: string): string {
-  return text.trim().split('\n')[0]?.slice(0, 200) ?? '';
+  const line = text.trim().split('\n')[0] ?? '';
+  return line.replace(/[^\u0020-\u007e]/g, '').slice(0, 200);
 }
 
 /**
  * Reads a generic password from the OS keychain (#160), without a shell and without the value
  * touching disk or any argv: only `service` and `account` are arguments.
  *
- * - **macOS:** `security find-generic-password -s <service> -a <account> -w`. It prints the
+ * - **macOS:** `/usr/bin/security find-generic-password -s <service> -a <account> -w`. It prints the
  *   password and a newline, or the password as hex when any byte is not printable ASCII
  *   (`keychain_find.c`), so only printable ASCII values (API keys are) read back as stored.
  *   A missing item, and a search that fails (a locked keychain), exit 44 (`errSecItemNotFound`,
  *   -25300); a failure reading the password exits with its own status (for example 51,
  *   `errSecAuthFailed`).
  * - **Linux:** `secret-tool lookup service <service> account <account>` (libsecret, Secret
- *   Service): the value exactly as stored. Not found and a locked keyring both exit 1 with no
- *   output (its unlock prompt needs a display); no session bus exits 1 with a message.
+ *   Service): the value exactly as stored. Not found and, without a display, a locked keyring
+ *   both exit 1 with no output; no session bus exits 1 with a message.
  *
- * Tacet never unlocks a keychain or answers a prompt.
+ * One trailing newline is dropped on both (`echo key | secret-tool store` stores `key\n`), and the
+ * value must then be printable ASCII: anything else (a NUL, which cannot go into an environment;
+ * other control characters; non-ASCII, which macOS returns as hex) is refused, without the value.
+ * Tacet never unlocks a keychain or answers a prompt. It runs synchronously, up to the timeout per
+ * reference.
  */
 export function readKeychain(ref: string, opts: KeychainOptions = {}): Secret {
   const { service, account } = parseKeychainRef(ref);
@@ -97,7 +111,8 @@ export function readKeychain(ref: string, opts: KeychainOptions = {}): Secret {
   let args: string[];
   let install: string;
   if (platform === 'darwin') {
-    tool = 'security';
+    // Absolute, so an earlier `security` on PATH cannot answer in its place.
+    tool = '/usr/bin/security';
     args = ['find-generic-password', '-s', service, '-a', account, '-w'];
     install = 'it ships with macOS at /usr/bin/security';
   } else if (platform === 'linux') {
@@ -118,10 +133,14 @@ export function readKeychain(ref: string, opts: KeychainOptions = {}): Secret {
   if (r.error)
     throw new KeychainError(`${tool} could not be run: ${r.error.code ?? r.error.message}`);
   if (r.status === 0) {
-    const value =
-      platform === 'darwin' && r.stdout.endsWith('\n') ? r.stdout.slice(0, -1) : r.stdout;
-    if (value !== '') return new Secret(value);
-    throw new KeychainError(`the keychain item for ${where} is empty`);
+    const value = r.stdout.replace(/\r?\n$/, '');
+    if (value === '') throw new KeychainError(`the keychain item for ${where} is empty`);
+    if (!PRINTABLE.test(value)) {
+      throw new KeychainError(
+        `the keychain item for ${where} holds characters other than printable ASCII (a newline, a control character or non-ASCII); store the key alone, e.g. with printf '%s'`,
+      );
+    }
+    return new Secret(value);
   }
   if (platform === 'darwin' && r.status === 44) {
     throw new KeychainError(`no keychain item for ${where}, or the keychain is locked`);

@@ -32,15 +32,27 @@ describe('readKeychain (#160)', () => {
     expect(s.reveal()).toBe(VALUE);
     expect(String(s)).toBe('[redacted]');
     expect(t.calls).toEqual([
-      { file: 'security', args: ['find-generic-password', '-s', 'tacet', '-a', 'goose', '-w'] },
+      {
+        file: '/usr/bin/security',
+        args: ['find-generic-password', '-s', 'tacet', '-a', 'goose', '-w'],
+      },
     ]);
   });
 
-  it('Linux: secret-tool lookup service account, the value exactly as stored', () => {
+  it('Linux: secret-tool lookup service account; one trailing newline (from `echo`) dropped', () => {
     const t = tool({ stdout: `${VALUE}\n` });
     expect(readKeychain('tacet/goose/team', { platform: 'linux', run: t.run }).reveal()).toBe(
-      `${VALUE}\n`,
+      VALUE,
     );
+    expect(
+      readKeychain('a/b', { platform: 'linux', run: tool({ stdout: VALUE }).run }).reveal(),
+    ).toBe(VALUE);
+    expect(
+      readKeychain('a/b', {
+        platform: 'linux',
+        run: tool({ stdout: `${VALUE}\r\n` }).run,
+      }).reveal(),
+    ).toBe(VALUE);
     expect(t.calls).toEqual([
       { file: 'secret-tool', args: ['lookup', 'service', 'tacet', 'account', 'goose/team'] },
     ]);
@@ -129,8 +141,37 @@ describe('readKeychain (#160)', () => {
     );
   });
 
+  it('refuses a value that is not printable ASCII, without showing it', () => {
+    // A NUL cannot go into an environment (Node would print the value refusing it); a newline
+    // inside, other control characters and non-ASCII are not an API key either.
+    for (const stdout of [
+      `fake\u0000${VALUE}`,
+      `${VALUE}\nsecond line\n`,
+      `${VALUE}\u001b[0m`,
+      `${VALUE}é`,
+      `${VALUE}\n\n`,
+    ]) {
+      for (const platform of ['linux', 'darwin'] as const) {
+        expect(
+          failure(() => readKeychain('a/b', { platform, run: tool({ stdout }).run })).message,
+        ).toMatch(/holds characters other than printable ASCII .* printf '%s'/);
+      }
+    }
+  });
+
+  it('keeps escape sequences from the tool out of its errors', () => {
+    const message = failure(() =>
+      readKeychain('a/b', {
+        platform: 'linux',
+        run: tool({ status: 3, stderr: '\u001b[31mboom\u001b[0m\n' }).run,
+      }),
+    ).message;
+    expect(message).toMatch(/exit 3: \[31mboom\[0m\)$/);
+    expect(message).not.toContain('\u001b');
+  });
+
   it('refuses malformed references and other platforms before running anything', () => {
-    for (const ref of ['tacet', '/b', 'a/', '-w/b', 'a/--help']) {
+    for (const ref of ['tacet', '/b', 'a/', '-w/b', 'a/--help', 'a/b\u0000c', 'a\n/b']) {
       const t = tool({});
       expect(() => readKeychain(ref, { platform: 'linux', run: t.run }), ref).toThrow(
         /keychain reference/,

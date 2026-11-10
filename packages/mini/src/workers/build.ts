@@ -68,6 +68,10 @@ export function buildWorkerAdapters(
   config: TacetConfig,
   opts: BuildWorkerAdaptersOptions = {},
 ): Record<string, WorkerAdapter> {
+  // A keychain item two agents reference is read once: each read may block (it is synchronous,
+  // up to its timeout) or wait on a prompt.
+  const fromKeychain = new Map<string, string>();
+
   const tiers = config.tiers ?? {};
   if (!tiers.worker) throw new WorkerConfigError('config has no tiers.worker');
   const baseEnv = opts.baseEnv ?? process.env;
@@ -173,7 +177,7 @@ export function buildWorkerAdapters(
     }
   }
 
-  /** The agent's secret references, resolved from `baseEnv`. */
+  /** The agent's secret references, resolved from `baseEnv` or the keychain. */
   function resolveEnv(
     slug: string,
     refs: NonNullable<TacetConfig['agents']>[string]['env'],
@@ -181,9 +185,13 @@ export function buildWorkerAdapters(
     const env: Record<string, string> = {};
     for (const [name, ref] of Object.entries(refs ?? {})) {
       try {
-        env[name] = resolveSecretRef(ref, `agents.${slug}.env.${name}`, baseEnv, {
-          ...(opts.keychain ? { keychain: opts.keychain } : {}),
-        }).reveal();
+        const known = 'keychain' in ref ? fromKeychain.get(ref.keychain) : undefined;
+        env[name] =
+          known ??
+          resolveSecretRef(ref, `agents.${slug}.env.${name}`, baseEnv, {
+            ...(opts.keychain ? { keychain: opts.keychain } : {}),
+          }).reveal();
+        if ('keychain' in ref) fromKeychain.set(ref.keychain, env[name]);
       } catch (err) {
         if (err instanceof SecretRefError) throw new WorkerConfigError(err.message, { cause: err });
         throw err;

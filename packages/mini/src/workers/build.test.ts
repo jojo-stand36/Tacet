@@ -183,6 +183,28 @@ describe('buildWorkerAdapters', () => {
     });
     expect(built['acp:goose']?.adapter.id).toBe('acp:goose');
     expect(calls).toEqual([['lookup', 'service', 'tacet', 'account', 'goose']]);
+    // The same item for two agents is read once.
+    calls.length = 0;
+    buildWorkerAdapters(
+      config({
+        tiers: { worker: { adapter: 'acp:goose' }, review: { adapter: 'acp:moose' } },
+        agents: {
+          goose: { kind: 'acp', command: ['goose'], env: { K: { keychain: 'tacet/goose' } } },
+          moose: { kind: 'acp', command: ['moose'], env: { K: { keychain: 'tacet/goose' } } },
+        },
+      }),
+      {
+        baseEnv: {},
+        keychain: {
+          platform: 'linux',
+          run: (_file, args) => {
+            calls.push(args);
+            return { status: 0, stdout: 'keychain-value-1234', stderr: '' };
+          },
+        },
+      },
+    );
+    expect(calls).toHaveLength(1);
     expect(() =>
       buildWorkerAdapters(config(over), {
         baseEnv: {},
