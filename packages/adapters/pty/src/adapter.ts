@@ -361,6 +361,13 @@ export class PtyAdapter implements AgentAdapter {
       const ptyEnv: Record<string, string> = {
         ...env,
         CLAUDE_CONFIG_DIR: configDir,
+        // Prompts are typed verbatim: Claude Code would otherwise read an `@path` mention into
+        // the prompt, outside the working directory too, with no hook or permission request, and
+        // a Worker's prompt can carry text a Worker wrote (a `verify` command's output). Verified
+        // live on 2.1.319, inline, at a line start and in a code fence; documented from 2.1.299
+        // (code.claude.com/docs/en/env-vars, checked 2026-11-10). Set here, last, so no base
+        // environment can unset it; Claude Code ignores it in project settings anyway (#226).
+        CLAUDE_CODE_DISABLE_FILE_MENTIONS: '1',
         TERM: env.TERM ?? 'xterm-256color',
         // The hook endpoint is local: never through a proxy the user has set.
         NO_PROXY: [env.NO_PROXY, '127.0.0.1'].filter(Boolean).join(','),

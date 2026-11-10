@@ -223,6 +223,8 @@ describe('PtyAdapter (fake claude)', () => {
     );
     expect(f.args[f.args.indexOf('--session-id') + 1]).toBe(h.vendorSessionId);
     expect(f.opts.env.CLAUDE_CONFIG_DIR).toContain(join(root, 'state'));
+    // No `@path` mention is read into a prompt (#226).
+    expect(f.opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
     expect(f.opts.env.NO_PROXY).toContain('127.0.0.1');
     expect(f.opts.env.OPENAI_API_KEY).toBeUndefined();
     expect(dropped).toEqual([['OPENAI_API_KEY']]);

@@ -127,6 +127,32 @@ describe.skipIf(!gate.ok)(
       assertConformance(results);
     });
 
+    it('reads no @path mention into a Worker prompt (#226)', { timeout: 180_000 }, async () => {
+      const cwd = join(root, 'wt-at');
+      mkdirSync(cwd);
+      writeFileSync(join(cwd, 'note.txt'), 'INSIDE-AT-CONTENT\n');
+      const outside = join(root, 'outside-at.txt');
+      writeFileSync(outside, 'OUTSIDE-AT-CONTENT\n');
+      // Inline, at the start of a line, and inside a fence: each was read in before (verified live).
+      for (const text of [
+        `SAY inline see @${outside} and @note.txt`,
+        `SAY line\n@${outside}`,
+        `SAY fenced\n\`\`\`\nsee @${outside} and @note.txt\n\`\`\``,
+      ]) {
+        const h = await adapter.start({ cwd });
+        const tap = new EventTap(adapter.events(h));
+        const { end, events } = await turn(h, tap, text);
+        expect(end).toEqual({ t: 'status', state: 'idle' });
+        expect(events.some((e) => e.t === 'approval.request')).toBe(false);
+        const raw = api.requests.at(-1)?.raw ?? '';
+        // Typed verbatim: the mentions reach the model as text, and nothing is read in.
+        expect(api.requests.at(-1)?.text).toContain(`@${outside}`);
+        expect(raw).not.toContain('OUTSIDE-AT-CONTENT');
+        expect(raw).not.toContain('INSIDE-AT-CONTENT');
+        await adapter.close(h);
+      }
+    });
+
     it('reports running, waiting and idle from the hooks', { timeout: 120_000 }, async () => {
       const cwd = join(root, 'wt-status');
       mkdirSync(cwd);
