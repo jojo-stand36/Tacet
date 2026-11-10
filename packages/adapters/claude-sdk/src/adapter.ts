@@ -79,7 +79,16 @@ export interface ClaudeSdkAdapterOptions {
    * this adapter started its first session (#108). Only the count: never names or contents.
    */
   onSweep?: (removedFiles: number) => void;
-  /** SDK options passed through unchanged, e.g. `settingSources` or `pathToClaudeCodeExecutable`. */
+  /**
+   * SDK options passed through unchanged, e.g. `pathToClaudeCodeExecutable`.
+   *
+   * `settingSources` defaults to `[]` (#181): no user, project or local settings and no CLAUDE.md,
+   * so a checkout a Worker wrote cannot add hooks, permissions, environment or instructions to a
+   * later session. Passing it here is the explicit opt-in, e.g. `['project']` for an interactive
+   * session in the user's own repo. Never opt in for a session in a Worker's checkout. MCP servers
+   * come only from Tacet's config either way (`strictMcpConfig` is always on), never from the
+   * user's or the project's settings or `.mcp.json`.
+   */
   sdkOptions?: Pick<
     Options,
     'settingSources' | 'pathToClaudeCodeExecutable' | 'permissionMode' | 'allowedTools'
@@ -252,6 +261,11 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         prompt: inbox,
         options: {
           ...this.#opts.sdkOptions,
+          // SDK isolation mode unless the caller opted in (#181); see `sdkOptions`.
+          settingSources: this.#opts.sdkOptions?.settingSources ?? [],
+          // Only Tacet's MCP config (the `--mcp-config` file below): never a checkout's `.mcp.json`
+          // or a plugin's servers, whatever the setting sources (#181).
+          strictMcpConfig: true,
           ...sessionOpts,
           cwd: opts.cwd,
           env,

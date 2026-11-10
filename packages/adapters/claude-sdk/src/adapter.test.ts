@@ -242,6 +242,18 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
     expect(vertex.CLAUDE_CODE_SOME_LOGIN_TOKEN).toBeUndefined();
   });
 
+  it('loads no filesystem settings unless the caller opts in (#181)', async () => {
+    const stub = stubQuery();
+    await make(stub).start({ cwd: root });
+    await make(stub, { sdkOptions: { permissionMode: 'default' } }).start({ cwd: root });
+    // Other SDK options do not drop the default, and a resume keeps it too.
+    await make(stub).start({ cwd: root, resume: { vendorSessionId: 'v-1' } });
+    expect(stub.calls.map((c) => c.settingSources)).toEqual([[], [], []]);
+    expect(stub.calls.every((c) => c.strictMcpConfig === true)).toBe(true);
+    await make(stub, { sdkOptions: { settingSources: ['project'] } }).start({ cwd: root });
+    expect(stub.calls[3]?.settingSources).toEqual(['project']);
+  });
+
   it('maps resume and fork to the SDK options', async () => {
     const stub = stubQuery();
     const adapter = make(stub);

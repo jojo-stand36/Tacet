@@ -39,7 +39,12 @@ import {
   type WorkerEnvPolicy,
   workerEnv,
 } from '@tacet/core';
-import { defaultStateDir, repoStateDir } from '@tacet/core/node';
+import {
+  defaultStateDir,
+  processGroupAlive,
+  processGroupGone,
+  repoStateDir,
+} from '@tacet/core/node';
 import type { AcpAgentSpec } from './agents.js';
 import {
   approvalChoices,
@@ -85,7 +90,11 @@ export interface AcpAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
-  /** Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL. Default 5000. */
+  /**
+   * Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL, and again for the
+   * rest of its process group (#181). Default 5000. Worst-case `close()` is about
+   * 0.5 s + 2 × this + 1 s.
+   */
   killTimeoutMs?: number;
   /** The repo the Workers belong to; keys the agent's own home (`agent.home`). Default: the cwd. */
   repoRoot?: string;
@@ -492,14 +501,17 @@ export class AcpAdapter implements AgentAdapter {
   ): Promise<NewSessionResponse> {
     const caps = s.init.agentCapabilities;
     const vendorId = opts.resume?.vendorSessionId;
+    const sessionMeta = this.#opts.agent.sessionMeta;
+    const meta = sessionMeta ? { _meta: { ...sessionMeta } } : {};
     if (vendorId === undefined) {
-      return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers });
+      return s.conn.agent.request('session/new', { cwd: opts.cwd, mcpServers, ...meta });
     }
     if (caps?.sessionCapabilities?.resume) {
       const r = await s.conn.agent.request('session/resume', {
         sessionId: vendorId,
         cwd: opts.cwd,
         mcpServers,
+        ...meta,
       });
       return { ...r, sessionId: vendorId };
     }
@@ -511,6 +523,7 @@ export class AcpAdapter implements AgentAdapter {
           sessionId: vendorId,
           cwd: opts.cwd,
           mcpServers,
+          ...meta,
         });
         return { ...(r ?? {}), sessionId: vendorId };
       } finally {
@@ -753,11 +766,22 @@ export class AcpAdapter implements AgentAdapter {
         new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
       ]);
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (await within(Math.min(500, timeout))) return;
-    if (!hasExited()) signalGroup(proc, 'SIGTERM');
-    if (await within(timeout)) return;
-    if (!hasExited()) signalGroup(proc, 'SIGKILL');
-    await exited;
+    if (!(await within(Math.min(500, timeout)))) {
+      if (!hasExited()) signalGroup(proc, 'SIGTERM');
+      if (!(await within(timeout))) {
+        if (!hasExited()) signalGroup(proc, 'SIGKILL');
+        await exited;
+      }
+    }
+    // The agent's own children (claude-agent-acp's Claude Code, its MCP servers) got SIGTERM
+    // when it exited, but may still be shutting down and writing: wait for the whole group, so
+    // nothing of a closed session is left running (#181 CI).
+    // SIGKILL only right after seeing a running member: a pid is not reused while it is the id
+    // of a group with members, so this cannot reach a reused group id.
+    if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
+      if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
+      await processGroupGone(proc.pid, 1000);
+    }
   }
 
   #live(h: SessionHandle): Session {

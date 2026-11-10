@@ -69,7 +69,6 @@ describe('a real Claude Worker calls escalate (#18 acceptance)', () => {
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       },
       mcpConfigDir: join(root, 'run', 'mcp'),
-      sdkOptions: { settingSources: [] },
     });
     const { config, revoke } = server.workerConfig({
       workerSessionId: 'worker-1',

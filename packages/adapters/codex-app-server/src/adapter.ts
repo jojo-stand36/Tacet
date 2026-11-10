@@ -1,6 +1,16 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -29,6 +39,8 @@ import {
 } from '@tacet/core';
 import {
   defaultStateDir,
+  processGroupAlive,
+  processGroupGone,
   repoStateDir,
   SAFE_GIT_ARGS,
   trustedGitEnv,
@@ -94,7 +106,11 @@ export interface CodexAdapterOptions {
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */
   codexPath?: string;
-  /** Milliseconds to wait for the process to exit after SIGTERM before SIGKILL. */
+  /**
+   * Milliseconds to wait for the process to exit after SIGTERM before SIGKILL, and again for the
+   * rest of its process group (#191). Default 5000. Worst-case `close()` is about
+   * 0.5 s + 2 × this + 1 s.
+   */
   killTimeoutMs?: number;
   /**
    * Extra non-secret `-c key=value` overrides for `codex app-server`, e.g.
@@ -163,7 +179,10 @@ interface Session {
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
   exited: Promise<void>;
-  /** Set synchronously on exit; after that the process group must never be signalled. */
+  /**
+   * Set synchronously on exit; after that the process group is signalled only right after a
+   * running member was seen (`#terminate`), never blindly: its id could be reused once empty.
+   */
   exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
 }
 
@@ -328,6 +347,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
       );
       privateDir(codexHome);
       launch.env.CODEX_HOME = codexHome;
+      // Codex trusts a repo by itself at the first thread that can write it, and a trusted
+      // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
+      // hooks) and AGENTS.md then apply: all of them files a Worker can write (#181, verified on
+      // 0.167.0). An explicit `untrusted` is respected and never overwritten.
+      untrustProjects(join(codexHome, 'config.toml'), [
+        workerRepoRoot(opts.cwd, this.#opts.repoRoot),
+        opts.cwd,
+      ]);
     } else {
       codexHome = launch.env.CODEX_HOME ?? join(home, '.codex');
       // Codex refuses to start when CODEX_HOME does not exist.
@@ -381,7 +408,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
       proc.once('exit', (code, signal) => {
         exitInfo.value = { code, signal };
         // Codex's children (e.g. its plugin `git` sync) keep the group alive, so signalling it
-        // here, synchronously on exit, cannot reach a reused group id. Later code never does.
+        // here, synchronously on exit, cannot reach a reused group id. Later code signals it only
+        // right after seeing a running member (#terminate).
         signalGroup(proc, 'SIGTERM');
         resolve();
       }),
@@ -618,8 +646,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
 
   /**
    * End a Codex process: end of input asks it to finish; then SIGTERM to its group (the npm
-   * wrapper forwards it to the native binary), then SIGKILL. Signals are sent only while the
-   * process is still running, so a long-dead group id is never signalled.
+   * wrapper forwards it to the native binary), then SIGKILL; then it waits for the rest of the
+   * group and SIGKILLs what is left. The group is signalled only while it has a running member
+   * (the process itself, or a member seen just before), so a reused group id is never signalled.
    */
   async #terminate(proc: ChildProcess, exited: Promise<void>, hasExited: () => boolean) {
     const within = (ms: number) =>
@@ -628,11 +657,23 @@ export class CodexAppServerAdapter implements AgentAdapter {
         new Promise<boolean>((r) => setTimeout(() => r(false), ms).unref()),
       ]);
     const timeout = this.#opts.killTimeoutMs ?? 5000;
-    if (await within(Math.min(500, timeout))) return;
-    if (!hasExited()) signalGroup(proc, 'SIGTERM');
-    if (await within(timeout)) return;
-    if (!hasExited()) signalGroup(proc, 'SIGKILL');
-    await exited;
+    if (!(await within(Math.min(500, timeout)))) {
+      if (!hasExited()) signalGroup(proc, 'SIGTERM');
+      if (!(await within(timeout))) {
+        if (!hasExited()) signalGroup(proc, 'SIGKILL');
+        await exited;
+      }
+    }
+    // Children Codex starts in its group (its plugin sync, and may include tool commands and MCP
+    // servers: not verified) got SIGTERM when it exited, but may still be shutting down and
+    // writing into the Worker's CODEX_HOME or checkout: wait for the whole group (#191). A child
+    // that starts a group or session of its own is not covered.
+    // SIGKILL only right after seeing a running member, synchronously: a pid is not reused while
+    // it is the id of a group with members, so this cannot reach a reused group id.
+    if (!(await processGroupGone(proc.pid, timeout)) && proc.pid !== undefined) {
+      if (processGroupAlive(proc.pid)) signalGroup(proc, 'SIGKILL');
+      await processGroupGone(proc.pid, 1000);
+    }
   }
 
   #session(h: SessionHandle): Session {
@@ -979,6 +1020,49 @@ export function configArgs(
     '-c',
     `${k}=${typeof v === 'string' ? JSON.stringify(v) : String(v)}`,
   ]);
+}
+
+/**
+ * Mark `paths` (and their real paths) `untrusted` in a Codex `config.toml` Tacet owns, replacing
+ * any entry Codex wrote for them. Other content is kept. Written with a rename, mode 0600.
+ * The editor is line-based: it recognises the `[projects."<path>"]` tables Codex writes, not
+ * other TOML spellings of them (a duplicate table would make Codex refuse the file: fails closed).
+ */
+export function untrustProjects(file: string, paths: readonly string[]): void {
+  const keys = new Set<string>();
+  for (const p of paths) {
+    keys.add(p);
+    try {
+      keys.add(realpathSync(p));
+    } catch {}
+  }
+  const headers = new Set([...keys].map((k) => `[projects.${JSON.stringify(k)}]`));
+  let text = '';
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    // Only a missing file starts empty: any other read error must not drop its content.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  // Drop each table for these paths: its header line up to the next table header.
+  const kept: string[] = [];
+  let dropping = false;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (t.startsWith('[')) dropping = headers.has(t);
+    if (!dropping) kept.push(line);
+  }
+  const body = kept.join('\n').replace(/\n*$/, '');
+  const tables = [...headers].map((h) => `${h}\ntrust_level = "untrusted"\n`).join('\n');
+  // A fresh name, created exclusively: never a planted file or symlink at a guessable path.
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, `${body ? `${body}\n\n` : ''}${tables}`, { mode: 0o600, flag: 'wx' });
+  try {
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
 }
 
 /** Append `-c`-style settings through `GIT_CONFIG_COUNT`, keeping any the caller already set. */

@@ -1,11 +1,25 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, configArgs, grantSubset, toCodexDecision } from './adapter.js';
+import {
+  CodexAppServerAdapter,
+  configArgs,
+  grantSubset,
+  toCodexDecision,
+  untrustProjects,
+} from './adapter.js';
 import { API_KEY_PROVIDER_ID, AuthRoutingError, chooseAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, RpcError } from './jsonrpc.js';
 
@@ -105,6 +119,41 @@ describe('toCodexDecision', () => {
     });
     expect(toCodexDecision('elicitation', {}, d('cancel'))).toMatchObject({ action: 'cancel' });
     expect(toCodexDecision('elicitation', {}, d('allow_once'))).toMatchObject({ action: 'accept' });
+  });
+});
+
+describe('untrustProjects (#181)', () => {
+  it('marks the paths untrusted, replacing what Codex wrote and keeping the rest', () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-codex-trust-')));
+    try {
+      const file = join(dir, 'config.toml');
+      writeFileSync(
+        file,
+        `model = "x"\n\n[projects.${JSON.stringify(dir)}]\ntrust_level = "trusted"\n\n[projects."/other"]\ntrust_level = "trusted"\n`,
+      );
+      untrustProjects(file, [dir]);
+      const text = readFileSync(file, 'utf8');
+      expect(text).toContain('model = "x"');
+      expect(text).toContain('[projects."/other"]\ntrust_level = "trusted"');
+      expect(text).toContain(`[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"`);
+      expect(text.split(`[projects.${JSON.stringify(dir)}]`)).toHaveLength(2);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      // Idempotent, and a missing file is created.
+      untrustProjects(file, [dir]);
+      expect(readFileSync(file, 'utf8')).toBe(text);
+      rmSync(file);
+      untrustProjects(file, [dir]);
+      expect(readFileSync(file, 'utf8')).toBe(
+        `[projects.${JSON.stringify(dir)}]\ntrust_level = "untrusted"\n`,
+      );
+      // Any read error but a missing file fails closed, leaving the path as it was.
+      const asDir = join(dir, 'is-a-dir');
+      mkdirSync(asDir);
+      expect(() => untrustProjects(asDir, [dir])).toThrow();
+      expect(statSync(asDir).isDirectory()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -461,6 +510,51 @@ describe('CodexAppServerAdapter with a fake app-server', () => {
         }
       };
       await expect.poll(state, { timeout: 5000 }).toBe('gone');
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'close() returns only once the whole process group is gone, SIGTERM or not (#191)',
+    async () => {
+      const adapter = make('child-term', { killTimeoutMs: 300 });
+      let childPid: number | undefined;
+      try {
+        const h = await adapter.start({ cwd: root });
+        childPid = clientLog().find((m) => m.childPid)?.childPid as number;
+        expect(childPid).toBeGreaterThan(0);
+        await adapter.close(h);
+        // Gone when close() returns: no polling on Linux, where /proc shows a zombie init has yet
+        // to reap. Elsewhere `kill(pid, 0)` also finds a zombie, so allow launchd a moment.
+        if (process.platform !== 'linux') {
+          for (let i = 0; i < 20; i++) {
+            try {
+              process.kill(childPid, 0);
+            } catch {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        }
+        const running = (() => {
+          try {
+            const stat = readFileSync(`/proc/${childPid}/stat`, 'utf8');
+            return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+          } catch {
+            try {
+              process.kill(childPid as number, 0);
+              return process.platform !== 'linux';
+            } catch {
+              return false;
+            }
+          }
+        })();
+        expect(running).toBe(false);
+      } finally {
+        // Never leave the SIGTERM-ignoring child running on the test machine.
+        try {
+          if (childPid) process.kill(childPid, 'SIGKILL');
+        } catch {}
+      }
     },
   );
 

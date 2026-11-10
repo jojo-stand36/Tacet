@@ -112,7 +112,6 @@ describe('a resumed Worker reaches the restarted Mini-conductor (#128)', () => {
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       },
       mcpConfigDir: join(root, 'run', 'mcp'),
-      sdkOptions: { settingSources: [] },
     });
     const one = await miniServer();
     const two = await miniServer();

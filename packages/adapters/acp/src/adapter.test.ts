@@ -87,6 +87,52 @@ describe('AcpAdapter (fake ACP agent)', () => {
       : [];
   const methods = () => received().flatMap((l) => (l.received?.method ? [l.received] : []));
 
+  it("leaves none of the agent's processes running after close, even one ignoring SIGTERM", async () => {
+    const adapter = make(
+      GEMINI_AGENT,
+      { GEMINI_API_KEY: 'placeholder', FAKE_CHILD: '1' },
+      {
+        killTimeoutMs: 300,
+      },
+    );
+    const childPid = () =>
+      received()
+        .map((l) => (l as { childPid?: number }).childPid)
+        .find((p) => p !== undefined);
+    let pid: number | undefined;
+    try {
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      pid = childPid();
+      expect(pid).toBeTypeOf('number');
+      await adapter.close(h);
+    } catch (err) {
+      // Never leave the SIGTERM-ignoring child running on the test machine.
+      const p = childPid();
+      if (p !== undefined) {
+        try {
+          process.kill(p, 'SIGKILL');
+        } catch {}
+      }
+      throw err;
+    }
+    // Running, not a zombie its parent (here: an init that may not reap) has yet to collect.
+    const alive = (() => {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+        return stat.slice(stat.lastIndexOf(')') + 2)[0] !== 'Z';
+      } catch {
+        try {
+          process.kill(pid as number, 0);
+          return process.platform !== 'linux';
+        } catch {
+          return false;
+        }
+      }
+    })();
+    if (alive) process.kill(pid as number, 'SIGKILL');
+    expect(alive).toBe(false);
+  });
+
   it('exposes why an agent may not run Workers (#183)', () => {
     expect(make(CODEX_ACP_AGENT).workerRefused).toMatch(/#183/);
     expect(make(GEMINI_AGENT).workerRefused).toBeUndefined();
@@ -352,6 +398,39 @@ describe('AcpAdapter (fake ACP agent)', () => {
         sessionId: 'old-1',
       });
       await adapter.close(h);
+    });
+
+    it("sends the spec's sessionMeta as _meta on session/new, load and resume (#181)", async () => {
+      const meta = { claudeCode: { options: { settingSources: [], strictMcpConfig: true } } };
+      const spec = { ...GEMINI_AGENT, sessionMeta: meta };
+      const env = { GEMINI_API_KEY: 'placeholder' };
+      const run = async (caps: object, resume?: string) => {
+        const a = make(spec, { ...env, FAKE_CAPS: JSON.stringify(caps) });
+        const h = await a.start({
+          cwd: join(root, 'wt'),
+          ...(resume ? { resume: { vendorSessionId: resume } } : {}),
+        });
+        await a.close(h);
+      };
+      await run({});
+      await run({ loadSession: true }, 'old-load');
+      await run({ sessionCapabilities: { resume: {} } }, 'old-resume');
+      const opened = methods().filter((m) =>
+        ['session/new', 'session/load', 'session/resume'].includes(m.method ?? ''),
+      );
+      expect(opened.map((m) => m.method)).toEqual([
+        'session/new',
+        'session/load',
+        'session/resume',
+      ]);
+      for (const m of opened) expect(m.params, m.method).toMatchObject({ _meta: meta });
+      // A spec without it sends none.
+      const plainAdapter = make(GEMINI_AGENT, env);
+      await plainAdapter.close(await plainAdapter.start({ cwd: join(root, 'wt') }));
+      const plain = methods()
+        .filter((m) => m.method === 'session/new')
+        .at(-1);
+      expect(plain?.params).not.toHaveProperty('_meta');
     });
 
     it('prefers session/resume when the agent offers it, and refuses a resume it cannot do', async () => {
