@@ -1185,6 +1185,30 @@ describe('WorktreeManager', () => {
       expect(events('workspace.removed')).toEqual([]);
     });
 
+    it('does not check a kept checkout again until it is used, a ref moves, or a day passes (#254)', async () => {
+      const kept = await manager.create('kept');
+      await writeFile(path.join(kept.path, 'notes.txt'), 'mine\n');
+      const now = Date.now() + 10 * 86_400_000;
+      const gc = (at: number) => manager.gc({ olderThanMs: 86_400_000, now: at });
+      expect((await gc(now)).skipped).toEqual([
+        { id: kept.id, reason: 'worktree contains local or ignored files' },
+      ]);
+      // Removable now, but nothing it depends on changed: the verdict stands.
+      await rm(path.join(kept.path, 'notes.txt'));
+      expect((await gc(now + 1_000)).removed).toEqual([]);
+      // A ref moved: checked again.
+      await git(repository, ['branch', 'elsewhere']);
+      expect((await gc(now + 2_000)).removed).toEqual([kept.id]);
+
+      // And once a day, whatever changed.
+      const later = await manager.create('later');
+      await writeFile(path.join(later.path, 'notes.txt'), 'mine\n');
+      expect((await gc(now)).removed).toEqual([]);
+      await rm(path.join(later.path, 'notes.txt'));
+      expect((await gc(now + 1_000)).removed).toEqual([]);
+      expect((await gc(now + 86_400_000)).removed).toEqual([later.id]);
+    });
+
     it('force-removes a planner checkout a crash left registered, at the next reconcile (#238)', async () => {
       const planner = await manager.create('plan-task', undefined, { scratch: true });
       // The planner wrote to it, then the process died before its own forced removal.

@@ -1,6 +1,6 @@
 import { statusEntries, type TaskStatusEntry, TaskTarget } from '@tacet/core';
-import type { EventStore, StoredEvent } from '@tacet/core/node';
-import { liveControl, liveStatus } from '../control.js';
+import type { EventStore, RepoStatePaths, StoredEvent } from '@tacet/core/node';
+import { liveControl, livePty, liveStatus } from '../control.js';
 import type { Io } from '../io.js';
 import {
   formatEvent,
@@ -21,6 +21,13 @@ import {
   subtasksOf,
 } from '../state.js';
 
+/**
+ * Undo what a Worker's terminal may have left on (#201): attributes, a hidden cursor, the
+ * alternate screen, bracketed paste and mouse reporting.
+ */
+const RESTORE_TERMINAL =
+  '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
+
 export interface Where {
   repo?: string;
   'user-dir'?: string;
@@ -33,7 +40,9 @@ export interface Where {
 async function open(
   io: Io,
   where: Where,
-): Promise<{ store: EventStore; live: () => boolean } | undefined> {
+): Promise<
+  { store: EventStore; live: () => boolean; repoRoot: string; paths: RepoStatePaths } | undefined
+> {
   const repoRoot = repoRootFrom(where.repo ?? io.cwd);
   const paths = statePaths(repoRoot, where['user-dir'], io.home);
   const store = openLog(paths);
@@ -42,7 +51,7 @@ async function open(
     return undefined;
   }
   const { miniLockHolder } = await import('@tacet/mini');
-  return { store, live: () => miniLockHolder(paths.lock) !== undefined };
+  return { store, live: () => miniLockHolder(paths.lock) !== undefined, repoRoot, paths };
 }
 
 /** Where a task starts and lands, as recorded when it started (#219); undefined for older tasks. */
@@ -78,7 +87,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   if (!tasks) {
     const store = openLog(paths);
     if (!store) {
-      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [] }));
+      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [], problems: [] }));
       else io.out(`no Tacet state for ${repoRoot}`);
       return 0;
     }
@@ -88,8 +97,10 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
       store.close();
     }
   }
+  // Kept in the log only, whoever answered for the tasks (#254).
+  const problems = readProblems(paths);
   if (o.json) {
-    io.out(safeJson({ running: pid ?? null, source, tasks }));
+    io.out(safeJson({ running: pid ?? null, source, tasks, problems: problems.map(problemJson) }));
     return 0;
   }
   io.out(
@@ -99,7 +110,22 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   );
   if (tasks.length === 0) io.out('no tasks');
   for (const t of tasks) io.out(formatStatusEntry(t));
+  if (problems.length > 0) {
+    io.out('maintenance problems (latest first):');
+    for (const p of problems) io.out(`  ${formatEvent(p.envelope)}`);
+  }
   return 0;
+}
+
+/** The recent maintenance problems in the repo's log (#254); none without a log. */
+function readProblems(paths: Parameters<typeof openLog>[0]): StoredEvent[] {
+  const store = openLog(paths);
+  if (!store) return [];
+  try {
+    return recentProblems(store);
+  } finally {
+    store.close();
+  }
 }
 
 /**
@@ -143,8 +169,9 @@ export async function logs(
 
 /**
  * `tacet attach <session | task/n>`: follow one Worker session from the log as it runs, until it
- * ends. Given a sub-task, its latest session, then each one that replaces it. Live PTY attach
- * needs the Mini-conductor's control endpoint, which standalone mode does not have yet.
+ * ends. Given a sub-task, its latest session, then each one that replaces it. A PTY Worker
+ * running in a live run is shown as its terminal instead, live from the run's port (#201), when
+ * the output is a terminal and not `--json`: until that session ends.
  */
 export async function attach(
   io: Io,
@@ -181,6 +208,32 @@ export async function attach(
     if (!session) {
       io.err(`no Worker session for ${terminalSafe(target)}`);
       return 1;
+    }
+    // A PTY Worker running in a live run: its terminal itself, as it draws (#201, ADR-003 §5).
+    const raw = io.raw;
+    if (!o.json && raw) {
+      const pty = await livePty(io, opened.repoRoot, opened.paths, session, raw);
+      if (pty) {
+        const stop = () => pty.close();
+        io.signal?.addEventListener('abort', stop, { once: true });
+        if (io.signal?.aborted) stop();
+        let code = 1000;
+        try {
+          code = (await pty.closed).code;
+        } finally {
+          io.signal?.removeEventListener('abort', stop);
+          // Whatever the Worker's bytes left switched on, the user's own terminal gets back.
+          raw(new TextEncoder().encode(RESTORE_TERMINAL));
+        }
+        if (io.signal?.aborted) return 0;
+        if (code === 1000) io.err('\r\n[the Worker session ended]');
+        else if (code === 1001) io.err('\r\n[the run ended]');
+        else {
+          io.err(`\r\n[the terminal stream failed (${code})]`);
+          return 1;
+        }
+        return 0;
+      }
     }
     const followed = new Set([session]);
     let after = 0;
@@ -232,4 +285,29 @@ function sessionOf(e: StoredEvent): string | undefined {
 
 function print(io: Io, e: StoredEvent, json?: boolean) {
   io.out(json ? safeJson(e.raw, 0) : formatEvent(e.envelope));
+}
+
+/**
+ * The Mini-conductor's latest upkeep failures (#254): at most 5, from the last 7 days, newest
+ * first. Nothing records that one was fixed, so older ones are not shown.
+ */
+function recentProblems(store: EventStore, now = Date.now()): StoredEvent[] {
+  const since = new Date(now - 7 * 86_400_000).toISOString();
+  return store
+    .query({ typePrefix: 'maintenance.problem' })
+    .filter((e) => e.envelope.ts >= since)
+    .slice(-5)
+    .reverse();
+}
+
+/** A problem as `tacet status --json` shows it. */
+function problemJson(e: StoredEvent): Record<string, unknown> {
+  const d = (e.envelope.data ?? {}) as Record<string, unknown>;
+  return {
+    ts: e.envelope.ts,
+    op: d.op,
+    message: d.message,
+    ...(e.envelope.taskId !== undefined ? { taskId: e.envelope.taskId } : {}),
+    ...(typeof d.workspaceId === 'string' ? { workspaceId: d.workspaceId } : {}),
+  };
 }

@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { TacetConfig, Task } from '@tacet/core';
 import {
@@ -179,6 +181,12 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       lockPath: paths.lock,
       repo: paths.repoId,
       miniId: 'standalone',
+      redactPaths: redactPathsFor([
+        [paths.worktrees, '<worktrees>'],
+        [paths.dir, '<state>'],
+        [o.repoRoot, '<repo>'],
+        [o.home ?? homedir(), '~'],
+      ]),
     });
     await mini.start();
     started = mini;
@@ -267,4 +275,25 @@ export class CheckoutPlanner implements Planner {
       await this.workspaces.remove(ws.id, { force: true }).catch(() => {});
     }
   }
+}
+
+/**
+ * Directories to replace in maintenance problems (#254), as given and as resolved (git reports the
+ * resolved path: on macOS /var is /private/var), longest first so the most specific wins.
+ */
+export function redactPathsFor(
+  dirs: ReadonlyArray<readonly [string, string]>,
+): Array<readonly [string, string]> {
+  const all = new Map<string, string>();
+  for (const [dir, label] of dirs) {
+    if (dir.length <= 1) continue;
+    if (!all.has(dir)) all.set(dir, label);
+    try {
+      const real = realpathSync(dir);
+      if (!all.has(real)) all.set(real, label);
+    } catch {
+      // Not there yet: only as given.
+    }
+  }
+  return [...all].sort(([a], [b]) => b.length - a.length);
 }

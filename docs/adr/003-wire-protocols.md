@@ -206,7 +206,15 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 
 ### Addendum (2026-11-10, accepted, approved by the owner): `workspace.*` namespace (§1)
 
-`workspace.*` (`workspace.created`, `workspace.removed`) joins the event namespaces of §1: the Mini-conductor's worktree registry, moved from per-worktree state files into the log (#126). It is local to the Mini-conductor: not in the upward stream of §3, never forwarded to the Conductor, and its payloads carry ids, never paths. Additive under §2.
+`workspace.*` (`workspace.created`, `workspace.removed`) joins the event namespaces of §1: the Mini-conductor's worktree registry, moved from per-worktree state files into the log (#126). It is local to the Mini-conductor: not in the upward stream of §4, never forwarded to the Conductor, and its payloads carry ids, never paths. Additive under §2.
+
+### Addendum (2026-11-11, accepted, approved by the owner on 2026-11-11 in a comment on PR #264, https://github.com/jojo-stand36/Tacet/pull/264#issuecomment-6802110023): `maintenance.*` namespace (§1)
+
+`maintenance.*` (`maintenance.problem`: `op`, an open enum of `reconcile`, `landed`, `gc`, `unpin` with fallback `other`; `message`; optional `workspaceId`; the envelope's `taskId` when the problem is about one task) joins the event namespaces of §1: failures of the Mini-conductor's unattended upkeep (the start-time worktree reconcile, the landed sweep, idle gc, deleting finished tasks' pin refs), recorded so the user sees them (#254). Like `workspace.*`, it is local to the Mini-conductor: not on the §4 upward allowlist, so never forwarded (`isForwardable`, #256; listed in `LOCAL_EVENT_NAMESPACES`). It has no path fields; in `message`, the repo, state, worktree and home directories are replaced, secrets are redacted, and the length is bounded. Additive under §2.
+
+### Addendum (2026-11-11, accepted, approved by the owner on 2026-11-11 in a comment on PR #264, https://github.com/jojo-stand36/Tacet/pull/264#issuecomment-6802110023): local event namespaces (§1)
+
+- **Standing rule:** a new event namespace that is not on the §4 upward allowlist (local to the Mini-conductor, never forwarded) is additive under §2 and needs only a line in ARCHITECTURE §3, not another addendum here. Anything added to the upward stream still needs the owner's approval. `workspace.*` and `maintenance.*` are the first two such namespaces.
 
 ## Consequences
 
@@ -258,3 +266,16 @@ Also recorded:
 - **What the CLI may do.** A standalone Mini-conductor's port serves `cli` hellos only: a `ui` hello is refused until browser sessions are served there, and a `mini` hello is refused because Mini-conductors dial the Conductor, not each other. `SendMessage` without `taskId` answers `-32004`: new tasks still start with `tacet run`.
 - **Paging.** `ListTasks` pages with an opaque `pageToken` (an offset today).
 - **Answering.** `tacet answer <id> <text>` is the CLI verb for an answer to a live run.
+
+### Addendum (2026-11-10): live terminal attach, `/pty/<sessionId>` (#201)
+
+Status of this addendum: **accepted** on 2026-11-11, approved by the owner on PR #267 ([comment 6802114697](https://github.com/jojo-stand36/Tacet/pull/267#issuecomment-6802114697): "Approved: /pty ADR-003 addendum"). The owner also decided that the attach client strips OSC 52 (clipboard writes) from the Worker's terminal bytes; window titles stay allowed. That filter is #302. §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
+
+1. **What `<sessionId>` names.** The Worker session id, the one in `worker.started` (AG-UI `runId`), not the `sessionId` a hello returns. It is a plain token (`[A-Za-z0-9._-]`, at most 128 characters); any other path is 404.
+2. **Authenticated at the upgrade only, no hello.** The upgrade passes the same checks as `/`, in this order: Host and Origin, then the bearer token, then the path, so nobody without the token learns which sessions exist. No hello is said: no protocol message travels on the socket, and the protocol version is the runtime file's `protocolVersions`. This is the one exception to §3.6.
+3. **Server to client, binary, read only.** Each frame is a chunk of the terminal's bytes. The stream starts with the screen so far (the scrollback), then follows the output. A viewer that fell behind gets `ESC c` (reset) and the scrollback again, in band, since the socket has no other channel. Any frame from the client closes the socket 1003: a typed key would bypass `send` and `respond`, and so the event log. Input to a Worker's terminal is not offered.
+4. **Closing.** 1000 `session ended` when the session stops running there: the Mini-conductor ends the stream when it ends the session, whether or not the terminal itself has ended, and a viewer dropped for falling behind is drawn again, not ended. 1001 when the server closes, 1011 if the stream fails. 404 before the upgrade when there is no such running session or it has no terminal; 503 when the server's limit of open terminal sockets (8) is reached. A slot is freed when its connection closes, upgraded or not, and the stream is let go as soon as the viewer leaves, even while it waits for output.
+5. **Backpressure.** The server pulls the next chunk only once the last one is handed to the socket, so a slow viewer slows its own stream, and the PTY adapter drops a viewer that falls about a million characters behind (it is drawn again) instead of the Mini-conductor buffering without limit.
+6. **Browsers later.** A browser cannot send the `Authorization` header (no cookies, see the 2026-11-09 addendum), so the web UI will need a first text frame carrying its session token on this path. That is deferred; nothing here rules it out.
+
+With a Conductor, the UI's `/pty` lives on the Conductor, which forwards bytes from the Mini-conductor through `tacet/attach` (§4); the standalone CLI connects to the Mini-conductor's own path directly.

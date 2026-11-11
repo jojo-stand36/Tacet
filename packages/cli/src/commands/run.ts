@@ -82,6 +82,8 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
   const dropped = new Set<string>();
   const warned = new Set<string>();
   let sa: Standalone;
+  // Problems the start itself records (the worktree reconcile, #254) come before the cursor below.
+  const startedAt = new Date().toISOString();
   try {
     sa = await startStandalone({
       repoRoot,
@@ -147,9 +149,17 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
 
     // Progress: what happens from now on, summary-grade, to stderr.
     let after = sa.store.query({}).at(-1)?.seq ?? 0;
+    for (const e of sa.store.query({ typePrefix: 'maintenance' })) {
+      if (e.seq <= after && e.envelope.ts >= startedAt) io.err(formatEvent(e.envelope));
+    }
     const progress = () => {
       for (const e of sa.store.query({ afterSeq: after })) {
         after = e.seq;
+        // The Mini-conductor's own upkeep failing (#254): about no task of the user's, or any.
+        if (e.envelope.type.startsWith('maintenance.')) {
+          io.err(formatEvent(e.envelope));
+          continue;
+        }
         const t = e.envelope.taskId;
         if (t === undefined || !roots.some((r) => isSubtaskOf(t, r))) continue;
         if (isSummaryEvent(e.envelope.type) && e.envelope.type !== 'agent.usage') {

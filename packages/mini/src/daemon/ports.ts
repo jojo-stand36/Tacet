@@ -40,7 +40,7 @@ export interface Workspaces {
     olderThanMs: number;
     activeWorktreeIds?: readonly string[];
     lastActivity?: ReadonlyMap<string, number>;
-  }): Promise<{ removed: string[] }>;
+  }): Promise<{ removed: string[]; failed?: ReadonlyArray<{ id: string; message: string }> }>;
   /**
    * The repo's checked-out branch (absent when its HEAD is detached) and commit right now: where a
    * new task's sub-tasks start (#219). Without it, each sub-task starts at the main branch as it is

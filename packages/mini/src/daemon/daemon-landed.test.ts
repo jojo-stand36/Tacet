@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -74,7 +75,12 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
     script: (cwd: string, input: string) => void,
     worktrees?: TacetConfig['worktrees'],
     verify?: string[],
-    more: { workspaces?: Workspaces; planner?: Planner; workersMax?: number } = {},
+    more: {
+      workspaces?: Workspaces;
+      planner?: Planner;
+      workersMax?: number;
+      integrator?: GitIntegrator;
+    } = {},
   ): Promise<{ id: string; published: { ref: string; commit: string } }> {
     const fake = new ScriptedAdapter('fake', (input, s): Script => {
       script(s.opts.cwd, input);
@@ -107,7 +113,7 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
         : {}),
       adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
       workspaces: more.workspaces ?? manager,
-      integrator: new GitIntegrator(repo, env),
+      integrator: more.integrator ?? new GitIntegrator(repo, env),
       planner: more.planner ?? new SingleStepPlanner(),
       mcp: {
         workerConfig: () => ({
@@ -713,6 +719,205 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(await manager.get(old.id)).toBeDefined();
     });
 
+    it('records maintenance failures once, without paths or secrets (#254)', async () => {
+      const where = join(root, 'worktrees', 'w-1');
+      let gcs = 0;
+      const failing: Workspaces = {
+        create: (workerId, base, o) => manager.create(workerId, base, o),
+        get: (id) => manager.get(id),
+        remove: (id, o) => manager.remove(id, o),
+        head: () => manager.head(),
+        reconcile: () => Promise.reject(new Error(`cannot remove ${where}: busy`)),
+        gc: async () => {
+          gcs += 1;
+          return {
+            removed: [],
+            failed: [
+              {
+                id: 'w-1',
+                // A fresh lock-file name each time: still the same problem.
+                message: `rm ${where}/.tacet-locks/w-1.draft.${randomUUID()}: token sk-ant-api03-${'a'.repeat(40)}`,
+              },
+            ],
+          };
+        },
+      };
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: failing,
+        planner: new SingleStepPlanner(),
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+        landedSweepMs: 20,
+        redactPaths: [[join(root, 'worktrees'), '<worktrees>']],
+      });
+      await daemon.start();
+      await vi.waitFor(() => expect(gcs).toBeGreaterThan(2), { timeout: 3_000 });
+      const problems = store
+        .query({ typePrefix: 'maintenance' })
+        .map((e) => ({ ...(e.envelope.data as object), taskId: e.envelope.taskId }));
+      expect(problems).toHaveLength(2);
+      expect(problems[0]).toEqual({
+        op: 'reconcile',
+        message: 'cannot remove <worktrees>/w-1: busy',
+        taskId: undefined,
+      });
+      expect(problems[1]).toMatchObject({ op: 'gc', workspaceId: 'w-1' });
+      const text = JSON.stringify(problems);
+      expect(text).not.toContain(root);
+      expect(text).not.toContain('sk-ant-api03');
+      expect(daemon.errors).toHaveLength(2);
+    });
+
+    it('records a landed sweep failure, and nothing for a checkout kept for its work (#254)', async () => {
+      const problems = () =>
+        store.query({ typePrefix: 'maintenance' }).map((e) => ({
+          ...(e.envelope.data as { op: string; workspaceId?: string }),
+          taskId: e.envelope.taskId,
+        }));
+      let fail: Error = Object.assign(new Error('kept'), { name: 'WorktreeKeptError' });
+      let removes = 0;
+      const refusing: Workspaces = {
+        create: (workerId, base, o) => manager.create(workerId, base, o),
+        get: (id) => manager.get(id),
+        head: () => manager.head(),
+        remove: async () => {
+          removes += 1;
+          throw fail;
+        },
+      };
+      const { id, published } = await runTask(commitWork, undefined, undefined, {
+        workspaces: refusing,
+      });
+      squashIntoMain(published.commit);
+      await vi.waitFor(() => expect(removes).toBeGreaterThan(1), { timeout: 3_000 });
+      expect(problems()).toEqual([]);
+      fail = new Error('git worktree remove failed');
+      const before = removes;
+      await vi.waitFor(() => expect(removes).toBeGreaterThan(before + 1), { timeout: 3_000 });
+      const started = store.query({ typePrefix: 'worker.started' })[0]?.envelope.data as
+        | { workspaceId: string }
+        | undefined;
+      const workspaceId = started?.workspaceId;
+      expect(problems()).toEqual([
+        { op: 'landed', workspaceId, taskId: id, message: 'git worktree remove failed' },
+      ]);
+    });
+
+    it('records a failed landed check once, about its task (#254)', async () => {
+      class Broken extends GitIntegrator {
+        override async landed(): Promise<never> {
+          throw new Error('cannot read the target');
+        }
+      }
+      const { id } = await runTask(commitWork, undefined, undefined, {
+        integrator: new Broken(repo, env),
+      });
+      await severalSweeps();
+      const problems = store.query({ typePrefix: 'maintenance' }).map((e) => ({
+        ...(e.envelope.data as object),
+        taskId: e.envelope.taskId,
+      }));
+      expect(problems).toEqual([{ op: 'landed', message: 'cannot read the target', taskId: id }]);
+    });
+
+    it("records a failure to clear a crashed Claude session's placeholders, once (#285)", async () => {
+      const left = await manager.create('crashed-session');
+      const id = 'crashed-claude-task';
+      const sub = `${id}/1`;
+      const envelope = (taskId: string, type: string, data: unknown, sessionId?: string) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId,
+        ...(sessionId ? { sessionId } : {}),
+        type,
+        data,
+      });
+      const created = (taskId: string, parentId?: string) =>
+        envelope(taskId, 'task.created', {
+          id: taskId,
+          ...(parentId ? { parentId } : {}),
+          goal: 'g',
+          acceptanceCriteria: ['ok'],
+          priority: 'p2',
+          createdAt: new Date().toISOString(),
+        });
+      // A Claude Worker session on a sub-task whose end was never recorded (a crash). The task is
+      // marked canceled only so that nothing resumes it here: no `claude-sdk` adapter is built.
+      store.append([
+        created(id),
+        created(sub, id),
+        envelope(
+          sub,
+          'worker.started',
+          {
+            sessionId: 's-crashed',
+            adapter: 'claude-sdk',
+            workspaceId: left.id,
+            baseCommit: left.baseCommit,
+          },
+          's-crashed',
+        ),
+        envelope(id, 'task.status', { state: 'canceled' }),
+        envelope(sub, 'task.status', { state: 'canceled' }),
+      ]);
+      class Unreadable extends GitIntegrator {
+        override async tracked(): Promise<never> {
+          throw new Error('cannot list the checkout');
+        }
+      }
+      const start = () =>
+        new MiniConductor({
+          store,
+          config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+          adapters: {
+            fake: {
+              adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+              authRoute: 'api_key',
+            },
+          },
+          workspaces: manager,
+          integrator: new Unreadable(repo, env),
+          planner: new SingleStepPlanner(),
+          mcp: {
+            workerConfig: () => ({
+              config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+              revoke: () => {},
+            }),
+          },
+          lockPath: join(root, 'mini.lock'),
+        });
+      const problems = () =>
+        store.query({ typePrefix: 'maintenance' }).map((e) => ({
+          ...(e.envelope.data as object),
+          taskId: e.envelope.taskId,
+        }));
+      daemon = start();
+      await daemon.start();
+      expect(problems()).toEqual([
+        { op: 'reconcile', message: 'cannot list the checkout', workspaceId: left.id, taskId: sub },
+      ]);
+      // The session is recorded as ended at that start, so the next one does not try again.
+      await daemon.stop();
+      daemon = start();
+      await daemon.start();
+      expect(problems()).toHaveLength(1);
+    });
+
     it('runs no gc with idle_days 0', async () => {
       const calls: GcOptions[] = [];
       await runTask(commitWork, { remove_merged: false, idle_days: 0 }, undefined, {
@@ -850,6 +1055,27 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       await vi.waitFor(() => expect(state(id)).toBe('canceled'), { timeout: 3_000 });
       await vi.waitFor(() => expect(pinOf(id)).toBeUndefined(), { timeout: 3_000 });
       expect(store.query({ taskId: id, typePrefix: 'task.target' })).toEqual([]);
+    });
+
+    it('records a failure to delete it once, and tries again at the next sweep (#254)', async () => {
+      let tries = 0;
+      const locked: Workspaces = {
+        create: (workerId, base, o) => manager.create(workerId, base, o),
+        get: (id) => manager.get(id),
+        remove: (id, o) => manager.remove(id, o),
+        head: () => manager.head(),
+        pin: (taskId, commit) => manager.pin(taskId, commit),
+        unpin: async () => {
+          tries += 1;
+          throw new Error('could not delete refs/tacet/x/target');
+        },
+      };
+      await runTask(commitWork, { remove_merged: false }, undefined, { workspaces: locked });
+      await vi.waitFor(() => expect(tries).toBeGreaterThan(2), { timeout: 3_000 });
+      const problems = store
+        .query({ typePrefix: 'maintenance' })
+        .map((e) => e.envelope.data as { op: string; message: string });
+      expect(problems).toEqual([{ op: 'unpin', message: 'could not delete refs/tacet/x/target' }]);
     });
 
     it('keeps it while the task is unfinished, though a sub-task finished', async () => {
