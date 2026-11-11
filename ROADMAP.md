@@ -53,9 +53,14 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Chore: fail CI when capability matrix dates are stale for active surfaces** — `chore` `P2` `claude`
 - [ ] **Claude SDK adapter: keep Worker transcripts out of the user's ~/.claude and discard them** — `feature` `P2` `claude`
 - [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
+- [ ] **Claude Workers can find a host OAuth token at Claude Code's fixed well-known path** — `feature` `P1` `claude + human`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
+- [ ] **Codex Worker isolation does not hold for a repo under /tmp or $TMPDIR** — `P2` `claude`
 - [ ] **Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off** — `feature` `P1` `claude`
+- [ ] **Codex Workers on macOS: a private TMPDIR, and sweeping leftover Worker temp dirs** — `feature` `P3` `claude`
+- [ ] **Codex Workers: CODEX_HOME, and a repo found without repoRoot, under a sandbox temp dir** — `P2` `claude`
+- [ ] **Codex Workers: a private TMPDIR per Worker so a repo under /tmp can be isolated** — `feature` `P3` `claude`
 - [ ] **Codex adapter: close() should wait for the whole process group** — `feature` `P2` `claude`
 - [ ] **Codex adapter: report a self-exit only once the process group is gone** — `feature` `P2` `claude`
 - [ ] **Codex fork keeps the source thread's model** — `feature` `P2` `claude`
@@ -74,6 +79,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision…)** — `feature` `P0` `either`
 - [ ] **Mini-conductor daemon: task queue, planner, worker pool** — `feature` `P0` `either`
 - [ ] **Mini-conductor: build Worker adapters from the effective config at startup** — `feature` `P1` `either`
+- [ ] **PTY Workers: stop Claude Code cloning the official plugin marketplace at session start** — `feature` `P2` `claude`
 - [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
 - [ ] **PTY adapter: clean up per-session Claude config directories** — `feature` `P2` `either`
 - [ ] **PTY adapters: don't leave a CLI's detached background processes running** — `feature` `P2` `claude`
@@ -97,6 +103,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
 - [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude`
 - [ ] **Verification pipeline: commands + reviewer agent** — `feature` `P1` `either`
+- [ ] **Verify Claude Code transcript facts behind PTY usage: [1m] model id and subagent calls** — `spike` `P3` `claude`
 - [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
 - [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
