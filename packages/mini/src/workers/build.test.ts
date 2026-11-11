@@ -1,17 +1,9 @@
 import { execFileSync } from 'node:child_process';
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CLAUDE_ACP_AGENT, claudeAcpWorkerSpec } from '@tacet/adapter-acp';
-import { startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
+import { codexFixtureDir, startMockResponsesApi } from '@tacet/adapter-codex-app-server/testing';
 import { PtyCliAdapter } from '@tacet/adapter-pty';
 import { gatedTitle, ptyGate } from '@tacet/adapter-pty/testing';
 import type { TacetConfig } from '@tacet/core';
@@ -560,7 +552,8 @@ describe('a Codex Worker built from config (#186)', () => {
     timeout: 120_000,
   }, async () => {
     const api = await startMockResponsesApi();
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-build-codex-')));
+    // Not under a temp dir the Codex sandbox leaves writable: the adapter refuses that (#293).
+    const root = codexFixtureDir('tacet-build-codex-');
     // Closed in `finally` too, so a failure part-way never leaves Codex running.
     let close = async () => {};
     try {

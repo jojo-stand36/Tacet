@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, sep } from 'node:path';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -332,6 +332,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
       this.#opts.apiBaseUrl !== undefined ? { baseUrl: this.#opts.apiBaseUrl } : {},
     );
     const home = launch.env.HOME ?? homedir();
+    // Before anything is created for the Worker: the sandbox could not protect its repo (#293).
+    if (unattended && this.#opts.repoRoot !== undefined) {
+      refuseGitInSandboxTemp(opts.cwd, this.#opts.repoRoot, launch.env.TMPDIR);
+    }
     let codexHome: string;
     if (unattended) {
       // Nothing inherited may point a Worker's git somewhere else.
@@ -1208,4 +1212,57 @@ function signalGroup(proc: ChildProcess, signal: NodeJS.Signals): void {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * The temp dirs Codex's `workspace-write` sandbox always leaves writable besides the cwd: `/tmp`
+ * and the Worker's `$TMPDIR` (capability matrix, "Sandbox writable roots (#116)"). Tacet does not
+ * exclude them, because tools (the macOS `git` shim among them) need a temp dir. Resolved, so a
+ * symlinked `/tmp` (`/private/tmp` on macOS) is caught too.
+ */
+export function sandboxTempRoots(tmpdir: string | undefined): string[] {
+  const roots = ['/tmp', ...(tmpdir && isAbsolute(tmpdir) ? [tmpdir] : [])];
+  return [
+    ...new Set(
+      roots.map((r) => {
+        try {
+          return realpathSync.native(r);
+        } catch {
+          return r;
+        }
+      }),
+    ),
+  ];
+}
+
+/**
+ * Refuse an unattended Codex Worker whose repo's git dirs (the shared one and the worktree's own,
+ * resolved) lie under a sandbox-writable temp dir: there the sandbox cannot keep the shared `.git`
+ * read-only, so the Worker could rewrite refs, objects and hooks that run outside it (#293).
+ */
+export function refuseGitInSandboxTemp(
+  cwd: string,
+  repoRoot: string,
+  tmpdir: string | undefined,
+): void {
+  const wt = workerWorktree(cwd, repoRoot);
+  let common: string | undefined = wt?.commonDir;
+  if (common === undefined) {
+    try {
+      common = realpathSync.native(join(repoRoot, '.git'));
+    } catch {
+      common = undefined;
+    }
+  }
+  const dirs = [common, wt?.gitDir].filter((d): d is string => d !== undefined);
+  for (const root of sandboxTempRoots(tmpdir)) {
+    const inside = dirs.find((d) => d === root || d.startsWith(root + sep));
+    if (inside !== undefined) {
+      throw new Error(
+        `refusing to start an unattended Codex Worker: its git dir ${inside} is under ${root}, ` +
+          "which Codex's sandbox leaves writable (/tmp and $TMPDIR), so the Worker could rewrite " +
+          'the shared .git (#293). Move the repository outside /tmp and $TMPDIR.',
+      );
+    }
+  }
 }
