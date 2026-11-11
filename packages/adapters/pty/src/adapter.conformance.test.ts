@@ -160,7 +160,9 @@ describe.skipIf(!gate.ok)(
         .filter((d) => existsSync(d));
       expect(configDirs).toHaveLength(1);
       // Claude Code registers (git-clones) the official marketplace on a first interactive
-      // launch, and every Worker's fresh config dir is one (seen live with 2.1.319).
+      // launch, and every Worker's fresh config dir is one (seen live with 2.1.319). Without
+      // network access the clone fails before writing these, so only a run with network shows
+      // the variable at work (CI has it: this failed there without the fix).
       expect(existsSync(join(configDirs[0] as string, 'plugins', 'marketplaces'))).toBe(false);
       expect(existsSync(join(configDirs[0] as string, 'plugins', 'known_marketplaces.json'))).toBe(
         false,
