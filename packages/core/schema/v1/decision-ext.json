@@ -24,7 +24,7 @@
       "type": "string"
     },
     "code": {
-      "description": "The Escalation's one-time answer code, which only the terminal of the run that asked shows: a Mini-conductor's control port takes no answer without it (#269)",
+      "description": "The Escalation's one-time answer code, which only the terminal of the run that asked shows: a Mini-conductor's control port takes no answer without it (#269). Never stored, logged or forwarded",
       "type": "string",
       "maxLength": 64
     }

@@ -574,6 +574,7 @@ ws.close();
         );
       expect(inFiles(root)).toBe(false);
       expect(r.err).not.toContain(code);
+      expect(r.out).not.toContain(code);
       // The port is gone with the run: status reads the log again.
       expect(existsSync(runtimeFile())).toBe(false);
       expect(await status()).toMatchObject({ running: null, source: 'log' });

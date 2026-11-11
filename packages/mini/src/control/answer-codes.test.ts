@@ -11,6 +11,9 @@ describe('AnswerCodes (#269)', () => {
     expect(codes.check('e1', code)).toBeUndefined();
     const loose = `${code.slice(0, 4).toLowerCase()}-${code.slice(4)} `;
     expect(codes.check('e1', loose)).toBeUndefined();
+    // Crockford's look-alikes: O for 0, I or l for 1.
+    const alike = code.replace(/0/g, 'O').replace(/1/g, 'l');
+    expect(codes.check('e1', alike)).toBeUndefined();
   });
 
   it('refuses no code, a wrong one and one of another escalation', () => {

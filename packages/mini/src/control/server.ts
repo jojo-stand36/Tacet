@@ -140,29 +140,37 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
         if (!task.escalations.some((x) => x.id === escalationId)) {
           throw new RpcError(-32602, `no open escalation ${escalationId} on task ${task.id}`);
         }
+        const text = message.parts
+          .flatMap((part) => ('text' in part ? [part.text] : []))
+          .join('\n')
+          .trim();
+        const answer = text || decision.data.choice.trim();
+        // Before the code is checked, so an answer refused for its text does not use it up.
+        if (answer === '') throw new RpcError(-32602, 'an answer must not be empty');
         // The code is never echoed, logged or stored.
         const refused = o.answerCodes.check(escalationId, decision.data.code);
         if (refused) {
+          if (refused === 'withdrawn') {
+            o.onError?.(
+              `escalation ${escalationId}: too many wrong answer codes over the control port; its code is withdrawn`,
+            );
+          }
           throw new RpcError(
             -32602,
             refused === 'none'
               ? `escalation ${escalationId} has no answer code yet: the tacet run terminal shows it when it asks the question`
               : refused === 'wrong'
                 ? `wrong answer code for escalation ${escalationId}`
-                : `too many wrong answer codes for escalation ${escalationId}: the tacet run terminal shows a new one when it asks again`,
+                : `too many wrong answer codes for escalation ${escalationId}: answer it at the tacet run terminal, or with tacet run --resume --answer`,
           );
         }
-        const text = message.parts
-          .flatMap((part) => ('text' in part ? [part.text] : []))
-          .join('\n')
-          .trim();
         try {
-          o.mini.answer(escalationId, text || decision.data.choice);
+          o.mini.answer(escalationId, answer);
         } catch (err) {
-          // Resolved meanwhile, or an empty answer: the message names the escalation only.
+          // Resolved meanwhile: the message names the escalation only.
           throw new RpcError(-32602, (err as Error).message);
         } finally {
-          // Used once, answered or not.
+          // Used once: answered, or no longer open.
           o.answerCodes.drop(escalationId);
         }
         return { task: toA2ATask(entry(task.id), o.contextId) };

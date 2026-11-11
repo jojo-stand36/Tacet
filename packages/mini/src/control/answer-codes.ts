@@ -35,12 +35,17 @@ export class AnswerCodes {
 
   /**
    * Check `given` for the escalation without using it up; `undefined` when it is right. Case,
-   * spaces and dashes do not matter.
+   * spaces and dashes do not matter, and O, I and L read as 0, 1 and 1.
    */
   check(escalationId: string, given: string | undefined): AnswerCodeRefusal | undefined {
     const known = this.#codes.get(escalationId);
     if (!known) return this.#withdrawn.has(escalationId) ? 'withdrawn' : 'none';
-    const typed = (given ?? '').toUpperCase().replace(/[\s-]/g, '');
+    // Crockford's decoding: O reads as 0, I and L as 1.
+    const typed = (given ?? '')
+      .toUpperCase()
+      .replace(/[\s-]/g, '')
+      .replace(/O/g, '0')
+      .replace(/[IL]/g, '1');
     const a = Buffer.from(typed.padEnd(LENGTH, '\0').slice(0, 64));
     const b = Buffer.from(known.code.padEnd(LENGTH, '\0'));
     const right = a.length === b.length && timingSafeEqual(a, b) && typed.length === LENGTH;
