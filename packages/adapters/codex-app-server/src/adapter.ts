@@ -7,13 +7,14 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   type AdapterCapabilities,
@@ -311,6 +312,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
   readonly id = 'codex-app-server';
   readonly #opts: CodexAdapterOptions;
   readonly #sessions = new Map<string, Session>();
+  /** `codex-tmp` dirs already swept for Worker TMPDIRs that killed hosts left (#299). */
+  readonly #sweptTmp = new Set<string>();
 
   constructor(opts: CodexAdapterOptions = {}) {
     this.#opts = opts;
@@ -384,7 +387,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
       privateDir(codexHome);
       // Beside CODEX_HOME, never inside it: the Worker writes here. Made just before Codex starts,
       // so a refusal on the way leaves nothing behind.
-      if (privateTmp) workerTmp = join(dirname(codexHome), 'codex-tmp', randomUUID());
+      if (privateTmp) {
+        const tmpRoot = join(dirname(codexHome), 'codex-tmp');
+        // Once per root and process: what hosts killed before they could clean up left (#299).
+        if (!this.#sweptTmp.has(tmpRoot)) {
+          this.#sweptTmp.add(tmpRoot);
+          sweepWorkerTmpdirs(tmpRoot);
+        }
+        workerTmp = join(tmpRoot, randomUUID());
+      }
       launch.env.CODEX_HOME = codexHome;
       // Codex trusts a repo by itself at the first thread that can write it, and a trusted
       // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
@@ -430,7 +441,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
       }),
     ].sort((a, b) => b.length - a.length);
     if (workerTmp !== undefined) {
-      privateDir(workerTmp, 'the Worker TMPDIR');
+      try {
+        privateDir(workerTmp, 'the Worker TMPDIR');
+        // Who owns it, beside it where the Worker cannot write, for the sweep (#299).
+        writeTmpOwner(workerTmp, { host: process.pid });
+      } catch (err) {
+        releaseWorkerTmp(workerTmp);
+        throw err;
+      }
       // Every temp variable a tool may read: the shared ones are read-only now (#294).
       launch.env.TMPDIR = workerTmp;
       launch.env.TMP = workerTmp;
@@ -449,6 +467,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
         detached: process.platform !== 'win32',
       },
     );
+    // Its process group too: a host killed while Codex runs on leaves a dir still in use.
+    if (workerTmp !== undefined && proc.pid !== undefined) {
+      try {
+        writeTmpOwner(workerTmp, { host: process.pid, group: proc.pid });
+      } catch {
+        // Best effort: the record naming this host still keeps the dir while the host runs.
+      }
+    }
     const exitInfo: { value: Session['exit'] } = { value: undefined };
     const exited = new Promise<void>((resolve) =>
       proc.once('exit', (code, signal) => {
@@ -600,7 +626,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
-      if (workerTmp !== undefined) removeWorkerTree(workerTmp);
+      if (workerTmp !== undefined) releaseWorkerTmp(workerTmp);
       if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
@@ -615,7 +641,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       this.#exited(session);
       await this.#reapGroup(proc);
       // Nothing of the Worker runs any more: its temp files go (#294).
-      if (workerTmp !== undefined) removeWorkerTree(workerTmp);
+      if (workerTmp !== undefined) releaseWorkerTmp(workerTmp);
     });
     void session.gone.then(() => this.#onExit(session));
 
@@ -1239,6 +1265,138 @@ export function removeWorkerTree(dir: string): void {
   } catch {
     // Left behind; nothing of the Worker runs any more.
   }
+}
+
+/**
+ * Who owns a Worker TMPDIR: the host process, once started Codex's process group, and where
+ * those pids mean anything (`ns`: the host name and, on Linux, the PID namespace).
+ */
+interface TmpOwner {
+  host: number;
+  group?: number;
+  ns: string;
+}
+
+const UUID_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A Worker TMPDIR with no usable owner record (a host killed while making it) goes after a day. */
+const UNOWNED_AGE_MS = 24 * 60 * 60 * 1000;
+/** A half-written owner record (`<uuid>.owner.<pid>`) goes after ten minutes. */
+const PARTIAL_AGE_MS = 10 * 60 * 1000;
+
+/**
+ * Where this process's pids mean something (#299): on Linux the machine (`/etc/machine-id`, else
+ * the host name) and the PID namespace, so a container sharing the state dir is told apart;
+ * elsewhere the platform alone, since a macOS host name changes with the network and would make
+ * every earlier record look foreign. Exported for tests.
+ */
+export function pidNamespace(): string {
+  if (process.platform !== 'linux') return process.platform;
+  let machine = hostname();
+  try {
+    machine = readFileSync('/etc/machine-id', 'utf8').trim() || machine;
+  } catch {
+    // No machine id: the host name.
+  }
+  let ns = '';
+  try {
+    ns = readlinkSync('/proc/self/ns/pid');
+  } catch {
+    // Unreadable: the machine alone.
+  }
+  return `${machine}|${ns}`;
+}
+
+/** Record `owner` in `<dir>.owner`, beside the dir: written whole (temp file and rename). */
+function writeTmpOwner(dir: string, owner: Omit<TmpOwner, 'ns'>): void {
+  const tmp = `${dir}.owner.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify({ ...owner, ns: pidNamespace() }), { mode: 0o600 });
+  renameSync(tmp, `${dir}.owner`);
+}
+
+/** Remove a Worker TMPDIR and then its owner record (#294, #299). Never throws. */
+function releaseWorkerTmp(dir: string): void {
+  removeWorkerTree(dir);
+  if (existsSync(dir)) return;
+  try {
+    rmSync(`${dir}.owner`, { force: true });
+  } catch {
+    // Left for the sweep: a record whose dir is gone.
+  }
+}
+
+/** Whether a process, or a process group, still runs. Unknown counts as running. */
+function running(pid: number, group: boolean): boolean {
+  // Group ids 0 and 1 mean something else to kill(); a host may be pid 1 (in a container).
+  if (!Number.isInteger(pid) || pid < (group ? 2 : 1)) return false;
+  try {
+    process.kill(group ? -pid : pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/** A well-formed owner record, or undefined. */
+function readTmpOwner(dir: string): TmpOwner | undefined {
+  try {
+    const o = JSON.parse(readFileSync(`${dir}.owner`, 'utf8')) as Partial<TmpOwner>;
+    if (!Number.isInteger(o.host) || typeof o.ns !== 'string') return undefined;
+    if (o.group !== undefined && !Number.isInteger(o.group)) return undefined;
+    return o as TmpOwner;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Remove the Worker TMPDIRs under `root` (`<state>/codex-tmp`) that hosts killed before they
+ * could clean up left (#299): a `<uuid>` dir whose owner record names a host that is gone and a
+ * Codex process group that is gone, both in this PID namespace, or, with no usable record, one
+ * untouched for a day. A dir of a live Worker, in this process or another, is never removed: its
+ * host or its group still runs. A reused pid keeps a dir, never removes a live one, and a record
+ * from another host or PID namespace (a container sharing the state dir) keeps it: its pids
+ * cannot be checked here. Leftover records go too: one whose dir is gone, and a half-written one
+ * after ten minutes. Returns how many dirs were removed; never throws.
+ */
+export function sweepWorkerTmpdirs(root: string, now = Date.now()): number {
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return 0;
+  }
+  const here = pidNamespace();
+  let removed = 0;
+  for (const name of names) {
+    const path = join(root, name);
+    try {
+      const st = lstatSync(path);
+      if (process.getuid && st.uid !== process.getuid()) continue;
+      const base = name.split('.')[0] as string;
+      if (!UUID_NAME.test(base)) continue;
+      if (name !== base) {
+        if (!st.isFile()) continue;
+        const partial = name.startsWith(`${base}.owner.`);
+        const orphan = name === `${base}.owner` && !existsSync(join(root, base));
+        if (orphan || (partial && now - st.mtimeMs > PARTIAL_AGE_MS)) rmSync(path, { force: true });
+        continue;
+      }
+      if (!st.isDirectory()) continue;
+      const owner = readTmpOwner(path);
+      if (owner) {
+        if (owner.ns !== here) continue;
+        if (running(owner.host, false)) continue;
+        if (owner.group !== undefined && running(owner.group, true)) continue;
+      } else if (now - st.mtimeMs < UNOWNED_AGE_MS) {
+        continue;
+      }
+      releaseWorkerTmp(path);
+      if (!existsSync(path)) removed++;
+    } catch {
+      // Left for the next sweep.
+    }
+  }
+  return removed;
 }
 
 /**

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -18,7 +18,7 @@ import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, removeWorkerTree } from './adapter.js';
+import { CodexAppServerAdapter, pidNamespace, removeWorkerTree } from './adapter.js';
 import { codexFixtureDir } from './testing/fixture-dir.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
@@ -106,16 +106,33 @@ describe('Codex Worker private TMPDIR (#294)', () => {
       repoRoot: repo,
       stateDir: state,
     });
+    const repoState = repoStateDir(repo, state);
+    const codexHome = join(repoState, 'codex');
+    const tmps = join(repoState, 'codex-tmp');
+    // What a host killed earlier left (#299): its host is gone, so the first start sweeps it.
+    const stale = join(tmps, '00000000-0000-4000-8000-000000000299');
+    mkdirSync(join(stale, 'x'), { recursive: true });
+    const gone = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+    writeFileSync(
+      `${stale}.owner`,
+      JSON.stringify({ host: Number(String(gone.stdout)), ns: pidNamespace() }),
+    );
     // Not refused: nothing shared is left writable.
     const h = await a.start({ cwd: worktree });
     const tap = new EventTap(a.events(h));
     await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
-    const repoState = repoStateDir(repo, state);
-    const codexHome = join(repoState, 'codex');
-    const tmps = join(repoState, 'codex-tmp');
-    const [own] = readdirSync(tmps);
-    expect(own).toBeDefined();
-    const workerTmp = join(tmps, own as string);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(`${stale}.owner`)).toBe(false);
+    const dirs = readdirSync(tmps).filter((n) => !n.endsWith('.owner'));
+    expect(dirs).toHaveLength(1);
+    const workerTmp = join(tmps, dirs[0] as string);
+    // Its owner record, beside it: this host, and Codex's process group.
+    const owner = JSON.parse(readFileSync(`${workerTmp}.owner`, 'utf8')) as {
+      host: number;
+      group?: number;
+    };
+    expect(owner.host).toBe(process.pid);
+    expect(owner.group).toEqual(expect.any(Number));
 
     // The first git inside the sandbox works: on macOS the Xcode shim writes its cache under
     // the per-user temp dir, which inside the sandbox is the private TMPDIR (#294).
@@ -171,8 +188,9 @@ describe('Codex Worker private TMPDIR (#294)', () => {
     );
     expect(locked).toContain('LOCK-OK');
     await a.close(h);
-    // Its temp files go with the session.
+    // Its temp files go with the session, and its owner record with them.
     expect(existsSync(workerTmp)).toBe(false);
+    expect(existsSync(`${workerTmp}.owner`)).toBe(false);
 
     // Resumed: a fresh private TMPDIR, and /tmp still read-only.
     const again = await a.start({
