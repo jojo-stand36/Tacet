@@ -34,7 +34,12 @@ import {
   type WorkerEnvPolicy,
   workerEnv,
 } from '@tacet/core';
-import { defaultStateDir, repoStateDir } from '@tacet/core/node';
+import {
+  defaultStateDir,
+  processGroupAlive,
+  processGroupGone,
+  repoStateDir,
+} from '@tacet/core/node';
 import { authEnv, type ClaudeAuthRoute, claudeEnvAllow, withSubprocessScrub } from './auth.js';
 import { isOwnDir, removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
@@ -44,6 +49,7 @@ import {
   SANDBOX_ENV,
   type SandboxResidue,
 } from './placeholders.js';
+import { StderrTail, signalGroup, spawnInOwnSession } from './spawn.js';
 
 /** Vendor session ids are UUIDs: they name each session's config directory. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -149,6 +155,11 @@ export interface ClaudeSdkAdapterOptions {
    * agent-sdk permissions); see docs/adapters/capability-matrix.md.
    */
   fileToolsOnly?: boolean;
+  /**
+   * Milliseconds to wait, once a session is closed, for Claude Code and the rest of its process
+   * group to exit before SIGKILL (#308). Default 5000.
+   */
+  killTimeoutMs?: number;
   /** Replaces the SDK's `query()`; for tests. */
   query?: typeof sdkQuery;
 }
@@ -205,6 +216,10 @@ interface Session {
   /** Context size after the last model call (prompt plus output). */
   contextUsed: number | undefined;
   mcpConfigPath: string | undefined;
+  /** Claude Code's process id, which is also its process group's (#308). */
+  pid: number | undefined;
+  /** The end of Claude Code's stderr, added to the error a failed session reports. */
+  stderr: StderrTail;
   loop: Promise<void>;
 }
 
@@ -430,6 +445,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     };
 
     let q: Query;
+    // The SDK may start Claude Code before `s` exists.
+    let spawnedPid: number | undefined;
+    const stderr = new StderrTail();
     try {
       q = (this.#opts.query ?? sdkQuery)({
         prompt: inbox,
@@ -479,9 +497,18 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           // A file, not the `mcpServers` option: the SDK passes `mcpServers` as JSON on the
           // command line, where any local user can read the Worker token in the process list.
           ...(mcpConfigPath ? { extraArgs: { 'mcp-config': mcpConfigPath } } : {}),
+          // In a session of its own, away from `tacet run`'s terminal (#308).
+          spawnClaudeCodeProcess: (o) => {
+            const child = spawnInOwnSession(o, stderr);
+            if (s) s.pid = child.pid;
+            else spawnedPid = child.pid;
+            return child;
+          },
         },
       });
     } catch (err) {
+      // Claude Code may already be running: nothing of a session that failed to start stays.
+      if (spawnedPid !== undefined) signalGroup(spawnedPid, 'SIGTERM');
       if (mcpConfigPath) removeMcpConfig(mcpConfigPath);
       unmake();
       throw err;
@@ -510,6 +537,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       contextMaxModel: undefined,
       contextUsed: undefined,
       mcpConfigPath,
+      pid: spawnedPid,
+      stderr,
       loop: Promise.resolve(),
     };
     this.#sessions.set(id, s);
@@ -599,6 +628,11 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       s.q.close();
       await s.loop;
     } finally {
+      try {
+        await this.#reapGroup(s.pid);
+      } catch {
+        // Reaping is best effort; the rest of close() still runs.
+      }
       if (s.mcpConfigPath) removeMcpConfig(s.mcpConfigPath);
       if (s.placeholders) removeSandboxResidue(s.placeholders);
       this.#setState(s, 'done');
@@ -628,6 +662,22 @@ export class ClaudeSdkAdapter implements AgentAdapter {
 
   status(h: SessionHandle): SessionState {
     return this.#sessions.get(h.id)?.state ?? 'done';
+  }
+
+  /**
+   * Once a session is closed, wait for Claude Code's process group to end, then SIGTERM what is
+   * left and SIGKILL what still is (#308): nothing of a closed session keeps running. Each signal
+   * follows a check that the group has a running member, and a pid is not reused while it names
+   * a group with members.
+   */
+  async #reapGroup(pid: number | undefined): Promise<void> {
+    if (pid === undefined || process.platform === 'win32') return;
+    const timeout = this.#opts.killTimeoutMs ?? 5000;
+    if (await processGroupGone(pid, timeout)) return;
+    if (processGroupAlive(pid)) signalGroup(pid, 'SIGTERM');
+    if (await processGroupGone(pid, 1000)) return;
+    if (processGroupAlive(pid)) signalGroup(pid, 'SIGKILL');
+    await processGroupGone(pid, 1000);
   }
 
   /** Sessions on the API-key route get a config dir of their own (#237). */
@@ -745,7 +795,15 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       for await (const m of s.q) await this.#onMessage(s, m);
       if (!s.closing) this.#setState(s, 'done');
     } catch (err) {
-      if (!s.closing) this.#setState(s, 'error', errorMessage(err));
+      if (!s.closing) {
+        // As the SDK's own spawn would: the end of Claude Code's stderr says why (#308).
+        const tail = s.stderr.text;
+        this.#setState(
+          s,
+          'error',
+          tail ? `${errorMessage(err)}; stderr: ${tail}` : errorMessage(err),
+        );
+      }
     } finally {
       s.ended = true;
       for (const p of s.approvals.values()) p.resolve(deny('session ended', true));
