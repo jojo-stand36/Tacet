@@ -36,6 +36,11 @@ export interface AcpAgentSpec {
    */
   apiKeyAuthMethods: readonly string[];
   /**
+   * The agent runs Claude Code, which also looks for an OAuth token at a fixed path in Claude
+   * Code's cloud containers (#291): checked at start (`checkHostClaudeToken`).
+   */
+  claudeHostToken?: boolean;
+  /**
    * What this agent supports through this adapter. Declared, not negotiated: a declared resume
    * still fails at start if the agent's `initialize` offers neither `session/resume` nor
    * `session/load`, and a declared `fork: 'native'` (which needs `resume`) is only attempted when
@@ -168,6 +173,7 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   envAllow: { prefixes: ['ANTHROPIC_', 'CLAUDE_'] },
   apiKeyEnv: ['ANTHROPIC_API_KEY'],
   apiKeyAuthMethods: [],
+  claudeHostToken: true,
   // Resume (`session/resume`, its transcripts in the repo's CLAUDE_CONFIG_DIR) and fork (unstable
   // `session/fork`) keep the Worker restrictions: verified live on 0.101.0 (#224).
   capabilities: {

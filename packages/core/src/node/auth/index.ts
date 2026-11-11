@@ -1,5 +1,6 @@
 export * from './browser-session.js';
 export * from './hello.js';
+export * from './host-claude-token.js';
 export * from './listen.js';
 export * from './origin.js';
 export * from './runtime-file.js';
