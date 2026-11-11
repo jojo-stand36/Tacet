@@ -13,7 +13,7 @@ import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-
 import {
   type AgentEvent,
   type AgentTerminal,
-  type Decision,
+  Decision,
   type DecisionScope,
   Escalation,
   type EventEnvelope,
@@ -645,34 +645,38 @@ export class MiniConductor {
     const at = this.#now();
     const proposal = raised?.category === 'decision' ? raised.proposedDecision : undefined;
     const approved = proposal !== undefined && isApproval(answer);
-    const decision: Decision = approved
-      ? {
-          id: proposal.decisionId,
-          escalationId,
-          taskId: x.taskId,
-          ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
-          topic: proposal.topic,
-          decision: proposal.decision,
-          ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
-          scope: 'repo',
-          source: 'user',
-          tags: [],
-          decidedAt: at.toISOString(),
-        }
-      : {
-          id: newUlid(at.getTime()),
-          escalationId,
-          taskId: x.taskId,
-          ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
-          topic: raised?.question ?? escalationId,
-          decision: answer,
-          ...(opts.rationale !== undefined ? { rationale: opts.rationale } : {}),
-          // An approval request is answered for this task only, whatever the reply says.
-          scope: proposal !== undefined ? 'task' : (opts.scope ?? 'task'),
-          source: 'user',
-          tags: [],
-          decidedAt: at.toISOString(),
-        };
+    const decision = Decision.parse(
+      approved
+        ? {
+            id: proposal.decisionId,
+            escalationId,
+            taskId: x.taskId,
+            ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+            topic: proposal.topic,
+            decision: proposal.decision,
+            // The user's own words only: the proposal's rationale is the Worker's, and a user
+            // decision is precedent other Workers read (#25 review).
+            ...(opts.rationale !== undefined ? { rationale: opts.rationale } : {}),
+            scope: 'repo',
+            source: 'user',
+            tags: [],
+            decidedAt: at.toISOString(),
+          }
+        : {
+            id: newUlid(at.getTime()),
+            escalationId,
+            taskId: x.taskId,
+            ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+            topic: raised?.question ?? escalationId,
+            decision: answer,
+            ...(opts.rationale !== undefined ? { rationale: opts.rationale } : {}),
+            // An approval request is answered for this task only, whatever the reply says.
+            scope: proposal !== undefined ? 'task' : (opts.scope ?? 'task'),
+            source: 'user',
+            tags: [],
+            decidedAt: at.toISOString(),
+          },
+    );
     // One append: the decision never exists without the answer that made it, nor the reverse.
     this.#o.store.append([
       this.#env(x.taskId, 'decision.recorded', decision, x.sessionId),
@@ -3341,7 +3345,10 @@ function fileList(files: readonly string[]): string {
   return files.length > 20 ? `${shown} and ${files.length - 20} more` : shown;
 }
 
-/** "approve" or "yes" (any case, surrounding spaces and a full stop aside): an approval. */
+/**
+ * An approval of a proposal: exactly "approve", "approved", "yes" or "y" (any case; surrounding
+ * spaces and one full stop aside). "yes, but …" or "approve it" are answers, not approvals.
+ */
 export function isApproval(answer: string): boolean {
   return /^(approve|approved|yes|y)\.?$/i.test(answer.trim());
 }

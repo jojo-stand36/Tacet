@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
   cancelStopped,
+  isApproval,
   isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,
@@ -1092,18 +1093,71 @@ describe('MiniConductor', () => {
       const decisionId = newUlid();
       const { d, sub } = await run(escId, proposal(decisionId));
       d.answer(escId, 'Approve');
-      expect(ofType('decision.recorded', sub).map((e) => e.data)).toEqual([
+      const [decision] = ofType('decision.recorded', sub).map((e) => e.data) as Decision[];
+      expect(decision).toMatchObject({
+        id: decisionId,
+        escalationId: escId,
+        topic: 'db',
+        decision: 'Postgres',
+        scope: 'repo',
+        source: 'user',
+      });
+      // The Worker's rationale is not made the user's.
+      expect(decision?.rationale).toBeUndefined();
+      await d.settled();
+    });
+
+    it('takes only a plain approval as one', () => {
+      for (const yes of ['approve', 'Approve.', ' APPROVED ', 'yes', 'Y', 'y.']) {
+        expect(isApproval(yes), yes).toBe(true);
+      }
+      for (const no of ['yes, but use SQLite', 'approve it', 'ok', 'reject', 'no', '', 'yess']) {
+        expect(isApproval(no), no).toBe(false);
+      }
+    });
+
+    it("turns a Worker's approved proposal into the user's repo precedent, end to end", async () => {
+      let proposed: { decisionId?: string | undefined; escalationId?: string | undefined } = {};
+      fake = new ScriptedAdapter('fake', (input, s) => {
+        if (input.includes('[ask]') && !s.inputs.some((x) => x.startsWith('Answer'))) {
+          const started = store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope;
+          if (!started?.taskId) throw new Error('no Worker started');
+          const sessionId = (started.data as { sessionId: string }).sessionId;
+          // What the Worker's MCP record_decision does, through the real backend.
+          void new EventLogBackend({ store })
+            .recordDecision(
+              { workerSessionId: sessionId, taskId: started.taskId },
+              { topic: 'db', decision: 'Postgres', rationale: 'one store', scope: 'repo' },
+            )
+            .then((r) => {
+              proposed = r;
+            });
+          return { do: 'reply', text: 'Proposed; waiting.' };
+        }
+        return script(input);
+      });
+      const d = make({
+        planner: new FixedPlanner([{ key: 'q', goal: 'decide [ask]', acceptanceCriteria: ['ok'] }]),
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+      d.answer(proposed.escalationId as string, 'yes');
+      await d.settled();
+      // Another task's Worker finds it as repo precedent.
+      const found = await new EventLogBackend({ store }).searchDecisions(
+        { workerSessionId: 'other', taskId: 'other-task' },
+        { query: 'db' },
+      );
+      expect(found.decisions).toEqual([
         expect.objectContaining({
-          id: decisionId,
-          escalationId: escId,
-          topic: 'db',
+          id: proposed.decisionId,
           decision: 'Postgres',
-          rationale: 'one store',
           scope: 'repo',
           source: 'user',
         }),
       ]);
-      await d.settled();
     });
 
     it('records anything but an approval as a task answer, never the proposal', async () => {

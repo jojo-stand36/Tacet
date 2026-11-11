@@ -375,4 +375,31 @@ describe('EventLogBackend', () => {
       proposedDecision: { decisionId: r.decisionId, scope: 'repo' },
     });
   });
+
+  it("leaves the user's answer standing when the gate answers in time after it (#25)", async () => {
+    const b = make({
+      gate: async (esc: { id: string }) => {
+        // The user answers while the gate works, and the gate still answers within its time.
+        store.append({
+          v: 1,
+          id: newUlid(),
+          ts: NOW,
+          source: { kind: 'mini', id: 'mini' },
+          taskId: 'task-1',
+          type: 'escalation.resolved',
+          data: { escalationId: esc.id, answer: 'mine', source: 'user' },
+        });
+        return { answer: 'the gate', source: 'mini' as const };
+      },
+    });
+    const r = await b.escalate(W1, { question: 'q4', urgency: 'low' });
+    // Pending, so the daemon delivers the user's answer; nothing marks the gate's as delivered.
+    expect(r.status).toBe('pending');
+    expect(
+      store
+        .query({ typePrefix: 'escalation.resolved' })
+        .map((e) => (e.envelope.data as { answer: string }).answer),
+    ).toEqual(['mine']);
+    expect(store.query({ typePrefix: 'escalation.delivered' })).toEqual([]);
+  });
 });

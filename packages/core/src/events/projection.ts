@@ -62,7 +62,6 @@ export const TaskEventData = {
     answer: z.string().optional(),
     /** Who answered: the user, or the gate (`policy`, `precedent`, `mini`). Absent in older logs. */
     source: DecisionSource.optional(),
-    rationale: z.string().optional(),
   }),
   'decision.recorded': Decision,
   'handoff.accepted': z.object({ handoffId: Ulid, sessionId: Id }),
