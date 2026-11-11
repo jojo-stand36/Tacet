@@ -2,7 +2,12 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, refuseGitInSandboxTemp, sandboxTempRoots } from './adapter.js';
+import {
+  CodexAppServerAdapter,
+  refuseGitInSandboxTemp,
+  refuseInSandboxTemp,
+  sandboxTempRoots,
+} from './adapter.js';
 import { codexFixtureDir } from './testing/fixture-dir.js';
 
 /** An unattended Codex Worker never runs on a repo under a sandbox-writable temp dir (#293). */
@@ -92,5 +97,56 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     );
     expect(readdirSync(state)).toEqual([]);
     expect(existsSync(join(parent, 'home'))).toBe(false);
+  });
+
+  it('refuses a CODEX_HOME under a temp dir, before creating it (#295)', async () => {
+    const tmp = codexFixtureDir('tacet-295-tmpdir-');
+    const outside = codexFixtureDir('tacet-295-repo-');
+    dirs.push(tmp, outside);
+    const { repo, wt } = repoIn(outside);
+    const state = join(tmp, 'state');
+    const adapter = new CodexAppServerAdapter({
+      repoRoot: repo,
+      stateDir: state,
+      codexPath: join(outside, 'no-codex-here'),
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: join(outside, 'home'),
+        TMPDIR: tmp,
+        OPENAI_API_KEY: 'placeholder-key',
+      },
+    });
+    // The Worker could otherwise write its own config.toml, which the next Worker's app-server
+    // loads outside the sandbox (seen live with a state dir under /tmp).
+    await expect(adapter.start({ cwd: wt })).rejects.toThrow(`its CODEX_HOME ${state}/`);
+    expect(existsSync(state)).toBe(false);
+    // Under /tmp, whatever $TMPDIR says.
+    expect(() => refuseInSandboxTemp('its CODEX_HOME', '/tmp/x/y/codex', undefined)).toThrow(
+      `is under ${realpathSync.native('/tmp')}`,
+    );
+    expect(() => refuseInSandboxTemp('its CODEX_HOME', join(outside, 'codex'), tmp)).not.toThrow();
+  });
+
+  it('without a repoRoot, refuses a cwd inside a repo under a temp dir (#295)', () => {
+    const tmp = codexFixtureDir('tacet-295-enclosing-');
+    const elsewhere = codexFixtureDir('tacet-295-elsewhere-');
+    dirs.push(tmp, elsewhere);
+    const { repo } = repoIn(tmp);
+    const sub = join(repo, 'src', 'deep');
+    mkdirSync(sub, { recursive: true });
+    expect(() => refuseGitInSandboxTemp(sub, undefined, tmp)).toThrow(
+      `its git dir ${join(repo, '.git')} is under ${tmp}`,
+    );
+    // A linked worktree outside the temp dir whose git dir points into it.
+    const linked = join(elsewhere, 'wt');
+    execFileSync('git', ['-C', repo, 'worktree', 'add', '-q', linked, '-b', 'tacet/linked'], {
+      env: gitEnv,
+      stdio: 'ignore',
+    });
+    expect(() => refuseGitInSandboxTemp(linked, undefined, tmp)).toThrow(`is under ${tmp}`);
+    // A directory in no repo, outside the temp dirs: nothing to refuse.
+    const plain = join(elsewhere, 'plain');
+    mkdirSync(plain);
+    expect(() => refuseGitInSandboxTemp(plain, undefined, tmp)).not.toThrow();
   });
 });
