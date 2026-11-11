@@ -51,7 +51,12 @@ Approving this ADR approves these items; the letters match the plan on #25.
 | `high` | As `medium`, plus the Mini-conductor's own reasoning without a candidate. |
 
 - **Urgency.** `blocking` is never gated: it always reaches the user. `high` is answered only by an exact precedent. Reasoning answers only `low` and `normal`. The Worker sets urgency itself, so this is a cost and user-experience control, not a security boundary.
-- **Merging.** `escalation.autonomy` follows §4's scalar rule across the user, repo and local layers (a layer that sets it replaces the one below; one that does not set it does not count, so `medium` applies only when none does). The task layer may only lower it: a task that raises it is a config error, as for `workers.*`. A task's autonomy, which today exists only in the A2A task metadata (`TaskExt`), is kept on the stored Task.
+- **Merging: only the user raises it.** A committed file, which a Worker can edit, must not widen what is answered without the user, for the same reason the repo layer may not `allow` (D). So:
+  - The **user** layer sets the level (`medium` when it says nothing).
+  - The committed **repo** layer may only lower it: a repo level above the user's is ignored, and `tacet run` warns that it was.
+  - The **local** layer (`.tacet/local.yaml`, the user's own and gitignored) replaces it either way, as §4's scalar rule has it.
+  - The **task** layer may only lower it: a task that raises it is a config error, as for `workers.*`.
+  - A task's autonomy, which today exists only in the A2A task metadata (`TaskExt`), is kept on the stored Task.
 - **The reasoning step** runs on `tiers.mini` as the planner and the reviewer do: on the API-key route, with no MCP server, every approval refused, in an empty working directory, with the Worker-process marker. It sees the question, its context and options, the task's goal, `always_ask`, and the candidates (their topic, decision and id). All of that but the task's goal is fenced between random markers and labelled untrusted, each field capped at 4000 characters. Its reply is strict JSON (`{verdict: "answer" | "forward", answer, rationale, cites, alwaysAsk}`), checked in code: the cited ids must be among the candidates it was given, the answer must be one of the options when there are options, the rationale is capped and redacted. Anything that does not check out forwards the question to the user. Its usage is charged to the sub-task (`agent.usage`). It is skipped when the task has a budget and less than a tenth of it is left. The `escalate` rate limit (6 per 10 minutes) bounds how often it runs.
 
 ### C. `always_ask`
@@ -99,4 +104,5 @@ Until the worker sandbox (#53) denies the state directory, code a Worker wrote r
 - **The gate answers tool `ask`s**: rejected. Code a Worker wrote would then approve its own tool calls.
 - **Policies answer escalations now**: deferred to CEL rules, which would need a TypeScript CEL dependency justified on its own.
 - **Replace the interim tool policy with policies now**: rejected until #53. `allow` rules widening it would rest on the interim policy's time-of-check assumptions.
-- **Autonomy as the lowest of all layers**: rejected. It departs from §4's scalar rule and would stop a user from setting `high` for a repo that says nothing; only the task layer is clamped.
+- **Autonomy by §4's plain scalar rule** (any layer replaces the one below): rejected. A committed repo config could then raise autonomy above the user's own setting.
+- **Autonomy as the lowest of all layers**: rejected. The user's own local file could not raise it for one repo.
