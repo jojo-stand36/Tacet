@@ -1,6 +1,7 @@
 import { WebSocket } from 'ws';
 import { HelloResult } from '../../schema/hello.js';
 import type { Secret } from '../auth/secret.js';
+import { incoming, isResponse, outgoing, type PeerHandler, parseFrame } from './peer.js';
 
 /** An error answer from the server, or a failure to reach it. Never carries the token. */
 export class RpcClientError extends Error {
@@ -22,6 +23,16 @@ export interface RpcClient {
   close(): Promise<void>;
   /** Settles when the connection is gone, whoever ended it, with the WebSocket close code. */
   closed: Promise<{ code: number; reason: string }>;
+  /** Send the server a notification; resolves once it is handed to the socket. */
+  notify(method: string, params?: unknown): Promise<void>;
+  /** Bytes queued on the socket and not yet sent: for a sender that must not outrun it. */
+  bufferedAmount(): number;
+}
+
+/** What a client knows when the server calls it (#24). */
+export interface ClientContext {
+  /** The session id the server's hello gave this connection. */
+  sessionId: string;
 }
 
 /** What a Mini-conductor says about itself in its hello (ADR-003 §3.6): a lightweight Agent Card. */
@@ -44,6 +55,17 @@ export interface ConnectRpcOptions {
    * a server that hangs or a peer that vanished without a FIN (#23). Off by default.
    */
   silenceTimeoutMs?: number;
+  /**
+   * Methods the server may call on this socket after the hello (#24, ADR-003 §4: either side may
+   * send requests). Anything else is answered `-32601`.
+   */
+  handlers?: Readonly<Record<string, PeerHandler<ClientContext>>>;
+  /** Capability flags the hello advertises (ADR-003 §2), e.g. the methods `handlers` serves. */
+  capabilities?: Record<string, unknown>;
+  /** Requests from the server in flight at once; more get `-32000`. Default 32. */
+  maxInFlight?: number;
+  /** Told about handler failures, by message only. */
+  onError?: (message: string) => void;
   /** Milliseconds for the connection and hello together, and the default per call. Default 10000. */
   timeoutMs?: number;
   maxPayload?: number;
@@ -64,28 +86,26 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
     maxPayload: o.maxPayload ?? 16 * 1024 * 1024,
     handshakeTimeout: timeoutMs,
   });
-  let next = 1;
-  const pending = new Map<number, { resolve(v: unknown): void; reject(e: Error): void }>();
-  const failAll = (err: Error) => {
-    for (const p of pending.values()) p.reject(err);
-    pending.clear();
-  };
-  ws.on('message', (data) => {
-    let msg: { id?: unknown; result?: unknown; error?: { code?: unknown; message?: unknown } };
-    try {
-      msg = JSON.parse(data.toString('utf8'));
-    } catch {
+  const out = outgoing(ws, timeoutMs, (m, code) => new RpcClientError(m, code));
+  const failAll = out.failAll;
+  const ctx: ClientContext = { sessionId: '' };
+  // Requests the server sends, served only once the hello is done.
+  let peer: ReturnType<typeof incoming<ClientContext>> | undefined;
+  const early: Record<string, unknown>[] = [];
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) return;
+    const msg = parseFrame(data);
+    if (!msg) return;
+    if (isResponse(msg)) {
+      out.settle(msg);
       return;
     }
-    if (typeof msg.id !== 'number') return;
-    const p = pending.get(msg.id);
-    if (!p) return;
-    pending.delete(msg.id);
-    if (msg.error) {
-      const code = typeof msg.error.code === 'number' ? msg.error.code : undefined;
-      const message = typeof msg.error.message === 'string' ? msg.error.message : 'error';
-      p.reject(new RpcClientError(message, code));
-    } else p.resolve(msg.result);
+    if (typeof msg.method === 'string') {
+      // A request can come in the same read as the hello's answer, before the handlers are set:
+      // held until then, in order (a few at most; the server sends after the hello).
+      if (peer) peer.handle(msg);
+      else if (early.length < 64) early.push(msg);
+    }
   });
   const closed = new Promise<{ code: number; reason: string }>((resolve) => {
     ws.on('close', (code, reason) => {
@@ -108,29 +128,7 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
   ws.once('open', heard);
   void closed.then(() => silence && clearTimeout(silence));
 
-  const call = (method: string, params?: unknown, opts: { timeoutMs?: number } = {}) =>
-    new Promise<unknown>((resolve, reject) => {
-      if (ws.readyState !== ws.OPEN) return reject(new RpcClientError('not connected'));
-      const id = next++;
-      const timer = setTimeout(() => {
-        pending.delete(id);
-        reject(new RpcClientError(`${method} timed out`));
-      }, opts.timeoutMs ?? timeoutMs);
-      timer.unref();
-      pending.set(id, {
-        resolve: (v) => {
-          clearTimeout(timer);
-          resolve(v);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        },
-      });
-      ws.send(
-        JSON.stringify({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) }),
-      );
-    });
+  const call = out.call;
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -143,15 +141,26 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
         protocolVersions: [1],
         role: o.role ?? 'cli',
         clientInfo: o.clientInfo,
-        capabilities: {},
+        capabilities: o.capabilities ?? {},
         ...(o.role === 'mini' ? o.card : {}),
       }),
     );
     ws.on('error', () => {});
+    ctx.sessionId = hello.sessionId;
+    peer = incoming(ws, {
+      handlers: o.handlers ?? {},
+      ctx,
+      ...(o.maxInFlight !== undefined ? { maxInFlight: o.maxInFlight } : {}),
+      reserved: ['tacet/hello'],
+      ...(o.onError ? { report: (e: unknown) => o.onError?.((e as Error).message) } : {}),
+    });
+    for (const msg of early.splice(0)) peer.handle(msg);
     return {
       hello,
       call,
       closed,
+      notify: out.notify,
+      bufferedAmount: () => ws.bufferedAmount,
       close: () =>
         new Promise<void>((resolve) => {
           if (ws.readyState === ws.CLOSED) return resolve();

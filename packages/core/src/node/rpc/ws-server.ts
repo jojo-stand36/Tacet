@@ -6,16 +6,9 @@ import { HelloGate, type HelloInfo } from '../auth/hello.js';
 import { listenLoopback } from '../auth/listen.js';
 import { checkHostAndOrigin } from '../auth/origin.js';
 import { checkBearer, type Secret } from '../auth/secret.js';
+import { incoming, isResponse, outgoing, parseFrame, RpcCallError, RpcError } from './peer.js';
 
-/** A JSON-RPC error a handler throws to answer with that code; its message goes to the client. */
-export class RpcError extends Error {
-  override name = 'RpcError';
-  readonly code: number;
-  constructor(code: number, message: string) {
-    super(message);
-    this.code = code;
-  }
-}
+export { RpcError };
 
 export interface RpcContext {
   /** The session id `tacet/hello` returned on this socket. */
@@ -46,6 +39,11 @@ export interface RpcServerOptions {
   /** Requests one socket may have in flight; more get `-32000`. Default 32. */
   maxInFlight?: number;
   /**
+   * Notifications one socket may have queued; past this its reads pause until they drain (never
+   * an answer, never a drop). Default 16.
+   */
+  maxQueued?: number;
+  /**
    * A live byte stream for `/pty/<id>` (ADR-003 §5, #201): the terminal of the Worker session
    * `id`, or undefined when there is none (404). The upgrade passes the same Host, Origin and
    * bearer checks as `/`, and no hello is said: the socket carries the stream's chunks, as binary
@@ -75,6 +73,14 @@ export interface RpcConnection {
   ping(timeoutMs: number): Promise<boolean>;
   /** Settles when the socket is gone, with its close code. */
   readonly closed: Promise<{ code: number; reason: string }>;
+  /**
+   * Call a method the client serves on this socket (#24, ADR-003 §4: after the hello either side
+   * may send requests). Rejects with an `RpcCallError`: the client's error, a timeout (default
+   * 10 s), or the socket closing.
+   */
+  call(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
+  /** Send the client a notification; resolves once it is handed to the socket. */
+  notify(method: string, params?: unknown): Promise<void>;
 }
 
 export interface RpcServer {
@@ -196,12 +202,17 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
         ctx = { sessionId: '', hello };
       },
     });
-    let inFlight = 0;
+    // Requests this side sends on the socket (#24), and what the client sends.
+    const out = outgoing(ws, 10_000);
+    let peer: ReturnType<typeof incoming<RpcContext>> | undefined;
     const helloTimer = setTimeout(() => {
       if (!ctx?.sessionId) ws.close(1008, 'no hello');
     }, o.helloTimeoutMs ?? 10_000);
     helloTimer.unref();
-    ws.on('close', () => clearTimeout(helloTimer));
+    ws.on('close', (code: number) => {
+      clearTimeout(helloTimer);
+      out.failAll(new RpcCallError(`connection closed (${code})`));
+    });
     const send = (msg: unknown) => {
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
     };
@@ -216,9 +227,19 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
       if (action.kind === 'reply') {
         if (ctx) ctx.sessionId = action.message.result.sessionId;
         send(action.message);
+        if (ctx) {
+          peer = incoming(ws, {
+            handlers: o.handlers,
+            ctx,
+            ...(o.maxInFlight !== undefined ? { maxInFlight: o.maxInFlight } : {}),
+            ...(o.maxQueued !== undefined ? { maxQueued: o.maxQueued } : {}),
+            reserved: ['tacet/hello'],
+            report,
+          });
+        }
         if (ctx && o.onConnection) {
           try {
-            o.onConnection(connection(ws, ctx));
+            o.onConnection(connection(ws, ctx, out));
           } catch (err) {
             report(err);
           }
@@ -229,25 +250,22 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
         ws.close(1003, 'text frames only');
         return;
       }
-      if (inFlight >= (o.maxInFlight ?? 32)) {
-        let id: unknown = null;
-        try {
-          id = (JSON.parse(data.toString('utf8')) as { id?: unknown }).id ?? null;
-        } catch {}
-        const rpcId = typeof id === 'string' || typeof id === 'number' ? id : null;
-        send({ jsonrpc: '2.0', id: rpcId, error: { code: -32000, message: 'too many requests' } });
+      const msg = parseFrame(data);
+      // An answer to a request this side sent: matched by id, never dispatched. One that answers
+      // nothing of ours is dropped (JSON-RPC never answers a response).
+      if (msg && isResponse(msg)) {
+        out.settle(msg);
         return;
       }
-      inFlight++;
-      void dispatch(data.toString('utf8'), ctx)
-        .then((reply) => reply && send(reply))
-        .finally(() => {
-          inFlight--;
-        });
+      peer?.handle(msg);
     });
   };
 
-  const connection = (ws: WebSocket, ctx: RpcContext): RpcConnection => {
+  const connection = (
+    ws: WebSocket,
+    ctx: RpcContext,
+    out: ReturnType<typeof outgoing>,
+  ): RpcConnection => {
     const closed = new Promise<{ code: number; reason: string }>((resolve) => {
       if (ws.readyState === ws.CLOSED) resolve({ code: 1006, reason: '' });
       ws.once('close', (code: number, reason: Buffer) =>
@@ -262,6 +280,8 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
         if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close(code, reason);
       },
       terminate: () => ws.terminate(),
+      call: out.call,
+      notify: out.notify,
       ping: (timeoutMs) =>
         new Promise<boolean>((resolve) => {
           if (ws.readyState !== ws.OPEN) return resolve(false);
@@ -277,38 +297,6 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
           ws.ping();
         }),
     };
-  };
-
-  const dispatch = async (frame: string, ctx: RpcContext) => {
-    let msg: unknown;
-    try {
-      msg = JSON.parse(frame);
-    } catch {
-      return { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } };
-    }
-    if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
-      return { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'invalid request' } };
-    }
-    const { jsonrpc, id, method, params } = msg as Record<string, unknown>;
-    const notification = id === undefined;
-    const rpcId = typeof id === 'string' || typeof id === 'number' ? id : null;
-    const error = (code: number, message: string) =>
-      notification ? undefined : { jsonrpc: '2.0', id: rpcId, error: { code, message } };
-    if (jsonrpc !== '2.0' || typeof method !== 'string' || (!notification && rpcId === null)) {
-      return error(-32600, 'invalid request');
-    }
-    if (method === 'tacet/hello') return error(-32600, 'already said hello');
-    const handler = Object.hasOwn(o.handlers, method) ? o.handlers[method] : undefined;
-    if (!handler) return error(-32601, `method not found: ${method}`);
-    try {
-      const result = await handler(params, ctx);
-      return notification ? undefined : { jsonrpc: '2.0', id: rpcId, result: result ?? null };
-    } catch (err) {
-      if (err instanceof RpcError) return error(err.code, err.message);
-      // Internal errors can name paths or state: the client gets a generic message.
-      report(err);
-      return error(-32603, 'internal error');
-    }
   };
 
   const listener = await listenLoopback(() => {

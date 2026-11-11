@@ -524,3 +524,133 @@ describe('connections a daemon keeps (#23)', () => {
     expect(closed.code).toBe(1006);
   });
 });
+
+describe('both directions on one socket (#24, ADR-003 §4)', () => {
+  type Conn = import('./ws-server.js').RpcConnection;
+  /** A server that hands over each connection, and a client of it with `handlers`. */
+  const pair = async (
+    handlers: Parameters<typeof connectRpc>[0]['handlers'],
+    extra: Partial<Parameters<typeof startRpcServer>[0]> = {},
+    onConn?: (c: Conn) => void,
+  ) => {
+    const conns: Conn[] = [];
+    const { server, token, errors } = await serve(randomToken(), {
+      onConnection: (c) => {
+        conns.push(c);
+        onConn?.(c);
+      },
+      ...extra,
+    });
+    const c = await connectRpc({
+      port: server.port,
+      token,
+      clientInfo: { name: 'test', version: '0' },
+      timeoutMs: 5000,
+      ...(handlers ? { handlers } : {}),
+      capabilities: { methods: Object.keys(handlers ?? {}) },
+    });
+    await vi.waitFor(() => expect(conns).toHaveLength(1));
+    return { c, conn: conns[0] as Conn, server, token, errors };
+  };
+
+  it('lets the server call the client while the client calls the server', async () => {
+    const { c, conn } = await pair({
+      ListTasks: async (p, ctx) => {
+        await new Promise((r) => setTimeout(r, 20));
+        return { got: p, session: ctx.sessionId };
+      },
+    });
+    const [down, up] = await Promise.all([
+      conn.call('ListTasks', { pageSize: 3 }),
+      c.call('echo', { x: 1 }),
+    ]);
+    expect(down).toEqual({ got: { pageSize: 3 }, session: c.hello.sessionId });
+    expect(up).toEqual({ x: 1 });
+    await c.close();
+  });
+
+  it("answers the server with the client's errors, never its internals", async () => {
+    const errors: string[] = [];
+    const { conn, c } = await pair({
+      refuse: () => {
+        throw new RpcError(-32001, 'task not found');
+      },
+      boom: () => {
+        throw new Error('/private/path in a message');
+      },
+    });
+    await expect(conn.call('refuse')).rejects.toMatchObject({
+      code: -32001,
+      message: 'task not found',
+    });
+    await expect(conn.call('boom')).rejects.toMatchObject({
+      code: -32603,
+      message: 'internal error',
+    });
+    await expect(conn.call('SendMessage')).rejects.toMatchObject({ code: -32601 });
+    await expect(conn.call('tacet/hello')).rejects.toMatchObject({ code: -32600 });
+    expect(errors).toEqual([]);
+    await c.close();
+  });
+
+  it('serves a request sent at once after the hello', async () => {
+    const answers: unknown[] = [];
+    const { c } = await pair({ GetTask: () => 'here' }, {}, (conn) => {
+      // In the same breath as the hello's answer.
+      void conn.call('GetTask').then((a) => answers.push(a));
+    });
+    await vi.waitFor(() => expect(answers).toEqual(['here']));
+    await c.close();
+  });
+
+  it('rejects calls in flight when the socket goes', async () => {
+    const { c, conn } = await pair({ slow: () => new Promise(() => {}) });
+    const pending = expect(conn.call('slow', undefined, { timeoutMs: 10_000 })).rejects.toThrow(
+      /connection closed/,
+    );
+    await c.close();
+    await pending;
+    await expect(conn.call('slow')).rejects.toThrow(/not connected/);
+  });
+
+  it('times out a call the client never answers', async () => {
+    const { c, conn } = await pair({ slow: () => new Promise(() => {}) });
+    await expect(conn.call('slow', undefined, { timeoutMs: 50 })).rejects.toThrow(/timed out/);
+    await c.close();
+  });
+
+  it('drops a response that answers nothing it asked, without replying', async () => {
+    const { server, token } = await serve();
+    const ws = await rawSocket(server.port, token);
+    const got: unknown[] = [];
+    ws.on('message', (d) => got.push(JSON.parse(d.toString())));
+    ws.send(hello());
+    await vi.waitFor(() => expect(got).toHaveLength(1));
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 999, result: 'forged' }));
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'echo', params: 'after' }));
+    await vi.waitFor(() => expect(got).toHaveLength(2));
+    expect(got[1]).toEqual({ jsonrpc: '2.0', id: 2, result: 'after' });
+    ws.close();
+  });
+
+  it('runs notifications in order and never answers or drops one, however many come', async () => {
+    const seen: number[] = [];
+    const { server, token } = await serve(randomToken(), {
+      maxQueued: 2,
+      maxInFlight: 1,
+      handlers: {
+        'tacet/event': async (p) => {
+          await new Promise((r) => setTimeout(r, 2));
+          seen.push((p as { n: number }).n);
+        },
+      },
+    });
+    const c = await client(server.port, token);
+    for (let n = 0; n < 40; n++) await c.notify('tacet/event', { n });
+    await vi.waitFor(() => expect(seen).toHaveLength(40), { timeout: 5000 });
+    expect(seen).toEqual([...Array(40).keys()]);
+    // The reads resumed: a request still gets through.
+    expect(await c.call('tacet/event', { n: 99 })).toBeNull();
+    await c.close();
+  });
+});

@@ -22,7 +22,7 @@ import {
   writeRuntimeFile,
 } from '@tacet/core/node';
 import { AnswerCodes } from './control/answer-codes.js';
-import { startMiniControl } from './control/server.js';
+import { LINK_METHODS, startMiniControl, taskMethods } from './control/server.js';
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
@@ -235,6 +235,11 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
           miniVersion: MINI_VERSION,
         },
         clientInfo: { name: 'tacet-mini', version: MINI_VERSION },
+        // Reading and cancelling only (#24): new tasks and answers stay with `tacet run` and its
+        // terminal until the Conductor can be authenticated to the Mini-conductor (#53).
+        handlers: taskMethods({ mini, store, contextId: paths.repoId }).handlers,
+        capabilities: { serves: [...LINK_METHODS] },
+        ...(o.onError ? { onError: (m: string) => o.onError?.(`conductor link: ${m}`) } : {}),
         runDir: o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
         ...(o.conductor?.minDelayMs !== undefined ? { minDelayMs: o.conductor.minDelayMs } : {}),
         ...(o.conductor?.settleMs !== undefined ? { settleMs: o.conductor.settleMs } : {}),

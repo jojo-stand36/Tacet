@@ -1,6 +1,9 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import {
+  type A2AListTasksRequest,
+  A2AListTasksResponse,
+  A2ATask,
   type EventEnvelope,
   newUlid,
   type RegistryDisconnectReason,
@@ -15,6 +18,7 @@ import {
   type EventStore,
   openEventStore,
   type ProcessLockText,
+  RpcCallError,
   type RpcConnection,
   type RpcServer,
   randomToken,
@@ -80,6 +84,11 @@ export interface Conductor {
   port: number;
   /** The registry as its log has it: registered repos and connected Mini-conductors. */
   registry(): RegistryState;
+  /**
+   * The live Mini-conductor of a repo, to call over its link (#24): reading and cancelling its
+   * tasks. Undefined when none is connected.
+   */
+  mini(repoId: string): MiniLink | undefined;
   /** Stop: drop the connections (recorded as closed), remove the runtime file, free the lock. */
   close(): Promise<void>;
 }
@@ -282,6 +291,10 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     return {
       port: rpc.port,
       registry,
+      mini: (repoId) => {
+        const entry = live.get(repoId);
+        return entry ? miniLink(entry.conn) : undefined;
+      },
       close: () => {
         closed ??= (async () => {
           clearInterval(beat);
@@ -422,5 +435,50 @@ function autostarter(
       stopped = true;
       clearInterval(timer);
     },
+  };
+}
+
+/**
+ * A connected Mini-conductor, as the Conductor calls it (#24, ADR-003 §4: the Conductor is the A2A
+ * client). Answers are checked against the A2A schemas: a Mini-conductor is a peer, not trusted to
+ * answer in shape. A JSON-RPC error rejects with an `RpcCallError` carrying its code (A2A's
+ * `-32001` for an unknown task, `-32002` for one that cannot be cancelled).
+ */
+export interface MiniLink {
+  readonly sessionId: string;
+  /** What the Mini-conductor says it serves (its hello's `capabilities.serves`). */
+  readonly serves: readonly string[];
+  listTasks(req?: A2AListTasksRequest): Promise<A2AListTasksResponse>;
+  getTask(id: string, historyLength?: number): Promise<A2ATask>;
+  cancelTask(id: string): Promise<A2ATask>;
+}
+
+function miniLink(conn: RpcConnection): MiniLink {
+  // Any schema of `@tacet/core` (zod), typed by shape so this package needs no zod of its own.
+  type Schema<T> = {
+    safeParse(v: unknown): { success: true; data: T } | { success: false };
+  };
+  const parse = <T>(schema: Schema<T>, value: unknown, method: string): T => {
+    const parsed = schema.safeParse(value);
+    if (!parsed.success)
+      throw new RpcCallError(`${method}: the Mini-conductor answered out of shape`);
+    return parsed.data;
+  };
+  const serves = (conn.hello as { capabilities?: { serves?: unknown } }).capabilities?.serves;
+  return {
+    sessionId: conn.sessionId,
+    serves: Array.isArray(serves) ? serves.filter((m): m is string => typeof m === 'string') : [],
+    listTasks: async (req = {}) =>
+      parse(A2AListTasksResponse, await conn.call('ListTasks', req), 'ListTasks'),
+    getTask: async (id, historyLength) =>
+      parse(
+        A2ATask,
+        await conn.call('GetTask', {
+          id,
+          ...(historyLength !== undefined ? { historyLength } : {}),
+        }),
+        'GetTask',
+      ),
+    cancelTask: async (id) => parse(A2ATask, await conn.call('CancelTask', { id }), 'CancelTask'),
   };
 }
