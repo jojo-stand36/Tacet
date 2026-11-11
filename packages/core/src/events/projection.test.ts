@@ -196,7 +196,12 @@ describe('registry projection (#23)', () => {
       at(9, 'registry.repo_added', { repoId: 'not-an-id', repoPath: '/x' }),
     ]);
     expect(state.repos).toEqual({
-      [a]: { repoId: a, repoPath: '/r/a', addedAt: '2026-11-11T12:00:01.000Z' },
+      [a]: {
+        repoId: a,
+        repoPath: '/r/a',
+        addedAt: '2026-11-11T12:00:01.000Z',
+        registration: '01J00000000000000000000001',
+      },
     });
     expect(Object.keys(state.connected)).toEqual([a]);
     expect(state.connected[a]).toMatchObject({

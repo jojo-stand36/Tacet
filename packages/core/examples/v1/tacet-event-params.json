@@ -1,0 +1,16 @@
+{
+  "logId": "3f9a2c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c",
+  "throughSeq": 42,
+  "events": [
+    {
+      "v": 1,
+      "id": "01JCX6000000000000000000AA",
+      "ts": "2026-11-11T12:00:00.000Z",
+      "source": { "kind": "mini", "id": "standalone" },
+      "repo": "5471e2437cf0e73f",
+      "taskId": "01JCX6000000000000000000TK",
+      "type": "task.status",
+      "data": { "state": "running" }
+    }
+  ]
+}

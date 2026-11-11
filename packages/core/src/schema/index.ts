@@ -5,6 +5,7 @@ import { EventEnvelope } from './envelope.js';
 import { Escalation, EscalationExt } from './escalation.js';
 import { HandoffPacket } from './handoff.js';
 import { HelloParams, HelloResult } from './hello.js';
+import { EventResumeParams, EventResumeResult, TacetEventParams } from './link.js';
 import { MaintenanceProblem } from './maintenance.js';
 import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
@@ -39,6 +40,7 @@ export * from './envelope.js';
 export * from './escalation.js';
 export * from './handoff.js';
 export * from './hello.js';
+export * from './link.js';
 export * from './maintenance.js';
 export * from './plan.js';
 export * from './profile.js';
@@ -111,6 +113,15 @@ export const jsonSchemas = {
   'registry-disconnected': {
     schema: RegistryDisconnected,
     title: 'Tacet registry.disconnected payload',
+  },
+  'tacet-event-params': { schema: TacetEventParams, title: 'Tacet tacet/event params' },
+  'tacet-event-resume-params': {
+    schema: EventResumeParams,
+    title: 'Tacet tacet/event.resume params',
+  },
+  'tacet-event-resume-result': {
+    schema: EventResumeResult,
+    title: 'Tacet tacet/event.resume result',
   },
   'maintenance-problem': {
     schema: MaintenanceProblem,

@@ -260,6 +260,11 @@ export interface RegisteredRepo {
   repoPath: string;
   /** When `registry.repo_added` was recorded. */
   addedAt: string;
+  /**
+   * The id of that `registry.repo_added` envelope: this registration, told apart from an earlier
+   * one of the same repo even when the user removes and adds it again in quick succession (#24).
+   */
+  registration: string;
 }
 
 /** A Mini-conductor connected to the Conductor (#23), registered or not. */
@@ -293,7 +298,12 @@ export const registryProjection: Projection<RegistryState> = {
       case 'registry.repo_added': {
         const d = RegistryRepoAdded.safeParse(e.data);
         if (!d.success) return state;
-        const repo = { repoId: d.data.repoId, repoPath: d.data.repoPath, addedAt: e.ts };
+        const repo = {
+          repoId: d.data.repoId,
+          repoPath: d.data.repoPath,
+          addedAt: e.ts,
+          registration: e.id,
+        };
         return { ...state, repos: { ...state.repos, [d.data.repoId]: repo } };
       }
       case 'registry.repo_removed': {

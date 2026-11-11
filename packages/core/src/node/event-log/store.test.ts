@@ -240,3 +240,48 @@ describe('event log', () => {
     expect(p.endsWith('events.db')).toBe(true);
   });
 });
+
+describe('log identity and caller meta (#24)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'tacet-store-id-'));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('keeps its id across reopening, and a log made again gets a new one', () => {
+    const path = join(dir, 'events.db');
+    const first = openEventStore(path);
+    const id = first.logId();
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    first.close();
+    const again = openEventStore(path);
+    expect(again.logId()).toBe(id);
+    again.close();
+    const reader = openEventStore(path, { readonly: true });
+    expect(reader.logId()).toBe(id);
+    reader.close();
+    rmSync(path);
+    const remade = openEventStore(path);
+    expect(remade.logId()).not.toBe(id);
+    remade.close();
+  });
+
+  it('keeps a caller value with the events in one transaction, under its own keys only', () => {
+    const s = openEventStore(join(dir, 'events.db'));
+    try {
+      s.append(fixture.slice(0, 2), { meta: { 'x.cursor': 'a:2' } });
+      expect(s.meta('x.cursor')).toBe('a:2');
+      expect(s.count()).toBe(2);
+      // A bad envelope rolls the cursor back with it.
+      expect(() =>
+        s.append([fixture[2], { nope: true }], { meta: { 'x.cursor': 'a:4' } }),
+      ).toThrow();
+      expect(s.meta('x.cursor')).toBe('a:2');
+      expect(s.count()).toBe(2);
+      expect(() => s.append([], { meta: { log_id: 'mine' } })).toThrow(/must start with "x."/);
+      expect(s.meta('log_id')).toBe(s.logId());
+    } finally {
+      s.close();
+    }
+  });
+});

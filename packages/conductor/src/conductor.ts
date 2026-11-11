@@ -5,10 +5,14 @@ import {
   A2AListTasksResponse,
   A2ATask,
   type EventEnvelope,
+  EventResumeResult,
   newUlid,
   type RegistryDisconnectReason,
   type RegistryState,
   registryProjection,
+  TACET_EVENT,
+  TACET_EVENT_RESUME,
+  type TasksState,
 } from '@tacet/core';
 import {
   CLOSE_CONFLICT,
@@ -29,6 +33,7 @@ import {
   takeProcessLock,
   writeRuntimeFile,
 } from '@tacet/core/node';
+import { replicas } from './replicas.js';
 
 export interface StartConductorOptions {
   /** The user layer's resolved `events.state_dir`: the Conductor's log goes under it. */
@@ -46,6 +51,8 @@ export interface StartConductorOptions {
   now?: () => Date;
   /** Told about failures, by message only. */
   onError?: (message: string) => void;
+  /** How often registration changes are acted on (resume, unregister), in ms. Default 2000. */
+  syncIntervalMs?: number;
   /** Start Mini-conductors for registered repos (`conductor.autostart`, off by default). */
   autostart?: AutostartOptions;
 }
@@ -89,6 +96,8 @@ export interface Conductor {
    * tasks. Undefined when none is connected.
    */
   mini(repoId: string): MiniLink | undefined;
+  /** A registered repo's tasks as its forwarded events have them (#24), or undefined. */
+  tasks(repoId: string): TasksState | undefined;
   /** Stop: drop the connections (recorded as closed), remove the runtime file, free the lock. */
   close(): Promise<void>;
 }
@@ -103,6 +112,16 @@ interface Live {
   repoId: string;
   conn: RpcConnection;
   missed: number;
+  /** The Mini-conductor log its events come from, once `tacet/event.resume` has answered (#24). */
+  resumed?: { logId: string } | undefined;
+  /** A resume is under way. */
+  resuming?: boolean;
+  /** Resume was asked on this connection (once per connection). */
+  asked?: boolean;
+  /** The registration (`registry.repo_added` id) it was resumed under. */
+  registration?: string | undefined;
+  /** Batches that came while the resume's answer was being read: taken right after it, in order. */
+  early?: unknown[] | undefined;
   /** Why it is being dropped, when the Conductor drops it. */
   ending?: RegistryDisconnectReason;
 }
@@ -181,6 +200,127 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     }
 
     const live = new Map<string, Live>();
+    // Forwarded events (#24): a replica per registered repo.
+    const copies = replicas(o.stateDir);
+    const bySession = new Map<string, Live>();
+    /** Drop a resumed (or resuming) connection: its Mini-conductor redials and resumes afresh. */
+    const drop = (entry: Live, code: number, reason: string) => {
+      entry.resumed = undefined;
+      entry.early = undefined;
+      entry.conn.close(code, reason);
+    };
+    /**
+     * Ask a registered repo's Mini-conductor for its events, from where its replica stands: once
+     * per connection (ADR-003 addendum on forwarding events, item 3). Anything that goes wrong, or
+     * changes meanwhile, closes the connection instead of retrying on it, so a batch can never be
+     * taken out of order: the next connection resumes from the stored cursor.
+     */
+    const resume = async (entry: Live) => {
+      if (entry.resumed || entry.resuming || entry.asked || closing) return;
+      const reg = registry().repos[entry.repoId];
+      if (!reg) return;
+      const caps = (entry.conn.hello as { capabilities?: { events?: unknown } }).capabilities;
+      if (!Array.isArray(caps?.events) || !caps.events.includes('resume')) return;
+      entry.asked = true;
+      entry.resuming = true;
+      entry.registration = reg.registration;
+      const early: unknown[] = [];
+      entry.early = early;
+      try {
+        copies.adopt(entry.repoId, reg.registration);
+        const at = copies.cursor(entry.repoId);
+        let raw: unknown;
+        try {
+          raw = await entry.conn.call(
+            TACET_EVENT_RESUME,
+            at ? { logId: at.logId, afterSeq: at.seq } : {},
+          );
+        } catch (err) {
+          report(err);
+          drop(entry, 1011, 'resume failed');
+          return;
+        }
+        const answer = EventResumeResult.safeParse(raw);
+        // Without a cursor, it can only start from the beginning.
+        if (!answer.success || (!at && answer.data.afterSeq !== 0)) {
+          drop(entry, 1008, 'invalid resume answer');
+          return;
+        }
+        // Unregistered, registered anew, or the replica changed while the answer was on its way.
+        const now = registry().repos[entry.repoId];
+        const still = copies.cursor(entry.repoId);
+        if (
+          closing ||
+          now?.registration !== reg.registration ||
+          still?.logId !== at?.logId ||
+          still?.seq !== at?.seq
+        ) {
+          drop(entry, 1000, 'registration changed');
+          return;
+        }
+        // Another log, or the same one from the start (it was made again, or the cursor was not
+        // its own): the replica is begun again, so no task of a log that is gone stays in view.
+        if (at && (answer.data.logId !== at.logId || answer.data.afterSeq !== at.seq)) {
+          copies.remove(entry.repoId);
+          copies.adopt(entry.repoId, reg.registration);
+        }
+        entry.resumed = { logId: answer.data.logId };
+        entry.resuming = false;
+        entry.early = undefined;
+        for (const p of early) onEvents(p, entry.conn.sessionId);
+      } catch (err) {
+        report(err);
+        drop(entry, 1011, 'resume failed');
+      } finally {
+        entry.resuming = false;
+        entry.early = undefined;
+      }
+    };
+    /**
+     * Registration as it is now (#24): a registered repo's connection is resumed; one whose repo
+     * is unregistered, or registered anew (removed and added again), is closed (its Mini-conductor
+     * redials) and its replica deleted, as is any replica of a repo not registered as it was.
+     */
+    const sync = () => {
+      const { repos } = registry();
+      for (const entry of live.values()) {
+        const reg = repos[entry.repoId];
+        if ((entry.resumed || entry.resuming) && reg?.registration !== entry.registration) {
+          drop(entry, 1000, 'repo unregistered');
+        } else if (reg) void resume(entry).catch(report);
+      }
+      for (const repoId of copies.list()) {
+        try {
+          const reg = repos[repoId];
+          if (!reg || copies.registration(repoId) !== reg.registration) copies.remove(repoId);
+        } catch (err) {
+          report(err);
+        }
+      }
+    };
+    const onEvents = (params: unknown, sessionId: string) => {
+      const entry = bySession.get(sessionId);
+      if (!entry) return;
+      // In the same read as the resume's answer: kept until it is handled.
+      if (entry.resuming && entry.early) {
+        if (entry.early.length >= 256) drop(entry, 1008, 'events before the resume');
+        else entry.early.push(params);
+        return;
+      }
+      // Not resumed: not asked for, so not taken (an unregistered repo, or never resumed).
+      if (!entry.resumed) return;
+      let result: ReturnType<typeof copies.take>;
+      try {
+        result = copies.take(entry.repoId, entry.resumed.logId, params);
+      } catch (err) {
+        // Not stored (a busy or full disk): the cursor must not move past it, so the connection
+        // goes and the next one resends from the stored cursor.
+        report(err);
+        drop(entry, 1011, 'events not stored');
+        return;
+      }
+      if (!result.ok) drop(entry, 1008, result.violation);
+    };
     let auto: ReturnType<typeof autostarter> | undefined;
     /** One decision at a time per repo, so two hellos at once cannot both be accepted. */
     const deciding = new Map<string, Promise<void>>();
@@ -190,6 +330,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       auto?.connected(repoId);
       const entry: Live = { repoId, conn, missed: 0 };
       live.set(repoId, entry);
+      bySession.set(conn.sessionId, entry);
       record('registry.connected', repoId, {
         repoId,
         repoPath,
@@ -197,8 +338,11 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
         miniVersion: hello.miniVersion,
         adapters: hello.adapters,
       });
+      // Events only once accepted, and only for a registered repo.
+      void resume(entry).catch(report);
       void conn.closed.then(() => {
         if (live.get(repoId) === entry) live.delete(repoId);
+        bySession.delete(conn.sessionId);
         if (closing) return;
         record('registry.disconnected', repoId, {
           repoId,
@@ -241,7 +385,12 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     const token = randomToken(32);
     server = await startRpcServer({
       token,
-      handlers: {},
+      handlers: {
+        // A notification: never answered.
+        [TACET_EVENT]: (p, ctx) => {
+          if (ctx.hello.role === 'mini') onEvents(p, ctx.sessionId);
+        },
+      },
       serverInfo: { name: 'tacet-conductor', version: o.version ?? '0.0.0' },
       roles: ['mini', 'cli'],
       ...(o.onError ? { onError: o.onError } : {}),
@@ -284,6 +433,15 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       }
     }, interval);
     beat.unref();
+    const syncing = setInterval(() => {
+      try {
+        sync();
+      } catch (err) {
+        report(err);
+      }
+    }, o.syncIntervalMs ?? 2000);
+    syncing.unref();
+    sync();
 
     if (o.autostart) auto = autostarter(o.autostart, registry, live, report);
 
@@ -291,6 +449,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     return {
       port: rpc.port,
       registry,
+      tasks: (repoId) => copies.tasks(repoId),
       mini: (repoId) => {
         const entry = live.get(repoId);
         return entry ? miniLink(entry.conn) : undefined;
@@ -298,6 +457,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       close: () => {
         closed ??= (async () => {
           clearInterval(beat);
+          clearInterval(syncing);
           auto?.stop();
           closing = true;
           try {
@@ -316,6 +476,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
               removeRuntimeFile(conductorRuntimePath(o.runDir), runtime.token);
             } finally {
               try {
+                copies.close();
                 log.close();
               } finally {
                 releaseLocks();
@@ -464,16 +625,24 @@ function miniLink(conn: RpcConnection): MiniLink {
       throw new RpcCallError(`${method}: the Mini-conductor answered out of shape`);
     return parsed.data;
   };
-  const serves = (conn.hello as { capabilities?: { serves?: unknown } }).capabilities?.serves;
+  const listed = (conn.hello as { capabilities?: { serves?: unknown } }).capabilities?.serves;
+  const serves = Array.isArray(listed)
+    ? listed.filter((m): m is string => typeof m === 'string')
+    : [];
+  // Only what the Mini-conductor says it serves: an older one gets no call it cannot answer.
+  const served = (method: string, params: unknown, opts?: { timeoutMs?: number }) =>
+    serves.includes(method)
+      ? conn.call(method, params, opts)
+      : Promise.reject(new RpcCallError(`${method} is not served by this Mini-conductor`, -32601));
   return {
     sessionId: conn.sessionId,
-    serves: Array.isArray(serves) ? serves.filter((m): m is string => typeof m === 'string') : [],
+    serves,
     listTasks: async (req = {}) =>
-      parse(A2AListTasksResponse, await conn.call('ListTasks', req), 'ListTasks'),
+      parse(A2AListTasksResponse, await served('ListTasks', req), 'ListTasks'),
     getTask: async (id, historyLength) =>
       parse(
         A2ATask,
-        await conn.call('GetTask', {
+        await served('GetTask', {
           id,
           ...(historyLength !== undefined ? { historyLength } : {}),
         }),
@@ -481,6 +650,6 @@ function miniLink(conn: RpcConnection): MiniLink {
       ),
     // A cancel ends the task's Worker sessions first, which can take a while.
     cancelTask: async (id) =>
-      parse(A2ATask, await conn.call('CancelTask', { id }, { timeoutMs: 60_000 }), 'CancelTask'),
+      parse(A2ATask, await served('CancelTask', { id }, { timeoutMs: 60_000 }), 'CancelTask'),
   };
 }
