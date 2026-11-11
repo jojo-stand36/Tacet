@@ -324,6 +324,44 @@ describe.skipIf(!gate.ok)(
       await adapter.close(again);
     });
 
+    it('reports each model call’s usage from its transcript, once, across a resume (#255)', {
+      timeout: 180_000,
+    }, async () => {
+      const usage = (tap: EventTap) => tap.events.filter((e) => e.t === 'usage');
+      const h = await adapter.start({ cwd: worktree, model: 'claude-sonnet-4-5' });
+      const tap = new EventTap(adapter.events(h));
+      const first = await turn(h, tap, 'SAY usage one');
+      expect(first.end).toEqual({ t: 'status', state: 'idle' });
+      // The mock reports 100 input and 10 output tokens a call; the window is from the matrix.
+      const call = {
+        t: 'usage',
+        inputTokens: 100,
+        outputTokens: 10,
+        contextUsed: 110,
+        contextMax: 200_000,
+        model: 'claude-sonnet-4-5',
+        source: 'reported',
+      };
+      // Written to the transcript just after the turn's Stop: it follows shortly.
+      await expect.poll(() => usage(tap), { timeout: 5000 }).toEqual([call]);
+      await turn(h, tap, 'SAY usage two');
+      await expect.poll(() => usage(tap), { timeout: 5000 }).toEqual([call, call]);
+      await adapter.close(h);
+      // Resumed: the earlier calls are not reported again.
+      const again = await adapter.start({
+        cwd: worktree,
+        model: 'claude-sonnet-4-5',
+        resume: { vendorSessionId: h.vendorSessionId as string },
+      });
+      const tap2 = new EventTap(adapter.events(again));
+      await turn(again, tap2, 'SAY usage three');
+      await expect.poll(() => usage(tap2), { timeout: 5000 }).toEqual([call]);
+      await adapter.close(again);
+      // Nothing counted twice by the reads at the next prompt and at close.
+      expect(usage(tap)).toHaveLength(2);
+      expect(usage(tap2)).toHaveLength(1);
+    });
+
     it('keeps hook and MCP tokens in 0600 files outside the worktree, gone after close', {
       timeout: 120_000,
     }, async () => {

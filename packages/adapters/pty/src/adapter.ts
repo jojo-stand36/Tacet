@@ -56,6 +56,12 @@ import {
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
+import {
+  contextWindow,
+  findTranscript,
+  type TranscriptCall,
+  TranscriptReader,
+} from './transcript.js';
 
 /**
  * What interactive Claude Code in a PTY honestly supports (#15), verified on 2.1.319:
@@ -65,7 +71,9 @@ import { TerminalBuffer } from './terminal.js';
  * - a prompt submitted while a turn still runs joins it under that turn's `prompt_id`, then runs
  *   under a new, unannounced one (#190): turns are matched to what was typed by the prompt text;
  * - resume by session id (`--resume`) in the session's own config directory; no fork yet;
- * - no usage: the hooks carry no token counts;
+ * - usage from the session's own transcript (#255), one event per model call before the turn's
+ *   end, no cost; the context gauge only when the model's window is in the verified table (a
+ *   model id not in it gets none, and fails the conformance context probe until it is added);
  * - the model is chosen at launch (`--model`).
  */
 export const CLAUDE_PTY_CAPABILITIES: AdapterCapabilities = {
@@ -75,7 +83,7 @@ export const CLAUDE_PTY_CAPABILITIES: AdapterCapabilities = {
   interrupt: 'turn',
   resume: true,
   fork: 'none',
-  usage: { live: false, context: false, cost: 'none' },
+  usage: { live: true, context: true, cost: 'none' },
   modelSwitch: 'launch-only',
   injectContext: false,
 };
@@ -111,6 +119,11 @@ export interface PtyAdapterOptions {
    * is reported as `waiting_input`: something in the terminal holds it up. Default 15000.
    */
   ackTimeoutMs?: number;
+  /**
+   * Longest wait, after a turn's `Stop`, for its last call to reach the transcript before the
+   * turn's end is reported (#255). Default 1000.
+   */
+  usageWaitMs?: number;
   /**
    * Longest wait after `SessionStart` for the interface to take input (it turns on bracketed
    * paste) before `start()` fails. Default 30000.
@@ -204,7 +217,16 @@ interface Session {
   exited: Promise<void>;
   exit?: { exitCode: number; signal?: number };
   closing: boolean;
+  /**
+   * The turn's `Stop` came and its end waits for its usage (#255): Claude Code is done, so an
+   * interrupt now ends the turn as finished instead of cancelling it.
+   */
+  ending: { message: string | undefined } | undefined;
   ended: boolean;
+  /** The session's own transcript, read for token usage when a turn ends (#255). */
+  transcript: TranscriptReader;
+  /** The context window for a call's model. */
+  contextMax: (model: string | undefined) => number | undefined;
 }
 
 const ESC = '\x1b';
@@ -437,8 +459,14 @@ export class PtyAdapter implements AgentAdapter {
         exited,
         closing: false,
         ended: false,
+        ending: undefined,
+        transcript: new TranscriptReader(() => findTranscript(configDir, vendorSessionId)),
+        // `--model`, else the model Claude Code reads from its environment.
+        contextMax: (model) => contextWindow(model, opts.model ?? ptyEnv.ANTHROPIC_MODEL, ptyEnv),
       };
       const session = s;
+      // A resumed session's earlier calls were reported by the run that made them.
+      if (opts.resume) session.transcript.skip();
       // The terminal itself is not an event stream; it is drained so the child never blocks, and
       // watched only for the moment the interface takes input (see below). The tail of the last
       // chunk is kept so the sequence is found across chunk boundaries.
@@ -532,6 +560,15 @@ export class PtyAdapter implements AgentAdapter {
   async interrupt(h: SessionHandle): Promise<InterruptResult> {
     const s = this.#live(h);
     s.queue.length = 0;
+    if (s.ending) {
+      // The turn already finished: no Esc for an idle interface. Its end is reported now.
+      const { message } = s.ending;
+      s.ending = undefined;
+      s.epoch++;
+      this.#usage(s);
+      this.#turnEnded(s, 'idle', message);
+      return {};
+    }
     if (s.state !== 'running' && s.state !== 'waiting_input') return {};
     this.#cancelTurn(s);
     return {};
@@ -567,6 +604,8 @@ export class PtyAdapter implements AgentAdapter {
     clearTimeout(s.ackTimer);
     this.#releaseApprovals(s);
     await this.#terminate(s, true);
+    // Claude Code has exited: its transcript is complete.
+    this.#usage(s);
     for (const f of s.files) removeSessionFile(f);
     if (s.placeholders) removeSandboxPlaceholders(s.placeholders.cwd, s.placeholders.before);
     await this.#hooks.unregister(s.hookKey);
@@ -724,6 +763,8 @@ export class PtyAdapter implements AgentAdapter {
       reply();
       return;
     }
+    // Before a new turn, whatever the last one left unread.
+    if (ev.hook_event_name === 'UserPromptSubmit') this.#usage(s);
     const promptId = typeof body.prompt_id === 'string' ? body.prompt_id : undefined;
     const turnHook =
       ev.hook_event_name !== 'SessionStart' && ev.hook_event_name !== 'UserPromptSubmit';
@@ -772,6 +813,8 @@ export class PtyAdapter implements AgentAdapter {
       }
     }
     if (stale) {
+      // A cancelled or stale turn's calls were made and billed too.
+      if (ev.hook_event_name === 'Stop' || ev.hook_event_name === 'StopFailure') this.#usage(s);
       if (ev.hook_event_name === 'PreToolUse')
         reply(preToolUseDecision(ev.tool_name, this.#tacetPrefix));
       else if (ev.hook_event_name === 'PermissionRequest') {
@@ -879,22 +922,74 @@ export class PtyAdapter implements AgentAdapter {
         }
         reply();
         return;
-      case 'Stop':
+      case 'Stop': {
         if (ev.last_assistant_message) {
           this.#emit(s, { t: 'message.delta', text: ev.last_assistant_message });
         }
-        this.#turnEnded(
-          s,
-          'idle',
-          ev.background_tasks?.length ? 'background tasks still running' : undefined,
-        );
+        const message = ev.background_tasks?.length ? 'background tasks still running' : undefined;
         reply();
+        void this.#endTurnAfterUsage(s, message);
         return;
+      }
       case 'StopFailure':
+        // A failed call leaves no usage to wait for (a placeholder line at most).
+        this.#usage(s);
         this.#turnEnded(s, 'idle', 'the turn failed');
         reply();
         return;
     }
+  }
+
+  /**
+   * Usage for the model calls the transcript gained since the last read (#255): one event per
+   * call, as the SDK adapter emits them. The context gauge follows the main conversation only;
+   * a subagent's call has its own context.
+   */
+  #usage(s: Session): boolean {
+    let calls: TranscriptCall[];
+    try {
+      calls = s.transcript.read();
+    } catch {
+      return false;
+    }
+    for (const c of calls) {
+      const max = s.contextMax(c.model);
+      this.#emit(s, {
+        t: 'usage',
+        inputTokens: c.inputTokens,
+        outputTokens: c.outputTokens,
+        ...(max !== undefined ? { contextUsed: c.contextUsed, contextMax: max } : {}),
+        ...(c.model !== undefined ? { model: c.model } : {}),
+        source: 'reported',
+      });
+    }
+    return calls.length > 0;
+  }
+
+  /**
+   * A turn ended (`Stop`): report its usage, then its end. Claude Code 2.1.319 writes the turn's
+   * last call to the transcript only after the hook has returned (seen live: about 25 ms later),
+   * so once the transcript exists the end waits, up to a second, for a call it had not reported.
+   * A cancel or close meanwhile ends the wait; the next prompt and the session's end read
+   * whatever was still unread.
+   */
+  async #endTurnAfterUsage(s: Session, message: string | undefined): Promise<void> {
+    const epoch = s.epoch;
+    this.#usage(s);
+    if (s.transcript.found) {
+      s.ending = { message };
+      // A turn whose last call was written before its Stop gains nothing here: it waits the
+      // whole time. Live, the last call came after the hook every time.
+      const until = Date.now() + (this.#opts.usageWaitMs ?? 1000);
+      while (Date.now() < until) {
+        await sleep(20);
+        // Ended meanwhile (interrupt, close, exit): whoever did it reported the end.
+        if (s.epoch !== epoch || s.ended || s.closing) return;
+        if (this.#usage(s)) break;
+      }
+      s.ending = undefined;
+    }
+    this.#turnEnded(s, 'idle', message);
   }
 
   /** Mark a turn's id stale; the set keeps the latest few. */
@@ -939,6 +1034,7 @@ export class PtyAdapter implements AgentAdapter {
     if (s.closing || s.ended || !this.#sessions.has(s.handle.id)) return;
     s.ended = true;
     s.approvals.clear();
+    this.#usage(s);
     this.#setState(s, 'error', `claude exited (code ${s.exit?.exitCode ?? 'unknown'})`);
     s.events.end();
     s.screen.end();
