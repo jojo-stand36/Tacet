@@ -22,6 +22,8 @@ import type { AddressInfo } from 'node:net';
  *   ToolSearch, so they are usually not offered by name).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the requested model id.
+ * - `SUBAGENT`: asks for a subagent (the offered `Agent` or `Task` tool) whose prompt is
+ *   `SAY subagent`; the subagent's own request is then answered as `SAY` above (#289).
  * Requests are recorded (model, last user text, offered tool names, and the effort and beta
  * settings the binary sent; never headers that carry credentials) for assertions.
  */
@@ -230,6 +232,21 @@ function plan(body: Body): Block[] {
   if (read) {
     return [
       { type: 'tool_use', id: `toolu_mock_${++n}`, name: 'Read', input: { file_path: read[1] } },
+    ];
+  }
+  if (/SUBAGENT/.test(text)) {
+    const offered = (body.tools ?? []).map((t) => t.name ?? '');
+    return [
+      {
+        type: 'tool_use',
+        id: `toolu_mock_${++n}`,
+        name: offered.find((t) => t === 'Agent' || t === 'Task') ?? 'Agent',
+        input: {
+          description: 'say a word',
+          prompt: 'SAY subagent',
+          subagent_type: 'general-purpose',
+        },
+      },
     ];
   }
   if (/ESCALATE/.test(text)) {
