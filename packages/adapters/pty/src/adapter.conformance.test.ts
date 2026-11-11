@@ -342,7 +342,8 @@ describe.skipIf(!gate.ok)(
         model: 'claude-opus-4-6',
         source: 'reported',
       };
-      expect(api.requests.at(-1)?.model).toBe('claude-opus-4-6');
+      // The prompt's own request, not a side request (title, suggestion).
+      expect(api.requests.find((r) => r.text === 'SAY onem')?.model).toBe('claude-opus-4-6');
       await expect.poll(() => usage(), { timeout: 5000 }).toEqual([call]);
 
       // A subagent: its calls go to a file of their own, not the session's transcript.
@@ -350,6 +351,7 @@ describe.skipIf(!gate.ok)(
       await adapter.send(h, { text: 'SUBAGENT' });
       const ask = await tap.waitFor((e) => e.t === 'approval.request', 60_000, from);
       if (ask.event.t !== 'approval.request') throw new Error('no approval request');
+      // `Agent` in the pinned 2.1.319 (`Task` in older versions; the mock takes either).
       expect(ask.event.toolName).toBe('Agent');
       await adapter.respond(h, ask.event.id, { kind: 'allow_once', persist: false });
       await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, ask.index + 1);
@@ -357,6 +359,8 @@ describe.skipIf(!gate.ok)(
       // The parent's two calls (the tool call, then its answer); none for the subagent.
       await expect.poll(() => usage(), { timeout: 5000 }).toEqual([call, call, call]);
       await adapter.close(h);
+      // Nothing more came (the poll stops at the first match): the subagent added no usage.
+      expect(usage()).toHaveLength(3);
 
       const state = join(root, 'state');
       const sessionDir = readdirSync(state)
@@ -365,16 +369,19 @@ describe.skipIf(!gate.ok)(
       const files = readdirSync(sessionDir, { recursive: true, encoding: 'utf8' }).filter((f) =>
         f.endsWith('.jsonl'),
       );
-      const sub = files.filter((f) => /\/subagents\/agent-[^/]+\.jsonl$/.test(f));
+      const sub = files.filter(
+        (f) => f.includes(`${h.vendorSessionId}/subagents/agent-`) && f.endsWith('.jsonl'),
+      );
       expect(sub).toHaveLength(1);
       const lines = (f: string) =>
         readFileSync(join(sessionDir, f), 'utf8')
           .split('\n')
           .filter(Boolean)
-          .map((l) => JSON.parse(l) as { type?: string; isSidechain?: boolean });
+          .map((l) => JSON.parse(l) as { type?: string; isSidechain?: boolean; agentId?: unknown });
       const subCalls = lines(sub[0] as string).filter((l) => l.type === 'assistant');
       expect(subCalls.length).toBeGreaterThan(0);
       expect(subCalls.every((l) => l.isSidechain === true)).toBe(true);
+      expect(subCalls.every((l) => typeof l.agentId === 'string' && l.agentId !== '')).toBe(true);
       const main = files.find((f) => f.endsWith(`/${h.vendorSessionId}.jsonl`)) as string;
       expect(lines(main).some((l) => l.type === 'assistant' && l.isSidechain)).toBe(false);
     });
