@@ -1193,6 +1193,55 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(ended).toEqual([expect.objectContaining({ sessionId: 's-t1', reason: 'canceled' })]);
     });
 
+    it("touches only the canceled task's open Claude sessions", async () => {
+      const make = async (name: string) => {
+        const c = await manager.create(name);
+        writeFileSync(join(c.path, '.env'), '');
+        return c;
+      };
+      const mine = await make('mine');
+      // Another task whose id starts the same: not canceled, not touched.
+      const other = await make('other');
+      crashedClaudeSession('t1', mine);
+      crashedClaudeSession('t10', other);
+      // Not a Claude session, or one whose end is recorded: none of this applies.
+      const codex = await make('codex');
+      const ended = await make('ended');
+      const at = (taskId: string, type: string, data: unknown) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId,
+        type,
+        data,
+      });
+      store.append([
+        at('t1/1', 'worker.started', {
+          sessionId: 's-codex',
+          adapter: 'codex-app-server',
+          workspaceId: codex.id,
+          baseCommit: codex.baseCommit,
+        }),
+        at('t1/1', 'worker.started', {
+          sessionId: 's-ended',
+          adapter: 'claude-sdk',
+          workspaceId: ended.id,
+          baseCommit: ended.baseCommit,
+        }),
+        at('t1/1', 'worker.ended', { sessionId: 's-ended', reason: 'restart' }),
+      ]);
+      const { errors } = await cancelStopped('t1', {
+        store,
+        lockPath: join(root, 'mini.lock'),
+        placeholders: placeholders(),
+      });
+      expect(errors).toEqual([]);
+      expect(existsSync(join(mine.path, '.env'))).toBe(false);
+      for (const c of [other, codex, ended])
+        expect(existsSync(join(c.path, '.env')), c.id).toBe(true);
+    });
+
     it('still cancels when the checkout cannot be read, and says why', async () => {
       const checkout = await manager.create('unreadable');
       writeFileSync(join(checkout.path, '.env'), '');
@@ -1209,7 +1258,9 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       });
       expect(canceled).toEqual(['t2/1', 't2']);
       expect(errors.map((e) => (e as Error).message)).toEqual([
-        expect.stringContaining('cannot list the checkout'),
+        expect.stringMatching(
+          new RegExp(`checkout ${checkout.id} \\(t2/1\\): cannot list the checkout`),
+        ),
       ]);
       // Not removed when what the checkout had to begin with cannot be told.
       expect(existsSync(join(checkout.path, '.env'))).toBe(true);

@@ -2772,7 +2772,7 @@ function cancelEvents(
   env: MakeEnvelope,
   opts: { open?: ReadonlySet<string> } = {},
 ): { events: EventEnvelope[]; canceled: string[] } {
-  const ours = (id: string) => id === taskId || id.startsWith(`${taskId}/`);
+  const ours = (id: string) => isOwnTask(id, taskId);
   const events: EventEnvelope[] = [];
   for (const s of v.sessions.values()) {
     if (s.ended === undefined && ours(s.taskId) && !opts.open?.has(s.sessionId)) {
@@ -2812,6 +2812,11 @@ export interface CancelStoppedOptions {
   repo?: string;
   miniId?: string;
   now?: () => Date;
+}
+
+/** `id` is `taskId` or one of its sub-tasks (`taskId/...`): never `taskId10`. */
+function isOwnTask(id: string, taskId: string): boolean {
+  return id === taskId || id.startsWith(`${taskId}/`);
 }
 
 /** What clearing a crashed Claude session's sandbox placeholders needs (#263, #304). */
@@ -2875,17 +2880,25 @@ export async function cancelStopped(
       rmSync(tmp, { force: true });
       errors.push(err);
     }
-    if (o.placeholders) {
-      // The processes are ended; the sessions about to be recorded as canceled are the task's own.
-      const own = [...readView(o.store).sessions.values()].filter(
-        (s) => s.taskId === taskId || s.taskId.startsWith(`${taskId}/`),
+    if (o.placeholders && errors.some((e) => e instanceof StaleWorkersLeftError)) {
+      // A sandbox still running may be using them: left for the next start, after its end.
+      errors.push(
+        new Error('sandbox placeholders not cleared: Worker processes are still running'),
       );
-      await clearCrashPlaceholders(own, o.placeholders, (err) =>
-        errors.push(
-          new Error(
-            `could not clear the sandbox placeholders of a crashed Claude session: ${(err as Error).message ?? String(err)}`,
+    } else if (o.placeholders) {
+      // The processes are ended; the sessions about to be recorded as canceled are the task's own
+      // (as `cancelEvents` picks them). A checkout not in the log's registry (an unmigrated
+      // pre-#126 one) is not found, so nothing of it is touched.
+      await clearCrashPlaceholders(
+        [...readView(o.store).sessions.values()].filter((s) => isOwnTask(s.taskId, taskId)),
+        o.placeholders,
+        (err, s) =>
+          errors.push(
+            new Error(
+              `could not clear the sandbox placeholders of checkout ${s.workspaceId ?? '?'} (${s.taskId}): ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            ),
           ),
-        ),
       );
     }
     const env: MakeEnvelope = (t, type, data, sessionId) =>
@@ -3090,6 +3103,14 @@ function releaseMiniLock(path: string): void {
   rmSync(path, { force: true });
 }
 
+/** Worker processes a crashed Mini-conductor left that SIGKILL did not end (#127). */
+class StaleWorkersLeftError extends Error {
+  override name = 'StaleWorkersLeftError';
+  constructor(readonly pids: readonly number[]) {
+    super(`Worker processes still running after SIGKILL: ${pids.join(' ')}`);
+  }
+}
+
 /**
  * End every process whose environment carries a marker in `file` (#127). The caller then records
  * that none is left. Returns the problems met, for the caller to report.
@@ -3117,7 +3138,7 @@ async function endStaleWorkerProcesses(file: string): Promise<unknown[]> {
   if (markers.length > 0) {
     const { left } = await endMarkedProcesses(markers);
     if (left.length > 0) {
-      errors.push(new Error(`Worker processes still running after SIGKILL: ${left.join(' ')}`));
+      errors.push(new StaleWorkersLeftError(left));
     }
   }
   return errors;
