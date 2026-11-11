@@ -1,12 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   conductorRuntimePath,
+  conductorStatePaths,
   connectRpc,
   readRuntimeFile,
   repoStatePaths,
+  resolveStateDir,
 } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Io } from './io.js';
@@ -63,6 +65,19 @@ describe('tacet up: the Conductor', () => {
     expect((await tacet(['conductor', 'status'])).out).toContain('Conductor not running');
     expect((await tacet(['up', '--remove', repo])).out).toContain('is now not registered');
     expect((await status()).repos).toEqual([]);
+  });
+
+  it("deletes a repo's forwarded events with it when no Conductor runs (#24)", async () => {
+    await tacet(['up', '--add', repo]);
+    const replica = join(
+      conductorStatePaths(resolveStateDir(undefined, undefined, home)).dir,
+      'repos',
+      repoStatePaths(repo).repoId,
+    );
+    mkdirSync(replica, { recursive: true });
+    writeFileSync(join(replica, 'events.db'), '');
+    expect((await tacet(['up', '--remove', repo])).code).toBe(0);
+    expect(existsSync(replica)).toBe(false);
   });
 
   it('refuses to register what is not a git repository', async () => {

@@ -3,8 +3,11 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type Conductor, startConductor } from '@tacet/conductor';
+import { newUlid } from '@tacet/core';
 import {
   conductorRuntimePath,
+  conductorStatePaths,
+  openEventStore,
   type RpcConnection,
   randomToken,
   repoStatePaths,
@@ -46,7 +49,11 @@ describe('the Conductor link, Conductor to Mini-conductor', () => {
     execFileSync('git', ['-C', repo, 'add', '.'], { env });
     execFileSync('git', ['-C', repo, 'commit', '-qm', 'init'], { env });
     const runDir = join(root, 'run');
-    conductor = await startConductor({ stateDir: join(root, 'conductor-state'), runDir });
+    conductor = await startConductor({
+      stateDir: join(root, 'conductor-state'),
+      runDir,
+      syncIntervalMs: 50,
+    });
     sa = await startStandalone({
       repoRoot: repo,
       userDir: join(root, 'user'),
@@ -90,6 +97,33 @@ describe('the Conductor link, Conductor to Mini-conductor', () => {
     expect(canceled.status.state).toBe('TASK_STATE_CANCELED');
     await expect(mini.cancelTask(id)).rejects.toMatchObject({ code: -32002 });
   });
+
+  it("forwards a registered repo's task events, and the Conductor's view follows", async () => {
+    const { repoId } = repoStatePaths(realpathSync(repo));
+    const id = sa.mini.submit({ goal: 'hold on', acceptanceCriteria: ['ok'] });
+    await link();
+    // Connected but not registered: nothing comes up.
+    await new Promise((r) => setTimeout(r, 200));
+    expect(conductor.tasks(repoId)).toBeUndefined();
+    const log = openEventStore(conductorStatePaths(join(root, 'conductor-state')).events);
+    log.append({
+      v: 1,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'conductor', id: 'cli' },
+      repo: repoId,
+      type: 'registry.repo_added',
+      data: { repoId, repoPath: realpathSync(repo) },
+    });
+    log.close();
+    await vi.waitFor(() => expect(conductor.tasks(repoId)?.tasks[id]?.state).toBe('working'), {
+      timeout: 10_000,
+    });
+    await sa.mini.cancel(id);
+    await vi.waitFor(() => expect(conductor.tasks(repoId)?.tasks[id]?.state).toBe('canceled'), {
+      timeout: 10_000,
+    });
+  }, 30_000);
 
   it('serves nothing else: no new tasks or answers over the link', async () => {
     const id = sa.mini.submit({ goal: 'hold on', acceptanceCriteria: ['ok'] });

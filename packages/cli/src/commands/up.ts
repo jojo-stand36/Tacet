@@ -6,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   realpathSync,
+  rmSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { type EventEnvelope, newUlid, type RegistryState, registryProjection } from '@tacet/core';
@@ -153,6 +154,11 @@ function register(io: Io, stateDir: string, path: string, add: boolean, json?: b
     } else if (!add && registered) {
       append(store, 'registry.repo_removed', repoId, { repoId });
       changed = true;
+    }
+    // Its forwarded events go with it (#24): a running Conductor deletes the replica on its next
+    // look at the registry; with none running, it is deleted here.
+    if (!add && processLockHolder(paths.lock) === undefined) {
+      rmSync(join(paths.dir, 'repos', repoId), { recursive: true, force: true });
     }
     if (json) io.out(safeJson({ repoId, repoPath, registered: add, changed }));
     else {
