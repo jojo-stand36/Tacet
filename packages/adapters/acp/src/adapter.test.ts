@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -101,6 +102,8 @@ describe('AcpAdapter (fake ACP agent)', () => {
       baseEnv: { PATH: process.env.PATH, HOME: root, FAKE_LOG: logFile, ...BUILTIN_MODES, ...env },
       // The fake agent is steered by FAKE_* variables (#147: passed through on purpose).
       envPolicy: { pass: ['FAKE_*'] },
+      // Hermetic: Claude Code's host token may exist on this machine (#291).
+      hostTokenFile: join(root, 'no-host-token'),
       ...extra,
     });
   const received = () =>
@@ -188,6 +191,38 @@ describe('AcpAdapter (fake ACP agent)', () => {
     expect(methods().some((m) => m.method === 'authenticate')).toBe(false);
     // Launched with the subscription login hidden.
     expect(received()[0]?.argv).toContain('--hide-claude-auth');
+  });
+
+  it('warns, without reading it, when the host token file exists for a Claude agent (#291)', async () => {
+    const token = join(root, 'host-token');
+    writeFileSync(token, 'never-read');
+    chmodSync(token, 0o000);
+    const warnings: string[] = [];
+    const opts = { hostTokenFile: token, onWarning: (m: string) => warnings.push(m) };
+    const claude = make(CLAUDE_ACP_AGENT, { ANTHROPIC_API_KEY: 'placeholder' }, opts);
+    await claude.close(await claude.start({ cwd: join(root, 'wt') }));
+    expect(warnings).toEqual([expect.stringContaining(token)]);
+    expect(warnings[0]).not.toContain('never-read');
+    // The variable naming the token's file descriptor never reaches it.
+    const fd = make(
+      CLAUDE_ACP_AGENT,
+      { ANTHROPIC_API_KEY: 'placeholder', CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '3' },
+      opts,
+    );
+    await fd.close(await fd.start({ cwd: join(root, 'wt') }));
+    const names =
+      (
+        received()
+          .filter((l) => 'envNames' in l)
+          .at(-1) as { envNames?: string[] }
+      ).envNames ?? [];
+    expect(names).toContain('ANTHROPIC_API_KEY');
+    expect(names).not.toContain('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR');
+    warnings.length = 1;
+    // Another vendor's agent is not Claude Code: nothing to say.
+    const gemini = make(GEMINI_AGENT, { GEMINI_API_KEY: 'placeholder' }, opts);
+    await gemini.close(await gemini.start({ cwd: join(root, 'wt') }));
+    expect(warnings).toHaveLength(1);
   });
 
   it('gives the agent an allowlist of the environment, not other vendors keys (#147)', async () => {

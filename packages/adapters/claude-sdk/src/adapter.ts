@@ -87,6 +87,10 @@ export interface ClaudeSdkAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
+  /** Told of a start that went ahead with a risk to know about (#291). */
+  onWarning?: (message: string) => void;
+  /** For tests: the host token path checked at start (#291). Default: Claude Code's fixed one. */
+  hostTokenFile?: string;
   /**
    * The repo the sessions belong to; keys their config directories (#237). Default: the repo of
    * the session's cwd (the main checkout, for a git worktree), else the cwd itself.
@@ -266,11 +270,14 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     this.#opts.onEnvDropped?.(filtered.dropped);
     // The SDK's `env` replaces the child's environment (verified, 0.3.319): only this reaches it.
     const route = this.#opts.authRoute ?? 'api_key';
-    const routed = authEnv(route, {
-      ...filtered.env,
-      ...opts.env,
-      CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
-    });
+    const routed = authEnv(
+      route,
+      { ...filtered.env, ...opts.env, CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP },
+      {
+        ...(this.#opts.onWarning ? { warn: this.#opts.onWarning } : {}),
+        ...(this.#opts.hostTokenFile !== undefined ? { file: this.#opts.hostTokenFile } : {}),
+      },
+    );
     // An API-key Worker's commands never see the key (#150); a login session has none to hide.
     const scrub =
       route === 'api_key' && !(this.#opts.subprocessScrub === false && this.#opts.query);

@@ -80,6 +80,7 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
   }
   const { startStandalone } = await import('@tacet/mini/standalone');
   const dropped = new Set<string>();
+  const warned = new Set<string>();
   let sa: Standalone;
   // Problems the start itself records (the worktree reconcile, #254) come before the cursor below.
   const startedAt = new Date().toISOString();
@@ -97,6 +98,12 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
         io.err(
           `note: ${id} Workers do not get ${names.length} variable(s) of your environment (workers.env.pass adds names)`,
         );
+      },
+      // Once per message: every Worker start, of every adapter it applies to, would repeat it.
+      onWarning: (id, m) => {
+        if (warned.has(m)) return;
+        warned.add(m);
+        io.err(`warning: ${id}: ${terminalSafe(m)}`);
       },
       onError: (m) => io.err(`mcp: ${terminalSafe(m)}`),
       ...io.standalone,

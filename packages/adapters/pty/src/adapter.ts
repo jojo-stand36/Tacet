@@ -99,6 +99,10 @@ export interface PtyAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
+  /** Told of a start that went ahead with a risk to know about (#291). */
+  onWarning?: (message: string) => void;
+  /** For tests: the host token path checked at start (#291). Default: Claude Code's fixed one. */
+  hostTokenFile?: string;
   /**
    * The repo the Workers belong to; keys the state directory. Default: the repo of the session's
    * cwd (the main checkout, for a git worktree), else the cwd itself.
@@ -305,7 +309,14 @@ export class PtyAdapter implements AgentAdapter {
       this.#opts.envPolicy,
     );
     this.#opts.onEnvDropped?.(filtered.dropped);
-    const keyed = authEnv('api_key', { ...filtered.env, ...opts.env });
+    const keyed = authEnv(
+      'api_key',
+      { ...filtered.env, ...opts.env },
+      {
+        ...(this.#opts.onWarning ? { warn: this.#opts.onWarning } : {}),
+        ...(this.#opts.hostTokenFile !== undefined ? { file: this.#opts.hostTokenFile } : {}),
+      },
+    );
     // The commands the Worker runs never see its key (#150).
     const scrub = !(this.#opts.subprocessScrub === false && this.#opts.spawn);
     const env = scrub ? { ...withSubprocessScrub(keyed), ...SANDBOX_ENV } : keyed;
