@@ -2,6 +2,7 @@ import { statusEntries, type TaskStatusEntry, TaskTarget } from '@tacet/core';
 import type { EventStore, RepoStatePaths, StoredEvent } from '@tacet/core/node';
 import { liveControl, livePty, liveStatus } from '../control.js';
 import type { Io } from '../io.js';
+import { OscFilter } from '../osc-filter.js';
 import {
   formatEvent,
   formatStatusEntry,
@@ -171,7 +172,10 @@ export async function logs(
  * `tacet attach <session | task/n>`: follow one Worker session from the log as it runs, until it
  * ends. Given a sub-task, its latest session, then each one that replaces it. A PTY Worker
  * running in a live run is shown as its terminal instead, live from the run's port (#201), when
- * the output is a terminal and not `--json`: until that session ends.
+ * the output is a terminal and not `--json`: until that session ends. Its bytes go through
+ * `OscFilter` (#302): clipboard writes (OSC 52, kitty's 5522, iTerm2's 1337 copy keys) are
+ * removed, and only well-formed text and sequences pass; window titles (in ASCII), hyperlinks,
+ * colours and images do.
  */
 export async function attach(
   io: Io,
@@ -212,7 +216,12 @@ export async function attach(
     // A PTY Worker running in a live run: its terminal itself, as it draws (#201, ADR-003 §5).
     const raw = io.raw;
     if (!o.json && raw) {
-      const pty = await livePty(io, opened.repoRoot, opened.paths, session, raw);
+      // No clipboard writes (OSC 52 and the like) from a Worker's terminal reach the user's (#302).
+      const osc = new OscFilter();
+      const pty = await livePty(io, opened.repoRoot, opened.paths, session, (chunk) => {
+        const shown = osc.push(chunk);
+        if (shown.length > 0) raw(shown);
+      });
       if (pty) {
         const stop = () => pty.close();
         io.signal?.addEventListener('abort', stop, { once: true });
@@ -222,7 +231,10 @@ export async function attach(
           code = (await pty.closed).code;
         } finally {
           io.signal?.removeEventListener('abort', stop);
-          // Whatever the Worker's bytes left switched on, the user's own terminal gets back.
+          // An OSC the Worker left open is ended, then whatever its bytes left switched on, the
+          // user's own terminal gets back.
+          const end = osc.flush();
+          if (end.length > 0) raw(end);
           raw(new TextEncoder().encode(RESTORE_TERMINAL));
         }
         if (io.signal?.aborted) return 0;
