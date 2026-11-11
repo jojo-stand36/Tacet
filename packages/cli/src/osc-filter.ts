@@ -14,8 +14,34 @@ const MAX_HELD = 64;
 /** A number with more significant digits than this is dropped: no OSC uses one, and a terminal's
  * own parser may wrap it round to any value (4294967348 is 52 in 32 bits). */
 const MAX_SIGNIFICANT = 5;
+const SEMICOLON = 0x3b;
+/**
+ * Clipboard writes by number (#302): OSC 52 everywhere, and kitty's OSC 5522 (kitty source,
+ * `kitty/vt-parser.c`, which sends both to `clipboard_control`).
+ */
+export const CLIPBOARD_OSC = new Set([52, 5522]);
+/**
+ * iTerm2's key=value OSCs, 1337 and the older 50 (iTerm2 source, `VT100XtermParser.m`), and the
+ * keys among them that write the pasteboard (`VT100Terminal.m`): `Copy`, `CopyToClipboard` and
+ * `EndCopy`. Matched case-insensitively, a stricter reading than iTerm2's exact match. Other keys,
+ * inline images (`File=`) included, pass.
+ */
+const KEYED_OSC = new Set([50, 1337]);
+const CLIPBOARD_KEYS = new Set(['copy', 'copytoclipboard', 'endcopy']);
+const MAX_KEY = 'copytoclipboard'.length;
 
-type Mode = 'text' | 'esc' | 'c2' | 'intro' | 'introC2' | 'pass' | 'drop' | 'dropEsc' | 'dropC2';
+type Mode =
+  | 'text'
+  | 'esc'
+  | 'c2'
+  | 'intro'
+  | 'introC2'
+  | 'key'
+  | 'keyEsc'
+  | 'pass'
+  | 'drop'
+  | 'dropEsc'
+  | 'dropC2';
 
 /**
  * In the ESC state a terminal runs C0 controls and ignores DEL, still waiting for the rest of the
@@ -26,13 +52,15 @@ const escIgnores = (b: number) => (b < 0x20 && b !== CAN && b !== SUB && b !== E
  * taken as skipped too, the stricter reading. */
 const oscIgnores = (b: number) => (escIgnores(b) && b !== BEL) || b === DEL;
 /** How many UTF-8 continuation bytes the lead byte `b` starts; 0 for any other byte. */
+const isLetter = (b: number) => (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
 const utf8Need = (b: number) =>
   b >= 0xc2 && b <= 0xdf ? 1 : b >= 0xe0 && b <= 0xef ? 2 : b >= 0xf0 && b <= 0xf4 ? 3 : 0;
 
 /**
- * Removes OSC sequences with a blocked number (by default 52, a clipboard write) from a stream of
- * terminal bytes, as they arrive, wherever chunks split them (#302). Everything else passes
- * through unchanged, other OSC sequences (window titles) included.
+ * Removes clipboard writes from a stream of terminal bytes, as they arrive, wherever chunks split
+ * them (#302): OSC sequences with a blocked number (by default 52, and kitty's 5522), and
+ * iTerm2's OSC 1337 (or 50) with a `Copy`, `CopyToClipboard` or `EndCopy` key. Everything else
+ * passes through unchanged, other OSC sequences (window titles, iTerm2 inline images) included.
  *
  * It reads the stream as a terminal's parser does, so a sequence a terminal would take as OSC 52
  * is taken as one here:
@@ -42,10 +70,12 @@ const utf8Need = (b: number) =>
  * - Its number may have C0 controls or DEL among its digits and any number of leading zeros.
  *   A number of more than 5 significant digits, or an introducer and number longer than 64
  *   bytes, is dropped as if blocked.
+ * - The key of an iTerm2 key=value OSC is read up to `=` or anything but a letter, in any case,
+ *   skipping C0 controls, DEL, U+009D's byte and `ESC ]` (iTerm2 skips that pair inside an OSC).
  * - It ends with BEL, `ESC \` or U+009C; CAN, SUB or another ESC abort it, so a reset (`ESC c`)
  *   after an unfinished sequence still gets through.
  *
- * Only the introducer and number are held back; a blocked sequence is dropped as it streams,
+ * Only the introducer, number and key are held back; a blocked sequence is dropped as it streams,
  * never buffered, and after `maxDrop` bytes with no terminator the rest passes as text, so an
  * unterminated one cannot hide the rest of the terminal. When a blocked sequence starts inside an
  * OSC already passed on, a CAN is sent in its place to end that one in the user's terminal.
@@ -56,6 +86,8 @@ export class OscFilter {
   #held: number[] = [];
   #value = 0;
   #significant = 0;
+  /** The key read so far of an iTerm2 key=value OSC, in lower case. */
+  #key = '';
   #dropped = 0;
   /** The user's terminal is inside an OSC passed on to it, not yet ended. */
   #inOsc = false;
@@ -65,7 +97,7 @@ export class OscFilter {
   #n = 0;
 
   constructor(
-    private readonly blocked: (code: number) => boolean = (code) => code === 52,
+    private readonly blocked: (code: number) => boolean = (code) => CLIPBOARD_OSC.has(code),
     private readonly maxDrop = 1024 * 1024,
   ) {}
 
@@ -153,11 +185,54 @@ export class OscFilter {
         } else if (oscIgnores(b)) this.#held.push(b);
         else if (b === C1_OSC) this.#startOsc([b]);
         else if (b === C2) this.#mode = 'introC2';
-        else {
+        else if (
+          b === SEMICOLON &&
+          this.#significant <= MAX_SIGNIFICANT &&
+          KEYED_OSC.has(this.#value) &&
+          !this.blocked(this.#value)
+        ) {
+          // iTerm2's key=value: whether it is blocked depends on the key.
+          this.#held.push(b);
+          this.#key = '';
+          this.#mode = 'key';
+        } else {
           this.#decide(false);
           return true;
         }
         return false;
+      case 'key':
+        if (this.#held.length >= MAX_HELD) {
+          this.#decide(true);
+          return true;
+        }
+        if (isLetter(b)) {
+          this.#held.push(b);
+          this.#key += String.fromCharCode(b).toLowerCase();
+          // Longer than any blocked key: it is not one.
+          if (this.#key.length > MAX_KEY) this.#decide(false);
+        } else if (oscIgnores(b) || b === C1_OSC) {
+          // Skipped, as a terminal skips them (or might): they do not end the key.
+          this.#held.push(b);
+        } else if (b === ESC) this.#mode = 'keyEsc';
+        else {
+          // `=`, a terminator or anything else ends the key.
+          this.#decide(false, CLIPBOARD_KEYS.has(this.#key));
+          return true;
+        }
+        return false;
+      case 'keyEsc':
+        if (b === RIGHT_BRACKET) {
+          // iTerm2 skips `ESC ]` inside an OSC: the key goes on.
+          this.#held.push(ESC, b);
+          this.#mode = 'key';
+          return false;
+        }
+        // The ESC ends the key; it is handled as the first byte after it.
+        if (this.#decide(false, CLIPBOARD_KEYS.has(this.#key))) {
+          this.#dropped++;
+          this.#mode = 'dropEsc';
+        } else this.#mode = 'esc';
+        return true;
       case 'introC2':
         if (b === C1_OSC) {
           this.#startOsc([C2, b]);
@@ -221,12 +296,12 @@ export class OscFilter {
     this.#mode = 'intro';
   }
 
-  /** The number is read: pass the OSC on, or drop it (true). */
-  #decide(tooLong: boolean): boolean {
+  /** The number (and any key) is read: pass the OSC on, or drop it (true). */
+  #decide(tooLong: boolean, blockedKey = false): boolean {
     const held = this.#held;
     this.#held = [];
     this.#need = 0;
-    if (tooLong || this.#significant > MAX_SIGNIFICANT || this.blocked(this.#value)) {
+    if (tooLong || blockedKey || this.#significant > MAX_SIGNIFICANT || this.blocked(this.#value)) {
       // The user's terminal is still inside an OSC passed on before this one started: end it, or
       // it would run on into what follows the dropped one.
       if (this.#inOsc) this.#emit(CAN);

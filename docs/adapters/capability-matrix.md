@@ -243,6 +243,27 @@ Read from the `agentclientprotocol/agent-client-protocol` repo schema `schema/v1
 
 **Design rule that follows:** Tacet launches the real `gemini` binary (or API key / Vertex env). It must never extract the Gemini CLI OAuth credential file and call Google services directly.
 
+## 5b. Terminal escapes that write the clipboard (#302, 2026-11-11)
+
+This matters to `tacet attach`, which relays a Worker's terminal bytes and must strip clipboard writes. It is not a vendor surface, so it has no row in the freshness table. The vendor doc hosts (`iterm2.com`, `sw.kovidgoyal.net`) are blocked by this environment's network policy, so the facts below were read from each terminal's own source at the commit named.
+
+| Capability | Fact | Status | Source |
+|---|---|---|---|
+| iTerm2 key=value OSC numbers | OSC 1337 and OSC 50 both map to `XTERMCC_SET_KVP` (50 is the older code, kept for Konsole compatibility). The number is read as an integer: leading zeros are accepted, overflow fails the sequence, and it must be followed by `;` (or ST). The key is everything before the first `=`, or the whole string when there is none. | verified (source) | iTerm2 source, shallow clone of https://github.com/gnachman/iTerm2 at 8bf82e4 (2026-11-10): `sources/VT100/VT100XtermParser.m` (`tokenTypeForMode:`, `parseModeFromContext:`, `parseKeyValuePairInToken:`) |
+| iTerm2 OSC string bytes | Inside the OSC string, `ESC ]` is **skipped** and the same OSC continues. U+009D is also skipped, but only with an 8-bit (ASCII or Latin-1) encoding. BEL, `ESC \` (and C1 ST in 8-bit) end the string. CAN, SUB and ESC followed by anything else fail the sequence. Other C0 bytes are appended to the string, so they become part of the key. The string is cut at 1 MiB. For keys `File=` and `Copy=` with mode 50 or 1337, parsing ends at the first `:` and the rest streams as a multi-token body. | verified (source) | iTerm2 source, shallow clone of https://github.com/gnachman/iTerm2 at 8bf82e4 (2026-11-10): `VT100XtermParser.m` `parseNextCharsInStringFromContext:` |
+| iTerm2 pasteboard keys | Keys are compared exactly and case-sensitively (`isEqualToString:`). Three keys write the pasteboard. `Copy` (value `:<base64>`, or modes `1;`, `2;uid`, `3;uid`, `4` for segmented copies) begins a copy to the pasteboard when the session is trusted. `CopyToClipboard` (value: pasteboard name) starts saving the text that follows (`_saveData`). `EndCopy` stops saving and copies the buffer to the pasteboard. `File`, `MultipartFile`, `SetUserVar` and the other keys in that dispatch do not touch the pasteboard. | verified (source) | iTerm2 source, shallow clone of https://github.com/gnachman/iTerm2 at 8bf82e4 (2026-11-10): `sources/VT100/VT100Terminal.m` (key dispatch near `isEqualToString:@"Copy"`), `sources/VT100/VT100Parser.m` (`CopyToClipboard` / `EndCopy` set `_saveData`) |
+| kitty clipboard OSC numbers | OSC 52 and OSC 5522 both dispatch to `clipboard_control`; 5522 is kitty's extended clipboard protocol, which can write the clipboard (`type=write` / `wdata`). kitty reads at most the first 5 digits of the number, so leading zeros count toward the 5. A `;` after the number is optional. kitty's OSC 1337 goes to `desktop_notify`, not the clipboard. | verified (source) | kitty source, shallow clone of https://github.com/kovidgoyal/kitty at 6d8f7ac (2026-11-11): `kitty/vt-parser.c` (OSC dispatch `case 52: case 5522:`), `docs/clipboard.rst` |
+| kitty OSC termination | An OSC is accumulated until BEL or `ESC \`. A lone ESC, CAN or SUB inside it does **not** end it. | verified (source) | kitty source, shallow clone of https://github.com/kovidgoyal/kitty at 6d8f7ac (2026-11-11): `kitty/vt-parser.c` `find_st_terminator` |
+| Other terminals (WezTerm, foot, Alacritty, Ghostty, Windows Terminal, tmux) | Whether any accepts a clipboard write by an escape other than OSC 52 (for example WezTerm with iTerm2's 1337 `Copy`). The filter's 1337 key check applies whichever terminal reads it. | UNVERIFIED (not read) | none read |
+
+**What `tacet attach` does with this:** it drops OSC 52 and 5522, and OSC 1337 or 50 whose key is `Copy`, `CopyToClipboard` or `EndCopy`. It reads more strictly than either terminal, so whatever either one would take as a clipboard write is dropped:
+- any case;
+- C0, DEL, U+009D's byte and `ESC ]` skipped inside the key;
+- leading zeros stripped;
+- numbers longer than 5 significant digits dropped.
+
+Other iTerm2 keys, inline images (`File=`) among them, pass.
+
 ## 6. Cross-surface comparison (summary)
 
 Derived from the tables above. Blank-free: `?` means UNVERIFIED.

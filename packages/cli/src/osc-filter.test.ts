@@ -133,6 +133,36 @@ describe('OscFilter (#302)', () => {
     expect(run(titles)).toBe(dec(titles));
   });
 
+  it("removes kitty's OSC 5522 and iTerm2's clipboard keys, but not iTerm2's other keys", () => {
+    for (const seq of [
+      `${E}]5522;type=write\x07`,
+      `${E}]5522;type=wdata:mime=dGV4dA==;AAAA${E}\\`,
+      `${E}]05522;type=write\x07`,
+      `${E}]1337;Copy=:ZWNobw==\x07`,
+      `${E}]1337;Copy=2;uid\x07`,
+      `${E}]1337;CopyToClipboard=\x07`,
+      `${E}]1337;EndCopy\x07`,
+      `${E}]50;CopyToClipboard=rule\x07`,
+      // Any case, with skipped bytes or iTerm2's skipped ESC ] inside the key.
+      `${E}]1337;copy=:AAAA\x07`,
+      `${E}]1337;Co\x01py=:AAAA\x07`,
+      `${E}]1337;Co${E}]py=:AAAA\x07`,
+      `${E}]1337;Co\x9dpy=:AAAA\x07`,
+      '\xc2\x9d01337;\x7fEndCopy\xc2\x9c',
+    ]) {
+      const input = bytes(`a${seq}b`);
+      for (let i = 0; i <= input.length; i++) {
+        expect(run(input, [i]), JSON.stringify(seq)).toBe('ab');
+      }
+    }
+    // iTerm2's other keys, inline images among them, and a key that only starts like one.
+    const kept = bytes(
+      `${E}]1337;File=inline=1:AAAA\x07${E}]1337;SetUserVar=a=Yg==\x07${E}]1337;CopyMode\x07${E}]1337;CurrentDir=/x\x07`,
+    );
+    expect(run(kept)).toBe(dec(kept));
+    for (let i = 0; i <= kept.length; i++) expect(run(kept, [i])).toBe(dec(kept));
+  });
+
   it('ends an OSC left open when the stream ends, and holds nothing back after flush', () => {
     const f = new OscFilter();
     expect(dec(f.push(bytes(`${E}]0;title`)))).toBe(`${E}]0;title`);

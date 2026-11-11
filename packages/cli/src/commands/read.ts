@@ -156,7 +156,8 @@ export async function logs(
  * ends. Given a sub-task, its latest session, then each one that replaces it. A PTY Worker
  * running in a live run is shown as its terminal instead, live from the run's port (#201), when
  * the output is a terminal and not `--json`: until that session ends. Its clipboard writes (OSC
- * 52) never reach the user's terminal (#302); everything else, window titles included, does.
+ * 52, kitty's 5522, iTerm2's 1337 copy keys) never reach the user's terminal (#302); everything
+ * else, window titles included, does.
  */
 export async function attach(
   io: Io,
@@ -197,7 +198,7 @@ export async function attach(
     // A PTY Worker running in a live run: its terminal itself, as it draws (#201, ADR-003 §5).
     const raw = io.raw;
     if (!o.json && raw) {
-      // No clipboard writes (OSC 52) from a Worker's terminal reach the user's (#302).
+      // No clipboard writes (OSC 52 and the like) from a Worker's terminal reach the user's (#302).
       const osc = new OscFilter();
       const pty = await livePty(io, opened.repoRoot, opened.paths, session, (chunk) => {
         const shown = osc.push(chunk);
