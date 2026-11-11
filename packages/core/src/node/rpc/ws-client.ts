@@ -33,10 +33,16 @@ export interface RpcClient {
   bufferedAmount(): number;
 }
 
-/** What a client knows when the server calls it (#24). */
+/** What a client knows when the server calls it (#24): its own connection. */
 export interface ClientContext {
   /** The session id the server's hello gave this connection. */
   sessionId: string;
+  /** Send the server a notification on this connection. */
+  notify(method: string, params?: unknown): Promise<void>;
+  /** Bytes queued on this connection and not yet sent. */
+  bufferedAmount(): number;
+  /** Settles when this connection is gone. */
+  closed: Promise<{ code: number; reason: string }>;
 }
 
 /** What a Mini-conductor says about itself in its hello (ADR-003 §3.6): a lightweight Agent Card. */
@@ -92,7 +98,8 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
   });
   const out = outgoing(ws, timeoutMs, (m, code) => new RpcClientError(m, code));
   const failAll = out.failAll;
-  const ctx: ClientContext = { sessionId: '' };
+  // Filled in once `closed` exists, before any handler can run (only after the hello).
+  let ctx = undefined as unknown as ClientContext;
   // Requests the server sends, served only once the hello is done.
   let peer: ReturnType<typeof incoming<ClientContext>> | undefined;
   const early: Record<string, unknown>[] = [];
@@ -121,6 +128,12 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
       resolve({ code, reason: reason.toString('utf8') });
     });
   });
+  ctx = {
+    sessionId: '',
+    notify: out.notify,
+    bufferedAmount: () => ws.bufferedAmount,
+    closed,
+  };
   // Any frame from the server, pings included, shows it is there.
   let silence: NodeJS.Timeout | undefined;
   const heard = () => {

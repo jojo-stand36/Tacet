@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { chmodSync, lstatSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
@@ -17,7 +18,15 @@ export interface EventStore {
    * is a no-op (the envelope id is the idempotency key). The raw input is stored as given, so
    * fields this version does not know survive a round trip.
    */
-  append(events: unknown | unknown[]): AppendResult;
+  append(events: unknown | unknown[], opts?: AppendOptions): AppendResult;
+  /**
+   * This log's own id (#24): random, made when the log is created (or first opened writable by a
+   * version that has it), so a log made again under the same path is told apart from the one
+   * before. A reader of a seq cursor keys it by this. Empty for an older log opened read-only.
+   */
+  logId(): string;
+  /** A value a caller kept with `append(…, { meta })`, e.g. a replication cursor. */
+  meta(key: string): string | undefined;
   /** Stored events in log order. */
   query(filter?: EventFilter): StoredEvent[];
   /** Fold matching events, in log order, into a fresh projection state. */
@@ -25,7 +34,18 @@ export interface EventStore {
   /** Apply the retention policy. Returns how many events were deleted. */
   compact(policy: RetentionPolicy): number;
   count(): number;
+  /** The highest `seq` written so far, 0 for an empty log. `seq` is never reused. */
+  lastSeq(): number;
   close(): void;
+}
+
+export interface AppendOptions {
+  /**
+   * Values to keep in the log's `meta` table in the same transaction as the events (#24: a
+   * replica's cursor with the batch it covers). Keys are the caller's: `x.`-prefixed, so none
+   * can overwrite the log's own (`schema_version`, `compacting`, `log_id`).
+   */
+  meta?: Readonly<Record<string, string>>;
 }
 
 export interface AppendResult {
@@ -165,12 +185,26 @@ function storeOn(db: Database.Database, readonly: boolean): EventStore {
       `event log schema version ${version.value} is not supported (expected ${SCHEMA_VERSION})`,
     );
   }
+  const readMeta = db.prepare(`SELECT value FROM meta WHERE key = ?`);
+  const metaValue = (key: string) => (readMeta.get(key) as { value: string } | undefined)?.value;
+  let logId = metaValue('log_id') ?? '';
+  if (!logId && !readonly) {
+    logId = randomUUID();
+    // OR IGNORE: another process may have made it first; read back whichever won.
+    db.prepare(`INSERT OR IGNORE INTO meta (key, value) VALUES ('log_id', ?)`).run(logId);
+    logId = metaValue('log_id') ?? logId;
+  }
+  const writeMeta = db.prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`);
 
   const insert = db.prepare(
     `INSERT OR IGNORE INTO events (id, ts, type, repo, task_id, session_id, correlation_id, causation_id, envelope)
      VALUES (@id, @ts, @type, @repo, @taskId, @sessionId, @correlationId, @causationId, @envelope)`,
   );
-  const appendMany = db.transaction((items: unknown[]): AppendResult => {
+  const appendMany = db.transaction((items: unknown[], opts?: AppendOptions): AppendResult => {
+    for (const [key, value] of Object.entries(opts?.meta ?? {})) {
+      if (!key.startsWith('x.')) throw new Error(`meta key ${key} must start with "x."`);
+      writeMeta.run(key, value);
+    }
     let appended = 0;
     for (const raw of items) {
       const env = EventEnvelope.parse(raw);
@@ -242,10 +276,12 @@ function storeOn(db: Database.Database, readonly: boolean): EventStore {
   });
 
   return {
-    append: (events) => {
+    append: (events, opts) => {
       if (readonly) throw new Error('event log opened read-only');
-      return appendMany(Array.isArray(events) ? events : [events]);
+      return appendMany(Array.isArray(events) ? events : [events], opts);
     },
+    logId: () => logId,
+    meta: (key) => metaValue(key),
     query: (filter) => select(filter).map(toStored),
     replay: (projection, filter) =>
       project(
@@ -257,6 +293,13 @@ function storeOn(db: Database.Database, readonly: boolean): EventStore {
       return compactTx(policy);
     },
     count: () => (db.prepare('SELECT count(*) AS n FROM events').get() as { n: number }).n,
+    // AUTOINCREMENT's high-water mark, so a seq compacted away still counts.
+    lastSeq: () =>
+      (
+        db.prepare(`SELECT seq AS n FROM sqlite_sequence WHERE name = 'events'`).get() as
+          | { n: number }
+          | undefined
+      )?.n ?? 0,
     close: () => db.close(),
   };
 }

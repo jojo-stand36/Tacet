@@ -27,6 +27,7 @@ import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
 import { GitIntegrator } from './git/integrate.js';
+import { eventForwarding } from './link/forward.js';
 import { EventLogBackend } from './mcp/backend.js';
 import { MiniMcpServer } from './mcp/server.js';
 import { AdapterReviewer } from './review/adapter-reviewer.js';
@@ -224,6 +225,11 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
     writeRuntimeFile({ path: runtimeFile, port: control.port, protocolVersions: [1], token });
     // Last: the Conductor sees a Mini-conductor only once it holds its lock and serves its port.
     let link: ConductorLink | undefined;
+    // Events up (#24): from the log, once the Conductor resumes them.
+    const events = eventForwarding({
+      store,
+      ...(o.onError ? { onError: (m: string) => o.onError?.(`conductor link: ${m}`) } : {}),
+    });
     if (o.conductor !== false) {
       const repoPath = realpathSync(o.repoRoot);
       link = dialConductor({
@@ -236,8 +242,11 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
         clientInfo: { name: 'tacet-mini', version: MINI_VERSION },
         // Reading and cancelling only (#24): new tasks and answers stay with `tacet run` and its
         // terminal until the Conductor can be authenticated to the Mini-conductor (#53).
-        handlers: taskMethods({ mini, store, contextId: paths.repoId }).handlers,
-        capabilities: { serves: [...LINK_METHODS] },
+        handlers: {
+          ...taskMethods({ mini, store, contextId: paths.repoId }).handlers,
+          ...events.handlers,
+        },
+        capabilities: { serves: [...LINK_METHODS], events: ['resume'] },
         ...(o.onError ? { onError: (m: string) => o.onError?.(`conductor link: ${m}`) } : {}),
         runDir: o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
         ...(o.conductor?.minDelayMs !== undefined ? { minDelayMs: o.conductor.minDelayMs } : {}),
@@ -259,6 +268,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       close: () => {
         closed ??= (async () => {
           try {
+            events.stop();
             await link?.close();
             try {
               removeRuntimeFile(file, token);
