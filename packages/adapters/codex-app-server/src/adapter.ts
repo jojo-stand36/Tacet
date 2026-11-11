@@ -344,7 +344,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     );
     const home = launch.env.HOME ?? homedir();
     // A private TMPDIR, and /tmp read-only: no shared temp dir is left writable (#294).
-    const privateTmp = unattended && (this.#opts.privateTmpdir ?? process.platform !== 'darwin');
+    const privateTmp = unattended && (this.#opts.privateTmpdir ?? true);
     // Without it, before anything is created for the Worker: the sandbox could not protect its
     // repo (#293), or the repo enclosing its cwd when no repoRoot is given (#295).
     if (unattended && !privateTmp) {

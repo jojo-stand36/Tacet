@@ -29,7 +29,7 @@ import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-res
  */
 const DENIED = /Read-only file system|Permission denied|Operation not permitted/;
 
-describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294)', () => {
+describe('Codex Worker private TMPDIR (#294)', () => {
   let api: MockResponsesApi;
   let root: string;
   let repo: string;
@@ -114,6 +114,15 @@ describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294
     expect(own).toBeDefined();
     const workerTmp = join(tmps, own as string);
 
+    // #299 experiment: what the first git inside the sandbox needs on this OS.
+    const probe = await run(
+      a,
+      h,
+      tap,
+      'echo "UTD=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) UCD=$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null)"; git --version; git status --short && echo GIT-OK',
+    );
+    console.log(`[#299 probe ${process.platform}]`, JSON.stringify(probe));
+    expect(probe, probe).toContain('GIT-OK');
     const mine = await run(
       a,
       h,
