@@ -278,7 +278,14 @@ export function buildWorkerAdapters(
     }
     const env = resolveEnv(slug, preset.env);
     return {
-      agent: customAcpAgent(slug, { command: preset.command, env }),
+      agent: customAcpAgent(slug, {
+        command: preset.command,
+        env,
+        // Declared only when the config says so (#184): by default no MCP tools.
+        ...(preset.capabilities?.mcp !== undefined
+          ? { capabilities: { mcp: preset.capabilities.mcp } }
+          : {}),
+      }),
       secrets: Object.values(env),
     };
   }

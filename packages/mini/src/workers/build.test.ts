@@ -345,6 +345,21 @@ describe('buildWorkerAdapters', () => {
     ).not.toThrow(/claude-agent-acp/);
   });
 
+  it('custom ACP agents declare no MCP client unless their config says so (#184)', () => {
+    const built = buildWorkerAdapters(
+      {
+        tiers: { worker: { adapter: 'acp:mine' }, review: { adapter: 'acp:verified' } },
+        agents: {
+          mine: { kind: 'acp', command: ['my-agent'] },
+          verified: { kind: 'acp', command: ['other-agent'], capabilities: { mcp: true } },
+        },
+      },
+      { baseEnv: {} },
+    );
+    expect(built['acp:mine']?.adapter.capabilities().mcp).toBe(false);
+    expect(built['acp:verified']?.adapter.capabilities().mcp).toBe(true);
+  });
+
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
     for (const tiers of [
       { worker: { adapter: 'acp:codex-acp' } },
