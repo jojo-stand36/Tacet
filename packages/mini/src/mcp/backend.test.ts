@@ -336,4 +336,43 @@ describe('EventLogBackend', () => {
       source: 'mini',
     });
   });
+
+  it('never lets a late gate answer resolve what the user has answered (#25)', async () => {
+    let release: (v: { answer: string; source: 'mini' }) => void = () => {};
+    const late = make({
+      gate: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+      gateTimeoutMs: 10,
+    });
+    const esc = await late.escalate(W1, { question: 'q3', urgency: 'low' });
+    // The user answers while the gate is still at work.
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: NOW,
+      source: { kind: 'mini', id: 'mini' },
+      taskId: 'task-1',
+      type: 'escalation.resolved',
+      data: { escalationId: esc.escalationId, answer: 'mine', source: 'user' },
+    });
+    release({ answer: 'the gate', source: 'mini' });
+    await new Promise((r) => setImmediate(r));
+    const answers = store
+      .query({ typePrefix: 'escalation.resolved' })
+      .map((e) => (e.envelope.data as { answer: string }).answer);
+    expect(answers).toEqual(['mine']);
+  });
+
+  it('asks to approve or reject a repo-wide proposal (#25)', async () => {
+    const r = await make().recordDecision(W1, { topic: 'db', decision: 'postgres', scope: 'repo' });
+    const raised = store.query({ typePrefix: 'escalation.raised' }).at(-1)?.envelope.data;
+    expect(raised).toMatchObject({
+      id: r.escalationId,
+      category: 'decision',
+      options: ['approve', 'reject'],
+      proposedDecision: { decisionId: r.decisionId, scope: 'repo' },
+    });
+  });
 });

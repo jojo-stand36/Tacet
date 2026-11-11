@@ -14,6 +14,7 @@ import {
   type AgentEvent,
   type AgentTerminal,
   type Decision,
+  type DecisionScope,
   Escalation,
   type EventEnvelope,
   HandoffPacket,
@@ -621,25 +622,77 @@ export class MiniConductor {
   }
 
   /**
-   * Answer an open escalation as the user (standalone `tacet run`, #21, until the inbox of #26):
-   * recorded as `escalation.resolved` with source `user` and delivered to the Worker as its next
-   * turn. Throws for an unknown escalation or one already resolved.
+   * Answer an open escalation as the user (standalone `tacet run`, #21, until the inbox of #26).
+   * The answer is recorded as a Decision with source `user` (ARCHITECTURE §2.2: reusable
+   * precedent), scope `task` unless the user chose `repo`, then as `escalation.resolved` naming
+   * it, and is delivered to the Worker as its next turn. For an approval request (a repo-wide
+   * decision a Worker proposed, category `decision`), an answer of "approve" (or "yes") records
+   * the proposal itself, under the id the Worker was given, as the user's; anything else records
+   * the answer and leaves the proposal unrecorded. Throws for an unknown escalation or one
+   * already resolved.
    */
-  answer(escalationId: string, answer: string): void {
+  answer(
+    escalationId: string,
+    answer: string,
+    opts: { scope?: DecisionScope; rationale?: string } = {},
+  ): void {
     if (!this.#started) throw new Error('call start() first');
     const x = this.#state().escalations.get(escalationId);
     if (!x) throw new Error(`unknown escalation ${escalationId}`);
     if (x.resolved) throw new Error(`escalation ${escalationId} is already resolved`);
     if (answer.trim() === '') throw new Error('an answer must not be empty');
-    this.#o.store.append(
+    const raised = this.#raised(x.taskId, escalationId);
+    const at = this.#now();
+    const proposal = raised?.category === 'decision' ? raised.proposedDecision : undefined;
+    const approved = proposal !== undefined && isApproval(answer);
+    const decision: Decision = approved
+      ? {
+          id: proposal.decisionId,
+          escalationId,
+          taskId: x.taskId,
+          ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+          topic: proposal.topic,
+          decision: proposal.decision,
+          ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
+          scope: 'repo',
+          source: 'user',
+          tags: [],
+          decidedAt: at.toISOString(),
+        }
+      : {
+          id: newUlid(at.getTime()),
+          escalationId,
+          taskId: x.taskId,
+          ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+          topic: raised?.question ?? escalationId,
+          decision: answer,
+          ...(opts.rationale !== undefined ? { rationale: opts.rationale } : {}),
+          // An approval request is answered for this task only, whatever the reply says.
+          scope: proposal !== undefined ? 'task' : (opts.scope ?? 'task'),
+          source: 'user',
+          tags: [],
+          decidedAt: at.toISOString(),
+        };
+    // One append: the decision never exists without the answer that made it, nor the reverse.
+    this.#o.store.append([
+      this.#env(x.taskId, 'decision.recorded', decision, x.sessionId),
       this.#env(
         x.taskId,
         'escalation.resolved',
-        { escalationId, answer, source: 'user' },
+        { escalationId, answer, source: 'user', decisionId: decision.id },
         x.sessionId,
       ),
-    );
+    ]);
     this.#kick();
+  }
+
+  /** The escalation as it was raised, read from the log. */
+  #raised(taskId: string, escalationId: string): Escalation | undefined {
+    for (const e of this.#o.store.query({ taskId, typePrefix: 'escalation.raised' })) {
+      const parsed = Escalation.safeParse(e.envelope.data);
+      if (parsed.success && parsed.data.id === escalationId) return parsed.data;
+    }
+    return undefined;
   }
 
   /**
@@ -3286,4 +3339,9 @@ function fileList(files: readonly string[]): string {
   const name = (f: string) => (f.length > 120 ? `${f.slice(0, 117)}...` : f);
   const shown = files.slice(0, 20).map(name).join(', ');
   return files.length > 20 ? `${shown} and ${files.length - 20} more` : shown;
+}
+
+/** "approve" or "yes" (any case, surrounding spaces and a full stop aside): an approval. */
+export function isApproval(answer: string): boolean {
+  return /^(approve|approved|yes|y)\.?$/i.test(answer.trim());
 }
