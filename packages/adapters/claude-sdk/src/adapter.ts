@@ -277,7 +277,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     const env = scrub ? { ...withSubprocessScrub(routed), ...SANDBOX_ENV } : routed;
     // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
     // runs with; removed at close (#263).
-    const placeholders = scrub ? residueSnapshot(opts.cwd, env.HOME ?? homedir()) : undefined;
+    const placeholders = scrub ? residueSnapshot(opts.cwd, env.HOME) : undefined;
     // Tacet owns the effort: this variable overrides the `effort` option and later
     // `applyFlagSettings` calls without any sign that it did.
     delete env.CLAUDE_CODE_EFFORT_LEVEL;

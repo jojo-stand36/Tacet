@@ -1,5 +1,6 @@
-import { lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { linkSync, lstatSync, readdirSync, renameSync, rmdirSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 /**
  * Paths in a checkout that Claude Code's Linux sandbox (on with the scrub, #150) protects, and
@@ -77,17 +78,26 @@ export const SANDBOX_ENV: Readonly<Record<string, string>> = { npm_config_logs_m
 export interface SandboxResidue {
   cwd: string;
   before: Set<string>;
-  home: string;
-  homeBefore: Set<string>;
+  /** Linux only, where the placeholders were observed; absent when the session has no HOME. */
+  home?: { dir: string; before: Set<string> };
 }
 
-/** Snapshot the checkout and `home` before a session under the sandbox starts. */
-export function residueSnapshot(cwd: string, home: string): SandboxResidue {
+/**
+ * Snapshot the checkout and `home` (the HOME the session runs with) before a session under the
+ * sandbox starts. HOME only on Linux, where its placeholders were observed: elsewhere removing
+ * them would risk the races `removeSandboxPlaceholders` narrows for no gain.
+ */
+export function residueSnapshot(
+  cwd: string,
+  home: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+): SandboxResidue {
   return {
     cwd,
     before: placeholderSnapshot(cwd),
-    home,
-    homeBefore: placeholderSnapshot(home, HOME_PLACEHOLDERS),
+    ...(home !== undefined && platform === 'linux'
+      ? { home: { dir: home, before: placeholderSnapshot(home, HOME_PLACEHOLDERS) } }
+      : {}),
   };
 }
 
@@ -100,8 +110,34 @@ export function residueSnapshot(cwd: string, home: string): SandboxResidue {
 export function removeSandboxResidue(r: SandboxResidue): string[] {
   return [
     ...removeSandboxPlaceholders(r.cwd, r.before),
-    ...removeSandboxPlaceholders(r.home, r.homeBefore, HOME_PLACEHOLDERS).map((p) => join('~', p)),
+    ...(r.home
+      ? removeSandboxPlaceholders(r.home.dir, r.home.before, HOME_PLACEHOLDERS).map((p) =>
+          join('~', p),
+        )
+      : []),
   ];
+}
+
+/**
+ * Remove `full` only if it is still an empty regular file: renamed aside first (atomic), checked
+ * there, then removed, or put back without overwriting what may have taken its name meanwhile.
+ */
+function removeEmptyFile(full: string): boolean {
+  const aside = join(dirname(full), `.tacet-rm-${randomBytes(6).toString('hex')}`);
+  renameSync(full, aside);
+  const st = lstatSync(aside);
+  if (st.isFile() && st.size === 0) {
+    unlinkSync(aside);
+    return true;
+  }
+  try {
+    // Never over a file that took the name meanwhile: link fails rather than replace it.
+    linkSync(aside, full);
+    unlinkSync(aside);
+  } catch {
+    renameSync(aside, `${full}.tacet-kept-${randomBytes(4).toString('hex')}`);
+  }
+  return false;
 }
 
 /** Whether every parent of `rel` under `cwd` is a directory and not a symlink. */
@@ -136,9 +172,13 @@ export function placeholderSnapshot(
 }
 
 /**
- * Removes the placeholders a session's sandbox left in `cwd` (#263): each path in
- * `SANDBOX_PLACEHOLDERS` that was not there before (`before`) and is still a 0-byte regular file
- * or an empty directory. Anything that existed before, has content, or is a link is kept, and
+ * Removes the placeholders a session's sandbox left in `cwd` (#263): each path in `list`
+ * (default `SANDBOX_PLACEHOLDERS`) that was not there before (`before`) and is still a 0-byte
+ * regular file or an empty directory. A file is first renamed aside and checked there, so one
+ * that someone writes in its place meanwhile (git renaming a new `~/.gitconfig` over it, say) is
+ * never removed: it is linked back, or, if the name was taken again meanwhile, kept beside it as
+ * `<name>.tacet-kept-<random>`. A directory is removed only while empty (`rmdir` refuses
+ * otherwise). Anything that existed before, has content, or is a link is kept, and
  * nothing behind a symlinked parent is touched, so a Worker's own file is never removed unless it
  * is empty and has one of these names (an empty `.env` it wrote is removed too). For a session
  * that never closed (a crash), the Mini-conductor calls it at its next start with the paths the
@@ -159,8 +199,9 @@ export function removeSandboxPlaceholders(
     if (!parentsAreDirs(cwd, p)) continue;
     try {
       const st = lstatSync(full);
-      if (st.isFile() && st.size === 0) unlinkSync(full);
-      else if (st.isDirectory() && readdirSync(full).length === 0) rmdirSync(full);
+      if (st.isFile() && st.size === 0) {
+        if (!removeEmptyFile(full)) continue;
+      } else if (st.isDirectory() && readdirSync(full).length === 0) rmdirSync(full);
       else continue;
       removed.push(p);
     } catch {

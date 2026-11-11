@@ -315,7 +315,7 @@ export class PtyAdapter implements AgentAdapter {
     const cwd = realpathSync(opts.cwd);
     // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
     // runs with; removed at close (#263).
-    const placeholders = scrub ? residueSnapshot(cwd, env.HOME ?? homedir()) : undefined;
+    const placeholders = scrub ? residueSnapshot(cwd, env.HOME) : undefined;
     // From the user's environment, not the Worker's: where state lives never depends on a session.
     const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
     const root = this.#configRoot(cwd, home);

@@ -126,7 +126,7 @@ describe("sandbox residue in the user's HOME (#263)", () => {
     writeFileSync(join(home, '.netrc'), '');
     mkdirSync(join(home, '.config', 'gh'), { recursive: true });
     writeFileSync(join(home, '.config', 'gh', 'hosts.yml'), 'x');
-    const r = residueSnapshot(cwd, home);
+    const r = residueSnapshot(cwd, home, 'linux');
     sandbox();
     // Written during the session: kept, being someone's.
     writeFileSync(join(home, '.gitconfig'), '[user]\n');
@@ -143,10 +143,21 @@ describe("sandbox residue in the user's HOME (#263)", () => {
   it('removes nothing behind a symlinked parent in HOME', () => {
     const elsewhere = join(root, 'elsewhere');
     mkdirSync(join(elsewhere, 'git'), { recursive: true });
-    const r = residueSnapshot(cwd, home);
+    const r = residueSnapshot(cwd, home, 'linux');
     symlinkSync(elsewhere, join(home, '.config'));
     removeSandboxResidue(r);
     expect(readdirSync(join(elsewhere))).toEqual(['git']);
+  });
+
+  it('leaves HOME alone outside Linux, or for a session without a HOME', () => {
+    for (const r of [
+      residueSnapshot(cwd, home, 'darwin'),
+      residueSnapshot(cwd, undefined, 'linux'),
+    ]) {
+      sandbox();
+      expect(removeSandboxResidue(r)).toEqual([]);
+      expect(readdirSync(home)).toContain('.bashrc');
+    }
   });
 
   it('turns the npm log off for the sessions it runs', () => {
