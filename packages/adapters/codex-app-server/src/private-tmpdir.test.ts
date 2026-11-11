@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -7,13 +8,17 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter } from './adapter.js';
+import { CodexAppServerAdapter, removeWorkerTree } from './adapter.js';
+import { codexFixtureDir } from './testing/fixture-dir.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
 /**
@@ -22,6 +27,8 @@ import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-res
  * where without it the adapter has to refuse them (#293, #295). Off on macOS (the Xcode `git`
  * shim and the per-user temp dir are unchecked there), so this runs elsewhere only.
  */
+const DENIED = /Read-only file system|Permission denied|Operation not permitted/;
+
 describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294)', () => {
   let api: MockResponsesApi;
   let root: string;
@@ -107,29 +114,84 @@ describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294
     expect(own).toBeDefined();
     const workerTmp = join(tmps, own as string);
 
-    const mine = await run(a, h, tap, 'echo "TMP=$TMPDIR"; touch "$TMPDIR/y" && echo TMP-OK');
-    expect(mine).toContain(`TMP=${workerTmp}`);
+    const mine = await run(
+      a,
+      h,
+      tap,
+      'echo "TMP=$TMPDIR T=$TMP TE=$TEMP"; touch "$TMPDIR/y" && echo TMP-OK',
+    );
+    expect(mine).toContain(`TMP=${workerTmp} T=${workerTmp} TE=${workerTmp}`);
     expect(mine).toContain('TMP-OK');
     expect(existsSync(join(workerTmp, 'y'))).toBe(true);
 
     const slashTmp = join('/tmp', `tacet-294-outside-${process.pid}`);
     const outside = await run(a, h, tap, `touch ${slashTmp} && echo OUT-OK`);
     expect(outside).not.toContain('OUT-OK');
+    // Refused by the sandbox, not merely not run.
+    expect(outside).toMatch(DENIED);
     expect(existsSync(slashTmp)).toBe(false);
 
     const ref = join(repo, '.git', 'refs', 'heads', 'evil');
     const shared = await run(a, h, tap, `git rev-parse HEAD > ${ref} && echo REF-OK`);
     expect(shared).not.toContain('REF-OK');
+    expect(shared).toMatch(DENIED);
     expect(existsSync(ref)).toBe(false);
 
     const config = join(codexHome, 'config.toml');
     const before = readFileSync(config, 'utf8');
     const home = await run(a, h, tap, `echo '# planted' >> ${config} && echo HOME-OK`);
     expect(home).not.toContain('HOME-OK');
+    expect(home).toMatch(DENIED);
     expect(readFileSync(config, 'utf8')).toBe(before);
 
+    // A directory the Worker locked (mode 000) does not stop the cleanup, or crash the host.
+    const locked = await run(
+      a,
+      h,
+      tap,
+      'mkdir -p "$TMPDIR/a/b" && touch "$TMPDIR/a/b/f" && chmod 000 "$TMPDIR/a" && echo LOCK-OK',
+    );
+    expect(locked).toContain('LOCK-OK');
     await a.close(h);
     // Its temp files go with the session.
     expect(existsSync(workerTmp)).toBe(false);
+
+    // Resumed: a fresh private TMPDIR, and /tmp still read-only.
+    const again = await a.start({
+      cwd: worktree,
+      resume: { vendorSessionId: h.vendorSessionId as string },
+    });
+    const tap2 = new EventTap(a.events(again));
+    await tap2.waitFor((e) => e.t === 'status' && e.state === 'idle', 30_000);
+    const resumed = await run(a, again, tap2, `touch ${slashTmp} && echo OUT-OK`);
+    expect(resumed).not.toContain('OUT-OK');
+    expect(resumed).toMatch(DENIED);
+    expect(existsSync(slashTmp)).toBe(false);
+    await a.close(again);
+    expect(readdirSync(tmps)).toEqual([]);
+  });
+});
+
+describe('removeWorkerTree (#294)', () => {
+  it('removes a tree with a locked directory, never following a symlink out of it', () => {
+    const base = codexFixtureDir('tacet-294-rm-');
+    try {
+      const outside = join(base, 'outside');
+      mkdirSync(join(outside, 'keep'), { recursive: true });
+      chmodSync(outside, 0o755);
+      const tree = join(base, 'tree');
+      mkdirSync(join(tree, 'a', 'b'), { recursive: true });
+      writeFileSync(join(tree, 'a', 'b', 'f'), 'x');
+      symlinkSync(outside, join(tree, 'link'));
+      chmodSync(join(tree, 'a'), 0o000);
+      expect(() => removeWorkerTree(tree)).not.toThrow();
+      expect(existsSync(tree)).toBe(false);
+      expect(existsSync(join(outside, 'keep'))).toBe(true);
+      expect(statSync(outside).mode & 0o777).toBe(0o755);
+      // A tree that is not there is not an error either.
+      expect(() => removeWorkerTree(tree)).not.toThrow();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 });

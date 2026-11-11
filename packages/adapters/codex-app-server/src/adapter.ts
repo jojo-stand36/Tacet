@@ -5,6 +5,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -111,7 +112,7 @@ export interface CodexAdapterOptions {
    * shared temp dir is writable and a repo or state dir under `/tmp` is protected (#294). Default
    * on, except on macOS: there the Xcode `git` shim writes under the per-user temp dir, which has
    * not been checked against a private `TMPDIR`, so macOS keeps the shared temp dirs and refuses
-   * a repo or CODEX_HOME under them instead (#293, #295).
+   * a repo or CODEX_HOME under them instead (#293, #295). Turning it on there is unverified.
    */
   privateTmpdir?: boolean;
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */
@@ -380,12 +381,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
         );
       }
       privateDir(codexHome);
-      if (privateTmp) {
-        // Beside CODEX_HOME, never inside it: the Worker writes here.
-        workerTmp = join(dirname(codexHome), 'codex-tmp', randomUUID());
-        privateDir(workerTmp);
-        launch.env.TMPDIR = workerTmp;
-      }
+      // Beside CODEX_HOME, never inside it: the Worker writes here. Made just before Codex starts,
+      // so a refusal on the way leaves nothing behind.
+      if (privateTmp) workerTmp = join(dirname(codexHome), 'codex-tmp', randomUUID());
       launch.env.CODEX_HOME = codexHome;
       // Codex trusts a repo by itself at the first thread that can write it, and a trusted
       // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
@@ -430,6 +428,13 @@ export class CodexAppServerAdapter implements AgentAdapter {
         return v && v.length >= 8 ? [v] : [];
       }),
     ].sort((a, b) => b.length - a.length);
+    if (workerTmp !== undefined) {
+      privateDir(workerTmp, 'the Worker TMPDIR');
+      // Every temp variable a tool may read: the shared ones are read-only now (#294).
+      launch.env.TMPDIR = workerTmp;
+      launch.env.TMP = workerTmp;
+      launch.env.TEMP = workerTmp;
+    }
     // Its own process group, so close() can end Codex's children too (e.g. its background
     // plugin `git` sync, which outlives app-server otherwise).
     const proc = spawn(
@@ -533,7 +538,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
             : {}),
           ...(effort !== undefined ? { model_reasoning_effort: effort } : {}),
           // Codex keeps a linked worktree's git dir read-only; the Worker's own one is made
-          // writable, and nothing else of the repo's .git (#116). Thread config keys are dotted
+          // writable, and nothing else of the repo's .git (#116); so is its private TMPDIR, with
+          // /tmp taken out (#294; $TMPDIR is that private dir, so it stays). Thread config keys are dotted
           // override paths, so this sets only `writable_roots` and keeps the rest of the table.
           ...(gitDir !== undefined || workerTmp !== undefined
             ? {
@@ -593,7 +599,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
-      if (workerTmp !== undefined) rmSync(workerTmp, { recursive: true, force: true });
+      if (workerTmp !== undefined) removeWorkerTree(workerTmp);
       if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
@@ -608,7 +614,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       this.#exited(session);
       await this.#reapGroup(proc);
       // Nothing of the Worker runs any more: its temp files go (#294).
-      if (workerTmp !== undefined) rmSync(workerTmp, { recursive: true, force: true });
+      if (workerTmp !== undefined) removeWorkerTree(workerTmp);
     });
     void session.gone.then(() => this.#onExit(session));
 
@@ -1195,13 +1201,43 @@ const GIT_LOCATION_VARS = [
 ] as const;
 
 /** Create `dir` (0700) if needed and refuse anything but a real directory owned by us. */
-function privateDir(dir: string): void {
+function privateDir(dir: string, what = 'Codex home'): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const st = lstatSync(dir);
   if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) {
-    throw new Error(`Codex home ${dir} is not a private directory`);
+    throw new Error(`${what} ${dir} is not a private directory`);
   }
   chmodSync(dir, 0o700);
+}
+
+/**
+ * Remove a tree the Worker could write (its TMPDIR, #294), best effort and never throwing: a
+ * Worker can leave a directory it cannot be removed from (mode 000), so on a failure every
+ * directory in it is made 0700 again, walking with `lstat` (never through a symlink), and the
+ * removal is retried once. Whatever still cannot go is left.
+ */
+export function removeWorkerTree(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    return;
+  } catch {
+    // Below: unlock and retry.
+  }
+  const unlock = (d: string): void => {
+    try {
+      if (!lstatSync(d).isDirectory()) return;
+      chmodSync(d, 0o700);
+      for (const name of readdirSync(d)) unlock(join(d, name));
+    } catch {
+      // Not ours to fix; the retry below leaves it.
+    }
+  };
+  unlock(dir);
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Left behind; nothing of the Worker runs any more.
+  }
 }
 
 /**
@@ -1257,10 +1293,10 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * The temp dirs Codex's `workspace-write` sandbox always leaves writable besides the cwd: `/tmp`
- * and the Worker's `$TMPDIR` (capability matrix, "Sandbox writable roots (#116)"). Tacet does not
- * exclude them, because tools (the macOS `git` shim among them) need a temp dir. Resolved, so a
- * symlinked `/tmp` (`/private/tmp` on macOS) is caught too.
+ * The temp dirs Codex's `workspace-write` sandbox leaves writable besides the cwd: `/tmp` and the
+ * Worker's `$TMPDIR` (capability matrix, "Sandbox writable roots (#116)"). They stay writable
+ * only without `privateTmpdir` (macOS by default: the Xcode `git` shim needs the per-user temp
+ * dir, #294). Resolved, so a symlinked `/tmp` (`/private/tmp` on macOS) is caught too.
  */
 export function sandboxTempRoots(tmpdir: string | undefined): string[] {
   const roots = ['/tmp', ...(tmpdir && isAbsolute(tmpdir) ? [tmpdir] : [])];
