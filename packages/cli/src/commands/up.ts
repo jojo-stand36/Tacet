@@ -129,7 +129,13 @@ function spawnMini(io: Io, repoPath: string, run: string, userDir?: string) {
 }
 
 /** Register or unregister the repo at `path` in the Conductor's log; a repeat changes nothing. */
-function register(io: Io, stateDir: string, path: string, add: boolean, json?: boolean): number {
+async function register(
+  io: Io,
+  stateDir: string,
+  path: string,
+  add: boolean,
+  json?: boolean,
+): Promise<number> {
   const given = isAbsolute(path) ? path : join(io.cwd, path);
   // A mistyped path must not register the repo around it.
   if (!existsSync(given)) {
@@ -158,7 +164,8 @@ function register(io: Io, stateDir: string, path: string, add: boolean, json?: b
     // Its forwarded events go with it (#24): a running Conductor deletes the replica on its next
     // look at the registry; with none running, it is deleted here.
     if (!add && processLockHolder(paths.lock) === undefined) {
-      rmSync(join(paths.dir, 'repos', repoId), { recursive: true, force: true });
+      const { replicaDir } = await import('@tacet/conductor');
+      rmSync(replicaDir(stateDir, repoId), { recursive: true, force: true });
     }
     if (json) io.out(safeJson({ repoId, repoPath, registered: add, changed }));
     else {

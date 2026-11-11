@@ -1,4 +1,5 @@
 import {
+  CONDUCTOR_LOCAL_EVENT_NAMESPACES,
   EVENT_BATCH_MAX,
   EVENT_BATCH_MAX_BYTES,
   EventResumeParams,
@@ -21,6 +22,18 @@ export interface ForwardOptions {
   highWaterBytes?: number;
   /** Told about what could not be forwarded, by message only. */
   onError?: (message: string) => void;
+}
+
+/**
+ * An envelope the Conductor refuses with a close (1008): never sent, or one bad row in the log
+ * would close the link at every resume. It claims to be the Conductor's, or is Conductor-local.
+ */
+function refused(e: { source: { kind: string }; type: string }): boolean {
+  const ns = e.type.split('.', 1)[0] ?? '';
+  return (
+    e.source.kind === 'conductor' ||
+    (CONDUCTOR_LOCAL_EVENT_NAMESPACES as readonly string[]).includes(ns)
+  );
 }
 
 /** Bytes of a frame's text other than its envelopes: `{"jsonrpc":…,"params":{"logId":…}}`. */
@@ -65,40 +78,55 @@ export function eventForwarding(o: ForwardOptions) {
       // After the resume's answer is on the socket: a batch never goes before it.
       await new Promise((r) => setImmediate(r));
       let after = start;
+      /** The `throughSeq` last sent: an empty batch is only worth sending when it moves this. */
+      let sent = start;
+      const page = max * 4;
       while (!stopped && !closed) {
-        const rows = o.store.query({ afterSeq: after, limit: max * 4 });
-        if (rows.length === 0) {
-          await sleep(o.idleMs ?? 250);
-          continue;
-        }
         const events: Record<string, unknown>[] = [];
         let bytes = 0;
         let through = after;
-        for (const row of rows) {
-          if (!isForwardable(row.envelope.type)) {
+        let full = false;
+        let caughtUp = false;
+        // Read on, page by page, until the batch is full or the log is read to its end: a long run
+        // of events that never go up (transcripts) costs reads, never a stream of empty frames.
+        while (!full && !caughtUp && !stopped) {
+          const rows = o.store.query({ afterSeq: through, limit: page });
+          caughtUp = rows.length < page;
+          for (const row of rows) {
+            if (!isForwardable(row.envelope.type) || refused(row.envelope)) {
+              through = row.seq;
+              continue;
+            }
+            const size = Buffer.byteLength(JSON.stringify(row.raw));
+            if (size > maxBytes) {
+              // Never sendable whole: skipped, said by its id and type only.
+              o.onError?.(
+                `event ${row.envelope.id} (${row.envelope.type}) is too large to forward`,
+              );
+              through = row.seq;
+              continue;
+            }
+            if (events.length >= max || bytes + size > maxBytes) {
+              full = true;
+              break;
+            }
+            events.push(row.raw);
+            bytes += size;
             through = row.seq;
-            continue;
           }
-          const size = Buffer.byteLength(JSON.stringify(row.raw));
-          if (size > maxBytes) {
-            // Never sendable whole: skipped, said by its id and type only.
-            o.onError?.(`event ${row.envelope.id} (${row.envelope.type}) is too large to forward`);
-            through = row.seq;
-            continue;
-          }
-          if (events.length >= max || bytes + size > maxBytes) break;
-          events.push(row.raw);
-          bytes += size;
-          through = row.seq;
         }
-        // An empty batch still moves the Conductor's cursor past what is never forwarded.
-        await ctx.notify(TACET_EVENT, { logId, throughSeq: through, events });
+        if (stopped) break;
+        // Empty only once caught up, to move the Conductor's cursor past what never goes up.
+        if (events.length > 0 || through > sent) {
+          await ctx.notify(TACET_EVENT, { logId, throughSeq: through, events });
+          sent = through;
+        }
         after = through;
         // Backpressure: the next batch only once the socket has sent most of this one.
         while (!stopped && ctx.bufferedAmount() > (o.highWaterBytes ?? 1024 * 1024)) {
           await sleep(20);
         }
-        if (rows.length < max * 4 && events.length < max) await sleep(o.idleMs ?? 250);
+        if (!full) await sleep(o.idleMs ?? 250);
       }
     };
     void run().catch((err: unknown) => {

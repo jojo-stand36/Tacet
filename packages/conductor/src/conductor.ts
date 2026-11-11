@@ -116,6 +116,10 @@ interface Live {
   resumed?: { logId: string } | undefined;
   /** A resume is under way. */
   resuming?: boolean;
+  /** Resume was asked on this connection (once per connection). */
+  asked?: boolean;
+  /** The registration (`registry.repo_added` id) it was resumed under. */
+  registration?: string | undefined;
   /** Batches that came while the resume's answer was being read: taken right after it, in order. */
   early?: unknown[] | undefined;
   /** Why it is being dropped, when the Conductor drops it. */
@@ -198,82 +202,124 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     const live = new Map<string, Live>();
     // Forwarded events (#24): a replica per registered repo.
     const copies = replicas(o.stateDir);
-    const bySession = (sessionId: string) => {
-      for (const e of live.values()) if (e.conn.sessionId === sessionId) return e;
-      return undefined;
+    const bySession = new Map<string, Live>();
+    /** Drop a resumed (or resuming) connection: its Mini-conductor redials and resumes afresh. */
+    const drop = (entry: Live, code: number, reason: string) => {
+      entry.resumed = undefined;
+      entry.early = undefined;
+      entry.conn.close(code, reason);
     };
-    /** Ask a registered repo's Mini-conductor for its events, from where its replica stands. */
+    /**
+     * Ask a registered repo's Mini-conductor for its events, from where its replica stands: once
+     * per connection (ADR-003 addendum on forwarding events, item 3). Anything that goes wrong, or
+     * changes meanwhile, closes the connection instead of retrying on it, so a batch can never be
+     * taken out of order: the next connection resumes from the stored cursor.
+     */
     const resume = async (entry: Live) => {
-      if (entry.resumed || entry.resuming || closing) return;
-      if (!(entry.repoId in registry().repos)) return;
+      if (entry.resumed || entry.resuming || entry.asked || closing) return;
+      const reg = registry().repos[entry.repoId];
+      if (!reg) return;
       const caps = (entry.conn.hello as { capabilities?: { events?: unknown } }).capabilities;
       if (!Array.isArray(caps?.events) || !caps.events.includes('resume')) return;
+      entry.asked = true;
       entry.resuming = true;
+      entry.registration = reg.registration;
       const early: unknown[] = [];
       entry.early = early;
       try {
+        copies.adopt(entry.repoId, reg.registration);
         const at = copies.cursor(entry.repoId);
-        const answer = EventResumeResult.safeParse(
-          await entry.conn.call(
+        let raw: unknown;
+        try {
+          raw = await entry.conn.call(
             TACET_EVENT_RESUME,
             at ? { logId: at.logId, afterSeq: at.seq } : {},
-          ),
-        );
-        if (!answer.success) {
-          entry.conn.close(1008, 'invalid resume answer');
+          );
+        } catch (err) {
+          report(err);
+          drop(entry, 1011, 'resume failed');
+          return;
+        }
+        const answer = EventResumeResult.safeParse(raw);
+        // Without a cursor, it can only start from the beginning.
+        if (!answer.success || (!at && answer.data.afterSeq !== 0)) {
+          drop(entry, 1008, 'invalid resume answer');
+          return;
+        }
+        // Unregistered, registered anew, or the replica changed while the answer was on its way.
+        const now = registry().repos[entry.repoId];
+        const still = copies.cursor(entry.repoId);
+        if (
+          closing ||
+          now?.registration !== reg.registration ||
+          still?.logId !== at?.logId ||
+          still?.seq !== at?.seq
+        ) {
+          drop(entry, 1000, 'registration changed');
           return;
         }
         // Another log, or the same one from the start (it was made again, or the cursor was not
         // its own): the replica is begun again, so no task of a log that is gone stays in view.
         if (at && (answer.data.logId !== at.logId || answer.data.afterSeq !== at.seq)) {
           copies.remove(entry.repoId);
+          copies.adopt(entry.repoId, reg.registration);
         }
         entry.resumed = { logId: answer.data.logId };
         entry.resuming = false;
         entry.early = undefined;
         for (const p of early) onEvents(p, entry.conn.sessionId);
+      } catch (err) {
+        report(err);
+        drop(entry, 1011, 'resume failed');
       } finally {
         entry.resuming = false;
         entry.early = undefined;
       }
     };
     /**
-     * Registration as it is now (#24): a registered repo's connection is resumed; an unregistered
-     * one that was is closed (its Mini-conductor redials and is not resumed) and its replica
-     * deleted, as is any replica of a repo no longer registered.
+     * Registration as it is now (#24): a registered repo's connection is resumed; one whose repo
+     * is unregistered, or registered anew (removed and added again), is closed (its Mini-conductor
+     * redials) and its replica deleted, as is any replica of a repo not registered as it was.
      */
     const sync = () => {
       const { repos } = registry();
       for (const entry of live.values()) {
-        if (entry.repoId in repos) void resume(entry).catch(report);
-        else if (entry.resumed) {
-          entry.resumed = undefined;
-          entry.conn.close(1000, 'repo unregistered');
-        }
+        const reg = repos[entry.repoId];
+        if ((entry.resumed || entry.resuming) && reg?.registration !== entry.registration) {
+          drop(entry, 1000, 'repo unregistered');
+        } else if (reg) void resume(entry).catch(report);
       }
       for (const repoId of copies.list()) {
-        if (!(repoId in repos)) {
-          try {
-            copies.remove(repoId);
-          } catch (err) {
-            report(err);
-          }
+        try {
+          const reg = repos[repoId];
+          if (!reg || copies.registration(repoId) !== reg.registration) copies.remove(repoId);
+        } catch (err) {
+          report(err);
         }
       }
     };
     const onEvents = (params: unknown, sessionId: string) => {
-      const entry = bySession(sessionId);
+      const entry = bySession.get(sessionId);
       if (!entry) return;
       // In the same read as the resume's answer: kept until it is handled.
       if (entry.resuming && entry.early) {
-        if (entry.early.length >= 64) entry.conn.close(1008, 'events before the resume');
+        if (entry.early.length >= 256) drop(entry, 1008, 'events before the resume');
         else entry.early.push(params);
         return;
       }
       // Not resumed: not asked for, so not taken (an unregistered repo, or never resumed).
       if (!entry.resumed) return;
-      const result = copies.take(entry.repoId, entry.resumed.logId, params);
-      if (!result.ok) entry.conn.close(1008, result.violation);
+      let result: ReturnType<typeof copies.take>;
+      try {
+        result = copies.take(entry.repoId, entry.resumed.logId, params);
+      } catch (err) {
+        // Not stored (a busy or full disk): the cursor must not move past it, so the connection
+        // goes and the next one resends from the stored cursor.
+        report(err);
+        drop(entry, 1011, 'events not stored');
+        return;
+      }
+      if (!result.ok) drop(entry, 1008, result.violation);
     };
     let auto: ReturnType<typeof autostarter> | undefined;
     /** One decision at a time per repo, so two hellos at once cannot both be accepted. */
@@ -284,6 +330,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       auto?.connected(repoId);
       const entry: Live = { repoId, conn, missed: 0 };
       live.set(repoId, entry);
+      bySession.set(conn.sessionId, entry);
       record('registry.connected', repoId, {
         repoId,
         repoPath,
@@ -295,6 +342,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       void resume(entry).catch(report);
       void conn.closed.then(() => {
         if (live.get(repoId) === entry) live.delete(repoId);
+        bySession.delete(conn.sessionId);
         if (closing) return;
         record('registry.disconnected', repoId, {
           repoId,

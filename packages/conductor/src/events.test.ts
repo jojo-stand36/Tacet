@@ -77,8 +77,19 @@ describe('the Conductor taking forwarded events', () => {
     ...more,
   });
 
+  interface MiniOptions {
+    logId?: string;
+    events?: string[];
+    /** Runs in the resume handler: may wait, or throw. */
+    onResume?: () => Promise<void> | void;
+    /** Batches sent right behind the resume's answer, in the same read. */
+    behind?: (ctx: ClientContext) => void;
+  }
   /** A stand-in Mini-conductor of the repo: records each resume and sends batches by hand. */
-  const mini = async (logId = 'log-a', events = ['resume']) => {
+  const mini = async (logIdOrOptions: string | MiniOptions = {}, events = ['resume']) => {
+    const opts: MiniOptions =
+      typeof logIdOrOptions === 'string' ? { logId: logIdOrOptions, events } : logIdOrOptions;
+    const logId = opts.logId ?? 'log-a';
     const resumes: EventResumeParams[] = [];
     let link: ClientContext | undefined;
     const c = await connectRpc({
@@ -87,12 +98,15 @@ describe('the Conductor taking forwarded events', () => {
       clientInfo: { name: 'fake-mini', version: '0' },
       role: 'mini',
       card: { repoId, repoPath: repo, adapters: [], miniVersion: '0' },
-      capabilities: { serves: [], events },
+      capabilities: { serves: [], events: opts.events ?? ['resume'] },
       handlers: {
-        [TACET_EVENT_RESUME]: (p, ctx) => {
+        [TACET_EVENT_RESUME]: async (p, ctx) => {
           resumes.push(p as EventResumeParams);
           link = ctx;
+          await opts.onResume?.();
           const q = p as EventResumeParams;
+          // Its answer goes out in a microtask after this returns; these go right behind it.
+          if (opts.behind) queueMicrotask(() => setImmediate(() => opts.behind?.(ctx)));
           return { logId, afterSeq: q.logId === logId ? (q.afterSeq ?? 0) : 0 };
         },
       },
@@ -208,5 +222,101 @@ describe('the Conductor taking forwarded events', () => {
     expect((await m.c.closed).code).toBe(1000);
     await vi.waitFor(() => expect(existsSync(replicaDir(stateDir, repoId))).toBe(false));
     expect(conductor.tasks(repoId)).toBeUndefined();
+  });
+
+  it('takes batches that come right behind the resume, in order, losing none', async () => {
+    registry('registry.repo_added');
+    const m = await mini({
+      behind: (ctx) => {
+        for (let n = 1; n <= 5; n++) {
+          void ctx.notify(TACET_EVENT, {
+            logId: 'log-a',
+            throughSeq: n,
+            events: [env('task.created', `t${n}`)],
+          });
+        }
+      },
+    });
+    await vi.waitFor(() =>
+      expect(Object.keys(conductor.tasks(repoId)?.tasks ?? {}).sort()).toEqual([
+        't1',
+        't2',
+        't3',
+        't4',
+        't5',
+      ]),
+    );
+    expect(m.resumes).toHaveLength(1);
+  });
+
+  it('closes the link when the resume fails, and resumes the next connection from the cursor', async () => {
+    registry('registry.repo_added');
+    const first = await mini({
+      onResume: () => {
+        throw new Error('no');
+      },
+    });
+    expect((await first.c.closed).code).toBe(1011);
+    // Asked once on that connection, never again on it.
+    expect(first.resumes).toHaveLength(1);
+    const again = await mini();
+    await vi.waitFor(() => expect(again.resumes).toEqual([{}]));
+  });
+
+  it('takes nothing for a repo unregistered while its resume was on its way', async () => {
+    registry('registry.repo_added');
+    let release: () => void = () => {};
+    const m = await mini({
+      onResume: () =>
+        new Promise<void>((r) => {
+          release = r;
+        }),
+    });
+    await vi.waitFor(() => expect(m.resumes).toHaveLength(1));
+    registry('registry.repo_removed');
+    await new Promise((r) => setTimeout(r, 80));
+    release();
+    expect((await m.c.closed).code).toBe(1000);
+    expect(existsSync(replicaDir(stateDir, repoId))).toBe(false);
+  });
+
+  it('refuses a forged envelope even in a batch the cursor already covers', async () => {
+    registry('registry.repo_added');
+    const m = await mini();
+    await vi.waitFor(() => expect(m.resumes).toHaveLength(1));
+    await m.send(9, [env('task.created')]);
+    await vi.waitFor(() => expect(conductor.tasks(repoId)?.tasks.t1).toBeDefined());
+    await m.send(3, [env('task.created', 't', { source: { kind: 'conductor', id: 'x' } })]);
+    expect((await m.c.closed).code).toBe(1008);
+  });
+
+  it('keeps its cursor across a Conductor restart', async () => {
+    registry('registry.repo_added');
+    const first = await mini();
+    await vi.waitFor(() => expect(first.resumes).toHaveLength(1));
+    await first.send(12, [env('task.created')]);
+    await vi.waitFor(() => expect(conductor.tasks(repoId)?.tasks.t1).toBeDefined());
+    await conductor.close();
+    clients.splice(0);
+    conductor = await startConductor({ stateDir, runDir, syncIntervalMs: 30 });
+    const again = await mini();
+    await vi.waitFor(() => expect(again.resumes).toEqual([{ logId: 'log-a', afterSeq: 12 }]));
+    expect(conductor.tasks(repoId)?.tasks.t1).toBeDefined();
+  });
+
+  it('treats a repo removed and added again as a new registration', async () => {
+    registry('registry.repo_added');
+    const m = await mini();
+    await vi.waitFor(() => expect(m.resumes).toHaveLength(1));
+    await m.send(4, [env('task.created')]);
+    await vi.waitFor(() => expect(conductor.tasks(repoId)?.tasks.t1).toBeDefined());
+    // Both before the Conductor next looks.
+    registry('registry.repo_removed');
+    registry('registry.repo_added');
+    expect((await m.c.closed).code).toBe(1000);
+    const again = await mini();
+    // Forwarded from the start, into a replica begun again.
+    await vi.waitFor(() => expect(again.resumes).toEqual([{}]));
+    expect(conductor.tasks(repoId)?.tasks ?? {}).toEqual({});
   });
 });

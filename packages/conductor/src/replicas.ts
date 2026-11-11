@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  CONDUCTOR_LOCAL_EVENT_NAMESPACES,
   EVENT_BATCH_MAX_BYTES,
   EventEnvelope,
   isForwardable,
@@ -22,6 +23,7 @@ export type TakeResult =
   | { ok: false; violation: string };
 
 const CURSOR = 'x.cursor';
+const REGISTRATION = 'x.registration';
 const REPO_ID = /^[0-9a-f]{16}$/;
 
 /**
@@ -77,22 +79,26 @@ export function replicas(stateDir: string) {
       if (!parsed.success) return { ok: false, violation: 'invalid event batch' };
       const batch = parsed.data;
       if (batch.logId !== logId) return { ok: false, violation: 'event batch of another log' };
-      const at = this.cursor(repoId);
-      // From before a later resume on this log: already covered.
-      if (at && at.logId === logId && batch.throughSeq <= at.seq) {
-        return { ok: true, stored: 0, skipped: batch.events.length };
-      }
       const keep: Record<string, unknown>[] = [];
       for (const raw of batch.events) {
         const env = EventEnvelope.safeParse(raw);
         // The envelope's shape is the protocol major's (§2): one that does not parse is a fault.
         if (!env.success) return { ok: false, violation: 'invalid event envelope' };
-        if (env.data.source.kind === 'conductor' || env.data.type.startsWith('registry.')) {
+        const ns = env.data.type.split('.', 1)[0] ?? '';
+        if (
+          env.data.source.kind === 'conductor' ||
+          (CONDUCTOR_LOCAL_EVENT_NAMESPACES as readonly string[]).includes(ns)
+        ) {
           return { ok: false, violation: 'event batch claims the Conductor' };
         }
         // Allowlisted namespaces are kept whole, a type this version does not know included, so a
         // newer Mini-conductor's events survive until the Conductor is upgraded to read them.
         if (isForwardable(env.data.type)) keep.push(raw);
+      }
+      // Checked after every refusal above: a batch the cursor already covers changes nothing.
+      const at = this.cursor(repoId);
+      if (at && at.logId === logId && batch.throughSeq <= at.seq) {
+        return { ok: true, stored: 0, skipped: batch.events.length };
       }
       const result = store(repoId).append(keep, {
         meta: { [CURSOR]: JSON.stringify({ logId, seq: batch.throughSeq }) },
@@ -100,8 +106,26 @@ export function replicas(stateDir: string) {
       return { ok: true, stored: result.appended, skipped: batch.events.length - keep.length };
     },
 
+    /**
+     * Mark the repo's replica as kept under `registration` (the `registry.repo_added` id), made if
+     * need be. A replica kept under another registration is begun again first.
+     */
+    adopt(repoId: string, registration: string): void {
+      if (this.registration(repoId) !== registration) {
+        this.remove(repoId);
+        store(repoId).append([], { meta: { [REGISTRATION]: registration } });
+      }
+    },
+
+    /** The registration the repo's replica is kept under, if it has one. */
+    registration(repoId: string): string | undefined {
+      if (!open.has(repoId) && !existsSync(join(dirOf(repoId), 'events.db'))) return undefined;
+      return store(repoId).meta(REGISTRATION);
+    },
+
     /** The repo's tasks as its forwarded events have them. */
     tasks(repoId: string): TasksState | undefined {
+      if (!REPO_ID.test(repoId)) return undefined;
       if (!open.has(repoId) && !existsSync(join(dirOf(repoId), 'events.db'))) return undefined;
       return store(repoId).replay(tasksProjection);
     },
