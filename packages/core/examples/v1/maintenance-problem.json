@@ -1,0 +1,5 @@
+{
+  "op": "gc",
+  "message": "cannot remove <worktrees>/worker-1-0f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a: Permission denied",
+  "workspaceId": "worker-1-0f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a"
+}

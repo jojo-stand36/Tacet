@@ -88,7 +88,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   if (!tasks) {
     const store = openLog(paths);
     if (!store) {
-      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [] }));
+      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [], problems: [] }));
       else io.out(`no Tacet state for ${repoRoot}`);
       return 0;
     }
@@ -98,8 +98,10 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
       store.close();
     }
   }
+  // Kept in the log only, whoever answered for the tasks (#254).
+  const problems = readProblems(paths);
   if (o.json) {
-    io.out(safeJson({ running: pid ?? null, source, tasks }));
+    io.out(safeJson({ running: pid ?? null, source, tasks, problems: problems.map(problemJson) }));
     return 0;
   }
   io.out(
@@ -109,7 +111,22 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   );
   if (tasks.length === 0) io.out('no tasks');
   for (const t of tasks) io.out(formatStatusEntry(t));
+  if (problems.length > 0) {
+    io.out('maintenance problems (latest first):');
+    for (const p of problems) io.out(`  ${formatEvent(p.envelope)}`);
+  }
   return 0;
+}
+
+/** The recent maintenance problems in the repo's log (#254); none without a log. */
+function readProblems(paths: Parameters<typeof openLog>[0]): StoredEvent[] {
+  const store = openLog(paths);
+  if (!store) return [];
+  try {
+    return recentProblems(store);
+  } finally {
+    store.close();
+  }
 }
 
 /**
@@ -279,4 +296,29 @@ function sessionOf(e: StoredEvent): string | undefined {
 
 function print(io: Io, e: StoredEvent, json?: boolean) {
   io.out(json ? safeJson(e.raw, 0) : formatEvent(e.envelope));
+}
+
+/**
+ * The Mini-conductor's latest upkeep failures (#254): at most 5, from the last 7 days, newest
+ * first. Nothing records that one was fixed, so older ones are not shown.
+ */
+function recentProblems(store: EventStore, now = Date.now()): StoredEvent[] {
+  const since = new Date(now - 7 * 86_400_000).toISOString();
+  return store
+    .query({ typePrefix: 'maintenance.problem' })
+    .filter((e) => e.envelope.ts >= since)
+    .slice(-5)
+    .reverse();
+}
+
+/** A problem as `tacet status --json` shows it. */
+function problemJson(e: StoredEvent): Record<string, unknown> {
+  const d = (e.envelope.data ?? {}) as Record<string, unknown>;
+  return {
+    ts: e.envelope.ts,
+    op: d.op,
+    message: d.message,
+    ...(e.envelope.taskId !== undefined ? { taskId: e.envelope.taskId } : {}),
+    ...(typeof d.workspaceId === 'string' ? { workspaceId: d.workspaceId } : {}),
+  };
 }
