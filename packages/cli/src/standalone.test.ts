@@ -618,7 +618,9 @@ ws.close();
             await tacet(['answer', ...user(), escId, 'MySQL'], { prompt: async () => 'ZZZZZZZZ' })
           ).err;
           seen.answer = (
-            await tacet(['answer', ...user(), escId, 'Postgres'], { prompt: async () => code })
+            await tacet(['answer', ...user(), escId, 'Postgres', '--repo-wide'], {
+              prompt: async () => code,
+            })
           ).code;
           // Left on the terminal: it was answered over the port meanwhile.
           return '';
@@ -655,6 +657,20 @@ ws.close();
         .map((e) => e.envelope.data);
       store.close();
       expect(resolved).toEqual([expect.objectContaining({ escalationId: escId, source: 'user' })]);
+      // The user's answer is their decision, kept for the repo as they asked (#25).
+      const again = openEventStore(paths.events);
+      const decisions = again
+        .query({ typePrefix: 'decision.recorded' })
+        .map((e) => e.envelope.data);
+      again.close();
+      expect(decisions).toEqual([
+        expect.objectContaining({
+          escalationId: escId,
+          decision: 'Postgres',
+          scope: 'repo',
+          source: 'user',
+        }),
+      ]);
       // Counted as one escalation that reached the user (#25).
       const counted = JSON.parse((await tacet(['status', ...user(), '--json'])).out);
       expect(counted.escalations.total).toMatchObject({

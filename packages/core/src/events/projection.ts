@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { Usage } from '../schema/agent-event.js';
 import { Id, openEnum, Ulid } from '../schema/common.js';
-import { Decision } from '../schema/decision.js';
+import { Decision, DecisionSource } from '../schema/decision.js';
 import type { EventEnvelope } from '../schema/envelope.js';
 import { Escalation } from '../schema/escalation.js';
 import { TaskPlan } from '../schema/plan.js';
@@ -60,6 +60,8 @@ export const TaskEventData = {
     escalationId: Ulid,
     decisionId: Ulid.optional(),
     answer: z.string().optional(),
+    /** Who answered: the user, or the gate (`policy`, `precedent`, `mini`). Absent in older logs. */
+    source: DecisionSource.optional(),
   }),
   'decision.recorded': Decision,
   'handoff.accepted': z.object({ handoffId: Ulid, sessionId: Id }),

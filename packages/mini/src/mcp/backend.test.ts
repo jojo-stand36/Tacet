@@ -337,6 +337,72 @@ describe('EventLogBackend', () => {
     });
   });
 
+  it('never lets a late gate answer resolve what the user has answered (#25)', async () => {
+    let release: (v: { answer: string; source: 'mini' }) => void = () => {};
+    const late = make({
+      gate: () =>
+        new Promise((r) => {
+          release = r;
+        }),
+      gateTimeoutMs: 10,
+    });
+    const esc = await late.escalate(W1, { question: 'q3', urgency: 'low' });
+    // The user answers while the gate is still at work.
+    store.append({
+      v: 1,
+      id: newUlid(),
+      ts: NOW,
+      source: { kind: 'mini', id: 'mini' },
+      taskId: 'task-1',
+      type: 'escalation.resolved',
+      data: { escalationId: esc.escalationId, answer: 'mine', source: 'user' },
+    });
+    release({ answer: 'the gate', source: 'mini' });
+    await new Promise((r) => setImmediate(r));
+    const answers = store
+      .query({ typePrefix: 'escalation.resolved' })
+      .map((e) => (e.envelope.data as { answer: string }).answer);
+    expect(answers).toEqual(['mine']);
+  });
+
+  it('asks to approve or reject a repo-wide proposal (#25)', async () => {
+    const r = await make().recordDecision(W1, { topic: 'db', decision: 'postgres', scope: 'repo' });
+    const raised = store.query({ typePrefix: 'escalation.raised' }).at(-1)?.envelope.data;
+    expect(raised).toMatchObject({
+      id: r.escalationId,
+      category: 'decision',
+      options: ['approve', 'reject'],
+      proposedDecision: { decisionId: r.decisionId, scope: 'repo' },
+    });
+  });
+
+  it("leaves the user's answer standing when the gate answers in time after it (#25)", async () => {
+    const b = make({
+      gate: async (esc: { id: string }) => {
+        // The user answers while the gate works, and the gate still answers within its time.
+        store.append({
+          v: 1,
+          id: newUlid(),
+          ts: NOW,
+          source: { kind: 'mini', id: 'mini' },
+          taskId: 'task-1',
+          type: 'escalation.resolved',
+          data: { escalationId: esc.id, answer: 'mine', source: 'user' },
+        });
+        return { answer: 'the gate', source: 'mini' as const };
+      },
+    });
+    const r = await b.escalate(W1, { question: 'q4', urgency: 'low' });
+    // Pending, so the daemon delivers the user's answer; nothing marks the gate's as delivered.
+    expect(r.status).toBe('pending');
+    expect(
+      store
+        .query({ typePrefix: 'escalation.resolved' })
+        .map((e) => (e.envelope.data as { answer: string }).answer),
+    ).toEqual(['mine']);
+    expect(store.query({ typePrefix: 'escalation.delivered' })).toEqual([]);
+  });
+
   it('writes escalations as escalationStats counts them (#25)', async () => {
     await make({ gate: async () => ({ answer: 'a', source: 'precedent' as const }) }).escalate(W1, {
       question: 'answered by precedent',
