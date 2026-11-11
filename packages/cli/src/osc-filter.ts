@@ -37,8 +37,21 @@ const CLIPBOARD_KEYS = new Set(['copy', 'copytoclipboard', 'endcopy']);
  * encoded output.
  */
 const DCS_FINALS = new Set([0x71]);
+/** The intermediates an ESC sequence may have: SP # % ( ) * + - . / */
+const PERCENT = 0x25;
+const ESC_INTERMEDIATES = new Set([0x20, 0x23, PERCENT, 0x28, 0x29, 0x2a, 0x2b, 0x2d, 0x2e, 0x2f]);
+/** Final bytes that start a string (in GNU screen, also after intermediates): P X [ ] ^ _ k ! " */
+const STRING_FINALS = new Set([0x50, 0x58, 0x5b, 0x5d, 0x5e, 0x5f, 0x6b, 0x21, 0x22]);
 /** C1 controls that start a string: DCS, SOS, OSC, PM, APC. */
 const C1_STRINGS = new Set([0x90, 0x98, 0x9d, 0x9e, 0x9f]);
+
+/** The code point of a complete, valid UTF-8 character. */
+function codePoint(bytes: number[]): number {
+  const [a = 0, b = 0, c = 0, d = 0] = bytes;
+  if (bytes.length === 2) return ((a & 0x1f) << 6) | (b & 0x3f);
+  if (bytes.length === 3) return ((a & 0x0f) << 12) | ((b & 0x3f) << 6) | (c & 0x3f);
+  return ((a & 0x07) << 18) | ((b & 0x3f) << 12) | ((c & 0x3f) << 6) | (d & 0x3f);
+}
 
 type Mode =
   | 'ground'
@@ -61,22 +74,30 @@ type Mode =
  * Terminals read malformed sequences in different ways (xterm.js drops invalid UTF-8 bytes inside
  * one, kitty reads at most five bytes of an OSC number, tmux and iTerm2 unwrap `ESC x` inside a
  * DCS, iTerm2 skips `ESC ]` inside an OSC, 8-bit terminals take a lone 9D for an OSC), so it does
- * not try to read them each terminal's way. It passes on only well-formed text and sequences,
- * which every terminal reads alike, and drops or ends the rest:
+ * not try to read them each terminal's way. It passes on only well-formed text and sequences, and
+ * drops or ends the rest:
  * - Text: printable characters and C0 controls pass. Bytes that are not UTF-8 become U+FFFD. C1
  *   controls (U+0080..U+009F) are dropped, one that starts a string with its string.
- * - An ESC or CSI sequence passes when it is well formed. C0 controls inside one are sent before
- *   it, as terminals run them in place; DEL inside one is dropped; anything else drops it.
+ * - An ESC sequence passes when it is well formed with an allowed intermediate (SP # ( ) * + - .
+ *   /); one that starts a string in GNU screen (a string introducer after intermediates, ESC k,
+ *   ESC !, ESC ") or switches the encoding (ESC %, except ESC % G back to UTF-8) is dropped. A
+ *   CSI passes when well formed; one longer than 256 bytes is dropped whole. C0 controls inside
+ *   either are sent before it, as terminals run them in place; DEL inside one is dropped.
  * - An OSC passes when its number is plain digits (no leading zero, at most 5) followed by `;` or
- *   its end, and the number (or iTerm2 key) is not blocked. Its text must be printable or UTF-8
- *   characters from U+00A0 up; anything else ends it there with `ESC \` and is read as text.
+ *   its end, and the number (or iTerm2 key) is not blocked. Its text may hold printable or UTF-8
+ *   characters from U+00A0 up; C0 controls and DEL in it are skipped; CAN, SUB, an ESC that is
+ *   not ST, or a byte that is not UTF-8 ends it there with `ESC \`.
  * - A DCS with final byte `q`, and an APC (kitty graphics), pass the same way with printable
- *   ASCII text. Other DCS, SOS and PM are dropped.
+ *   ASCII text (other bytes skipped; BEL ends them). Other DCS, SOS and PM are dropped.
  *
- * A dropped sequence is dropped as it streams, never buffered, up to BEL, `ESC \` or the next
- * ESC, and after `maxDrop` bytes the rest passes as text, so an unterminated one cannot hide the
- * rest of the terminal. Only a sequence's introducer, number and key are held back, at most
- * `MAX_SEQ` bytes.
+ * A dropped sequence is dropped as it streams, never buffered, up to BEL, `ESC \`, U+009C, CAN,
+ * SUB or the next ESC, and after `maxDrop` bytes the rest passes as text, so an unterminated one
+ * cannot hide the rest of the terminal. Only a sequence's introducer, number and key are held
+ * back, at most `MAX_SEQ` bytes.
+ *
+ * Open (#302): GNU screen keeps only the low byte of each character of an OSC title and re-sends
+ * it to the outer terminal, so a title of characters whose low bytes are control bytes can still
+ * reach it as an escape sequence. Whether titles give up characters for that is the owner's call.
  */
 export class OscFilter {
   #mode: Mode = 'ground';
@@ -178,16 +199,31 @@ export class OscFilter {
             this.#mode = 'stringBody';
             return false;
           }
-          // SOS, PM.
-          if (b === 0x58 || b === 0x5e) return this.#drop(false);
+          // SOS, PM, and GNU screen's strings (ESC k title, ESC ! and ESC ").
+          if (b === 0x58 || b === 0x5e || b === 0x6b || b === 0x21 || b === 0x22) {
+            return this.#drop(false);
+          }
         }
         if (this.#seq.length >= MAX_SEQ) return this.#drop(false);
-        this.#seq.push(b);
-        // 20..2F are intermediates; anything else is the final byte.
-        if (b >= 0x30) {
-          this.#emitSeq();
-          this.#mode = 'ground';
+        if (b < 0x30) {
+          // Intermediates: only those of charset designation, DEC line and screen attributes,
+          // and ESC SP's announcers; `%` (encoding switch) is checked with its final byte.
+          if (!ESC_INTERMEDIATES.has(b)) return this.#abort(false);
+          this.#seq.push(b);
+          return false;
         }
+        // The final byte. After an intermediate, a string introducer still starts a string in
+        // GNU screen; ESC % switches the encoding (iTerm2 to Latin-1, with 8-bit controls), and
+        // only ESC % G, back to UTF-8, passes.
+        if (this.#seq.length > 1) {
+          if (STRING_FINALS.has(b)) return this.#abort(false);
+          if (this.#seq.includes(PERCENT) && !(this.#seq.length === 2 && b === 0x47)) {
+            return this.#abort(false);
+          }
+        }
+        this.#seq.push(b);
+        this.#emitSeq();
+        this.#mode = 'ground';
         return false;
 
       case 'csi':
@@ -295,7 +331,15 @@ export class OscFilter {
           this.#emit(b);
           return false;
         }
-        // Anything else may not be in it: it ends there, and the byte is read as text.
+        // BEL ends a DCS or APC in kitty and not elsewhere: ended here for all.
+        if (b === BEL) {
+          this.#close();
+          return false;
+        }
+        // Other C0 controls and DEL (and, in DCS or APC, bytes from 80): skipped, as terminals
+        // skip C0 inside a string; iTerm2 would take some bytes from 80 as 8-bit controls.
+        if (b !== CAN && b !== SUB) return false;
+        // CAN and SUB end it (not in kitty or tmux): ended with ST for all, then sent as text.
         this.#close();
         return true;
       }
@@ -373,7 +417,7 @@ export class OscFilter {
       if (--this.#need > 0) return true;
       const bytes = this.#utf8;
       this.#utf8 = [];
-      return done(bytes, Buffer.from(bytes).toString('utf8').codePointAt(0) ?? 0);
+      return done(bytes, codePoint(bytes));
     }
     // Lead bytes, with the range their next byte must be in (no overlong forms, no surrogates).
     if (b >= 0xc2 && b <= 0xdf) this.#lead(b, 1, 0x80, 0xbf);
@@ -409,11 +453,11 @@ export class OscFilter {
     return false;
   }
 
-  /** The sequence is malformed: dropped, and the byte read as text. */
-  #abort(): true {
+  /** The sequence is malformed: dropped, and (`again`) the byte read as text, or dropped too. */
+  #abort(again = true): boolean {
     this.#seq = [];
     this.#mode = 'ground';
-    return true;
+    return again;
   }
 
   /**

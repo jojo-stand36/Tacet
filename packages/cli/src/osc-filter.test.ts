@@ -151,17 +151,48 @@ describe('OscFilter (#302)', () => {
     expect(everySplit(bytes(`a${E}Ptmux;x\x18\x07${ST}b`))).toBe(`a\x07${ST}b`);
   });
 
+  it('drops ESC sequences that start a string or switch the encoding in some terminal', () => {
+    for (const h of [
+      // GNU screen starts a DCS (and other strings) after intermediates, and has ESC k, ESC !.
+      '1b 20 50 1b 5d 35 1b 5c 1b 20 50 32 3b 63 3b 5a 6d 39 76 07 1b 5c',
+      '1b 23 5d 35 32 3b 63 3b 41 07',
+      '1b 6b 74 69 74 6c 65 1b 5c',
+      '1b 21 78 1b 5c',
+      // ESC % @: iTerm2 switches to Latin-1 with 8-bit controls; then 9C 9D inside a title.
+      '1b 25 40 1b 5d 30 3b e1 9c 9d 35 32 3b 63 3b 5a 6d 39 76 07',
+      // An intermediate no terminal sequence uses.
+      '1b 21 21 41',
+    ]) {
+      const out = everySplit(hex(`61 ${h} 62`));
+      expect(out.includes(`${E} P`) || out.includes(`${E}%@`), h).toBe(false);
+      expect(out.includes(`${E}]52`), h).toBe(false);
+      expect(out.includes(`${E}k`) || out.includes(`${E}!`), h).toBe(false);
+    }
+    // Back to UTF-8, charsets, DEC line attributes and ESC SP announcers pass.
+    const kept = bytes(`${E}%G${E}(0${E})B${E}#8${E} F`);
+    expect(everySplit(kept)).toBe(dec(kept));
+  });
+
+  it('skips C0 controls inside a string, as terminals do, and ends it on CAN, SUB or BEL', () => {
+    // A sixel image with its line breaks, and a title with a tab.
+    const sixel = bytes(`${E}Pq#0~~
+-#0~~${ST}`);
+    expect(everySplit(sixel)).toBe(`${E}Pq#0~~-#0~~${ST}`);
+    expect(everySplit(bytes(`${E}]0;a	b`))).toBe(`${E}]0;ab`);
+    expect(everySplit(bytes(`${E}]0;ab`))).toBe(`${E}]0;a${ST}b`);
+    expect(everySplit(bytes(`${E}Pq#0x`))).toBe(`${E}Pq#0${ST}x`);
+  });
+
   it('ends a string at a byte that may not be in it, and reads that byte as text', () => {
-    // A C0 control, an ESC that is not ST, invalid UTF-8 or a C1 control inside a title.
-    expect(everySplit(bytes(`${E}]0;t\nX`))).toBe(`${E}]0;t${ST}\nX`);
+    // An ESC that is not ST, invalid UTF-8 or a C1 control inside a title.
     expect(everySplit(bytes(`${E}]0;t${E}]52;c;QQ==\x07after`))).toBe(`${E}]0;t${ST}after`);
     expect(everySplit(bytes(`${E}]0;t\xc2\x9d52;c;QQ==\x07after`))).toBe(
       `${E}]0;t${ST}52;c;QQ==\x07after`,
     );
     expect(everySplit(bytes(`${E}]0;t\x9c${E}]52;c;QQ==\x07after`))).toBe(`${E}]0;t${ST}after`);
     expect(everySplit(bytes(`${E}]0;t${E}cX`))).toBe(`${E}]0;t${ST}${E}cX`);
-    // DCS and APC text is printable ASCII only.
-    expect(everySplit(bytes(`${E}Pq#0\xc3\xa9${ST}`))).toBe(`${E}Pq#0${ST}\xc3\xa9${ST}`);
+    // DCS and APC text is printable ASCII only: other bytes are skipped.
+    expect(everySplit(bytes(`${E}Pq#0\xc3\xa9${ST}`))).toBe(`${E}Pq#0${ST}`);
   });
 
   it('runs C0 controls inside an ESC sequence or CSI before it, as terminals do', () => {

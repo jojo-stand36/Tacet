@@ -172,9 +172,10 @@ export async function logs(
  * `tacet attach <session | task/n>`: follow one Worker session from the log as it runs, until it
  * ends. Given a sub-task, its latest session, then each one that replaces it. A PTY Worker
  * running in a live run is shown as its terminal instead, live from the run's port (#201), when
- * the output is a terminal and not `--json`: until that session ends. Its clipboard writes (OSC
- * 52, kitty's 5522, iTerm2's 1337 copy keys) never reach the user's terminal (#302); everything
- * else, window titles included, does.
+ * the output is a terminal and not `--json`: until that session ends. Its bytes go through
+ * `OscFilter` (#302): clipboard writes (OSC 52, kitty's 5522, iTerm2's 1337 copy keys) are
+ * removed, and only well-formed text and sequences pass; window titles, hyperlinks, colours and
+ * images do.
  */
 export async function attach(
   io: Io,

@@ -269,21 +269,21 @@ Also recorded:
 
 ### Addendum (2026-11-10): live terminal attach, `/pty/<sessionId>` (#201)
 
-Status of this addendum: **accepted** on 2026-11-11, approved by the owner on PR #267 ([comment 6802114697](https://github.com/jojo-stand36/Tacet/pull/267#issuecomment-6802114697): "Approved: /pty ADR-003 addendum"). The owner also decided that the attach client strips OSC 52 (clipboard writes) from the Worker's terminal bytes; window titles stay allowed. That filter is #302. Terminals read malformed escape sequences differently. For example, xterm.js drops invalid UTF-8 bytes inside one, kitty reads at most five bytes of an OSC number, tmux and iTerm2 unwrap `ESC x` inside a DCS, and iTerm2 skips `ESC ]` inside an OSC. So `tacet attach` does not try to read the Worker's bytes each terminal's way. It passes on only well-formed text and sequences, which every terminal reads alike:
+Status of this addendum: **accepted** on 2026-11-11, approved by the owner on PR #267 ([comment 6802114697](https://github.com/jojo-stand36/Tacet/pull/267#issuecomment-6802114697): "Approved: /pty ADR-003 addendum"). The owner also decided that the attach client strips OSC 52 (clipboard writes) from the Worker's terminal bytes; window titles stay allowed. That filter is #302. Terminals read malformed escape sequences differently. For example, xterm.js drops invalid UTF-8 bytes inside one, kitty reads at most five bytes of an OSC number, tmux and iTerm2 unwrap `ESC x` inside a DCS, and iTerm2 skips `ESC ]` inside an OSC. So `tacet attach` does not try to read the Worker's bytes each terminal's way. It passes on only well-formed text and sequences, which removes most of those differences:
 
 - Text: bytes that are not UTF-8 become U+FFFD, and C1 controls are dropped.
-- ESC and CSI sequences pass only when well formed.
-- An OSC passes only with a plain number: digits, no leading zero, at most 5, followed by `;` or its end. Its text must be printable; anything else ends it with `ESC \`.
+- ESC and CSI sequences pass only when well formed and allowed. ESC sequences that start a string in GNU screen, and `ESC %` encoding switches other than `ESC % G`, are dropped.
+- An OSC passes only with a plain number: digits, no leading zero, at most 5. Its text must be printable.
 
 Within that, it drops:
 
 - OSC 52, and numbers that wrap to it in 8 or 16 bits.
 - kitty's OSC 5522.
 - iTerm2's OSC 1337 (or 50) with a `Copy`, `CopyToClipboard` or `EndCopy` key.
-- Every DCS but `q` (sixel, DECRQSS, XTGETTCAP). This covers tmux passthrough (`ESC P tmux; …`), which tmux and iTerm2 both unwrap and read as terminal input, and iTerm2's `p` hooks. It also drops images a Worker sends through tmux.
+- Every DCS but `q` (sixel, DECRQSS, XTGETTCAP). This covers tmux passthrough, which tmux and iTerm2 unwrap, and iTerm2's `p` hooks. It also drops images a Worker sends through tmux.
 - SOS and PM.
 
-iTerm2's other keys, inline images among them, and kitty's APC graphics pass. The facts are in capability matrix §5b. It assumes the user's terminal decodes UTF-8. Attach sends `ESC \` when it ends, to close a string a Worker left open. §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
+iTerm2's other keys, inline images among them, and kitty's APC graphics pass. The facts are in capability matrix §5b. It assumes the user's terminal decodes UTF-8, and it keeps a Worker from switching it away (`ESC % @`). Attach sends `ESC \` when it ends, to close a string a Worker left open. Well-formed output is not read alike everywhere: GNU screen keeps only the low byte of each character of an OSC title and re-sends it, so a title can still reach the outer terminal as an escape sequence. This is open in #302, for the owner to decide (titles in ASCII only, or characters whose low byte is a control byte replaced). §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
 
 1. **What `<sessionId>` names.** The Worker session id, the one in `worker.started` (AG-UI `runId`), not the `sessionId` a hello returns. It is a plain token (`[A-Za-z0-9._-]`, at most 128 characters); any other path is 404.
 2. **Authenticated at the upgrade only, no hello.** The upgrade passes the same checks as `/`, in this order: Host and Origin, then the bearer token, then the path, so nobody without the token learns which sessions exist. No hello is said: no protocol message travels on the socket, and the protocol version is the runtime file's `protocolVersions`. This is the one exception to §3.6.
