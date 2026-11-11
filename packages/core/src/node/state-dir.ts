@@ -118,3 +118,9 @@ export function conductorStatePaths(stateDir: string = defaultStateDir()): Condu
   const dir = join(stateDir, 'conductor');
   return { dir, events: join(dir, 'events.db'), lock: join(dir, 'conductor.lock') };
 }
+
+/**
+ * Exit code of `tacet mini` when its repo has unfinished tasks (#23): only the user resumes those
+ * (`tacet run --resume`), so the Conductor's auto-start does not start it again until they have.
+ */
+export const MINI_EXIT_UNFINISHED = 4;

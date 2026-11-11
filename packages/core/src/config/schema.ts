@@ -244,6 +244,13 @@ export const TacetConfig = z.strictObject({
     .strictObject({ remove_merged: z.boolean(), idle_days: z.number().int().min(0) })
     .partial()
     .optional(),
+  /**
+   * The Conductor (#23). With `autostart` on, `tacet up` starts a Mini-conductor (`tacet mini`)
+   * for each registered repo that has none; one with unfinished tasks refuses to start and is not
+   * retried. Off by default (owner decision on #23). Only the user layer may set it: a repo's
+   * committed config must not make the user's Conductor start processes.
+   */
+  conductor: z.strictObject({ autostart: z.boolean() }).partial().optional(),
 });
 /** One config file as written: every key is optional. */
 export type TacetConfig = z.infer<typeof TacetConfig>;
@@ -267,6 +274,7 @@ export const DEFAULT_CONFIG = {
     verify_fix_attempts: 2,
   },
   worktrees: { remove_merged: true, idle_days: 7 },
+  conductor: { autostart: false },
 } satisfies TacetConfig;
 
 /** Checks that only make sense on the merged result. */

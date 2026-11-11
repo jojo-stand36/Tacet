@@ -66,6 +66,12 @@ export interface AcpAgentSpec {
   /** Variables never passed to the agent, whatever the allowlist or the user's passthrough. */
   envDeny?: readonly string[];
   /**
+   * Variables of the user's environment never passed to the agent, whatever the allowlist or the
+   * user's passthrough (`workers.env.pass`); unlike `envDeny`, the spec's own `env` and the
+   * session's may still set them (#183).
+   */
+  userEnvDeny?: readonly string[];
+  /**
    * The ACP session mode every session is put in right after it opens (#145), for agents whose
    * default runs tools without asking. Set by the `mode` config option, or `session/set_mode` when
    * the agent has none; a session the agent can't put in this mode fails to start. The mode
@@ -295,11 +301,12 @@ export function codexAcpConfig(baseUrl = 'https://api.openai.com/v1'): string {
 export const CODEX_ACP_AGENT: AcpAgentSpec = {
   id: 'codex-acp',
   command: ['codex-acp'],
-  // Interim default while the owner decides #183: verified live (#181), it marks every session
+  // Settled (owner decision on #183, 2026-11-11). Verified live (#181): it marks every session
   // root trusted after any config Tacet can pass, so a Worker-written checkout's
-  // `.codex/config.toml` (an MCP server command ran) and AGENTS.md apply.
+  // `.codex/config.toml` (an MCP server command ran) and AGENTS.md apply. Refused until
+  // codex-acp offers a way to keep a session root untrusted (asked upstream, #183).
   workerRefused:
-    'it trusts every session directory itself, so a checkout a Worker or anyone else wrote can run commands through its .codex/config.toml; Tacet cannot turn that off (interim default until #183 is decided; use codex-app-server)',
+    'it trusts every session directory itself, so a checkout a Worker or anyone else wrote can run commands through its .codex/config.toml; Tacet cannot turn that off (#183; use codex-app-server)',
   env: { NO_BROWSER: '1' },
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
   apiKeyEnv: ['OPENAI_API_KEY'],
@@ -311,6 +318,10 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   home: { env: 'CODEX_HOME', files: { 'config.toml': codexAcpConfig() } },
   // `CODEX_API_KEY` would be a second key route besides the provider's `env_key` (#145).
   envDeny: ['CODEX_API_KEY'],
+  // The user's own Codex config and binary, which the `CODEX_` prefix would let through: never
+  // from the user's environment, whatever the policy (interactive sessions too); only this spec
+  // or the session's own variables, which Tacet sets, could (#183).
+  userEnvDeny: ['CODEX_CONFIG', 'CODEX_PATH'],
   // It starts in `agent` ("Auto review: only ask for actions detected as potentially unsafe").
   // `workspace-write` is the native adapter's default (`on-request`): edits in the checkout run in
   // the sandbox, and leaving it (other files, the network) asks. `read-only` asks for every edit.
