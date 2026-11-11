@@ -6,6 +6,11 @@ import type { SpawnDetached } from './commands/detach.js';
 export interface Io {
   out: (text: string) => void;
   err: (text: string) => void;
+  /**
+   * Bytes to standard output as they are, for a Worker's live terminal (`tacet attach`, #201).
+   * Absent, `attach` follows the log instead.
+   */
+  raw?: (bytes: Uint8Array) => void;
   cwd: string;
   /** The user's environment, for Workers. Default `process.env`. */
   env?: Record<string, string | undefined>;

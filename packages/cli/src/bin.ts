@@ -39,6 +39,8 @@ const log =
 process.exitCode = await main(process.argv.slice(2), {
   out: log ?? ((t) => process.stdout.write(`${t}\n`)),
   err: log ?? ((t) => process.stderr.write(`${t}\n`)),
+  // A Worker's terminal on a terminal only: piped, `attach` prints its events instead.
+  ...(process.stdout.isTTY ? { raw: (b: Uint8Array) => process.stdout.write(b) } : {}),
   cwd: process.cwd(),
   signal: abort.signal,
   ...(prompt ? { prompt } : {}),

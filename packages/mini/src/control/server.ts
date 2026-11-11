@@ -26,7 +26,7 @@ import type { MiniConductor } from '../daemon/daemon.js';
 import type { AnswerCodes } from './answer-codes.js';
 
 export interface MiniControlOptions {
-  mini: Pick<MiniConductor, 'answer' | 'cancel'>;
+  mini: Pick<MiniConductor, 'answer' | 'cancel'> & Partial<Pick<MiniConductor, 'terminalStream'>>;
   store: EventStore;
   /** The A2A `contextId` of every task: the repo's id (a standalone task has no wider context). */
   contextId: string;
@@ -81,6 +81,10 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
     token: o.token,
     // The CLI only: a Mini-conductor dials the Conductor, never another Mini-conductor.
     roles: ['cli'],
+    // A PTY Worker's terminal, live, for `tacet attach` (ADR-003 §5).
+    ...(o.mini.terminalStream
+      ? { pty: (id: string, left: AbortSignal) => o.mini.terminalStream?.(id, left) }
+      : {}),
     serverInfo: o.serverInfo ?? { name: 'tacet-mini', version: '0.0.0' },
     ...(o.onError ? { onError: o.onError } : {}),
     handlers: {

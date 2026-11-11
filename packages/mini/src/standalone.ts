@@ -42,6 +42,8 @@ export interface StandaloneOptions {
   home?: string;
   /** Told the names (never values) of variables a Worker's environment left out. */
   onEnvDropped?: (adapterId: string, names: string[]) => void;
+  /** Told when a Worker starts with a risk to know about (#291). */
+  onWarning?: (adapterId: string, message: string) => void;
   /** Plan every task as one sub-task, even when `tiers.mini` is set. */
   singleStep?: boolean;
   /** Told about MCP server failures (message only). */
@@ -103,6 +105,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       baseEnv,
       withPlanner: !o.singleStep,
       ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
+      ...(o.onWarning ? { onWarning: o.onWarning } : {}),
       codex: { ...o.workers?.codex, stateDir },
       acp: { ...o.workers?.acp, stateDir },
       claude: { ...o.workers?.claude, stateDir },

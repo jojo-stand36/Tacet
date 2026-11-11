@@ -9,8 +9,9 @@ import { Id, openEnum } from './common.js';
 
 /**
  * Which upkeep failed: the start-time worktree `reconcile` (#126, including removing planner
- * checkouts a crash left, #238), the `landed` sweep (#210), idle `gc` (#238), or deleting finished
- * tasks' pin refs (`unpin`, #247). Unknown values read as `other`.
+ * checkouts a crash left, #238, and clearing the sandbox placeholders a crashed Claude session left
+ * in its checkout, #285), the `landed` sweep (#210), idle `gc` (#238), or deleting finished tasks'
+ * pin refs (`unpin`, #247). Unknown values read as `other`.
  */
 export const MaintenanceOp = openEnum(['reconcile', 'landed', 'gc', 'unpin', 'other'], 'other');
 export type MaintenanceOp = z.infer<typeof MaintenanceOp>;
