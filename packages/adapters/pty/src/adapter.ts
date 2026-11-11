@@ -6,10 +6,12 @@ import { fileURLToPath } from 'node:url';
 import {
   authEnv,
   claudeEnvAllow,
-  placeholderSnapshot,
   removeClaudeConfigDir,
-  removeSandboxPlaceholders,
+  removeSandboxResidue,
   repoOf,
+  residueSnapshot,
+  SANDBOX_ENV,
+  type SandboxResidue,
   sweepClaudeConfigDirs,
   withSubprocessScrub,
   writeMcpConfig,
@@ -170,8 +172,8 @@ interface Session {
   events: AsyncQueue<AgentEvent>;
   state: SessionState;
   secrets: string[];
-  /** Under the scrub: the checkout and which sandbox placeholder paths it had before (#263). */
-  placeholders: { cwd: string; before: Set<string> } | undefined;
+  /** Under the scrub: the checkout and HOME, and which placeholder paths they had (#263). */
+  placeholders: SandboxResidue | undefined;
   hookKey: string;
   files: string[];
   approvals: Map<string, PendingApproval>;
@@ -317,13 +319,14 @@ export class PtyAdapter implements AgentAdapter {
     );
     // The commands the Worker runs never see its key (#150).
     const scrub = !(this.#opts.subprocessScrub === false && this.#opts.spawn);
-    const env = scrub ? withSubprocessScrub(keyed) : keyed;
+    const env = scrub ? { ...withSubprocessScrub(keyed), ...SANDBOX_ENV } : keyed;
 
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
     const cwd = realpathSync(opts.cwd);
-    // The sandbox the scrub turns on leaves empty placeholders in the checkout; removed at close.
-    const placeholders = scrub ? { cwd, before: placeholderSnapshot(cwd) } : undefined;
+    // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
+    // runs with; removed at close (#263).
+    const placeholders = scrub ? residueSnapshot(cwd, env.HOME) : undefined;
     // From the user's environment, not the Worker's: where state lives never depends on a session.
     const home = (this.#opts.baseEnv ?? process.env).HOME ?? homedir();
     const root = this.#configRoot(cwd, home);
@@ -624,7 +627,7 @@ export class PtyAdapter implements AgentAdapter {
     // Claude Code has exited: its transcript is complete.
     this.#usage(s);
     for (const f of s.files) removeSessionFile(f);
-    if (s.placeholders) removeSandboxPlaceholders(s.placeholders.cwd, s.placeholders.before);
+    if (s.placeholders) removeSandboxResidue(s.placeholders);
     await this.#hooks.unregister(s.hookKey);
     this.#setState(s, 'done');
     s.events.end();

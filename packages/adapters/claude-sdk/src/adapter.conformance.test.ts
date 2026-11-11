@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { ProfileRefusedError, type SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -179,6 +179,12 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
         .filter((e) => e.isFile())
         .map((e) => join(e.parentPath, e.name));
     const userBefore = Object.fromEntries(listAll(home).map((p) => [p, readFileSync(p, 'utf8')]));
+    const dirsOf = (dir: string): string[] =>
+      readdirSync(dir, { recursive: true, withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => join(e.parentPath, e.name))
+        .sort();
+    const userDirsBefore = dirsOf(home);
     const state = join(root, 'state-237');
     const make237 = (extra: Partial<ConstructorParameters<typeof ClaudeSdkAdapter>[0]> = {}) =>
       new ClaudeSdkAdapter({
@@ -262,22 +268,14 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
     ).toEqual([]);
     await worker.discard(optedIn, worktree);
 
-    // The user's home is byte for byte as it was, and their login was never copied. The one
-    // exception is Claude Code's Linux sandbox, which API-key Workers run under (#150, owner
-    // decision 17): it adds an empty placeholder for each dotfile it write-protects that is
-    // missing (`.bashrc`, `.gitconfig`, `.netrc`, …), and its startup `npm root` writes an npm
-    // log. Never a non-empty file, never a change to one that existed (#263).
+    // The user's home is byte for byte as it was, and their login was never copied. Claude
+    // Code's Linux sandbox, which API-key Workers run under (#150, owner decision 17), adds an
+    // empty placeholder for each dotfile it write-protects that is missing (`.bashrc`,
+    // `.gitconfig`, `.netrc`, …), and its startup `npm root` would write an npm log: the adapter
+    // removes the first at close and turns the log off (#263), so nothing is left.
     const userAfter = Object.fromEntries(listAll(home).map((p) => [p, readFileSync(p, 'utf8')]));
-    const added = Object.keys(userAfter).filter((p) => !(p in userBefore));
-    expect(
-      added.filter(
-        (p) =>
-          !(
-            process.platform === 'linux' &&
-            (userAfter[p] === '' || p.startsWith(join(home, '.npm', '_logs') + sep))
-          ),
-      ),
-    ).toEqual([]);
+    expect(Object.keys(userAfter).filter((p) => !(p in userBefore))).toEqual([]);
+    expect(dirsOf(home)).toEqual(userDirsBefore);
     for (const [p, text] of Object.entries(userBefore)) expect(userAfter[p], p).toBe(text);
     expect(
       listAll(state).filter((p) => readFileSync(p, 'utf8').includes('user-login-237')),
