@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -73,12 +74,29 @@ describe('isGitCheckout', () => {
     expect(isGitCheckout(headDir)).toBe(false);
   });
 
-  it('does not follow a symbolic link at .git', () => {
+  it('follows symbolic links at .git and HEAD, as git does', () => {
     const real = gitDir(join(dir, 'real'));
     const link = join(dir, 'link');
     mkdirSync(link);
     symlinkSync(join(real, '.git'), join(link, '.git'));
-    expect(isGitCheckout(link)).toBe(false);
+    expect(isGitCheckout(link)).toBe(true);
+
+    const headLink = join(dir, 'head-link');
+    mkdirSync(join(headLink, '.git'), { recursive: true });
+    symlinkSync(join(real, '.git', 'HEAD'), join(headLink, '.git', 'HEAD'));
+    expect(isGitCheckout(headLink)).toBe(true);
+
+    const dangling = join(dir, 'dangling');
+    mkdirSync(dangling);
+    symlinkSync(join(dir, 'nowhere'), join(dangling, '.git'));
+    expect(isGitCheckout(dangling)).toBe(false);
+  });
+
+  it('rejects a FIFO at .git without hanging', () => {
+    const fifo = join(dir, 'fifo');
+    mkdirSync(fifo);
+    execFileSync('mkfifo', [join(fifo, '.git')]);
+    expect(isGitCheckout(fifo)).toBe(false);
   });
 });
 
@@ -100,6 +118,15 @@ describe('repoRootFrom', () => {
     expect(root).not.toBe(outer);
     // The start directory comes back, unless a real checkout sits above the temp dir.
     expect(root === plain || isGitCheckout(root)).toBe(true);
+  });
+
+  it('stops at a symlinked .git rather than walking on to an outer repo', () => {
+    const outer = gitDir(join(dir, 'outer'));
+    const target = gitDir(join(dir, 'target'));
+    const inner = join(outer, 'inner');
+    mkdirSync(inner);
+    symlinkSync(join(target, '.git'), join(inner, '.git'));
+    expect(repoRootFrom(inner)).toBe(inner);
   });
 
   it('walks past a skeleton to the real checkout above it', () => {

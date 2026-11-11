@@ -1,4 +1,4 @@
-import { closeSync, existsSync, lstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, readSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { type TasksState, tasksProjection } from '@tacet/core';
 import {
@@ -11,33 +11,36 @@ import {
 } from '@tacet/core/node';
 
 /**
- * Whether `dir` is the top of a git checkout: its `.git` is a git directory (one with a `HEAD`
- * file) or a gitdir file (`gitdir: <path>`, a linked worktree or submodule). An empty `.git`, or
- * one with only the read-only placeholders Claude Code's Linux sandbox leaves in directories it
- * guards (`config`, `hooks`, `info/.claude-sandbox-noreplace`, but no `HEAD`; #326), is not one:
- * git would not take it for a repository either.
+ * Whether `dir` is the top of a git checkout: its `.git` is a git directory (one with a `HEAD`)
+ * or a gitdir file (`gitdir: <path>`, a linked worktree or submodule). Symbolic links are
+ * followed, as git follows them. An empty `.git`, or one with only the read-only placeholders
+ * Claude Code's Linux sandbox leaves in directories it guards (`config`, `hooks`,
+ * `info/.claude-sandbox-noreplace`, but no `HEAD`; #326), is not one: git would not take it for a
+ * repository either. A gitdir file's target is not checked, so a stale pointer still counts.
  */
 export function isGitCheckout(dir: string): boolean {
   const dotGit = join(dir, '.git');
-  let st: ReturnType<typeof lstatSync>;
+  let st: ReturnType<typeof statSync>;
   try {
-    st = lstatSync(dotGit);
+    st = statSync(dotGit);
   } catch {
     return false;
   }
   if (st.isDirectory()) {
     try {
-      return lstatSync(join(dotGit, 'HEAD')).isFile();
+      return statSync(join(dotGit, 'HEAD')).isFile();
     } catch {
       return false;
     }
   }
   if (!st.isFile()) return false;
-  // The first bytes only: a gitdir file is one short line.
+  // The first bytes only: a gitdir file is one short line. Non-blocking, and checked again once
+  // open, so a FIFO swapped in after the stat cannot hang the read.
   const buf = Buffer.alloc(8);
   let fd: number | undefined;
   try {
-    fd = openSync(dotGit, 'r');
+    fd = openSync(dotGit, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return false;
     const n = readSync(fd, buf, 0, buf.length, 0);
     return buf.subarray(0, n).toString('utf8') === 'gitdir: ';
   } catch {
