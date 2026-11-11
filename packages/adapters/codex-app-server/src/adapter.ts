@@ -310,6 +310,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
   readonly id = 'codex-app-server';
   readonly #opts: CodexAdapterOptions;
   readonly #sessions = new Map<string, Session>();
+  /** `codex-tmp` dirs already swept for Worker TMPDIRs that killed hosts left (#299). */
+  readonly #sweptTmp = new Set<string>();
 
   constructor(opts: CodexAdapterOptions = {}) {
     this.#opts = opts;
@@ -383,7 +385,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
       privateDir(codexHome);
       // Beside CODEX_HOME, never inside it: the Worker writes here. Made just before Codex starts,
       // so a refusal on the way leaves nothing behind.
-      if (privateTmp) workerTmp = join(dirname(codexHome), 'codex-tmp', randomUUID());
+      if (privateTmp) {
+        const tmpRoot = join(dirname(codexHome), 'codex-tmp');
+        // Once per root and process: what hosts killed before they could clean up left (#299).
+        if (!this.#sweptTmp.has(tmpRoot)) {
+          this.#sweptTmp.add(tmpRoot);
+          sweepWorkerTmpdirs(tmpRoot);
+        }
+        workerTmp = join(tmpRoot, randomUUID());
+      }
       launch.env.CODEX_HOME = codexHome;
       // Codex trusts a repo by itself at the first thread that can write it, and a trusted
       // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
@@ -430,6 +440,8 @@ export class CodexAppServerAdapter implements AgentAdapter {
     ].sort((a, b) => b.length - a.length);
     if (workerTmp !== undefined) {
       privateDir(workerTmp, 'the Worker TMPDIR');
+      // Who owns it, beside it where the Worker cannot write, for the sweep (#299).
+      writeTmpOwner(workerTmp, { host: process.pid });
       // Every temp variable a tool may read: the shared ones are read-only now (#294).
       launch.env.TMPDIR = workerTmp;
       launch.env.TMP = workerTmp;
@@ -448,6 +460,10 @@ export class CodexAppServerAdapter implements AgentAdapter {
         detached: process.platform !== 'win32',
       },
     );
+    // Its process group too: a host killed while Codex runs on leaves a dir still in use.
+    if (workerTmp !== undefined && proc.pid !== undefined) {
+      writeTmpOwner(workerTmp, { host: process.pid, group: proc.pid });
+    }
     const exitInfo: { value: Session['exit'] } = { value: undefined };
     const exited = new Promise<void>((resolve) =>
       proc.once('exit', (code, signal) => {
@@ -599,7 +615,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
-      if (workerTmp !== undefined) removeWorkerTree(workerTmp);
+      if (workerTmp !== undefined) releaseWorkerTmp(workerTmp);
       if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
@@ -614,7 +630,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       this.#exited(session);
       await this.#reapGroup(proc);
       // Nothing of the Worker runs any more: its temp files go (#294).
-      if (workerTmp !== undefined) removeWorkerTree(workerTmp);
+      if (workerTmp !== undefined) releaseWorkerTmp(workerTmp);
     });
     void session.gone.then(() => this.#onExit(session));
 
@@ -1238,6 +1254,83 @@ export function removeWorkerTree(dir: string): void {
   } catch {
     // Left behind; nothing of the Worker runs any more.
   }
+}
+
+/** Who owns a Worker TMPDIR: the host process, and once started Codex's process group. */
+interface TmpOwner {
+  host: number;
+  group?: number;
+}
+
+const UUID_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A Worker TMPDIR with no owner record (a host killed while making it) is swept after a day. */
+const UNOWNED_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Record `owner` in `<dir>.owner`, beside the dir: written whole (temp file and rename). */
+function writeTmpOwner(dir: string, owner: TmpOwner): void {
+  const tmp = `${dir}.owner.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(owner), { mode: 0o600 });
+  renameSync(tmp, `${dir}.owner`);
+}
+
+/** Remove a Worker TMPDIR and then its owner record (#294, #299). Never throws. */
+function releaseWorkerTmp(dir: string): void {
+  removeWorkerTree(dir);
+  if (existsSync(dir)) return;
+  rmSync(`${dir}.owner`, { force: true });
+}
+
+/** Whether a process, or a process group, still runs. Unknown counts as running. */
+function running(pid: number, group: boolean): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(group ? -pid : pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/**
+ * Remove the Worker TMPDIRs under `root` (`<state>/codex-tmp`) that hosts killed before they
+ * could clean up left (#299): a `<uuid>` dir whose owner record names a host that is gone and a
+ * Codex process group that is gone, or, with no record, one untouched for a day. A dir of a live
+ * Worker, in this process or another, is never removed: its host or its group still runs. A
+ * reused pid keeps a dir, never removes a live one. Returns how many were removed; never throws.
+ */
+export function sweepWorkerTmpdirs(root: string, now = Date.now()): number {
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!UUID_NAME.test(name)) continue;
+    const dir = join(root, name);
+    try {
+      const st = lstatSync(dir);
+      if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) continue;
+      let owner: TmpOwner | undefined;
+      try {
+        owner = JSON.parse(readFileSync(`${dir}.owner`, 'utf8')) as TmpOwner;
+      } catch {
+        owner = undefined;
+      }
+      if (owner) {
+        if (running(Number(owner.host), false)) continue;
+        if (owner.group !== undefined && running(Number(owner.group), true)) continue;
+      } else if (now - st.mtimeMs < UNOWNED_AGE_MS) {
+        continue;
+      }
+      releaseWorkerTmp(dir);
+      if (!existsSync(dir)) removed++;
+    } catch {
+      // Left for the next sweep.
+    }
+  }
+  return removed;
 }
 
 /**
