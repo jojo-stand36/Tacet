@@ -17,8 +17,12 @@ const ev = (
   type,
   data,
 });
-const raise = (id: string, kind: 'worker' | 'mini' = 'worker', ts?: string) =>
-  ev('escalation.raised', { id, question: 'q' }, kind, ts);
+const raise = (
+  id: string,
+  kind: 'worker' | 'mini' = 'worker',
+  ts?: string,
+  extra: Record<string, unknown> = {},
+) => ev('escalation.raised', { id, question: 'q', ...extra }, kind, ts);
 const resolve = (escalationId: string, source?: string) =>
   ev('escalation.resolved', { escalationId, answer: 'a', ...(source ? { source } : {}) });
 
@@ -42,6 +46,9 @@ describe('escalationStats (#25)', () => {
       resolve('m1', 'user'),
       // A second answer to the same escalation changes nothing.
       resolve('e2', 'mini'),
+      // An approval request: the gate never answers it, so it is counted apart.
+      raise('a1', 'worker', undefined, { category: 'decision' }),
+      resolve('a1', 'user'),
     ]);
     expect(s).toEqual({
       raised: 6,
@@ -50,12 +57,13 @@ describe('escalationStats (#25)', () => {
       answeredUnknown: 1,
       open: 1,
       rate: 0.5,
+      approvals: 1,
       raisedByMini: 1,
     });
   });
 
   it('counts only escalations raised since a time, and has no rate without any', () => {
-    expect(escalationStats([]).rate).toBeUndefined();
+    expect(escalationStats([]).rate).toBeNull();
     const s = escalationStats(
       [raise('old', 'worker', '2026-11-01T00:00:00.000Z'), raise('new'), resolve('old', 'user')],
       { since: '2026-11-04T00:00:00.000Z' },

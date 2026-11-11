@@ -1,6 +1,7 @@
 import {
   type EscalationStats,
   escalationStats,
+  NO_ESCALATIONS,
   statusEntries,
   type TaskStatusEntry,
   TaskTarget,
@@ -94,8 +95,16 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   if (!tasks) {
     const store = openLog(paths);
     if (!store) {
-      if (o.json) io.out(safeJson({ running: pid ?? null, tasks: [], problems: [] }));
-      else io.out(`no Tacet state for ${repoRoot}`);
+      if (o.json) {
+        io.out(
+          safeJson({
+            running: pid ?? null,
+            tasks: [],
+            problems: [],
+            escalations: { last7Days: NO_ESCALATIONS, total: NO_ESCALATIONS },
+          }),
+        );
+      } else io.out(`no Tacet state for ${repoRoot}`);
       return 0;
     }
     try {
@@ -115,7 +124,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
         source,
         tasks,
         problems: problems.map(problemJson),
-        ...(escalations ? { escalations } : {}),
+        escalations,
       }),
     );
     return 0;
@@ -131,7 +140,8 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
     io.out('maintenance problems (latest first):');
     for (const p of problems) io.out(`  ${formatEvent(p.envelope)}`);
   }
-  if (escalations && escalations.total.raised + escalations.total.raisedByMini > 0) {
+  const t = escalations.total;
+  if (t.raised + t.approvals + t.raisedByMini > 0) {
     io.out(`escalations, last 7 days: ${formatEscalationStats(escalations.last7Days)}`);
     io.out(`escalations, in all: ${formatEscalationStats(escalations.total)}`);
   }
@@ -140,33 +150,44 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** The repo's escalation counts (#25), the last 7 days and in all; none without a log. */
-function readEscalationStats(
+/** The repo's escalation counts (#25), the last 7 days and in all; zero without a log. */
+export function readEscalationStats(
   paths: Parameters<typeof openLog>[0],
-): { last7Days: EscalationStats; total: EscalationStats } | undefined {
+  now = Date.now(),
+): { last7Days: EscalationStats; total: EscalationStats } {
   const store = openLog(paths);
-  if (!store) return undefined;
+  if (!store) return { last7Days: NO_ESCALATIONS, total: NO_ESCALATIONS };
   try {
-    const events = store.query({ typePrefix: 'escalation' }).map((e) => e.envelope);
-    const since = new Date(Date.now() - WEEK_MS).toISOString();
+    const events = [
+      ...store.query({ typePrefix: 'escalation.raised' }),
+      ...store.query({ typePrefix: 'escalation.resolved' }),
+    ]
+      .sort((a, b) => a.seq - b.seq)
+      .map((e) => e.envelope);
+    const since = new Date(now - WEEK_MS).toISOString();
     return { last7Days: escalationStats(events, { since }), total: escalationStats(events) };
   } finally {
     store.close();
   }
 }
 
-/** One line: what Workers asked, what was answered here, and what reached the user. */
+/** One line: what Workers asked, what was answered without the user, and what reached them. */
 export function formatEscalationStats(s: EscalationStats): string {
-  if (s.raised === 0 && s.raisedByMini === 0) return 'none';
-  const local = s.resolvedLocally.policy + s.resolvedLocally.precedent + s.resolvedLocally.mini;
+  if (s.raised === 0 && s.approvals === 0 && s.raisedByMini === 0) return 'none';
+  const r = s.resolvedLocally;
+  const local = r.policy + r.precedent + r.mini;
   const parts = [`${s.raised} from Workers`];
   if (s.raised > 0) {
-    parts.push(
-      `${local} answered without you (policy ${s.resolvedLocally.policy}, precedent ${s.resolvedLocally.precedent}, Mini-conductor ${s.resolvedLocally.mini})`,
-      `${s.raised - local} to you (${Math.round((s.rate ?? 0) * 100)}%)`,
-    );
-    if (s.open > 0) parts.push(`${s.open} open`);
+    const by = [
+      r.policy > 0 ? `policy ${r.policy}` : '',
+      r.precedent > 0 ? `precedent ${r.precedent}` : '',
+      r.mini > 0 ? `Mini-conductor ${r.mini}` : '',
+    ].filter(Boolean);
+    parts.push(`${local} answered without you${by.length > 0 ? ` (${by.join(', ')})` : ''}`);
+    const open = s.open > 0 ? `; ${s.open} still open` : '';
+    parts.push(`${s.raised - local} to you (${Math.round((s.rate ?? 0) * 100)}%${open})`);
   }
+  if (s.approvals > 0) parts.push(`${s.approvals} proposals to approve`);
   if (s.raisedByMini > 0) parts.push(`${s.raisedByMini} from the Mini-conductor`);
   return parts.join(', ');
 }

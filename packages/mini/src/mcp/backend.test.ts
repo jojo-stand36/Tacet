@@ -1,4 +1,4 @@
-import { newUlid } from '@tacet/core';
+import { escalationStats, newUlid } from '@tacet/core';
 import { type EventStore, openEventStore, type WorkerBinding } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend, ToolError } from './backend.js';
@@ -334,6 +334,23 @@ describe('EventLogBackend', () => {
       status: 'resolved',
       answer: 'later',
       source: 'mini',
+    });
+  });
+
+  it('writes escalations as escalationStats counts them (#25)', async () => {
+    await make({ gate: async () => ({ answer: 'a', source: 'precedent' as const }) }).escalate(W1, {
+      question: 'answered by precedent',
+      urgency: 'low',
+    });
+    await make().escalate(W1, { question: 'left to the user', urgency: 'low' });
+    await make().recordDecision(W1, { topic: 'db', decision: 'postgres', scope: 'repo' });
+    expect(escalationStats(store.query({}).map((e) => e.envelope))).toMatchObject({
+      raised: 2,
+      resolvedLocally: { precedent: 1 },
+      open: 1,
+      rate: 0.5,
+      approvals: 1,
+      raisedByMini: 0,
     });
   });
 });
