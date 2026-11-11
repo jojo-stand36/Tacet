@@ -3,6 +3,11 @@ import { HelloParams, type HelloResult } from '../../schema/hello.js';
 /** WebSocket close codes used by the handshake (ADR-003 §2, §3). */
 export const CLOSE_AUTH_FAILED = 4401;
 export const CLOSE_NO_COMMON_VERSION = 4406;
+/**
+ * A Mini-conductor said hello for a repo that already has a live connection (#23, ADR-003
+ * addendum): the newcomer is refused, and backs off and tries again later.
+ */
+export const CLOSE_CONFLICT = 4409;
 /** RFC 6455 policy violation: a first frame that is not a valid `tacet/hello`. */
 export const CLOSE_POLICY_VIOLATION = 1008;
 

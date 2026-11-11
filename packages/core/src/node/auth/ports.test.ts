@@ -86,6 +86,8 @@ describe('local ports (#259)', () => {
         'packages/mini/src/control/server.ts',
         // The standalone Mini-conductor: its MCP endpoint and control port.
         'packages/mini/src/standalone.ts',
+        // The Conductor's port (#23), on `startRpcServer`: a token new on every start, roles mini and cli.
+        'packages/conductor/src/conductor.ts',
       ].sort(),
     );
   });

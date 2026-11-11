@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:registry-disconnected:v1",
+  "title": "Tacet registry.disconnected payload",
+  "type": "object",
+  "properties": {
+    "repoId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "reason": {
+      "enum": [
+        "closed",
+        "silent",
+        "replaced",
+        "conductor_restart"
+      ],
+      "x-tacet-fallback": "closed",
+      "type": "string"
+    }
+  },
+  "required": [
+    "repoId",
+    "sessionId",
+    "reason"
+  ]
+}

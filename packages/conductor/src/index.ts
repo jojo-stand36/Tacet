@@ -1,2 +1,3 @@
-/** Global Conductor daemon: registry, inbox, workflows and the API for the UI. Placeholder until its roadmap issue lands. */
+/** Global Conductor daemon (#23): the registry of Mini-conductors; inbox, workflows and the UI API to come. */
 export const packageName = '@tacet/conductor' as const;
+export * from './conductor.js';
