@@ -357,7 +357,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
       );
       // Its own CODEX_HOME, which the next Worker's app-server reads outside the sandbox, must be
       // out of the sandbox's reach too (#295).
-      refuseInSandboxTemp('its CODEX_HOME', codexHome, launch.env.TMPDIR);
+      refuseInSandboxTemp(
+        'its CODEX_HOME',
+        codexHome,
+        launch.env.TMPDIR,
+        'Set a state dir (`events.state_dir`, or the stateDir option) or HOME outside /tmp and $TMPDIR.',
+      );
       privateDir(codexHome);
       launch.env.CODEX_HOME = codexHome;
       // Codex trusts a repo by itself at the first thread that can write it, and a trusted
@@ -1266,13 +1271,18 @@ function sandboxTempRootOf(path: string, tmpdir: string | undefined): string | u
  * Refuse an unattended Codex Worker when `path`, which it must not be able to write, lies under
  * a temp dir Codex's sandbox leaves writable (#293, #295).
  */
-export function refuseInSandboxTemp(what: string, path: string, tmpdir: string | undefined): void {
+export function refuseInSandboxTemp(
+  what: string,
+  path: string,
+  tmpdir: string | undefined,
+  fix: string,
+): void {
   const root = sandboxTempRootOf(path, tmpdir);
   if (root === undefined) return;
   throw new Error(
     `refusing to start an unattended Codex Worker: ${what} ${resolvedPath(path)} is under ${root}, ` +
       "which Codex's sandbox leaves writable (/tmp and $TMPDIR), so the Worker could rewrite " +
-      `files that run outside the sandbox (#293). Move it outside /tmp and $TMPDIR.`,
+      `what Codex reads outside the sandbox (#295). ${fix}`,
   );
 }
 

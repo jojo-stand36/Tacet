@@ -119,15 +119,18 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     // The Worker could otherwise write its own config.toml, which the next Worker's app-server
     // loads outside the sandbox (seen live with a state dir under /tmp).
     await expect(adapter.start({ cwd: wt })).rejects.toThrow(`its CODEX_HOME ${state}/`);
+    await expect(adapter.start({ cwd: wt })).rejects.toThrow('Set a state dir');
     expect(existsSync(state)).toBe(false);
     // Under /tmp, whatever $TMPDIR says.
-    expect(() => refuseInSandboxTemp('its CODEX_HOME', '/tmp/x/y/codex', undefined)).toThrow(
+    expect(() => refuseInSandboxTemp('its CODEX_HOME', '/tmp/x/y/codex', undefined, 'fix')).toThrow(
       `is under ${realpathSync.native('/tmp')}`,
     );
-    expect(() => refuseInSandboxTemp('its CODEX_HOME', join(outside, 'codex'), tmp)).not.toThrow();
+    expect(() =>
+      refuseInSandboxTemp('its CODEX_HOME', join(outside, 'codex'), tmp, 'fix'),
+    ).not.toThrow();
   });
 
-  it('without a repoRoot, refuses a cwd inside a repo under a temp dir (#295)', () => {
+  it('without a repoRoot, refuses a cwd inside a repo under a temp dir (#295)', async () => {
     const tmp = codexFixtureDir('tacet-295-enclosing-');
     const elsewhere = codexFixtureDir('tacet-295-elsewhere-');
     dirs.push(tmp, elsewhere);
@@ -137,6 +140,21 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     expect(() => refuseGitInSandboxTemp(sub, undefined, tmp)).toThrow(
       `its git dir ${join(repo, '.git')} is under ${tmp}`,
     );
+    // Through start(), before anything is created.
+    const state = codexFixtureDir('tacet-295-norepo-state-');
+    dirs.push(state);
+    const adapter = new CodexAppServerAdapter({
+      stateDir: state,
+      codexPath: join(elsewhere, 'no-codex-here'),
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: elsewhere,
+        TMPDIR: tmp,
+        OPENAI_API_KEY: 'k-placeholder',
+      },
+    });
+    await expect(adapter.start({ cwd: sub })).rejects.toThrow(`is under ${tmp}`);
+    expect(readdirSync(state)).toEqual([]);
     // A linked worktree outside the temp dir whose git dir points into it.
     const linked = join(elsewhere, 'wt');
     execFileSync('git', ['-C', repo, 'worktree', 'add', '-q', linked, '-b', 'tacet/linked'], {
