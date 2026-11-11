@@ -5,6 +5,7 @@ import {
   lstatSync,
   openSync,
   readdirSync,
+  readlinkSync,
   readSync,
   realpathSync,
 } from 'node:fs';
@@ -20,8 +21,9 @@ import { join, sep } from 'node:path';
  * The transcript is found here, under the session's own config dir, and never taken from a
  * hook's `transcript_path`: a hook body is the Worker's word, and a path in it could point
  * Tacet at any file. Every read opens the file without following a symlink, without blocking on
- * a FIFO, and checks it is still the very file found first (device and inode): a file or
- * directory swapped in later is refused.
+ * a FIFO, and checks it is still the very file found first (device and inode, one link): a file
+ * or directory swapped in later, or a hard link, is refused. A transcript Claude Code replaced by
+ * rename would therefore stop being read; 2.1.319 only appends to it.
  */
 
 /** Usage to report for one model call: what it added since it was last reported. */
@@ -55,7 +57,9 @@ function openChecked(path: string, expect?: { dev: number; ino: number }) {
   }
   try {
     const st = fstatSync(fd);
-    if (st.isFile() && (!expect || (st.dev === expect.dev && st.ino === expect.ino))) {
+    // One link only: a hard link to a file elsewhere passes every path check.
+    const same = !expect || (st.dev === expect.dev && st.ino === expect.ino);
+    if (st.isFile() && st.nlink === 1 && same) {
       return { fd, dev: st.dev, ino: st.ino, size: st.size };
     }
   } catch {
@@ -63,6 +67,22 @@ function openChecked(path: string, expect?: { dev: number; ino: number }) {
   }
   closeSync(fd);
   return undefined;
+}
+
+/** The open file is still what `path` names, and `path` still resolves inside `root`. */
+function openedInside(f: { fd: number; dev: number; ino: number }, path: string, root: string) {
+  try {
+    const st = lstatSync(path);
+    if (st.dev !== f.dev || st.ino !== f.ino) return false;
+    if (!realpathSync(path).startsWith(root + sep)) return false;
+    if (process.platform === 'linux') {
+      // Where the descriptor itself points, as the kernel sees it.
+      return readlinkSync(`/proc/self/fd/${f.fd}`).startsWith(root + sep);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -95,8 +115,10 @@ export function findTranscript(configDir: string, sessionId: string): Transcript
     }
     const f = openChecked(path);
     if (!f) continue;
+    // The file opened is the one checked above: nothing was swapped in between.
+    const opened = openedInside(f, path, root);
     closeSync(f.fd);
-    found.push({ path, dev: f.dev, ino: f.ino });
+    if (opened) found.push({ path, dev: f.dev, ino: f.ino });
   }
   return found.length === 1 ? found[0] : undefined;
 }

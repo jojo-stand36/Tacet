@@ -481,6 +481,38 @@ describe('PtyAdapter (fake claude)', () => {
       expect(tap.events.at(-1)).toEqual({ t: 'status', state: 'done' });
     });
 
+    it('an interrupt during the wait ends the finished turn as idle, with no Esc', async () => {
+      const adapter = make({}, { usageWaitMs: 60_000 });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      const f = fake();
+      const file = transcriptOf(f);
+      writeFileSync(file, `${JSON.stringify({ type: 'last-prompt' })}\n`);
+      f.submitted = undefined;
+      await adapter.send(h, { text: 'HANG' });
+      await expect.poll(() => f.submitted).toBeDefined();
+      await f.hook('Stop', { last_assistant_message: 'reply' });
+      await sleep(50);
+      appendFileSync(file, line(f, 'm1', 100, 10));
+      const from = tap.events.length;
+      await adapter.interrupt(h);
+      await tap.waitFor((e) => e.t === 'status' && e.state !== 'running', 5000, from);
+      expect(f.writes).not.toContain('\x1b');
+      expect(states(tap).slice(-1)).toEqual(['idle']);
+      expect(states(tap)).not.toContain('cancelled');
+      expect(usage(tap)).toEqual([sonnet(100, 10)]);
+      // The wait ends without a second end.
+      await sleep(100);
+      const after = tap.events.slice(from).filter((e) => e.t === 'status');
+      expect(after).toEqual([{ t: 'status', state: 'idle' }]);
+      // The next prompt is a fresh turn.
+      await stopTurn(adapter, h, tap, {}, () => {
+        setTimeout(() => appendFileSync(file, line(f, 'm2', 1, 1)), 100);
+      });
+      expect(usage(tap)).toHaveLength(2);
+      await adapter.close(h);
+    });
+
     it('does not report a resumed session’s earlier calls again', async () => {
       const adapter = make();
       const h = await adapter.start({ cwd: join(root, 'wt') });

@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import {
   appendFileSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   renameSync,
@@ -69,6 +70,13 @@ describe('findTranscript', () => {
     expect(findTranscript(root, ID)).toBeUndefined();
     rmSync(join(root, 'projects'), { recursive: true });
     symlinkSync(outside, join(root, 'projects'));
+    expect(findTranscript(root, ID)).toBeUndefined();
+  });
+
+  it('refuses a hard link (it passes every path check)', () => {
+    const target = join(outside, `${ID}.jsonl`);
+    writeFileSync(target, assistantLine('leak', { input: 666 }));
+    linkSync(target, join(project(), `${ID}.jsonl`));
     expect(findTranscript(root, ID)).toBeUndefined();
   });
 
@@ -206,6 +214,12 @@ describe('TranscriptReader', () => {
     it('refuses another regular file put in its place', () => {
       rmSync(file);
       writeFileSync(file, assistantLine('leak', { input: 666 }));
+      expect(r.read()).toEqual([]);
+    });
+
+    it('refuses it once it gains a second link', () => {
+      linkSync(file, join(outside, 'copy.jsonl'));
+      appendFileSync(file, assistantLine('m2', { input: 2 }));
       expect(r.read()).toEqual([]);
     });
 
