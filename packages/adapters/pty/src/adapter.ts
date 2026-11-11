@@ -549,7 +549,7 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.effort !== undefined) {
       throw new ProfileRefusedError('effort', 'the PTY adapter does not set an effort');
     }
-    const text = promptText(input.text);
+    const text = withoutImagePaths(promptText(input.text));
     if (s.typing || s.state === 'running' || s.state === 'waiting_input') {
       s.queue.push(text);
       return;
@@ -1119,6 +1119,56 @@ function promptKey(text: string): string {
   const wrapped =
     /^\s*<pasted_content id="([^"]*)">\n([\s\S]*)\n<\/pasted_content id="\1">\s*$/.exec(text);
   return (wrapped?.[2] ?? text).replace(/\s+/g, ' ').trim();
+}
+
+/** Claude Code 2.1.319's split of a pasted line: before a space and a path (`Mr`). */
+const PASTE_SEGMENT = / (?=["']?(?:\/|[A-Za-z]:\\))/;
+/** Its image-file test (`f4t`). */
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+/** A terminal focus report its paste reader takes off the end of a paste (`uEe`). */
+const FOCUS_TAIL = /\[[IO]$/;
+
+/**
+ * Whether interactive Claude Code 2.1.319 would take a pasted line, or a part of it, for an image
+ * file (#244): split before a space and a path, each part trimmed, unquoted (matching quotes)
+ * and unescaped (backslash escapes) as its paste handler does, then tested against its image
+ * extensions. Such a part is read when absolute (and permitted) and attached as an image, inside
+ * the checkout or not; read or not, the Enter typed with the paste is dropped, so the prompt is
+ * never submitted. It ignores the handler's one way out (a line of several parts that are not all
+ * paths is kept as text), so it only ever says yes more often than Claude Code would read.
+ */
+export function claudeReadsImagePath(line: string): boolean {
+  return line.split(PASTE_SEGMENT).some((part) => {
+    let p = part.trim();
+    if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+      p = p.slice(1, -1);
+    }
+    const unescaped = p.replaceAll('\\\\', '\0').replace(/\\(.)/g, '$1').replaceAll('\0', '\\');
+    return IMAGE_FILE.test(unescaped);
+  });
+}
+
+/**
+ * `text` with a suffix after each line Claude Code would take for an image path (#244), so it
+ * keeps that line as text: its last part then ends in `.`, and a line of several parts holds one
+ * that is no path (an unescaped space in it). That is ` .`, or ` . .` after a trailing backslash,
+ * which would escape the first space. The last line is also tested without a focus report
+ * (`[I`, `[O`), which Claude Code takes off the end of a paste before its test; a prompt ending in
+ * one gets ` .` whatever it holds, so nothing is taken off (a paste of only `[I` would otherwise
+ * read the clipboard's image on macOS and WSL). Verified live on Claude Code 2.1.319 (capability
+ * matrix, "PTY: pasted image paths").
+ */
+export function withoutImagePaths(text: string): string {
+  const lines = text.split('\n');
+  return lines
+    .map((line, i) => {
+      const last = i === lines.length - 1;
+      const image =
+        claudeReadsImagePath(line) || (last && claudeReadsImagePath(line.replace(FOCUS_TAIL, '')));
+      if (!image && !(last && FOCUS_TAIL.test(line))) return line;
+      return line.endsWith('\\') ? `${line} . .` : `${line} .`;
+    })
+    .join('\n');
 }
 
 /**
