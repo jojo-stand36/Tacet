@@ -5,6 +5,7 @@ import { answer } from './commands/answer.js';
 import { cancel } from './commands/cancel.js';
 import { detach } from './commands/detach.js';
 import { init, uninstall } from './commands/init.js';
+import { mini } from './commands/mini.js';
 import { attach, logs, status } from './commands/read.js';
 import { run } from './commands/run.js';
 import { conductorStatus, up } from './commands/up.js';
@@ -44,11 +45,16 @@ const USAGE = `usage:
                                  its clipboard writes, OSC 52 and the like, and tmux
                                  passthrough are left out)
   tacet config explain [--json]  the effective configuration and where each value comes from
-  tacet up [--json]              run the Conductor until interrupted (Ctrl-C)
+  tacet up [--json]              run the Conductor until interrupted (Ctrl-C); with
+                                 conductor.autostart on (user config), it starts a
+                                 Mini-conductor for each registered repo that has none
   tacet up --add PATH | --remove PATH [--json]
                                  register a repo with the Conductor, or unregister it
   tacet conductor status [--json]
                                  registered repos and connected Mini-conductors
+  tacet mini                     a Mini-conductor for this repo with no task of its own, until
+                                 interrupted; it refuses to start (exit 4) while the repo has
+                                 unfinished tasks: resume those with tacet run --resume
 
 Every command takes --user-dir DIR, and those about one repo --repo DIR (default: the repo of the
 current directory).
@@ -96,6 +102,7 @@ const OPTIONS = {
     remove: { type: 'string' },
   },
   conductor: { 'user-dir': { type: 'string' }, json: { type: 'boolean' } },
+  mini: { repo: { type: 'string' }, 'user-dir': { type: 'string' } },
 } as const;
 
 /** Entry point for the `tacet` command. Resolves to the process exit code. */
@@ -169,6 +176,9 @@ export async function main(argv: string[], io: Io): Promise<number> {
       case 'up':
         if (positionals.length > 0) return usage(io);
         return await up(io, v);
+      case 'mini':
+        if (positionals.length > 0) return usage(io);
+        return await mini(io, v);
       case 'conductor':
         if (positionals.length !== 1 || positionals[0] !== 'status') return usage(io);
         return conductorStatus(io, v);

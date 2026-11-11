@@ -38,9 +38,11 @@ describe('Codex Worker isolation', () => {
   beforeAll(async () => {
     api = await startMockResponsesApi();
     // Outside every temp dir: Codex makes $TMPDIR and /tmp writable in workspace-write, so a repo
-    // there would not show what the sandbox protects (and the adapter refuses it, #293), even
-    // when this checkout is itself under /tmp. Excluding them instead (as an earlier version did)
-    // breaks git on macOS, where the Xcode `git` shim writes its cache under the per-user temp dir.
+    // there would not show what the sandbox protects with `privateTmpdir: false` (which refuses
+    // it, #293; the default private TMPDIR protects it, tested in private-tmpdir.test.ts), even
+    // when this checkout is itself under /tmp. (Excluding just them, as an earlier version did,
+    // broke git on macOS, where the Xcode `git` shim writes its cache under the per-user temp dir;
+    // the private TMPDIR, on by default since #294, gives the shim one of its own instead.)
     root = codexFixtureDir('tacet-codex-iso-');
     home = join(root, 'home');
     repo = join(root, 'repo');

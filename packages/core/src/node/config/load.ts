@@ -28,8 +28,10 @@ export function configPaths(opts: { userDir?: string; repoRoot?: string }) {
 /** Every problem found while loading, so the user can fix them all in one pass. */
 export class ConfigError extends Error {
   override name = 'ConfigError';
-  constructor(readonly issues: string[]) {
+  readonly issues: string[];
+  constructor(issues: string[]) {
     super(`invalid Tacet config:\n  ${issues.join('\n  ')}`);
+    this.issues = issues;
   }
 }
 

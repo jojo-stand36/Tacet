@@ -6,8 +6,8 @@ import { sandboxTempRoots } from '../adapter.js';
 
 /**
  * A fresh directory for a test repo that an unattended Codex Worker runs in: outside every temp
- * dir Codex's sandbox leaves writable (`/tmp`, `$TMPDIR`), where the adapter refuses to start
- * (#293) and the sandbox could not protect the shared `.git` anyway. The package's own
+ * dir Codex's sandbox leaves writable with `privateTmpdir: false` (`/tmp`, `$TMPDIR`), where the
+ * adapter then refuses to start (#293) and the sandbox could not protect the shared `.git`. The package's own
  * gitignored `node_modules/.cache` first, then `~/.cache/tacet-tests` (for a checkout that is
  * itself under `/tmp`). The caller removes it.
  */

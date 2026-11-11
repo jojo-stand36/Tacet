@@ -1,19 +1,31 @@
-import { existsSync, realpathSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+} from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import { type EventEnvelope, newUlid, type RegistryState, registryProjection } from '@tacet/core';
 import {
   conductorStatePaths,
   defaultRunDir,
   type EventStore,
+  isProcessAlive,
   loadConfig,
+  miniRuntimePath,
   openEventStore,
   processLockHolder,
+  readRuntimeFile,
   repoStatePaths,
   resolveStateDir,
 } from '@tacet/core/node';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
 import { repoRootFrom } from '../state.js';
+import { spawnDetachedWith } from './detach.js';
 
 export interface UpOptions {
   'user-dir'?: string;
@@ -26,6 +38,11 @@ export interface UpOptions {
 function conductorStateDir(io: Io, userDir?: string): string {
   const { config } = loadConfig(userDir ? { userDir } : {});
   return resolveStateDir(config.events?.state_dir, undefined, io.home);
+}
+
+/** An auto-started Mini-conductor's log: `~/.tacet/run/minis/<repo-hash>.mini.log`. */
+export function miniLogFor(repoPath: string, run: string): string {
+  return miniRuntimePath(repoPath, run).replace(/\.json$/, '.mini.log');
 }
 
 function runDir(io: Io): string {
@@ -46,10 +63,27 @@ export async function up(io: Io, o: UpOptions): Promise<number> {
     return register(io, stateDir, (o.add ?? o.remove) as string, o.add !== undefined, o.json);
   }
   const { startConductor } = await import('@tacet/conductor');
+  const run = runDir(io);
+  const { config } = loadConfig(o['user-dir'] ? { userDir: o['user-dir'] } : {});
   const conductor = await startConductor({
     stateDir,
-    runDir: runDir(io),
+    runDir: run,
     onError: (m) => io.err(`conductor: ${terminalSafe(m)}`),
+    ...(config.conductor?.autostart
+      ? {
+          autostart: {
+            spawnMini: (repoPath: string) => spawnMini(io, repoPath, run, o['user-dir']),
+            isMiniLive: (repoPath: string) => {
+              try {
+                return isProcessAlive(readRuntimeFile(miniRuntimePath(repoPath, run)).pid);
+              } catch {
+                return false;
+              }
+            },
+            onNotice: (m: string) => io.err(terminalSafe(m)),
+          },
+        }
+      : {}),
   });
   try {
     if (o.json) io.out(safeJson({ port: conductor.port, pid: process.pid }));
@@ -64,6 +98,32 @@ export async function up(io: Io, o: UpOptions): Promise<number> {
     return 0;
   } finally {
     await conductor.close();
+  }
+}
+
+/**
+ * `tacet mini --repo <path>` in the background (#23): a session of its own, output to its log
+ * (0600, new for each start), the user's environment unchanged. No secret is passed: it reads its own config
+ * and makes its port's token itself.
+ */
+function spawnMini(io: Io, repoPath: string, run: string, userDir?: string) {
+  const log = miniLogFor(repoPath, run);
+  mkdirSync(dirname(log), { recursive: true, mode: 0o700 });
+  // New for each start; readable, so the Mini-conductor keeps its newest lines under a cap (#273).
+  const fd = openSync(
+    log,
+    constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_APPEND,
+    0o600,
+  );
+  try {
+    chmodSync(log, 0o600);
+    return (io.spawnDetached ?? spawnDetachedWith())(
+      ['mini', '--repo', repoPath, ...(userDir !== undefined ? ['--user-dir', userDir] : [])],
+      io.env ?? process.env,
+      fd,
+    );
+  } finally {
+    closeSync(fd);
   }
 }
 
