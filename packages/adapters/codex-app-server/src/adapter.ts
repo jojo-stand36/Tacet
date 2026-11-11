@@ -112,7 +112,8 @@ export interface CodexAdapterOptions {
    * shared temp dir is writable and a repo or state dir under `/tmp` is protected (#294). Default
    * on, on Linux and macOS (verified live on both; on macOS the Xcode `git` shim works with it:
    * inside the sandbox the per-user temp dir is the private `TMPDIR`, #294). Off, the shared temp
-   * dirs stay writable and a repo or CODEX_HOME under them is refused instead (#293, #295).
+   * dirs stay writable and a repo or CODEX_HOME under them is refused instead (#293, #295): an
+   * escape hatch for a tool that needs the shared temp dir.
    */
   privateTmpdir?: boolean;
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */

@@ -11,8 +11,8 @@ import {
 import { codexFixtureDir } from './testing/fixture-dir.js';
 
 /**
- * Without a private TMPDIR (`privateTmpdir: false`, #294), an unattended Codex Worker never runs on a repo, or
- * with a CODEX_HOME, under a sandbox-writable temp dir (#293, #295).
+ * Without a private TMPDIR (`privateTmpdir: false`, #294), an unattended Codex Worker never runs
+ * on a repo, or with a CODEX_HOME, under a sandbox-writable temp dir (#293, #295).
  */
 describe('repos under the sandbox temp dirs (#293)', () => {
   const dirs: string[] = [];
