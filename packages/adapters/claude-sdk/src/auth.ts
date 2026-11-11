@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import { delimiter, isAbsolute, join } from 'node:path';
 import type { EnvAllow } from '@tacet/core';
+import { CLAUDE_HOST_TOKEN_FD_VAR, checkHostClaudeToken } from '@tacet/core/node';
 
 /**
  * Auth routing for Claude Workers (owner policy, 2026-11-09; docs/RESEARCH.md §7):
@@ -50,20 +51,27 @@ export function chooseAuthRoute(
 export function authEnv(
   route: ClaudeAuthRoute,
   env: Record<string, string | undefined>,
+  hostToken: { warn?: (message: string) => void; file?: string } = {},
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
+  // Names Claude Code's first source for the host's own token (#291): never handed on.
+  delete out[CLAUDE_HOST_TOKEN_FD_VAR];
+  const hasCloud = CLOUD_PROVIDER_VARS.some((k) => out[k] && out[k] !== '0');
   if (route === 'api_key') {
     const hasKey = API_KEY_VARS.some((k) => out[k]);
-    const hasCloud = CLOUD_PROVIDER_VARS.some((k) => out[k] && out[k] !== '0');
     if (!hasKey && !hasCloud) {
       throw new AuthRoutingError(
         'unattended Claude Workers need ANTHROPIC_API_KEY (or a cloud provider such as CLAUDE_CODE_USE_BEDROCK) in the environment',
       );
     }
+    // In a Claude Code cloud container the host's token is there too (#291): a warning.
+    checkHostClaudeToken({ hasKey: true, ...hostToken });
     return out;
   }
   for (const k of API_KEY_VARS) delete out[k];
+  // A login session with the host's token in reach would use it, not the user's own (#291).
+  checkHostClaudeToken({ hasKey: hasCloud, ...hostToken });
   return out;
 }
 

@@ -48,6 +48,7 @@ import {
   workerEnv,
 } from '@tacet/core';
 import {
+  checkHostClaudeToken,
   defaultStateDir,
   processGroupAlive,
   processGroupGone,
@@ -99,6 +100,10 @@ export interface AcpAdapterOptions {
   envPolicy?: WorkerEnvPolicy;
   /** Told the names (never values) of the variables left out of each session's environment. */
   onEnvDropped?: (names: string[]) => void;
+  /** Told of a start that went ahead with a risk to know about (#291). */
+  onWarning?: (message: string) => void;
+  /** For tests: the host token path checked at start (#291). Default: Claude Code's fixed one. */
+  hostTokenFile?: string;
   /**
    * Milliseconds to wait for the agent to exit after SIGTERM before SIGKILL, and again for the
    * rest of its process group (#181). Default 5000. Worst-case `close()` is about
@@ -538,6 +543,14 @@ export class AcpAdapter implements AgentAdapter {
       throw new AuthRoutingError(
         `${spec.id}: Workers use an API key only; set ${spec.apiKeyEnv.join(' or ')}`,
       );
+    }
+    if (spec.claudeHostToken) {
+      // Its key was required just above, so the host's token is only a warning here (#291).
+      checkHostClaudeToken({
+        hasKey: spec.apiKeyEnv.some((k) => env[k]),
+        ...(this.#opts.onWarning ? { warn: this.#opts.onWarning } : {}),
+        ...(this.#opts.hostTokenFile !== undefined ? { file: this.#opts.hostTokenFile } : {}),
+      });
     }
     return env;
   }

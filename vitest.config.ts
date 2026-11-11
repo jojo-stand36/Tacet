@@ -9,5 +9,7 @@ export default defineConfig({
   test: {
     include: ['packages/**/src/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/dist/**'],
+    // The same on a machine with Claude Code's host token file as on one without (#291).
+    setupFiles: ['./vitest.setup.ts'],
   },
 });
