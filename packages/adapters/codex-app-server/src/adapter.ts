@@ -1282,15 +1282,27 @@ const UNOWNED_AGE_MS = 24 * 60 * 60 * 1000;
 /** A half-written owner record (`<uuid>.owner.<pid>`) goes after ten minutes. */
 const PARTIAL_AGE_MS = 10 * 60 * 1000;
 
-/** Where this process's pids mean something: its host and, on Linux, its PID namespace. */
+/**
+ * Where this process's pids mean something (#299): on Linux the machine (`/etc/machine-id`, else
+ * the host name) and the PID namespace, so a container sharing the state dir is told apart;
+ * elsewhere the platform alone, since a macOS host name changes with the network and would make
+ * every earlier record look foreign. Exported for tests.
+ */
 export function pidNamespace(): string {
+  if (process.platform !== 'linux') return process.platform;
+  let machine = hostname();
+  try {
+    machine = readFileSync('/etc/machine-id', 'utf8').trim() || machine;
+  } catch {
+    // No machine id: the host name.
+  }
   let ns = '';
   try {
     ns = readlinkSync('/proc/self/ns/pid');
   } catch {
-    // Not Linux: the host name alone.
+    // Unreadable: the machine alone.
   }
-  return `${hostname()}|${ns}`;
+  return `${machine}|${ns}`;
 }
 
 /** Record `owner` in `<dir>.owner`, beside the dir: written whole (temp file and rename). */
