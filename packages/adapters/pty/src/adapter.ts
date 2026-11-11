@@ -1025,17 +1025,12 @@ function promptKey(text: string): string {
   return (wrapped?.[2] ?? text).replace(/\s+/g, ' ').trim();
 }
 
-/**
- * The text to type for a prompt. Control characters would act as keys (Esc, Ctrl-C, Ctrl-D, the
- * end of the paste), so only newlines and tabs are kept. A prompt starting with `/` or `!` would
- * run a slash command or, without asking anyone, a shell command (verified live on 2.1.319: a
- * leading `!` runs it with no `UserPromptSubmit`, `PreToolUse` or `PermissionRequest`; a leading
- * space or zero-width character does not stop `/`), so it is refused.
- */
 /** Claude Code 2.1.319's split of a pasted line: before a space and a path (`Mr`). */
 const PASTE_SEGMENT = / (?=["']?(?:\/|[A-Za-z]:\\))/;
 /** Its image-file test (`f4t`). */
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+/** A terminal focus report its paste reader takes off the end of a paste (`uEe`). */
+const FOCUS_TAIL = /\[[IO]$/;
 
 /**
  * Whether interactive Claude Code 2.1.319 would take a pasted line, or a part of it, for an image
@@ -1043,8 +1038,8 @@ const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
  * and unescaped (backslash escapes) as its paste handler does, then tested against its image
  * extensions. Such a part is read when absolute (and permitted) and attached as an image, inside
  * the checkout or not; read or not, the Enter typed with the paste is dropped, so the prompt is
- * never submitted. Errs towards yes: Claude Code also keeps a line of several parts that are not
- * all paths as text.
+ * never submitted. It ignores the handler's one way out (a line of several parts that are not all
+ * paths is kept as text), so it only ever says yes more often than Claude Code would read.
  */
 export function claudeReadsImagePath(line: string): boolean {
   return line.split(PASTE_SEGMENT).some((part) => {
@@ -1058,18 +1053,35 @@ export function claudeReadsImagePath(line: string): boolean {
 }
 
 /**
- * `text` with ` .` after each line Claude Code would take for an image path (#244): that line's
- * last part then ends in `.`, and a line of several parts is kept as text, so nothing is read or
- * attached and the paste is submitted. Verified live on Claude Code 2.1.319 (capability matrix,
- * "PTY: pasted image paths").
+ * `text` with a suffix after each line Claude Code would take for an image path (#244), so it
+ * keeps that line as text: its last part then ends in `.`, and a line of several parts holds one
+ * that is no path (an unescaped space in it). That is ` .`, or ` . .` after a trailing backslash,
+ * which would escape the first space. The last line is also tested without a focus report
+ * (`[I`, `[O`), which Claude Code takes off the end of a paste before its test; a prompt ending in
+ * one gets ` .` whatever it holds, so nothing is taken off (a paste of only `[I` would otherwise
+ * read the clipboard's image on macOS and WSL). Verified live on Claude Code 2.1.319 (capability
+ * matrix, "PTY: pasted image paths").
  */
 export function withoutImagePaths(text: string): string {
-  return text
-    .split('\n')
-    .map((line) => (claudeReadsImagePath(line) ? `${line} .` : line))
+  const lines = text.split('\n');
+  return lines
+    .map((line, i) => {
+      const last = i === lines.length - 1;
+      const image =
+        claudeReadsImagePath(line) || (last && claudeReadsImagePath(line.replace(FOCUS_TAIL, '')));
+      if (!image && !(last && FOCUS_TAIL.test(line))) return line;
+      return line.endsWith('\\') ? `${line} . .` : `${line} .`;
+    })
     .join('\n');
 }
 
+/**
+ * The text to type for a prompt. Control characters would act as keys (Esc, Ctrl-C, Ctrl-D, the
+ * end of the paste), so only newlines and tabs are kept. A prompt starting with `/` or `!` would
+ * run a slash command or, without asking anyone, a shell command (verified live on 2.1.319: a
+ * leading `!` runs it with no `UserPromptSubmit`, `PreToolUse` or `PermissionRequest`; a leading
+ * space or zero-width character does not stop `/`), so it is refused.
+ */
 export function promptText(text: string): string {
   const clean = [...text.replace(/\r\n?/g, '\n')]
     .filter((c) => {

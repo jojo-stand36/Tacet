@@ -16,6 +16,7 @@ describe('withoutImagePaths', () => {
       'my\\ shot.png',
       '/abs/a.p\\ng',
       'see /abs/a.png',
+      'see\t/abs/a.png',
     ]) {
       expect(claudeReadsImagePath(line), line).toBe(true);
     }
@@ -35,14 +36,19 @@ describe('withoutImagePaths', () => {
     const text = 'Do the task.\nSee in.png\n/abs/out.png\nThen stop.';
     const out = withoutImagePaths(text);
     expect(out).toBe('Do the task.\nSee in.png .\n/abs/out.png .\nThen stop.');
-    for (const line of out.split('\n')) {
-      // Every part of every line now ends in something other than an image extension.
-      expect(
-        line
-          .split(/ (?=["']?(?:\/|[A-Za-z]:\\))/)
-          .some((p) => /\.(png|jpe?g|gif|webp)$/i.test(p.trim())),
-      ).toBe(false);
-    }
     expect(withoutImagePaths('nothing to change')).toBe('nothing to change');
+  });
+
+  it('keeps a trailing backslash or a focus report from undoing the suffix (#244 review)', () => {
+    // A trailing backslash would escape the space before the dot: two of them.
+    expect(withoutImagePaths('/abs/a.png /tmp/x\\')).toBe('/abs/a.png /tmp/x\\ . .');
+    expect(withoutImagePaths('"/a/b.png" /c/d\\')).toBe('"/a/b.png" /c/d\\ . .');
+    // Claude Code takes `[I` or `[O` off the end of a paste before its test.
+    expect(withoutImagePaths('SAY see x.png[I')).toBe('SAY see x.png[I .');
+    expect(withoutImagePaths('first\n/abs/out.png[O')).toBe('first\n/abs/out.png[O .');
+    // Only at the very end of the paste: elsewhere `x.png[I` is no image name.
+    expect(withoutImagePaths('x.png[I\nnext')).toBe('x.png[I\nnext');
+    // A prompt ending in one is never left for Claude Code to take off.
+    expect(withoutImagePaths('just text [O')).toBe('just text [O .');
   });
 });

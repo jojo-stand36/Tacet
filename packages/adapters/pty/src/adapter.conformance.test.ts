@@ -19,7 +19,7 @@ import type { SessionHandle } from '@tacet/core';
 import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { PtyAdapter } from './adapter.js';
+import { PtyAdapter, withoutImagePaths } from './adapter.js';
 import { loadPty } from './pty.js';
 import { gatedTitle, ptyGate } from './testing/pty-gate.js';
 
@@ -186,6 +186,7 @@ describe.skipIf(!gate.ok)(
       const cwd = join(root, 'wt-img');
       mkdirSync(cwd);
       writeFileSync(join(cwd, 'in.png'), testPng());
+      writeFileSync(join(cwd, 'note.txt'), 'note\n');
       const outside = join(root, 'outside-img.png');
       writeFileSync(outside, testPng());
       // Each of these left the paste unsubmitted (the Enter dropped), and the absolute ones on a
@@ -197,6 +198,10 @@ describe.skipIf(!gate.ok)(
         `SAY first\n${join(cwd, 'in.png')}`,
         `SAY quoted\n"${outside}"`,
         'SAY see a.JPG and b.webp',
+        // Several parts: an absolute image path and a path that is none.
+        `SAY both\n${outside} ${join(cwd, 'note.txt')}`,
+        // A trailing backslash, which would escape a lone space before the dot.
+        `SAY both\n${outside} ${cwd}\\`,
       ]) {
         const h = await adapter.start({ cwd });
         const tap = new EventTap(adapter.events(h));
@@ -208,21 +213,22 @@ describe.skipIf(!gate.ok)(
         expect(end, text).toEqual({ t: 'status', state: 'idle' });
         const sent = promptRequest(before, 'SAY ');
         // Sent as text, with ` .` after the line that named an image, and no image in it.
-        expect(sent?.text, text).toBe(
-          text
-            .split('\n')
-            .map((l, i, all) => (i === all.length - 1 ? `${l} .` : l))
-            .join('\n'),
-        );
-        expect(sent?.raw, text).not.toContain('"type":"image"');
-        expect(sent?.raw, text).not.toContain('iVBOR');
+        expect(sent?.text, text).toBe(withoutImagePaths(text));
+        expect(withoutImagePaths(text)).not.toBe(text);
+        // No request of the turn carries an image: the prompt's, or a side request's.
+        for (const r of api.requests.slice(before)) {
+          expect(r.raw, text).not.toContain('"type":"image"');
+          expect(r.raw, text).not.toContain('iVBOR');
+        }
         // The next prompt goes out on its own: nothing was left in the input box.
         const nextFrom = api.requests.length;
         const next = await turn(h, tap, 'SAY next');
         expect(next.end).toEqual({ t: 'status', state: 'idle' });
         const followed = promptRequest(nextFrom, 'SAY next');
         expect(followed?.text).toBe('SAY next');
-        expect(followed?.raw).not.toContain('"type":"image"');
+        for (const r of api.requests.slice(nextFrom)) {
+          expect(r.raw).not.toContain('"type":"image"');
+        }
         await adapter.close(h);
       }
     });
