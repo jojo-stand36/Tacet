@@ -17,6 +17,7 @@ import {
   type Decision,
   Escalation,
   type EventEnvelope,
+  HandoffPacket,
   type MaintenanceOp,
   type MaintenanceProblem,
   newUlid,
@@ -166,7 +167,8 @@ interface View {
    * Per sub-task, the latest handoff not yet taken up by a successor (#129): requested by
    * `sessionId`, with no `handoff.accepted` after it.
    */
-  pendingHandoffs: Map<string, { handoffId: string; sessionId: string }>;
+  /** `packet` is the HandoffPacket as requested, when it parses (inlined for #184). */
+  pendingHandoffs: Map<string, { handoffId: string; sessionId: string; packet?: HandoffPacket }>;
   /** Handoffs requested per sub-task, for `workers.max_handoffs`. */
   handoffCount: Map<string, number>;
 }
@@ -186,6 +188,8 @@ interface Run {
   mcp: boolean;
   /** Tool requests refused in the current turn ("tool: reason"), for a blocked turn (#184). */
   refused: string[];
+  /** `commit` when the current turn started, so a turn's own commit can be told apart (#184). */
+  turnBase?: string | undefined;
   text: string;
   /** The last complete assistant message, for the summary. */
   lastMessage?: string;
@@ -421,6 +425,14 @@ export class MiniConductor {
       if (tier && !opts.adapters[tier.adapter]) {
         throw new Error(`no Worker adapter ${tier.adapter} for its tier`);
       }
+    }
+    // A Worker with neither Tacet's MCP tools nor approval requests could never reach the
+    // Mini-conductor (#184): refused here, once, not on every attempt.
+    const caps = opts.adapters[worker.adapter]?.adapter.capabilities();
+    if (caps && !caps.mcp && caps.approvals !== 'roundtrip') {
+      throw new Error(
+        `${worker.adapter} has neither Tacet's MCP tools nor approval requests: it cannot run a Worker (#184)`,
+      );
     }
     const problem = reviewConfigProblem(opts.config);
     if (problem) throw new Error(problem);
@@ -1752,7 +1764,7 @@ export class MiniConductor {
       const text = resume
         ? safePrompt([RESUME_PROMPT, ...answers.map((x) => answerText(x, mcp))], '\n\n')
         : workerPrompt(view.task, this.#lastFeedback(subtaskId), [
-            ...(seed ? [mcp ? HANDOFF_NOTE : inlineHandoffNote(inlinePacket(seed))] : []),
+            ...(seed ? [mcp ? HANDOFF_NOTE : inlineHandoffNote(inlinePacket(seed.packet))] : []),
             ...(history.length > 0 && v.progress.has(subtaskId)
               ? [`Progress reported before: ${v.progress.get(subtaskId)}`]
               : []),
@@ -1858,7 +1870,10 @@ export class MiniConductor {
           );
         } else if (e.t === 'status') {
           if (e.state === 'running') {
-            if (!started) run.refused = [];
+            if (!started) {
+              run.refused = [];
+              run.turnBase = run.commit;
+            }
             started = true;
             run.turnActive = true;
           } else if (e.state === 'idle') {
@@ -2009,12 +2024,12 @@ export class MiniConductor {
       if (
         !run.mcp &&
         run.refused.length > 0 &&
-        run.commit === undefined &&
+        run.commit === run.turnBase &&
         !('changes' in left && left.changes.length > 0) &&
         (this.#state().kinds.get(run.subtaskId) ?? 'implement') === 'implement'
       ) {
         this.#raise(run.subtaskId, blockedQuestion(run), {
-          urgency: 'normal',
+          urgency: 'high',
           category: 'blocked',
         });
         run.refused = [];
@@ -2926,7 +2941,10 @@ function readView(store: EventStore, prev?: View): View {
   const decisions = new Map<string, string>();
   const progress = new Map<string, string>();
   const progressAt = new Map<string, number>();
-  const pendingHandoffs = new Map<string, { handoffId: string; sessionId: string }>();
+  const pendingHandoffs = new Map<
+    string,
+    { handoffId: string; sessionId: string; packet?: HandoffPacket }
+  >();
   const handoffCount = new Map<string, number>();
   for (const { envelope: e } of store.query({})) {
     const d = (e.data ?? {}) as Record<string, unknown>;
@@ -3006,7 +3024,12 @@ function readView(store: EventStore, prev?: View): View {
       // Written by the MCP backend: the session is on the envelope (#129).
       const handoffId = str('handoffId');
       if (handoffId && e.taskId && e.sessionId) {
-        pendingHandoffs.set(e.taskId, { handoffId, sessionId: e.sessionId });
+        const packet = HandoffPacket.safeParse((d as { packet?: unknown }).packet);
+        pendingHandoffs.set(e.taskId, {
+          handoffId,
+          sessionId: e.sessionId,
+          ...(packet.success ? { packet: packet.data } : {}),
+        });
         handoffCount.set(e.taskId, (handoffCount.get(e.taskId) ?? 0) + 1);
       }
     } else if (e.type === 'handoff.accepted') {
@@ -3127,7 +3150,9 @@ function refusedField(err: unknown): ProfileField | undefined {
 
 function answerText(x: EscalationRecord, mcp = true): string {
   return x.answer !== undefined
-    ? `Answer to your escalation ${x.id}: ${x.answer}`
+    ? mcp
+      ? `Answer to your escalation ${x.id}: ${x.answer}`
+      : `The user's answer to what you said you needed: ${x.answer}`
     : `Your escalation ${x.id} was resolved without an answer text; continue with your best judgement or ${mcp ? 'escalate again' : 'end your turn saying what you still need'}.`;
 }
 
@@ -3136,8 +3161,13 @@ function answerText(x: EscalationRecord, mcp = true): string {
  * blocked (#184): the requests refused in it and the end of its last message, redacted.
  */
 function blockedQuestion(run: Run): string {
-  const refused = run.refused.slice(0, 10).map((r) => `- ${redactSecrets(r)}`);
-  const last = redactSecrets(run.lastMessage ?? '').trim();
+  // Text the Worker chose, which the Mini-conductor writes as its own: redacted, no controls.
+  const refused = run.refused
+    .slice(0, 10)
+    .map((r) => `- ${redactSecrets(r).replace(CONTROL, ' ')}`);
+  const last = redactSecrets(run.lastMessage ?? '')
+    .replace(CONTROL, (c) => (c === '\n' ? c : ' '))
+    .trim();
   return [
     `A Worker (${run.adapterId}) that cannot escalate by itself stopped with no work done after these requests were refused:`,
     ...refused,
@@ -3150,8 +3180,11 @@ function blockedQuestion(run: Run): string {
 }
 
 /** A HandoffPacket as text for a Worker's first message (#184): secrets redacted, capped. */
-function inlinePacket(packet: unknown): string {
-  const text = redactSecrets(JSON.stringify(packet));
+function inlinePacket(packet: HandoffPacket | undefined): string {
+  if (packet === undefined)
+    return '(not readable: work out what is left from the checkout and the sub-task)';
+  // Redacted field by field, so one secret does not blank the whole packet.
+  const text = JSON.stringify(redactSecrets(packet));
   return text.length > 16_000 ? `${text.slice(0, 16_000)}…` : text;
 }
 

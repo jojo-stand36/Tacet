@@ -358,6 +358,16 @@ describe('buildWorkerAdapters', () => {
     );
     expect(built['acp:mine']?.adapter.capabilities().mcp).toBe(false);
     expect(built['acp:verified']?.adapter.capabilities().mcp).toBe(true);
+    // A PTY preset never gets the server, so the setting is refused rather than ignored.
+    expect(() =>
+      buildWorkerAdapters(
+        {
+          tiers: { worker: { adapter: 'pty:mine' } },
+          agents: { mine: { kind: 'pty', command: ['my-cli'], capabilities: { mcp: true } } },
+        },
+        { baseEnv: {} },
+      ),
+    ).toThrow(/agents\.mine\.capabilities is for kind acp only/);
   });
 
   it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {

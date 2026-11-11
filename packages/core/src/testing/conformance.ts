@@ -242,6 +242,13 @@ const PROBES: Probe[] = [
     priority: 'P0',
     run: async (ctx) => {
       if (ctx.caps.mcp) return skip('declares mcp: needs an MCP probe server to check');
+      // The same start without servers must work, so a refusal is about the servers and not a
+      // broken scenario or a crash.
+      try {
+        await ctx.adapter.close(await ctx.adapter.start(ctx.sc.session));
+      } catch (err) {
+        return fail(`start without mcpServers failed: ${(err as Error).message}`);
+      }
       let h: SessionHandle;
       try {
         h = await ctx.adapter.start({

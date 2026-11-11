@@ -304,6 +304,8 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
   apiKeyEnv: ['OPENAI_API_KEY'],
   apiKeyAuthMethods: [],
+  // `mcp`: it passes the `session/new` servers through, http only (capability matrix §5, "Codex
+  // ACP adapter", #62); Tacet's server is http.
   capabilities: { ...ACP_BASE, mcp: true, usage: { live: true, context: true, cost: 'none' } },
   verifiedVersion: '@agentclientprotocol/codex-acp 2.6.0',
   home: { env: 'CODEX_HOME', files: { 'config.toml': codexAcpConfig() } },
