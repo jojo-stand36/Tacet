@@ -191,7 +191,12 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
   // its encoding of the cwd is Claude Code's own.
   sessionFiles: ['projects/*/{id}.jsonl', 'projects/*/{id}', 'file-history/{id}', 'debug/{id}.txt'],
   // Never a subscription or gateway token, whatever the user passes through (#145).
-  envDeny: ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN'],
+  // The last names Claude Code's first source for its cloud host's token (#291).
+  envDeny: [
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_AUTH_TOKEN',
+    'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+  ],
   // It starts in `auto` ("Claude handles permission decisions") and runs tools unasked; `default`
   // ("Manual: always ask before making changes") sends `session/request_permission` (verified).
   sessionMode: 'default',

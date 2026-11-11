@@ -14,7 +14,7 @@ import {
   openEventStore,
   repoStateDir,
 } from '@tacet/core/node';
-import { EventTap } from '@tacet/core/testing';
+import { EventTap, setDefaultHostClaudeTokenFile } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
@@ -752,5 +752,51 @@ describe.skipIf(!gate.ok)(gatedTitle('a PTY preset built from config (#149)', ga
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("a Claude Worker with Claude Code's host token in reach (#291)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'tacet-host-token-'));
+    const token = join(dir, 'host-token');
+    writeFileSync(token, '');
+    setDefaultHostClaudeTokenFile(token);
+  });
+  afterEach(() => {
+    // Back to the path no machine has (vitest.setup.ts).
+    setDefaultHostClaudeTokenFile('/nonexistent/tacet-test/host-claude-token');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('tells onWarning which adapter started with it', async () => {
+    const warnings: [string, string][] = [];
+    const adapters = buildWorkerAdapters(
+      { tiers: { worker: { adapter: 'acp:claude-acp' } }, workers: { env: { pass: ['FAKE_*'] } } },
+      {
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: dir,
+          ANTHROPIC_API_KEY: 'placeholder',
+          // The modes claude-agent-acp offers, which the Worker spec pins.
+          FAKE_SESSION: JSON.stringify({
+            modes: {
+              currentModeId: 'default',
+              availableModes: [
+                { id: 'default', name: 'Manual' },
+                { id: 'workspace-write', name: 'Workspace access' },
+              ],
+            },
+          }),
+        },
+        acp: { executable: [process.execPath, FAKE_AGENT], killTimeoutMs: 1000 },
+        onWarning: (id, m) => warnings.push([id, m]),
+      },
+    );
+    const adapter = adapters['acp:claude-acp']?.adapter;
+    if (!adapter) throw new Error('no adapter');
+    mkdirSync(join(dir, 'wt'));
+    await adapter.close(await adapter.start({ cwd: join(dir, 'wt') }));
+    expect(warnings).toEqual([['acp:claude-acp', expect.stringContaining('host-token')]]);
   });
 });

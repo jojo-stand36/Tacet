@@ -97,10 +97,10 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
           `note: ${id} Workers do not get ${names.length} variable(s) of your environment (workers.env.pass adds names)`,
         );
       },
-      // Once per adapter and message: every Worker start would repeat it.
+      // Once per message: every Worker start, of every adapter it applies to, would repeat it.
       onWarning: (id, m) => {
-        if (warned.has(`${id}\n${m}`)) return;
-        warned.add(`${id}\n${m}`);
+        if (warned.has(m)) return;
+        warned.add(m);
         io.err(`warning: ${id}: ${terminalSafe(m)}`);
       },
       onError: (m) => io.err(`mcp: ${terminalSafe(m)}`),

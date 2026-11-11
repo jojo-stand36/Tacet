@@ -203,6 +203,22 @@ describe('AcpAdapter (fake ACP agent)', () => {
     await claude.close(await claude.start({ cwd: join(root, 'wt') }));
     expect(warnings).toEqual([expect.stringContaining(token)]);
     expect(warnings[0]).not.toContain('never-read');
+    // The variable naming the token's file descriptor never reaches it.
+    const fd = make(
+      CLAUDE_ACP_AGENT,
+      { ANTHROPIC_API_KEY: 'placeholder', CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '3' },
+      opts,
+    );
+    await fd.close(await fd.start({ cwd: join(root, 'wt') }));
+    const names =
+      (
+        received()
+          .filter((l) => 'envNames' in l)
+          .at(-1) as { envNames?: string[] }
+      ).envNames ?? [];
+    expect(names).toContain('ANTHROPIC_API_KEY');
+    expect(names).not.toContain('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR');
+    warnings.length = 1;
     // Another vendor's agent is not Claude Code: nothing to say.
     const gemini = make(GEMINI_AGENT, { GEMINI_API_KEY: 'placeholder' }, opts);
     await gemini.close(await gemini.start({ cwd: join(root, 'wt') }));

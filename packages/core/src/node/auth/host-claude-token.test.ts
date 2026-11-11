@@ -21,6 +21,11 @@ describe('checkHostClaudeToken (#291)', () => {
     expect(CLAUDE_HOST_TOKEN_FILE).toBe('/home/claude/.claude/remote/.oauth_token');
   });
 
+  it('checks a path no machine has in tests unless one is given (vitest.setup.ts)', () => {
+    // Even in a Claude Code cloud container, where the real file exists.
+    expect(() => checkHostClaudeToken({ hasKey: false })).not.toThrow();
+  });
+
   it('does nothing when the file does not exist', () => {
     const warnings: string[] = [];
     for (const hasKey of [true, false]) {

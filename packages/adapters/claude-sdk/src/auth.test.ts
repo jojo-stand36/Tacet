@@ -62,8 +62,17 @@ describe("Claude Code's host token at its fixed path (#291)", () => {
   it('refuses a login session that could fall back to it', () => {
     expect(() => authEnv('subscription', { PATH: '/bin' }, { file })).toThrow(HostClaudeTokenError);
     expect(() => authEnv('subscription', { PATH: '/bin' }, { file })).toThrow(
-      /Set ANTHROPIC_API_KEY/,
+      /API-key route \(ANTHROPIC_API_KEY, with auth.interactive: api_key/,
     );
+  });
+
+  it('never hands on the variable naming its file descriptor, on either route', () => {
+    const fd = { CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: '3' };
+    const missing = { file: join(dir, 'none') };
+    expect(authEnv('api_key', { ANTHROPIC_API_KEY: FAKE, ...fd }, missing)).toEqual({
+      ANTHROPIC_API_KEY: FAKE,
+    });
+    expect(authEnv('subscription', { PATH: '/bin', ...fd }, missing)).toEqual({ PATH: '/bin' });
   });
 
   it('warns once a key or cloud provider is set, and starts', () => {
