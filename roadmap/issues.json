@@ -615,6 +615,18 @@
       "body": "The interim Worker tool policy (#200) decides every approval request a Worker sends. Some calls never become a request, though. The Claude Agent SDK, in its default permission mode, runs these without calling `canUseTool`:\n- file reads inside its working directories;\n- Bash commands it judges read-only.\n\nSource: https://code.claude.com/docs/en/agent-sdk/permissions, checked 2026-11-10, recorded in `docs/adapters/capability-matrix.md`. So a Claude Worker can still run read-only Bash (e.g. `cat`, `ls`) without Tacet seeing a request. The owner's policy refuses Bash outright.\n\nAlso from the same research (SDK 0.3.319 tools reference, checked 2026-11-10): `Glob` and `Grep` are absent by default on macOS, Linux and WSL, where Claude Code searches with Bash `find`/`grep` instead. Under #200 a Claude Worker therefore cannot search at all. The tools come back when the SDK `tools`/`allowedTools` option names them, or when Bash is removed.\n\n### Tasks\n- [ ] For unattended Claude SDK Workers, turn Bash off at the source: verify the right option against the pinned SDK types (`disallowedTools: ['Bash']`, a deny rule, or `tools` naming only the file tools). Then make sure `Glob` and `Grep` are available without a bare-name `allowedTools` entry, which would skip `canUseTool`.\n- [ ] Do the same for `acp:claude-acp` and `pty:claude`, or record why it cannot be done there.\n- [ ] Decide whether in-worktree reads that skip `canUseTool` need a `PreToolUse` hook to be recorded.\n- [ ] A test with the SDK's mock Messages API showing a read-only Bash call is refused and a `Grep` call is decided by the policy.\n\n### Acceptance criteria\n- An unattended Claude Worker cannot run any Bash command, read-only ones included.\n- `Glob` and `Grep` work inside the worktree, and are refused outside it.\n\n_See #200, #25, docs/ARCHITECTURE.md §2 and docs/adapters/capability-matrix.md §1._"
     },
     {
+      "title": "Claude's sandbox leaves a .git placeholder skeleton in /tmp (an ancestor or write-allowed dir), and Tacet then takes /tmp for a repo",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:cli",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Claude Code's Linux sandbox reserves `.git` in the session's cwd, its ancestors and its write-allowed dirs, and can leave a read-only skeleton (config, hooks, info, no HEAD) at a shared `/tmp/.git`. `repoRootFrom` accepted any `.git`, so every path under `/tmp` resolved to `/tmp` as its repo.\n\n### Tasks\n- [ ] Repo detection accepts only a gitdir file or a `.git` directory with HEAD, with tests that plant the skeleton\n- [ ] Give Claude Workers a private TMPDIR, as #294 did for Codex, after verifying how Claude Code treats `$TMPDIR`\n- [ ] Never start a Claude session with cwd `/tmp`, `$TMPDIR`, `/` or HOME (adapter assertion)\n\n### Acceptance criteria\n- With a sandbox placeholder skeleton at `/tmp/.git`, `tacet up --add` and `tacet run` in a plain directory under `/tmp` report \"not a git repository\" (test)\n- Claude Worker sessions leave nothing in the shared temp dir, or the residue is documented and accepted by the owner\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context, and #263, #304, #294/#314, #150._"
+    },
+    {
       "title": "Clean up orphaned Worker processes after a Mini-conductor crash",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [

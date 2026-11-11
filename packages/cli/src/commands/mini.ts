@@ -1,9 +1,15 @@
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
 import type { Io } from '../io.js';
 import { terminalSafe } from '../render.js';
-import { DONE_STATES, openLog, readState, repoRootFrom, rootTasks, statePaths } from '../state.js';
+import {
+  DONE_STATES,
+  isGitCheckout,
+  openLog,
+  readState,
+  repoRootFrom,
+  rootTasks,
+  statePaths,
+} from '../state.js';
 
 export interface MiniOptions {
   repo?: string;
@@ -30,7 +36,7 @@ export const MINI_EXIT = {
  */
 export async function mini(io: Io, o: MiniOptions): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
-  if (!existsSync(join(repoRoot, '.git'))) {
+  if (!isGitCheckout(repoRoot)) {
     io.err(`${terminalSafe(repoRoot)} is not in a git repository: Tacet works on a git repo`);
     return MINI_EXIT.failed;
   }
