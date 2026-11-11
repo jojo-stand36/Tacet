@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   type AdapterCapabilities,
   type AgentAdapter,
@@ -41,6 +41,7 @@ import {
   defaultStateDir,
   processGroupAlive,
   processGroupGone,
+  readWorkerFile,
   repoStateDir,
   SAFE_GIT_ARGS,
   trustedGitEnv,
@@ -332,10 +333,9 @@ export class CodexAppServerAdapter implements AgentAdapter {
       this.#opts.apiBaseUrl !== undefined ? { baseUrl: this.#opts.apiBaseUrl } : {},
     );
     const home = launch.env.HOME ?? homedir();
-    // Before anything is created for the Worker: the sandbox could not protect its repo (#293).
-    if (unattended && this.#opts.repoRoot !== undefined) {
-      refuseGitInSandboxTemp(opts.cwd, this.#opts.repoRoot, launch.env.TMPDIR);
-    }
+    // Before anything is created for the Worker: the sandbox could not protect its repo (#293),
+    // or the repo enclosing its cwd when no repoRoot is given (#295).
+    if (unattended) refuseGitInSandboxTemp(opts.cwd, this.#opts.repoRoot, launch.env.TMPDIR);
     let codexHome: string;
     if (unattended) {
       // Nothing inherited may point a Worker's git somewhere else.
@@ -354,6 +354,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
           this.#opts.stateDir ?? defaultStateDir(home),
         ),
         'codex',
+      );
+      // Its own CODEX_HOME, which the next Worker's app-server reads outside the sandbox, must be
+      // out of the sandbox's reach too (#295).
+      refuseInSandboxTemp(
+        'its CODEX_HOME',
+        codexHome,
+        launch.env.TMPDIR,
+        'Set a state dir (`events.state_dir`, or the stateDir option) or HOME outside /tmp and $TMPDIR.',
       );
       privateDir(codexHome);
       launch.env.CODEX_HOME = codexHome;
@@ -1235,35 +1243,97 @@ export function sandboxTempRoots(tmpdir: string | undefined): string[] {
   ];
 }
 
+/** `path` resolved through its nearest existing ancestor (it may not exist yet). */
+function resolvedPath(path: string): string {
+  const abs = resolve(path);
+  let dir = abs;
+  for (;;) {
+    try {
+      return join(realpathSync.native(dir), relative(dir, abs));
+    } catch {
+      const up = dirname(dir);
+      if (up === dir) return abs;
+      dir = up;
+    }
+  }
+}
+
+/** The sandbox temp root `path` lies under, if any. */
+function sandboxTempRootOf(path: string, tmpdir: string | undefined): string | undefined {
+  const p = resolvedPath(path);
+  return sandboxTempRoots(tmpdir).find((root) => {
+    const prefix = root.endsWith(sep) ? root : root + sep;
+    return p === root || p.startsWith(prefix);
+  });
+}
+
+/**
+ * Refuse an unattended Codex Worker when `path`, which it must not be able to write, lies under
+ * a temp dir Codex's sandbox leaves writable (#293, #295).
+ */
+export function refuseInSandboxTemp(
+  what: string,
+  path: string,
+  tmpdir: string | undefined,
+  fix: string,
+): void {
+  const root = sandboxTempRootOf(path, tmpdir);
+  if (root === undefined) return;
+  throw new Error(
+    `refusing to start an unattended Codex Worker: ${what} ${resolvedPath(path)} is under ${root}, ` +
+      "which Codex's sandbox leaves writable (/tmp and $TMPDIR), so the Worker could rewrite " +
+      `what Codex reads outside the sandbox (#295). ${fix}`,
+  );
+}
+
+/**
+ * The git dirs of the repo enclosing `cwd` (the nearest ancestor with a `.git`): the `.git` itself
+ * and, for a `gitdir:` file, where it points. Best effort: an unreadable pointer adds nothing.
+ */
+function enclosingGitDirs(cwd: string): string[] {
+  for (let dir = resolvedPath(cwd); ; ) {
+    const dotGit = join(dir, '.git');
+    if (existsSync(dotGit)) {
+      const dirs = [dotGit];
+      try {
+        const text = readWorkerFile(dotGit).trim();
+        if (text.startsWith('gitdir:')) dirs.push(resolve(dir, text.slice(7).trim()));
+      } catch {
+        // A directory, or nothing readable: the `.git` path itself is checked.
+      }
+      return dirs;
+    }
+    const up = dirname(dir);
+    if (up === dir) return [];
+    dir = up;
+  }
+}
+
 /**
  * Refuse an unattended Codex Worker whose repo's git dirs (the shared one and the worktree's own,
  * resolved) lie under a sandbox-writable temp dir: there the sandbox cannot keep the shared `.git`
  * read-only, so the Worker could rewrite refs, objects and hooks that run outside it (#293).
+ * Without a `repoRoot`, the repo enclosing `cwd` is checked (#295).
  */
 export function refuseGitInSandboxTemp(
   cwd: string,
-  repoRoot: string,
+  repoRoot: string | undefined,
   tmpdir: string | undefined,
 ): void {
-  const wt = workerWorktree(cwd, repoRoot);
-  let common: string | undefined = wt?.commonDir;
-  if (common === undefined) {
-    try {
-      common = realpathSync.native(join(repoRoot, '.git'));
-    } catch {
-      common = undefined;
-    }
+  let dirs: string[];
+  if (repoRoot === undefined) {
+    dirs = enclosingGitDirs(cwd);
+  } else {
+    const wt = workerWorktree(cwd, repoRoot);
+    dirs = [wt?.commonDir ?? join(repoRoot, '.git'), ...(wt ? [wt.gitDir] : [])];
   }
-  const dirs = [common, wt?.gitDir].filter((d): d is string => d !== undefined);
-  for (const root of sandboxTempRoots(tmpdir)) {
-    const prefix = root.endsWith(sep) ? root : root + sep;
-    const inside = dirs.find((d) => d === root || d.startsWith(prefix));
-    if (inside !== undefined) {
-      throw new Error(
-        `refusing to start an unattended Codex Worker: its git dir ${inside} is under ${root}, ` +
-          "which Codex's sandbox leaves writable (/tmp and $TMPDIR), so the Worker could rewrite " +
-          'the shared .git (#293). Move the repository outside /tmp and $TMPDIR.',
-      );
-    }
+  for (const d of dirs) {
+    const root = sandboxTempRootOf(d, tmpdir);
+    if (root === undefined) continue;
+    throw new Error(
+      `refusing to start an unattended Codex Worker: its git dir ${resolvedPath(d)} is under ${root}, ` +
+        "which Codex's sandbox leaves writable (/tmp and $TMPDIR), so the Worker could rewrite " +
+        'the shared .git (#293). Move the repository outside /tmp and $TMPDIR.',
+    );
   }
 }
