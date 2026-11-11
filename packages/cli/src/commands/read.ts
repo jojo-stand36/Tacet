@@ -212,7 +212,10 @@ export async function attach(
           code = (await pty.closed).code;
         } finally {
           io.signal?.removeEventListener('abort', stop);
-          // Whatever the Worker's bytes left switched on, the user's own terminal gets back.
+          // An OSC the Worker left open is ended, then whatever its bytes left switched on, the
+          // user's own terminal gets back.
+          const end = osc.flush();
+          if (end.length > 0) raw(end);
           raw(new TextEncoder().encode(RESTORE_TERMINAL));
         }
         if (io.signal?.aborted) return 0;

@@ -79,8 +79,66 @@ describe('OscFilter (#302)', () => {
     expect(dec(f.push(bytes('A'.repeat(90))))).toBe('');
     // `;c;` and 90 A's are 93 dropped bytes; 7 more B's reach the limit of 100.
     expect(dec(f.push(bytes(`${'B'.repeat(20)}tail`)))).toBe(`${'B'.repeat(13)}tail`);
-    // A long run of digits is not held back without bound either.
-    const digits = bytes(`${E}]${'1'.repeat(40)};x\x07`);
-    expect(run(digits)).toBe(dec(digits));
+    // A long run of digits is not held back without bound either: no OSC has such a number.
+    expect(run(bytes(`a${E}]${'1'.repeat(40)};x\x07b`))).toBe('ab');
+    expect(run(bytes(`a${E}]${'\x01'.repeat(100)}52;x\x07b`))).toBe('ab');
+  });
+
+  it('removes OSC 52 written as a terminal still reads it (review of #302)', () => {
+    for (const seq of [
+      // Leading zeros, and a number a 32-bit parser wraps round to 52.
+      `${E}]052;c;AAAA\x07`,
+      `${E}]${'0'.repeat(30)}52;c;AAAA\x07`,
+      `${E}]4294967348;c;AAAA\x07`,
+      // C0 controls or DEL between ESC and ], or among the digits.
+      `${E}\x00]52;c;AAAA\x07`,
+      `${E}\x7f\x7f]52;c;AAAA\x07`,
+      `${E}]5\x002;c;AAAA\x07`,
+      `${E}]5\x7f2;c;AAAA\x07`,
+      // The 8-bit introducer as a lone byte, not part of a UTF-8 character.
+      '\x9d52;c;AAAA\x9c',
+    ]) {
+      const input = bytes(`a${seq}b`);
+      const got = run(input);
+      // C0 controls a terminal runs in the ESC state may stay; the sequence itself goes.
+      expect(
+        got
+          .split('')
+          .filter((c) => c !== '\x00' && c !== '\x7f')
+          .join(''),
+        JSON.stringify(seq),
+      ).toBe('ab');
+      for (let i = 0; i <= input.length; i++) {
+        expect(
+          run(input, [i])
+            .split('')
+            .filter((c) => c !== '\x00' && c !== '\x7f')
+            .join(''),
+          JSON.stringify(seq),
+        ).toBe('ab');
+      }
+    }
+  });
+
+  it('removes an OSC 52 started inside another OSC, and ends that one (review of #302)', () => {
+    // U+009D inside a title restarts the OSC; the title is ended with CAN in its place.
+    expect(run(bytes(`${E}]0;t\xc2\x9d52;c;AAAA\x07x`))).toBe(`${E}]0;t\x18x`);
+    expect(run(bytes(`${E}]0;t${E}]52;c;AAAA\x07x`))).toBe(`${E}]0;t\x18x`);
+    // Right after an introducer, before any digit.
+    expect(run(bytes(`a${E}]\xc2\x9d52;c;AAAA\x07b`))).toBe('ab');
+    // An empty OSC (U+009D) passed on, then OSC 52 inside it: removed, the empty one ended.
+    expect(run(bytes(`a\xc2\x9d${E}]52;c;AAAA\x07b`))).toBe('a\xc2\x9d\x18b');
+    // A title started inside another title passes, as the terminal would read it.
+    const titles = bytes(`${E}]0;t${E}]2;u\x07x`);
+    expect(run(titles)).toBe(dec(titles));
+  });
+
+  it('ends an OSC left open when the stream ends, and holds nothing back after flush', () => {
+    const f = new OscFilter();
+    expect(dec(f.push(bytes(`${E}]0;title`)))).toBe(`${E}]0;title`);
+    expect(dec(f.flush())).toBe('\x18');
+    expect(dec(f.push(bytes(`${E}]5`)))).toBe('');
+    expect(dec(f.flush())).toBe('');
+    expect(dec(f.push(bytes('2;c;AAAA\x07ok')))).toBe('2;c;AAAA\x07ok');
   });
 });

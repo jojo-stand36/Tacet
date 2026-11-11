@@ -2,163 +2,256 @@ const ESC = 0x1b;
 const BEL = 0x07;
 const CAN = 0x18;
 const SUB = 0x1a;
+const DEL = 0x7f;
 /** UTF-8 lead byte of U+0080..U+00BF: the C1 controls OSC (U+009D) and ST (U+009C). */
 const C2 = 0xc2;
 const C1_OSC = 0x9d;
 const C1_ST = 0x9c;
 const RIGHT_BRACKET = 0x5d;
 const BACKSLASH = 0x5c;
-const MAX_DIGITS = 16;
+/** At most this many bytes of an OSC's introducer and number are held back; past it, dropped. */
+const MAX_HELD = 64;
+/** A number with more significant digits than this is dropped: no OSC uses one, and a terminal's
+ * own parser may wrap it round to any value (4294967348 is 52 in 32 bits). */
+const MAX_SIGNIFICANT = 5;
 
-type Mode =
-  | 'text'
-  | 'esc'
-  | 'c2'
-  | 'intro'
-  | 'pass'
-  | 'passEsc'
-  | 'passC2'
-  | 'drop'
-  | 'dropEsc'
-  | 'dropC2';
+type Mode = 'text' | 'esc' | 'c2' | 'intro' | 'introC2' | 'pass' | 'drop' | 'dropEsc' | 'dropC2';
+
+/**
+ * In the ESC state a terminal runs C0 controls and ignores DEL, still waiting for the rest of the
+ * sequence (the DEC/VT parser that xterm, VTE and tmux follow); CAN, SUB and ESC end it.
+ */
+const escIgnores = (b: number) => (b < 0x20 && b !== CAN && b !== SUB && b !== ESC) || b === DEL;
+/** Inside an OSC a terminal skips C0 controls (BEL ends it; CAN, SUB and ESC abort it). DEL is
+ * taken as skipped too, the stricter reading. */
+const oscIgnores = (b: number) => (escIgnores(b) && b !== BEL) || b === DEL;
+/** How many UTF-8 continuation bytes the lead byte `b` starts; 0 for any other byte. */
+const utf8Need = (b: number) =>
+  b >= 0xc2 && b <= 0xdf ? 1 : b >= 0xe0 && b <= 0xef ? 2 : b >= 0xf0 && b <= 0xf4 ? 3 : 0;
 
 /**
  * Removes OSC sequences with a blocked number (by default 52, a clipboard write) from a stream of
  * terminal bytes, as they arrive, wherever chunks split them (#302). Everything else passes
  * through unchanged, other OSC sequences (window titles) included.
  *
- * An OSC starts with `ESC ]` or the C1 control U+009D (UTF-8 `C2 9D`, the 8-bit form as a UTF-8
- * terminal reads it; a lone `9D` byte is part of other UTF-8 text) and ends with BEL, `ESC \` or
- * U+009C; like a terminal, CAN, SUB or another ESC abort it, so a reset (`ESC c`) after an
- * unfinished sequence still gets through. Only the introducer and its number are held back
- * (at most 16 digits); a blocked sequence is dropped as it streams, never buffered, and after
- * `maxDrop` bytes with no terminator the rest passes as text, so an unterminated one cannot hide
- * the rest of the terminal.
+ * It reads the stream as a terminal's parser does, so a sequence a terminal would take as OSC 52
+ * is taken as one here:
+ * - An OSC starts with `ESC ]` (with any C0 control or DEL between them), the C1 control U+009D
+ *   (UTF-8 `C2 9D`), or a lone `9D` byte that is not part of a UTF-8 character (the 8-bit form).
+ *   One starting inside another OSC starts afresh.
+ * - Its number may have C0 controls or DEL among its digits and any number of leading zeros.
+ *   A number of more than 5 significant digits, or an introducer and number longer than 64
+ *   bytes, is dropped as if blocked.
+ * - It ends with BEL, `ESC \` or U+009C; CAN, SUB or another ESC abort it, so a reset (`ESC c`)
+ *   after an unfinished sequence still gets through.
+ *
+ * Only the introducer and number are held back; a blocked sequence is dropped as it streams,
+ * never buffered, and after `maxDrop` bytes with no terminator the rest passes as text, so an
+ * unterminated one cannot hide the rest of the terminal. When a blocked sequence starts inside an
+ * OSC already passed on, a CAN is sent in its place to end that one in the user's terminal.
  */
 export class OscFilter {
   #mode: Mode = 'text';
-  /** The introducer and number of the OSC being read. */
-  #intro: number[] = [];
-  #digits = '';
+  /** The raw bytes of the introducer and number of the OSC being read. */
+  #held: number[] = [];
+  #value = 0;
+  #significant = 0;
   #dropped = 0;
+  /** The user's terminal is inside an OSC passed on to it, not yet ended. */
+  #inOsc = false;
+  /** UTF-8 continuation bytes still expected. */
+  #need = 0;
+  #out = new Uint8Array(0);
+  #n = 0;
 
   constructor(
-    private readonly blocked: (code: string) => boolean = (code) => code === '52',
+    private readonly blocked: (code: number) => boolean = (code) => code === 52,
     private readonly maxDrop = 1024 * 1024,
   ) {}
 
   /** The bytes of `chunk` that may reach the user's terminal. */
   push(chunk: Uint8Array): Uint8Array {
-    // Never longer than the input plus what was held back (at most the introducer and digits).
-    const out = new Uint8Array(chunk.length + this.#intro.length + 2);
-    let n = 0;
-    const emit = (b: number) => {
-      out[n++] = b;
-    };
+    // Usually enough: each input byte is emitted at most once, plus what an earlier chunk held
+    // back. `#emit` grows it otherwise.
+    this.#out = new Uint8Array(chunk.length + MAX_HELD + 8);
+    this.#n = 0;
     for (let i = 0; i < chunk.length; i++) {
       const b = chunk[i] as number;
-      // A byte is looked at again after a held one turns out not to start a sequence.
-      for (let again = true; again; ) {
-        again = false;
-        switch (this.#mode) {
-          case 'text':
-            if (b === ESC) this.#mode = 'esc';
-            else if (b === C2) this.#mode = 'c2';
-            else emit(b);
-            break;
-          case 'esc':
-            if (b === RIGHT_BRACKET) this.#startOsc([ESC, RIGHT_BRACKET]);
-            else {
-              emit(ESC);
-              this.#mode = 'text';
-              again = true;
-            }
-            break;
-          case 'c2':
-            if (b === C1_OSC) this.#startOsc([C2, C1_OSC]);
-            else {
-              emit(C2);
-              this.#mode = 'text';
-              again = true;
-            }
-            break;
-          case 'intro':
-            if (b >= 0x30 && b <= 0x39 && this.#digits.length < MAX_DIGITS) {
-              this.#digits += String.fromCharCode(b);
-              this.#intro.push(b);
-            } else if (this.blocked(this.#digits)) {
-              this.#intro = [];
-              this.#dropped = 0;
-              this.#mode = 'drop';
-              again = true;
-            } else {
-              for (const x of this.#intro) emit(x);
-              this.#intro = [];
-              this.#mode = 'pass';
-              again = true;
-            }
-            break;
-          case 'pass':
-            if (b === ESC) this.#mode = 'passEsc';
-            else if (b === C2) this.#mode = 'passC2';
-            else {
-              emit(b);
-              if (b === BEL || b === CAN || b === SUB) this.#mode = 'text';
-            }
-            break;
-          case 'passEsc':
-            if (b === BACKSLASH) {
-              emit(ESC);
-              emit(b);
-              this.#mode = 'text';
-            } else {
-              // A new sequence ends this one; the ESC starts it.
-              this.#mode = 'esc';
-              again = true;
-            }
-            break;
-          case 'passC2':
-            emit(C2);
-            if (b === C1_ST) {
-              emit(b);
-              this.#mode = 'text';
-            } else {
-              this.#mode = 'pass';
-              again = true;
-            }
-            break;
-          case 'drop':
-            if (b === BEL || b === CAN || b === SUB) this.#mode = 'text';
-            else if (b === ESC) this.#mode = 'dropEsc';
-            else if (b === C2) this.#mode = 'dropC2';
-            else if (++this.#dropped > this.maxDrop) {
-              this.#mode = 'text';
-              again = true;
-            }
-            break;
-          case 'dropEsc':
-            if (b === BACKSLASH) this.#mode = 'text';
-            else {
-              this.#mode = 'esc';
-              again = true;
-            }
-            break;
-          case 'dropC2':
-            if (b === C1_ST) this.#mode = 'text';
-            else {
-              this.#mode = 'drop';
-              again = true;
-            }
-            break;
-        }
-      }
+      // A byte is looked at again when the state it ends hands it on.
+      while (this.#step(b));
     }
-    return out.subarray(0, n);
+    return this.#out.subarray(0, this.#n);
   }
 
-  #startOsc(intro: number[]): void {
-    this.#intro = intro;
-    this.#digits = '';
+  /**
+   * Ends the stream: drops whatever is held back (an unfinished introducer) and, if the user's
+   * terminal is still inside an OSC passed on to it, returns a CAN to end it. Then starts afresh.
+   */
+  flush(): Uint8Array {
+    const end = this.#inOsc ? Uint8Array.of(CAN) : new Uint8Array(0);
+    this.#mode = 'text';
+    this.#held = [];
+    this.#inOsc = false;
+    this.#need = 0;
+    return end;
+  }
+
+  /** Handles one byte; true if the same byte must be handled again in the new state. */
+  #step(b: number): boolean {
+    switch (this.#mode) {
+      case 'text':
+        if (this.#continues(b)) this.#emit(b);
+        else if (b === ESC) this.#mode = 'esc';
+        else if (b === C2) this.#mode = 'c2';
+        else if (b === C1_OSC) this.#startOsc([b]);
+        else this.#emit(b);
+        return false;
+      case 'pass':
+        if (this.#continues(b)) this.#emit(b);
+        else if (b === ESC) this.#mode = 'esc';
+        else if (b === C2) this.#mode = 'c2';
+        else if (b === C1_OSC) this.#startOsc([b]);
+        else {
+          this.#emit(b);
+          if (b === BEL || b === CAN || b === SUB || b === C1_ST) this.#toText();
+        }
+        return false;
+      case 'esc':
+        if (b === RIGHT_BRACKET) this.#startOsc([ESC, b]);
+        else if (escIgnores(b)) this.#emit(b);
+        else {
+          this.#emit(ESC);
+          this.#toText();
+          return true;
+        }
+        return false;
+      case 'c2':
+        if (b === C1_OSC) this.#startOsc([C2, b]);
+        else {
+          this.#emit(C2);
+          if (b === C1_ST) {
+            this.#emit(b);
+            this.#toText();
+            return false;
+          }
+          this.#need = 1;
+          this.#mode = this.#inOsc ? 'pass' : 'text';
+          return true;
+        }
+        return false;
+      case 'intro':
+        if (this.#held.length >= MAX_HELD) {
+          this.#decide(true);
+          return true;
+        }
+        if (b >= 0x30 && b <= 0x39) {
+          this.#held.push(b);
+          if (this.#value > 0 || b !== 0x30) {
+            this.#significant++;
+            if (this.#significant <= MAX_SIGNIFICANT) this.#value = this.#value * 10 + (b - 0x30);
+          }
+        } else if (oscIgnores(b)) this.#held.push(b);
+        else if (b === C1_OSC) this.#startOsc([b]);
+        else if (b === C2) this.#mode = 'introC2';
+        else {
+          this.#decide(false);
+          return true;
+        }
+        return false;
+      case 'introC2':
+        if (b === C1_OSC) {
+          this.#startOsc([C2, b]);
+          return false;
+        }
+        // The C2 ends the number; it is handled as the first byte after it.
+        if (this.#decide(false)) {
+          this.#dropped++;
+          this.#mode = 'dropC2';
+        } else this.#mode = 'c2';
+        return true;
+      case 'drop':
+        if (++this.#dropped > this.maxDrop) {
+          this.#toText();
+          return true;
+        }
+        if (this.#continues(b)) return false;
+        if (b === BEL || b === CAN || b === SUB || b === C1_ST) this.#toText();
+        else if (b === ESC) this.#mode = 'dropEsc';
+        else if (b === C2) this.#mode = 'dropC2';
+        else if (b === C1_OSC) this.#startOsc([b]);
+        return false;
+      case 'dropEsc':
+        if (b === BACKSLASH) {
+          this.#toText();
+          return false;
+        }
+        // The ESC starts whatever comes next.
+        this.#mode = 'esc';
+        return true;
+      case 'dropC2':
+        if (b === C1_ST) {
+          this.#toText();
+          return false;
+        }
+        if (b === C1_OSC) {
+          this.#startOsc([C2, b]);
+          return false;
+        }
+        this.#mode = 'drop';
+        this.#need = 1;
+        return true;
+    }
+  }
+
+  /** Whether `b` continues a UTF-8 character; otherwise notes what it starts. */
+  #continues(b: number): boolean {
+    if (b >= 0x80 && b <= 0xbf && this.#need > 0) {
+      this.#need--;
+      return true;
+    }
+    this.#need = utf8Need(b);
+    return false;
+  }
+
+  #startOsc(held: number[]): void {
+    this.#held = held;
+    this.#value = 0;
+    this.#significant = 0;
+    this.#need = 0;
     this.#mode = 'intro';
+  }
+
+  /** The number is read: pass the OSC on, or drop it (true). */
+  #decide(tooLong: boolean): boolean {
+    const held = this.#held;
+    this.#held = [];
+    this.#need = 0;
+    if (tooLong || this.#significant > MAX_SIGNIFICANT || this.blocked(this.#value)) {
+      // The user's terminal is still inside an OSC passed on before this one started: end it, or
+      // it would run on into what follows the dropped one.
+      if (this.#inOsc) this.#emit(CAN);
+      this.#inOsc = false;
+      this.#dropped = 0;
+      this.#mode = 'drop';
+      return true;
+    }
+    for (const x of held) this.#emit(x);
+    this.#inOsc = true;
+    this.#mode = 'pass';
+    return false;
+  }
+
+  #toText(): void {
+    this.#mode = 'text';
+    this.#inOsc = false;
+  }
+
+  #emit(b: number): void {
+    if (this.#n === this.#out.length) {
+      const grown = new Uint8Array(this.#out.length * 2 + 16);
+      grown.set(this.#out);
+      this.#out = grown;
+    }
+    this.#out[this.#n++] = b;
   }
 }
