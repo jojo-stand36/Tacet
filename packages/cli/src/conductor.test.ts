@@ -72,6 +72,14 @@ describe('tacet up: the Conductor', () => {
     expect(r.err).toContain('not a git repository');
   });
 
+  it('refuses a mistyped path rather than register the repo around it, and both flags at once', async () => {
+    const r = await tacet(['up', '--add', join(repo, 'tpyo')]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('no such path');
+    expect((await status()).repos).toEqual([]);
+    expect((await tacet(['up', '--add', repo, '--remove', repo])).code).toBe(2);
+  });
+
   it('runs until interrupted, and shows who is connected', async () => {
     await tacet(['up', '--add', repo]);
     const stop = new AbortController();
@@ -96,6 +104,30 @@ describe('tacet up: the Conductor', () => {
     );
     expect((await status()).running).toBe(process.pid);
     expect((await tacet(['conductor', 'status'])).out).toMatch(/connected since/);
+    // A Mini-conductor of a repo the user did not register is shown, and not registered.
+    const other = join(root, 'other');
+    mkdirSync(other);
+    execFileSync('git', ['init', '-q', other]);
+    const stranger = await connectRpc({
+      port: info.port,
+      token: info.token,
+      clientInfo: { name: 'test-mini', version: '0' },
+      role: 'mini',
+      card: {
+        repoId: repoStatePaths(other).repoId,
+        repoPath: other,
+        adapters: [],
+        miniVersion: '0',
+      },
+    });
+    await vi.waitFor(async () =>
+      expect((await status()).unregistered).toEqual([expect.objectContaining({ repoPath: other })]),
+    );
+    expect((await tacet(['conductor', 'status'])).out).toContain(
+      `${other}: connected, not registered`,
+    );
+    expect((await status()).repos).toHaveLength(1);
+    await stranger.close();
     await mini.close();
     stop.abort();
     const r = await running;

@@ -1,5 +1,5 @@
-import { existsSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { existsSync, mkdirSync, realpathSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
 import {
   type EventEnvelope,
   newUlid,
@@ -11,6 +11,7 @@ import {
   CLOSE_CONFLICT,
   conductorRuntimePath,
   conductorStatePaths,
+  defaultRunDir,
   type EventStore,
   openEventStore,
   type ProcessLockText,
@@ -75,7 +76,24 @@ interface Live {
  */
 export async function startConductor(o: StartConductorOptions): Promise<Conductor> {
   const paths = conductorStatePaths(o.stateDir);
-  takeProcessLock(paths.lock, LOCK_TEXT);
+  // One per user: a lock beside the runtime file every Mini-conductor reads, whatever state dir a
+  // Conductor uses, and one beside its log.
+  const runLock = join(o.runDir ?? defaultRunDir(), 'conductor.lock');
+  mkdirSync(dirname(runLock), { recursive: true, mode: 0o700 });
+  takeProcessLock(runLock, LOCK_TEXT);
+  try {
+    takeProcessLock(paths.lock, LOCK_TEXT);
+  } catch (err) {
+    releaseProcessLock(runLock);
+    throw err;
+  }
+  const releaseLocks = () => {
+    try {
+      releaseProcessLock(paths.lock);
+    } finally {
+      releaseProcessLock(runLock);
+    }
+  };
   let store: EventStore | undefined;
   let server: RpcServer | undefined;
   try {
@@ -83,7 +101,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     const log = store;
     const now = () => o.now?.() ?? new Date();
     const report = (err: unknown) => o.onError?.(err instanceof Error ? err.message : String(err));
-    const record = (type: string, repoId: string, data: unknown) => {
+    const recordOrThrow = (type: string, repoId: string, data: unknown) => {
       const at = now();
       log.append({
         v: 1,
@@ -94,6 +112,14 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
         type,
         data,
       } as EventEnvelope);
+    };
+    /** Recorded, or reported: a failed write (a busy or full disk) never takes the daemon down. */
+    const record = (type: string, repoId: string, data: unknown) => {
+      try {
+        recordOrThrow(type, repoId, data);
+      } catch (err) {
+        report(err);
+      }
     };
     let view = { seq: 0, state: registryProjection.initial() };
     const registry = (): RegistryState => {
@@ -107,7 +133,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     };
     // Whatever the log still shows as connected belonged to a Conductor that is gone.
     for (const c of Object.values(registry().connected)) {
-      record('registry.disconnected', c.repoId, {
+      recordOrThrow('registry.disconnected', c.repoId, {
         repoId: c.repoId,
         sessionId: c.sessionId,
         reason: 'conductor_restart',
@@ -201,7 +227,8 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     const interval = o.pingIntervalMs ?? 10_000;
     const beat = setInterval(() => {
       for (const entry of live.values()) {
-        void entry.conn.ping(interval).then((ok) => {
+        // Answered within half the interval, so pings never overlap.
+        void entry.conn.ping(Math.max(1, Math.floor(interval / 2))).then((ok) => {
           if (ok) {
             entry.missed = 0;
             return;
@@ -223,24 +250,27 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       close: () => {
         closed ??= (async () => {
           clearInterval(beat);
-          // Recorded as closed here, once, before the store goes.
-          for (const entry of live.values()) {
-            record('registry.disconnected', entry.repoId, {
-              repoId: entry.repoId,
-              sessionId: entry.conn.sessionId,
-              reason: 'closed',
-            });
-          }
           closing = true;
-          live.clear();
           try {
+            // Recorded as closed here, once, before the store goes.
+            for (const entry of live.values()) {
+              record('registry.disconnected', entry.repoId, {
+                repoId: entry.repoId,
+                sessionId: entry.conn.sessionId,
+                reason: 'closed',
+              });
+            }
+            live.clear();
             await rpc.close();
           } finally {
             try {
               removeRuntimeFile(conductorRuntimePath(o.runDir), runtime.token);
             } finally {
-              log.close();
-              releaseProcessLock(paths.lock);
+              try {
+                log.close();
+              } finally {
+                releaseLocks();
+              }
             }
           }
         })();
@@ -250,12 +280,15 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
   } catch (err) {
     await server?.close();
     store?.close();
-    releaseProcessLock(paths.lock);
+    releaseLocks();
     throw err;
   }
 }
 
-/** The canonical path of a repo's main checkout a hello names, or undefined if it is not one. */
+/**
+ * The canonical path of the checkout a hello names (a main checkout, or a linked worktree, whose
+ * `.git` is a file, as `tacet up --add` takes it), or undefined if it is not one.
+ */
 function canonicalRepo(path: string): string | undefined {
   if (!isAbsolute(path)) return undefined;
   try {

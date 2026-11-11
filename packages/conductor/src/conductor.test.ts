@@ -120,6 +120,42 @@ describe('the Conductor daemon (#23)', () => {
     expect(again.port).toBeGreaterThan(0);
   });
 
+  it('runs one per user, even with another state dir', async () => {
+    await start();
+    await expect(startConductor({ stateDir: join(root, 'other-state'), runDir })).rejects.toThrow(
+      /already running/,
+    );
+  });
+
+  it('accepts exactly one of two Mini-conductors that dial a repo at once', async () => {
+    const c = await start();
+    const path = repo('api');
+    const [a, b] = await Promise.all([dial(c, path), dial(c, path)]);
+    const loser = await Promise.race([
+      a.closed.then((e) => ({ who: a, e })),
+      b.closed.then((e) => ({ who: b, e })),
+    ]);
+    expect(loser.e.code).toBe(4409);
+    const winner = loser.who === a ? b : a;
+    expect(Object.values(c.registry().connected).map((x) => x.sessionId)).toEqual([
+      winner.hello.sessionId,
+    ]);
+    await winner.close();
+  });
+
+  it('records a live connection as closed once when it stops, and refuses nothing after', async () => {
+    const c = await start();
+    const path = repo('api');
+    const mini = await dial(c, path);
+    await vi.waitFor(() => expect(Object.keys(c.registry().connected)).toHaveLength(1));
+    await c.close();
+    running.length = 0;
+    await mini.closed;
+    expect(ended()).toEqual([
+      { repoId: card(path).repoId, sessionId: mini.hello.sessionId, reason: 'closed' },
+    ]);
+  });
+
   it('records a Mini-conductor that dials in, unregistered, and its going', async () => {
     const c = await start();
     const path = repo('api');

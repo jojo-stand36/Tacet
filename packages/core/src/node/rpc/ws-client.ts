@@ -54,6 +54,9 @@ export interface ConnectRpcOptions {
  * in the upgrade's `Authorization` header only, never in a URL, argument or error.
  */
 export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
+  if ((o.role ?? 'cli') === 'mini' && !o.card) {
+    throw new RpcClientError('a mini hello needs its card');
+  }
   const timeoutMs = o.timeoutMs ?? 10_000;
   const ws = new WebSocket(`ws://127.0.0.1:${o.port}/`, {
     headers: { authorization: `Bearer ${o.token.reveal()}` },
@@ -135,8 +138,6 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
       // `ws` names only the status (e.g. "Unexpected server response: 401"), never headers.
       ws.once('error', (err) => reject(new RpcClientError(`cannot connect: ${err.message}`)));
     });
-    if ((o.role ?? 'cli') === 'mini' && !o.card)
-      throw new RpcClientError('a mini hello needs its card');
     const hello = HelloResult.parse(
       await call('tacet/hello', {
         protocolVersions: [1],

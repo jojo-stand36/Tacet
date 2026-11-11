@@ -69,7 +69,13 @@ export async function up(io: Io, o: UpOptions): Promise<number> {
 
 /** Register or unregister the repo at `path` in the Conductor's log; a repeat changes nothing. */
 function register(io: Io, stateDir: string, path: string, add: boolean, json?: boolean): number {
-  const root = repoRootFrom(isAbsolute(path) ? path : join(io.cwd, path));
+  const given = isAbsolute(path) ? path : join(io.cwd, path);
+  // A mistyped path must not register the repo around it.
+  if (!existsSync(given)) {
+    io.err(`no such path: ${terminalSafe(path)}`);
+    return 1;
+  }
+  const root = repoRootFrom(given);
   if (!existsSync(join(root, '.git'))) {
     io.err(`not a git repository: ${terminalSafe(path)}`);
     return 1;
@@ -92,6 +98,9 @@ function register(io: Io, stateDir: string, path: string, add: boolean, json?: b
     else {
       const what = add ? 'registered' : 'not registered';
       io.out(`${terminalSafe(repoPath)} ${changed ? `is now ${what}` : `was already ${what}`}`);
+      if (realpathSync(given) !== repoPath) {
+        io.out(`(the repo containing ${terminalSafe(path)})`);
+      }
     }
     return 0;
   } finally {
