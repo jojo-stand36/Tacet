@@ -234,12 +234,16 @@ describe('PtyAdapter (fake claude)', () => {
     // No `@path` mention is read into a prompt (#226).
     expect(f.opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
     // Set last: neither the base environment nor a session's own env can turn it off.
-    const off = make(
-      { CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0' },
-      { envPolicy: { pass: ['FAKE_*', 'CLAUDE_CODE_DISABLE_FILE_MENTIONS'] } },
-    );
-    await off.start({ cwd: join(root, 'wt'), env: { CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0' } });
+    // No official plugin marketplace is cloned into the fresh config dir (#288).
+    expect(f.opts.env.CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL).toBe('1');
+    const unset = {
+      CLAUDE_CODE_DISABLE_FILE_MENTIONS: '0',
+      CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '0',
+    };
+    const off = make(unset, { envPolicy: { pass: ['FAKE_*', 'CLAUDE_CODE_*'] } });
+    await off.start({ cwd: join(root, 'wt'), env: unset });
     expect(fake().opts.env.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe('1');
+    expect(fake().opts.env.CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL).toBe('1');
     expect(f.opts.env.NO_PROXY).toContain('127.0.0.1');
     expect(f.opts.env.OPENAI_API_KEY).toBeUndefined();
     expect(dropped).toEqual([['OPENAI_API_KEY']]);

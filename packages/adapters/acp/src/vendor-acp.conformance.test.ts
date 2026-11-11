@@ -459,6 +459,8 @@ for (const c of CASES) {
 
         const done = await turn(undefined, 'done232');
         expect(traces(done, 'done232').some((p) => p.endsWith(`${done}.jsonl`))).toBe(true);
+        // No plugin marketplace cloned into the Worker's config dir (#288).
+        expect(Object.keys(snapshot(state)).filter((p) => p.includes('marketplaces'))).toEqual([]);
         await worker.discard(done, cwd);
         expect(traces(done, 'done232')).toEqual([]);
 
