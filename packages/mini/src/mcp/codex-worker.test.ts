@@ -1,8 +1,8 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { CodexAppServerAdapter } from '@tacet/adapter-codex-app-server';
 import {
+  codexFixtureDir,
   type MockResponsesApi,
   startMockResponsesApi,
 } from '@tacet/adapter-codex-app-server/testing';
@@ -26,7 +26,8 @@ describe('a real Codex Worker calls escalate (#18 acceptance)', () => {
 
   beforeAll(async () => {
     api = await startMockResponsesApi();
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-mini-codex-')));
+    // Not under a temp dir the Codex sandbox leaves writable: the adapter refuses that (#295).
+    root = codexFixtureDir('tacet-mini-codex-');
     mkdirSync(join(root, 'worktree'));
     mkdirSync(join(root, 'home'));
     store = openEventStore(':memory:');

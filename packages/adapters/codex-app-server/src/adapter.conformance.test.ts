@@ -1,18 +1,10 @@
-import {
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  statSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SendOptions, SessionHandle } from '@tacet/core';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CodexAppServerAdapter } from './adapter.js';
+import { codexFixtureDir } from './testing/fixture-dir.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
 /**
@@ -28,7 +20,8 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
 
   beforeAll(async () => {
     api = await startMockResponsesApi();
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-codex-')));
+    // Not under a temp dir the sandbox leaves writable: the adapter refuses a CODEX_HOME there (#295).
+    root = codexFixtureDir('tacet-codex-');
     worktree = join(root, 'worktree');
     home = join(root, 'home');
     mkdirSync(worktree);

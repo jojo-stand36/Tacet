@@ -99,6 +99,18 @@
     {
       "name": "needs-human",
       "color": "e4e669"
+    },
+    {
+      "name": "priority:p3",
+      "color": "ededed"
+    },
+    {
+      "name": "area:cli",
+      "color": "ededed"
+    },
+    {
+      "name": "bug",
+      "color": "d73a4a"
     }
   ],
   "milestones": [
@@ -368,6 +380,16 @@
       "body": "A developer can `tacet init` in a repo, give a task, and have the mini-conductor plan it, run cheap workers in worktrees, verify, and report back.\n\n### Tasks\n- [ ] All M1 issues\n\n### Acceptance criteria\n- Demo: a multi-file feature completed end-to-end with ≥2 parallel workers and passing verification\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "A task reports \"completed\" when nothing was integrated and verify did not run",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "bug",
+        "area:mini",
+        "priority:p1"
+      ],
+      "body": "Found in the Amadeus #101 pilot, alongside #260.\n\n## What happened\nThe task ended with status `completed` and verify `not_run`, but the Worker's change was never committed or integrated (#260). From the status alone, a run that did nothing looks like a success.\n\n## Expected\n- A task is not `completed` unless its work was integrated. With no commit, it ends in a distinct non-success state, for example `not_integrated` or `failed`, with the reason given.\n- When verify is `not_run`, the summary says so plainly rather than reporting it as a pass."
+    },
+    {
       "title": "ACP adapter: close() after a self-exit must not poll the reaped process group again",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -523,6 +545,17 @@
       "body": "Minimal CLI to use a mini-conductor without the Conductor.\n\n### Tasks\n- [ ] `tacet run \"task\"`\n- [ ] `tacet status`\n- [ ] `tacet attach <worker>` (live PTY or stream)\n- [ ] `tacet logs <task>`\n\n### Acceptance criteria\n- End-to-end demo scriptable from CLI only\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Cap or rotate the background run's log (tacet run --detach)",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "agent:either",
+        "priority:p3",
+        "area:cli"
+      ],
+      "body": "`tacet run --detach` (#201, #272) sends the background run's stdout and stderr to `~/.tacet/run/minis/<repo-hash>.log`. The file is mode 0600 and truncated for each run, but it has no size limit. It holds only the run's own progress lines: summary-grade events, one notice per escalation and the final report. Worker output goes to the adapters' pipes or PTYs, never to this log. A long run with many sub-tasks or restarts can still grow it without bound.\n\n### Tasks\n- [ ] Cap the log, for example at a few MB, keeping the newest lines: rotate to `<hash>.log.1`, or have the background run write through a capped writer instead of an inherited file descriptor.\n- [ ] Keep it mode 0600, and keep it new for each run.\n- [ ] Make sure a crash before the writer exists still reaches the log, so the parent's \"ended at once\" tail still works.\n\n### Acceptance criteria\n- A background run that writes past the cap leaves a log no larger than the cap plus one rotation, holding its latest lines.\n- `tacet run --detach` still shows the end of the log when the run ends at once.\n\n_See #201, #272 and docs/ARCHITECTURE.md §1._"
+    },
+    {
       "title": "Chore: fail CI when capability matrix dates are stale for active surfaces",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -558,6 +591,19 @@
       "body": "This came out of #19 PR2 (#180, independent review blocker).\n\nThe `claude-sdk` adapter never sets the Agent SDK's `settingSources`. It only passes `sdkOptions` through (`packages/adapters/claude-sdk/src/adapter.ts`). The pinned SDK's `sdk.d.ts` (0.3.318, `Options.settingSources`) says:\n- \"When omitted, all sources are loaded (matches CLI defaults)\", meaning user `~/.claude/settings.json`, project `.claude/settings.json` and local `.claude/settings.local.json`;\n- \"Pass `[]` to disable filesystem settings (SDK isolation mode)\";\n- \"Must include `'project'` to load CLAUDE.md files\".\n\nThis is recorded in `docs/adapters/capability-matrix.md` (Claude, \"Filesystem settings\").\n\nSo every Tacet-driven Claude SDK session (Workers and the planner) loads the project settings, hooks included, and the CLAUDE.md of its working directory, as well as the user's own settings. Any Worker, of any vendor, can commit a `.claude/settings.json` with hooks such as `SessionStart`. Those hooks then run unsandboxed and without Tacet's approval in a later Claude session in that checkout, for example:\n- a retry;\n- a resume after a restart;\n- a Claude Worker on a dependent sub-task.\n\nThe repo's or user's `permissions`, `env` and hooks can also override what Tacet sets up. CLAUDE.md is a prompt-injection channel outside Tacet's prompts.\n\n`packages/adapters/pty/src/claude.ts:78` assumes the opposite. Its comment says the PTY preset passes `--setting-sources ''` \"as the SDK adapter's `settingSources: []`\", but the SDK adapter does not pass that. The #19 reviewer agent already avoids the problem by working in an empty directory of its own (#180).\n\n### Tasks\n- [ ] Set `settingSources: []` for every session the `claude-sdk` adapter starts (Workers, the planner, the reviewer), unless a caller explicitly opts in. Check that Tacet's own system prompt, MCP config and permission handling still work without filesystem settings.\n- [ ] Fix the `claude.ts:78` comment once it is true, or reword it.\n- [ ] Check Gemini (`acp:gemini`) and the other ACP agents for the same exposure: do they load project settings, hooks, extensions or instruction files (`GEMINI.md`, `.gemini/settings.json`, `AGENTS.md`) from the checkout? Record the findings in the capability matrix (`verify-vendor-facts`) and close what can be closed per agent.\n- [ ] Update ARCHITECTURE.md §6 with what each adapter loads from its working directory.\n\n### Acceptance criteria\n- A test with a checkout holding a hostile `.claude/settings.json` (a `SessionStart` hook that writes a file) and a `CLAUDE.md` shows, for a `claude-sdk` Worker session, that the hook does not run and the CLAUDE.md text never reaches the model. Use the mock API or the recorded request, as the #150 tests do.\n- The capability matrix records, for Gemini and each built-in ACP agent, which project files it loads, with a source, and ARCHITECTURE.md §6 states the residual risk for any that cannot be turned off.\n\n_See docs/adapters/capability-matrix.md (Claude), packages/adapters/claude-sdk/src/adapter.ts, packages/adapters/pty/src/claude.ts and #180._"
     },
     {
+      "title": "Claude Workers can find a host OAuth token at Claude Code's fixed well-known path",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "During the #288 live test, inside a Claude Code cloud container, a `pty:claude` Worker's screen showed \"Both CCR_OAUTH_TOKEN_FILE and ANTHROPIC_API_KEY set\". Tacet gave that Worker only `PATH`, `HOME` (a fake one), `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` and `DISABLE_AUTOUPDATER`. Its requests still went to the mock with the API key.\n\nNo token value, file content or env value was read, printed or copied in this investigation. Only names, a path's existence and vendor code strings were looked at.\n\n### How the binary finds it\n\nThis was read from the pinned Claude Code 2.1.319 binary's own code strings, not from docs:\n- `CCR_OAUTH_TOKEN_FILE` is not an environment variable. It is a *source label* in Claude Code's auth-source detection, with the hint \"This token is injected by the CCR host; check the host session.\"\n- The detection reads an OAuth token from the file descriptor in `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` when that is set. Otherwise it reads a **fixed absolute well-known path**, `/home/claude/.claude/remote/.oauth_token`. This path does not depend on `HOME` or `CLAUDE_CONFIG_DIR`.\n- When the token comes from a descriptor, the code also appears to write it to that well-known path. This is unverified.\n- In this container the path exists; only its existence was checked. That is why a Worker with a fresh `HOME` and config dir still detects a token.\n\n### Scope\n\n- **Likely specific to Claude Code's cloud containers.** The path sits under `/home/claude`, and the label names the CCR host. On a normal macOS or Linux machine the path should not exist.\n- **Affects every Claude Code Worker.** `pty:claude`, claude-sdk and claude-agent-acp all run the same binary, so all three are presumably affected. Only `pty:claude` was observed.\n- **The API key won here.** With `ANTHROPIC_API_KEY` set, requests used the key. But the Claude Code process may still load the host's subscription token into memory, and a Worker launched without a key could use the host's subscription. That conflicts with the hard rule that Tacet launches vendor CLIs only under the user's own auth or API key and never uses a token it was not given.\n\n### Tasks\n- [ ] Verify from primary sources (`verify-vendor-facts`) whether this well-known path and `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` are documented, and whether any switch turns the lookup off. Record the result in the capability matrix. Never touch the real file.\n- [ ] Decide (**needs-human**) what Tacet does in general. Options:\n  - (a) Detect the well-known path at Worker start and warn or refuse.\n  - (b) Hide it from the Worker process, for example with a mount namespace or sandbox around Claude Code itself, not only around its subprocesses.\n  - (c) Document it as a cloud-container-only risk.\n- [ ] Test with a fake token at a fake well-known path, never the real one, if the path can be redirected in a test. Otherwise use a unit test of the detection.\n\n### Acceptance criteria\n- The matrix records how Claude Code finds a token in this case, with sources.\n- A recorded decision, and a test for whatever behaviour Tacet adopts.\n\n_Found during #288 (PR #290). See docs/RESEARCH.md §7 and AGENTS.md hard rules._"
+    },
+    {
       "title": "Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -581,6 +627,18 @@
       "body": "Follow-up from #17 (architect review). If the Mini-conductor dies without closing its Workers, their vendor processes (Claude Code, `codex app-server` and their children) can keep running and writing to the worktree, and race the resumed session after a restart. The daemon cannot see them today: adapters own the processes and `AgentAdapter` exposes no process id.\n\n### Tasks\n- [ ] Let adapters report the process group of a session (e.g. an optional field on `SessionHandle`, recorded in a 0600 runtime file under `~/.tacet/run/minis/`, not in forwarded events)\n- [ ] On `start()`, signal stale process groups that belonged to this repo's previous daemon before resuming, guarding against pid reuse\n\n### Acceptance criteria\n- After a simulated crash, no Worker process from the previous run is alive when the resumed session starts (test with a real adapter against its mock API)\n\n_See docs/ARCHITECTURE.md §6 and ADR-003 §3.2._"
     },
     {
+      "title": "Codex Worker isolation does not hold for a repo under /tmp or $TMPDIR",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "bug",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Running the suite from a checkout under `/tmp` (a linked worktree in a scratch dir) fails 9 of 13 tests in `packages/adapters/codex-app-server/src/isolation.test.ts`. The same tests pass from a checkout outside the temp dirs.\n\n### Root cause\n\nThe trigger is the temp dir, not the linked worktree.\n- The first test, \"unattended: … never writes the shared .git\", fails because the sandboxed Worker *did* move a shared ref (`REF_MOVED`).\n- The other 8 then fail on the corrupted fixture repo (`fatal: invalid reference: HEAD`).\n\nWhy the Worker could write there:\n- In `workspace-write`, Codex makes the cwd, `$TMPDIR` and `/tmp` writable. This is recorded in the capability matrix, \"Sandbox writable roots (#116)\".\n- Tacet's production Workers deliberately do not set `exclude_slash_tmp` / `exclude_tmpdir_env_var`. On macOS the Xcode `git` shim writes under the per-user `$TMPDIR` (830dccf).\n- The test fixture lives under `packages/adapters/codex-app-server/node_modules/.cache/`, to stay out of the temp dirs. When the checkout itself is under `/tmp`, that cache is under `/tmp` too.\n\n**This is a product gap, not only a test one.** Whenever a repo, and so its shared `.git`, sits under `/tmp` or `$TMPDIR`, an unattended Codex Worker can write the shared refs, objects and hooks. The \"never writes the shared .git\" guarantee from #116 does not hold there. Repos under `/tmp` are common for scratch checkouts and in CI and agent containers.\n\n### Options (decision needed on the product side)\n\n1. **Refuse or warn** when an unattended Codex Worker's repo common git dir (or worktree git dir) resolves, through realpath, under `/tmp` or the Worker's `$TMPDIR`. The error says why and how to fix it (move the repo). Cheap and honest.\n2. **On Linux only, exclude `/tmp` and `$TMPDIR`.** There is no shim problem there, but Worker tools that need a temp dir would then break, unless Tacet gives each Worker its own `TMPDIR` inside its worktree state and excludes only the shared ones.\n3. **Per-Worker private `TMPDIR` plus `exclude_slash_tmp`**, on both platforms. That needs checking against the macOS shim, which writes under whatever `$TMPDIR` is set to.\n\n### Tasks\n- [ ] Decide between the options above.\n- [ ] Make the isolation test independent of where the checkout lives: put its fixture repo outside every sandbox-writable temp root. Don't skip it.\n- [ ] Implement the chosen behaviour with a test, and record it in the matrix.\n\n### Acceptance criteria\n- `isolation.test.ts` passes from a checkout under `/tmp`.\n- An unattended Codex Worker never writes a shared `.git` under a temp dir. Either it is refused with a clear error, or the sandbox keeps that path read-only. A test covers it.\n\n_Found while verifying #289 (PR #292) from a scratch worktree._"
+    },
+    {
       "title": "Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -591,6 +649,42 @@
         "agent:claude"
       ],
       "body": "Owner decision (2026-11-09), from the #12 review (PR #115). Builds on the Codex adapter once #115 is merged. One issue because all three change how the adapter launches Codex for a Worker.\n\n### Tasks\n- [ ] Verify the 0.167.0 config keys first (`verify-vendor-facts`): sandbox writable roots for `workspace-write` (e.g. `sandbox_workspace_write.writable_roots`) and how `thread/start` `config` or `-c` sets them; record in the capability matrix\n- [ ] Writable git dir: add the Worker's own worktree git dir (`git rev-parse --git-dir` in the worktree) to the writable roots, and nothing else; never the main repo's whole `.git`\n- [ ] Own `CODEX_HOME` for unattended Workers at `~/.tacet/state/<repo>/codex` (dir 0700, created on demand, `<repo>` as in the event log path); interactive sessions keep the user's `~/.codex`\n- [ ] `features.plugins = false` for unattended Workers (no GitHub plugin sync on start)\n- [ ] Document in the adapter README / capability matrix that the user's `config.toml` customisations do not apply to unattended Workers\n\n### Acceptance criteria\n- A Codex Worker in a git worktree can `git commit` without an approval request (test against the mock Responses API)\n- An unattended Worker's thread state lands under `~/.tacet/state/<repo>/codex`, never in `~/.codex` (test with an isolated HOME)\n- No `plugins-clone-*` directory is created for an unattended Worker\n- An interactive session still uses the user's `CODEX_HOME`\n\n_See docs/ARCHITECTURE.md §6 (Codex Worker isolation) and docs/adapters/capability-matrix.md §2._"
+    },
+    {
+      "title": "Codex Workers on macOS: a private TMPDIR, and sweeping leftover Worker temp dirs",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "agent:claude",
+        "priority:p3"
+      ],
+      "body": "#294 gives each unattended Codex Worker a private `TMPDIR` and takes `/tmp` out of the sandbox, **on Linux only** (verified live there). Two pieces are left:\n\n1. **macOS.** The private TMPDIR is off there, so the #293/#295 refusals still apply.\n   - The Xcode `git` shim writes its cache under the per-user temp dir (830dccf). It is not known whether that follows `$TMPDIR` or always uses `confstr(_CS_DARWIN_USER_TEMP_DIR)`.\n   - This could not be checked from Linux.\n   - Task: on macOS CI, run `isolation.test.ts` and `private-tmpdir.test.ts` with `privateTmpdir: true`, plus a first `git` call inside the sandbox. If they pass, turn it on by default on macOS. If not, record why in the matrix.\n2. **Leftover temp dirs.** A Worker's `<state>/codex-tmp/<uuid>` is removed when its session ends, but not when the host is killed (SIGKILL).\n   - A sweep has to skip the dirs of live Workers of the same repo, possibly in other processes.\n   - The fix might sweep at Mini-conductor start, using its run lock, or remove dirs older than the retention period.\n\n### Acceptance criteria\n- macOS: a private TMPDIR either verified and on, with CI covering it, or recorded as not workable, with the reason.\n- Dirs left by killed hosts are removed without touching a live Worker's dir, with a test.\n\n_Follow-up to #294._"
+    },
+    {
+      "title": "Codex Workers: CODEX_HOME, and a repo found without repoRoot, under a sandbox temp dir",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "bug",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "#293 refuses an unattended Codex Worker when the repo's git dirs lie under `/tmp` or the Worker's `$TMPDIR`. Codex's `workspace-write` sandbox leaves those writable. Its review found two related paths the refusal does not cover. Both were left out of #293 to keep that change narrow.\n\n1. **`CODEX_HOME` under a temp dir.** This is inferred, not verified live.\n   - When `stateDir`, or `HOME` and so the default state dir, lies under `/tmp` or `$TMPDIR`, the Worker's own `CODEX_HOME` is sandbox-writable.\n   - A Worker could then add `mcp_servers` or project trust to `<CODEX_HOME>/config.toml`, and the next Worker's app-server would load it outside the sandbox.\n   - `HOME=/tmp` is common in CI and agent containers.\n2. **No `repoRoot`.**\n   - The #293 check runs only when `repoRoot` is set.\n   - Without it, `workerRepoRoot` refuses only when `cwd/.git` exists.\n   - So an unattended Worker whose cwd is a subdirectory of a repo under `/tmp` starts, and the parent `.git` is writable.\n\n### Tasks\n- [ ] Verify item 1 live, with a Worker writing to its `CODEX_HOME/config.toml`.\n- [ ] Extend the containment check to `CODEX_HOME`, and to the cwd's enclosing repo when there is no `repoRoot`. Alternatively, refuse unattended Workers with no `repoRoot`.\n- [ ] Move any test fixtures this affects outside the temp roots (`codexFixtureDir`).\n\n### Acceptance criteria\n- No unattended Codex Worker starts with its `CODEX_HOME`, or an enclosing repo's `.git`, under a sandbox-writable temp dir. A test covers each case.\n- The long-term fix (#294, a private TMPDIR) lifts these refusals too.\n\n_Found in the review of #293._"
+    },
+    {
+      "title": "Codex Workers: a private TMPDIR per Worker so a repo under /tmp can be isolated",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "agent:claude",
+        "priority:p3"
+      ],
+      "body": "#293 makes the Codex adapter **refuse** an unattended Worker when the repo's git dirs lie under `/tmp` or the Worker's `$TMPDIR`. Codex's `workspace-write` sandbox leaves those paths writable, so it could not keep the shared `.git` read-only there.\n\nThis issue is the longer-term fix that would lift the refusal (option 3 in #293): give each Worker its own `TMPDIR` inside its state, and exclude the shared temp dirs from the sandbox.\n\n### Tasks\n- [ ] Verify (`verify-vendor-facts`) that `exclude_slash_tmp` and `exclude_tmpdir_env_var` behave as documented on Linux and macOS for Codex 0.167.0.\n- [ ] Give each unattended Worker a private `TMPDIR`, for example under its worktree git dir or its state dir, writable through `writable_roots`. Set `sandbox_workspace_write.exclude_slash_tmp=true` and `exclude_tmpdir_env_var=true`.\n- [ ] Live-check the macOS Xcode `git` shim with the private `TMPDIR`. 830dccf dropped the excludes because the shim writes its cache under the per-user temp dir.\n- [ ] Remove the #293 refusal once a repo under `/tmp` is protected. Run `isolation.test.ts` with its fixture under `/tmp`.\n\n### Acceptance criteria\n- An unattended Codex Worker on a repo under `/tmp` runs, and still never writes the shared `.git`. Tested on Linux and macOS CI.\n\n_Follow-up to #293._"
     },
     {
       "title": "Codex adapter: close() should wait for the whole process group",
@@ -637,6 +731,17 @@
       "body": "Found while working on #245. In live tests against the local mock Responses API, interactive Codex 0.167.0 in a PTY does not read an `@path` into a prompt. But when a Worker prompt ends in an `@token` (`… see @note.txt`), Codex opens its \"Mentions\" popup, and the Enter that Tacet types then inserts the selected completion instead of submitting. The prompt text changes (`@note.txt` became `note.txt`), and the turn is not submitted until Esc and then Enter. The `PtyCliAdapter` turn stalls, and the next prompt Tacet types lands in that composer. An `@` that is not the last word submits normally.\n\nSeparately, Codex source (`codex-rs/tui/src/bottom_pane/chat_composer.rs`, main) attaches a pasted path as an image when it names an image file (`handle_paste_image_path`). That would send an image from outside the checkout to the model. When this triggers, for example whether a prompt with surrounding text counts, is unverified.\n\n### Tasks\n- [ ] Reproduce the trailing-`@` popup with the PTY live setup, and decide how to fix it: close the popup before submitting, end the prompt with a character that doesn't complete, or disable `mentions_v2`. Verify any switch first (`verify-vendor-facts`).\n- [ ] Probe live whether a Worker prompt holding an image path attaches the image, both inside and outside the checkout.\n- [ ] Record the results in the capability matrix.\n\n### Acceptance criteria\n- A Codex `pty:<slug>` Worker prompt that ends in `@<path>` is submitted with its text unchanged, shown live.\n- A prompt holding an image path outside the checkout attaches nothing, shown live or documented with a source.\n\n_See #245, #244 and docs/adapters/capability-matrix.md (\"Generic PTY presets\")._"
     },
     {
+      "title": "Codex isolation test: commit probe times out at 10s on macOS when git's first run is slow",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:adapters",
+        "agent:either",
+        "priority:p3"
+      ],
+      "body": "On #241's CI run, the macOS / Node 24 job failed in `packages/adapters/codex-app-server/src/isolation.test.ts`, in the test \"unattended: commits without approval into its own store, never writes the shared .git\" (around line 194). The commit probe timed out at 10 s. On the macOS runner `/usr/bin/git` went through the Xcode command-line-tools first-run shim: the log shows `DARWIN_USER_TEMP_DIR` confstr warnings. The first `git commit` therefore didn't finish in time. A rerun passed, and main is green. This is a robustness bug in the test, not a flake. Filed so the next red run isn't dismissed as one.\n\n### Tasks\n- [ ] Find where the 10 s limit comes from: the probe's wait for the command, or the command's own yield or timeout in the mock's tool call.\n- [ ] Make the probe wait until the command exits, or for a deadline well above a cold git start on macOS. Keep failures distinguishable: the probe already timestamps each step.\n- [ ] Warm git up once in `beforeAll` (for example `git --version` through the same `PATH`), so a first-run shim doesn't land inside a measured step.\n\n### Acceptance criteria\n- The test passes on a macOS runner where the first `git` invocation is slow, without loosening what it checks: commits land in the Worker's own store, the shared `.git` is untouched, and no maintenance runs.\n\n_See #241's CI run and docs/ARCHITECTURE.md (Codex Worker isolation)._"
+    },
+    {
       "title": "Core: modelSwitch 'none' for adapters that cannot choose a model",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -670,6 +775,18 @@
         "agent:claude"
       ],
       "body": "Follow-up from #236 (PR #243). The Mini-conductor writes `refs/tacet/<task>/target` to keep a task's pinned target commit safe from `git gc`. Today only `tacet uninstall --purge` deletes it, so every task leaves one ref behind for good. The ref is cheap, but they pile up.\n\n### Tasks\n- [ ] Delete the task's `refs/tacet/<task>/target` (compare-and-swap on the pinned commit) in the landed sweep (#210), once `task.landed` is recorded and the task's checkouts are removed or none are left\n- [ ] Decide whether a task that ends without landing (failed, canceled, or a result never merged) also drops its ref, and when\n- [ ] Update docs/ARCHITECTURE.md §2.4\n\n### Acceptance criteria\n- After a task's result lands and the sweep runs, `refs/tacet/<task>/target` is gone, and other tasks' refs are untouched (test)\n- A task that has not finished keeps its ref (test)\n\n_See #219, #236 and docs/ARCHITECTURE.md §2.4._"
+    },
+    {
+      "title": "Forward events by the ADR-003 §4 allowlist, not a local-namespace denylist",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:security",
+        "priority:p1",
+        "agent:claude"
+      ],
+      "body": "Found in the architect check for #254. ADR-003 §4 defines the stream the Mini-conductor sends up to the Conductor as an **allowlist**: `task.*`, `escalation.*`, `decision.*`, `handoff.*`, `agent.usage` and `worker.*`. But `isForwardable` in `@tacet/core` (`packages/core/src/schema/envelope.ts`) is a **denylist**: it forwards everything except `LOCAL_EVENT_NAMESPACES` (today `workspace`). That fails open:\n- a new namespace someone forgets to list as local is forwarded;\n- the schema test already shows `workspacex.created` counts as forwardable.\n\nLocal events can carry details that must stay with the Mini-conductor, such as the worktree registry (#126) and maintenance problems (#254). Transcript-grade `agent.*` events must never go up either (\"summary packets, never transcripts\").\n\nThis must land before the Conductor port, or any forwarder, exists.\n\n### Tasks\n- [ ] `isForwardable` (or a new `isUpwardEvent`) implements the §4 allowlist exactly. Anything not on it stays local, including unknown namespaces and transcript-grade `agent.*`.\n- [ ] Keep `LOCAL_EVENT_NAMESPACES` as documentation, or drop it. Either way it must no longer be what decides forwarding.\n- [ ] Tests:\n  - every allowlisted type is forwardable;\n  - `workspace.*`, `maintenance.*` (#254), an unknown namespace and `agent.message.delta` are not.\n- [ ] Docs: ARCHITECTURE §3, and an ADR-003 note if the allowlist's wording needs it.\n\n### Acceptance criteria\n- A namespace not on the ADR-003 §4 allowlist is never forwardable (test).\n\n_See ADR-003 §1 and §4, #126 and #254._"
     },
     {
       "title": "Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout",
@@ -774,6 +891,18 @@
         "agent:either"
       ],
       "body": "`MiniConductorOptions.adapters` takes ready-made adapter instances, and only tests construct them today.\n\nAt startup (`tacet up` or the Mini-conductor entry point), each adapter has to be built from the effective config:\n- the auth route (`auth.*`);\n- `agents.*` presets, as `acp:<slug>` or `pty:<slug>` agents with their `env` secret references resolved;\n- the Worker environment policy (`workerEnvPolicy(config)` from `@tacet/core`, #147).\n\n### Tasks\n- [ ] Composition root that builds the Claude, Codex and ACP adapters from `TacetConfig`\n- [ ] Pass `workers.env.pass` to every adapter as `envPolicy`; log dropped variable names at debug level only\n- [ ] Resolve `agents.*.env` secret references into the agent's fixed environment without logging values\n- [ ] Build `agents.*` presets of kind `pty` as `PtyCliAdapter` (`pty:<slug>`, #156): `command`, `env`, `ready_prompt` → `readyPrompt`, and the values resolved from secret references passed as `PtyPreset.secrets` so they are scrubbed from events\n\n### Acceptance criteria\n- A test starts a Mini-conductor from a config file and shows a Worker gets exactly the allowlisted environment plus `workers.env.pass`\n- A `kind: pty` preset with a secret reference yields a `pty:<slug>` adapter whose events never contain the resolved value\n\n_See docs/ARCHITECTURE.md §4 and §6, #147 and #15._"
+    },
+    {
+      "title": "PTY Workers: stop Claude Code cloning the official plugin marketplace at session start",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Interactive Claude Code 2.1.319, started as a `pty:claude` Worker with a fresh per-session `CLAUDE_CONFIG_DIR`, git-clones the official plugin marketplace into that config dir when the session starts. This was seen live during #255.\n\nThat is a network fetch Tacet did not ask for, made by every Worker, under the sandbox too. It also brings plugin content into the Worker's config dir that Tacet never chose, and it adds startup time.\n\n### Tasks\n- [ ] Verify from primary sources (`verify-vendor-facts`) whether a setting or environment variable turns off the marketplace auto-install or clone, or nonessential network traffic in general, and whether a `--settings` file honours it. Record it in the capability matrix.\n- [ ] If a switch exists, set it for `pty:claude` Workers (and check the claude-sdk and ACP Workers, which also get a per-session config dir).\n- [ ] If none exists, record the residual risk in the matrix and in docs/RESEARCH.md, and consider blocking the fetch some other way (sandbox network rules).\n\n### Acceptance criteria\n- A live PTY session against the mock Messages API leaves no `plugins/marketplaces` clone in the Worker's config dir and makes no git fetch. Or, if no switch exists, the matrix records that with its source.\n- A test fails if the clone comes back.\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context. Found during #255 (PR #287)._"
     },
     {
       "title": "PTY adapter credits an interrupted turn's reply to the next turn",
@@ -887,6 +1016,28 @@
         "agent:claude"
       ],
       "body": "CodeQL (polynomial-regex) flagged `packages/mini/src/review/adapter-reviewer.ts:45-48`, as reported in a Copilot comment on #103. It is real.\n\n`parseReview` strips a code fence from the reviewer's reply with `.replace(/^```(?:json)?\\s*/i, '')` and `.replace(/\\s*```$/, '')`. The second pattern is quadratic on a long run of whitespace that is not followed by a fence: the engine retries the `\\s*` run from every start position. Timed on Node 24 with `\"x\" + \" \".repeat(n) + \"y\"`:\n\n| n | time |\n|---|---|\n| 10,000 | 42 ms |\n| 20,000 | 196 ms |\n| 40,000 | 809 ms |\n| 400,000 | about 80 s (extrapolated) |\n\n**Reachable:** the input is the reviewer model's whole reply, and the reviewer reads a diff the Worker wrote (#19). A Worker that gets the reviewer to emit a long whitespace run, or a reviewer that misbehaves on its own, blocks the Mini-conductor's event loop and so stalls every Worker. The planner's `parseProposal` (`packages/mini/src/daemon/planner.ts:37-38`) uses the same two regexes on the planner's reply.\n\n### Tasks\n- [ ] One shared fence-stripping helper with linear time (string operations, no backtracking regex), used by `parseReview` and `parseProposal`.\n- [ ] Cap the reply length that is parsed at 256 KB. A longer reply is an invalid reply, as for invalid JSON.\n- [ ] Review `packages/mini/` for other regexes applied to model- or Worker-controlled text.\n\n### Acceptance criteria\n- A reply of 1 MB of whitespace, with or without a fence, is handled in well under a second, and the test fails on the old code.\n- The existing parse tests (with and without a fence) still pass.\n\n_See packages/mini/src/review/adapter-reviewer.ts, packages/mini/src/daemon/planner.ts and #19._"
+    },
+    {
+      "title": "Record Mini-conductor maintenance failures as events, and stop re-checking kept checkouts",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from the #238 and #247 reviews. The Mini-conductor's maintenance work runs unattended, so its failures need to reach the user. Today they land in `MiniConductor.errors`, an in-memory list nothing prints: not `tacet run`, `tacet status` or `tacet logs`. That covers:\n- the start-time worktree `reconcile` (#126), which includes removing planner checkouts a crash left behind (#238);\n- the landed sweep (#210);\n- idle gc (#238);\n- deleting a finished task's pin ref (#247).\n\nA failure (a locked ref, git refusing a removal, an unreadable worktree) is silent, and the cleanup quietly never happens.\n\nSeparately, idle gc re-runs `git status` and the reachability checks every 10 minutes on each stale checkout it already kept for local or unintegrated work.\n\n### Tasks\n- [ ] A local event namespace for the Mini-conductor's own maintenance, like `workspace.*` (ADR-003 §1 addendum): not forwarded, never a path in a field of its own. The proposal is a summary-grade `maintenance.problem` with `{ op, message, taskId?, workspaceId? }`, where `op` is an open enum with a fallback. Architect check, plus an ADR-003 line if needed.\n- [ ] Record maintenance failures as that event instead of only in `errors`, once per distinct problem per process, so nothing repeats every sweep.\n- [ ] Show them:\n  - `tacet run` prints them as they happen.\n  - `tacet status` lists recent ones.\n  - `tacet logs <task>` includes those about the task.\n- [ ] Idle gc remembers the checkouts it kept for local files or unintegrated work, and skips them until their last activity changes or the process restarts.\n- [ ] Docs: ARCHITECTURE §2.4 and §3.\n\n### Acceptance criteria\n- A maintenance failure (for example, a planner checkout that cannot be removed at start, or a pin ref that cannot be deleted) is recorded once as an event and shown by `tacet run` and `tacet status` (test).\n- A checkout idle gc kept is not checked again on the next sweep unless it was used since (test).\n\n_See #126, #210, #238, #247 and ADR-003 §1._"
+    },
+    {
+      "title": "Record crash-placeholder cleanup failures as maintenance problems",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:mini",
+        "agent:claude",
+        "priority:p3"
+      ],
+      "body": "Follow-up from #254 (PR #264). **Depends on #264.**\n\nAt start, `MiniConductor.start()` runs `#removeCrashPlaceholders()`, which cleans up what crashed Claude sessions left in their checkouts before any session resumes there. A failure in that step only goes to the in-memory `MiniConductor.errors` list. `tacet run`, `tacet status` and `tacet logs` never print that list, so the failure is silent. #254 fixed the same gap for the reconcile, landed-sweep, idle-gc and unpin steps by recording `maintenance.problem` events.\n\n### Tasks\n- [ ] Report `#removeCrashPlaceholders` failures through `#problem(...)`. Either add a new `op` value (the `MaintenanceOp` open enum takes additions without a breaking change, ADR-003 §2) or use `reconcile`. Include the `workspaceId` when the failure concerns one checkout.\n- [ ] Test: a placeholder that cannot be removed is recorded once as `maintenance.problem` and shown by `tacet run` and `tacet status`.\n- [ ] Docs: ARCHITECTURE §2.4 (the list of recorded upkeep failures), and the `maintenance.*` ADR-003 addendum if a new `op` is added.\n\n### Acceptance criteria\n- A crash-placeholder cleanup failure at start is recorded once as a `maintenance.problem` and shown by `tacet run` (test).\n\n_See #254 and #264._"
     },
     {
       "title": "Remove worktrees automatically once their task's work is merged (setting)",
@@ -1016,6 +1167,17 @@
       "body": "Run repo verify commands and an optional reviewer agent (cross-vendor by default) before a task is marked done.\n\n### Tasks\n- [ ] Run verify commands from config in worktree\n- [ ] Reviewer agent on a different vendor than author\n- [ ] Failure → feedback to worker, retry budget\n- [ ] Borrow (ADR-001): Cross-vendor review: the reviewer agent uses a different vendor from the Worker (Omnigent Polly pattern)\n\n### Acceptance criteria\n- Failing tests block completion and loop back to the worker\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Verify Claude Code transcript facts behind PTY usage: [1m] model id and subagent calls",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:spike",
+        "area:adapters",
+        "agent:claude",
+        "priority:p3"
+      ],
+      "body": "#255 (PR #287) reads token usage and the context gauge from a PTY Worker's Claude Code transcript. Two facts it depends on are unverified, and both are marked so in the capability matrix:\n\n1. **`[1m]` in `message.model`.** In a 1M-context session, does the assistant line's `message.model` carry the `[1m]` suffix? The docs say Claude Code strips it before the request, so probably not. If it doesn't, an Opus 4.6 or Sonnet 4.6 session gets its 1M window only from the launch model (`--model` or `ANTHROPIC_MODEL`), which is what the adapter uses now.\n2. **Subagent calls.** Are a subagent's calls written to the main `<session id>.jsonl` (with `isSidechain: true`), to a separate file, or not at all? The adapter currently leaves `isSidechain` calls out, as the claude-sdk adapter leaves subagent usage out.\n\n### Tasks\n- [ ] Capture a real transcript from a 1M session (Opus 4.6 or Sonnet 4.6 with `[1m]`) and note `message.model`.\n- [ ] Run a turn that starts a subagent (the Task tool) against the mock and record where its calls are written.\n- [ ] Update the matrix rows \"PTY: token usage from the transcript (#255)\" and \"Model context windows (#255)\". Change the adapter only if the facts call for it.\n\n### Acceptance criteria\n- Both facts recorded in the capability matrix with how they were verified and the date.\n- If either changes the adapter, a test covers it.\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
       "title": "Verify live how Codex and Gemini CLI scope resume to a worktree",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1117,6 +1279,17 @@
       "body": "Follow-up from the #16 review (PR #103). The worktree manager keeps per-worktree state in `.tacet-<id>.json` sidecar files that `touch()` mutates. AGENTS.md says state changes go through the append-only event log. Move worktree lifecycle (created, touched, merged, removed) to events, keyed by workspace id, and rebuild the registry from the log.\n\n### Tasks\n- [ ] `workspace.*` events (created, used, removed) with ids, never paths in forwarded events\n- [ ] Registry rebuilt by a projection; no sidecar files\n- [ ] Migrate or ignore existing sidecar files\n\n### Acceptance criteria\n- No mutable state files remain for worktrees (test)\n- A restarted Mini-conductor finds every live worktree from the event log (test)\n\n_See docs/ARCHITECTURE.md and AGENTS.md (Events) for context._"
     },
     {
+      "title": "Worktree test \"keeps no state files\" times out at 5s on macOS, then fails cleanup with ENOTEMPTY",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:mini",
+        "agent:either",
+        "priority:p3"
+      ],
+      "body": "On #262's CI run, the macOS / Node 24 job failed in `packages/mini/src/worktree.test.ts` › \"the registry in the event log (#126)\" › \"keeps no state files, with or without a log\" (around line 1051). The test timed out at vitest's default 5 s. Cleanup then failed with `ENOTEMPTY` on `rmdir` of the `tacet-worktrees` temp dir. One re-run passed, and #262 did not touch worktree code.\n\nLikely cause: the test does a lot of real git work within the default limit. For two managers (with and without a log) it creates two checkouts, makes a Worker commit, runs a squash merge to a branch and removes a checkout. A cold or slow git on the macOS runner (see #251) can push that past 5 s. The `ENOTEMPTY` is most likely a consequence, not a second bug: when vitest times the test out, its git children are still writing into the temp dir while `afterEach` removes it.\n\n### Tasks\n- [ ] Confirm from the job log which step was running at the timeout.\n- [ ] Give the test a timeout that fits its git work (as other git-heavy tests in this file do), or split the two managers into two tests.\n- [ ] Make cleanup robust to a timed-out test: retry `rm` (`maxRetries`), or wait for in-flight git work to end, so a timeout reports as a timeout and not also as `ENOTEMPTY`.\n\n### Acceptance criteria\n- The test passes on a macOS runner with a slow first git, without loosening what it checks: no state files beside the checkouts, and no path in any `workspace.*` event.\n- A test that does time out fails with the timeout alone.\n\n_See #251 (the same macOS slow-git pattern in the Codex isolation test) and #262's CI run._"
+    },
+    {
       "title": "`tacet init` installer for repos",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1150,6 +1323,17 @@
         "agent:claude"
       ],
       "body": "Over `acp:claude-acp`, an unattended Claude Worker (#206) gets only `Read`, `Write`, `Edit` and `NotebookEdit`, with no shell. They are passed through `_meta.claudeCode.options`. But reads inside its checkout still run without asking. The SDK self-approves them, and over ACP Tacet has no `PreToolUse` hook to ask with, so the #200 policy never sees them.\n\nWhat leaks today is small:\n- Symlinks out of the checkout are asked about (verified live in the #206 review).\n- In a linked worktree `.git` is a file, so `.git/...` paths fail.\n- Workers cannot write `.git`.\n- A `Read` of `<checkout>/.git` itself sends the main repo's absolute path to the vendor.\n- Nested repositories under the checkout can be read.\n\nA second gap is related: `claudeAcpWorkerSpec` only covers the built-in `claude-acp` id. A custom `agents.<slug>` ACP preset that runs claude-agent-acp keeps Bash, and its read-only Bash calls run unasked. The policy refuses everything such a preset asks about, so this is not new, but it is the same class of gap.\n\n### Tasks\n- [ ] Find a way to route in-cwd reads through Tacet over ACP. Options: an inline `settings` command hook passed in `_meta.claudeCode.options`, or a claude-agent-acp option. Verify it against the pinned claude-agent-acp source and live against the mock Messages API (`verify-vendor-facts`).\n- [ ] Apply the Worker options to a custom ACP preset that runs claude-agent-acp, or refuse such a preset for Workers.\n- [ ] Update ARCHITECTURE §2 and the capability matrix.\n\n### Acceptance criteria\n- An in-cwd `Read` by an `acp:claude-acp` Worker raises an approval request that the #200 policy decides, shown live.\n- No Worker over claude-agent-acp, built in or custom, has a shell.\n\n_See #200, #206, docs/ARCHITECTURE.md §2 and docs/adapters/capability-matrix.md §1._"
+    },
+    {
+      "title": "claude-sdk Workers have no commit path, so their work is never integrated",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "bug",
+        "area:mini",
+        "area:adapters",
+        "priority:p1"
+      ],
+      "body": "Found in the Amadeus #101 pilot (Tacet run on a balance-sheet scaffold).\n\n## What happened\n- 1 sub-task, a `claude-sdk` Worker on Sonnet 5.5, about $0.66.\n- The Worker wrote the scaffold into its worktree. It escalated once because policy refused `.github/workflows`, which is correct.\n- `claude-sdk` Workers have no Bash (#216) and no commit tool, so the change was never committed and nothing was integrated. The diff had to be copied out of the worktree by hand.\n\n## Expected\nA Worker that cannot run git still gets its work integrated. Options to weigh:\n- Tacet commits the worktree diff itself when the turn ends (after the file policy and verify);\n- or an MCP commit tool for Workers, gated the same way as the other Worker tools.\n\nAny such path must keep the current Worker restrictions: no Bash, the file policy, and protected `.tacet/`.\n\nRelated: #261 (false \"completed\")."
     },
     {
       "title": "codex-acp Workers trust the checkout: refuse, accept or patch",
@@ -1186,6 +1370,18 @@
         "agent:claude"
       ],
       "body": "The #226 review found that a `pty:claude` Worker prompt containing an image path (`@<png>`, a quoted path, or `../x.png`) makes interactive Claude Code 2.1.319 show \"Pasting…\". The input box ends up holding only the path and the prompt is never submitted, even after another Enter. Tacet types every prompt as a bracketed paste, so a Worker's prompt is a paste. The turn wedges, with or without `CLAUDE_CODE_DISABLE_FILE_MENTIONS`. No image was attached in that probe. However, the docs list pasted images as their own attachment route (code.claude.com/docs/en/permissions, \"What Read and Edit rules cover\"), and `CLAUDE_CODE_DISABLE_FILE_MENTIONS` covers only `@` mentions.\n\n### Tasks\n- [ ] Probe live with the PTY conformance setup: a real-size PNG; absolute, relative and quoted paths; inside and outside the checkout. Does anything get attached? What do Tacet's submit acknowledgement and timeout do with the stuck turn?\n- [ ] Evaluate `permissions.blockReadsOutsideWorkingDirectories: true` in Tacet's `--settings` file. The docs say attachments from refused paths are left out (v2.1.257+). Also evaluate `CLAUDE_CODE_DISABLE_ATTACHMENTS=1`. Verify each live before relying on it.\n- [ ] Make a stuck paste fail the turn visibly instead of hanging. Refusing or neutralising image paths in prompts is also acceptable.\n\n### Acceptance criteria\n- A `pty:claude` Worker prompt containing an image path outside the checkout attaches nothing and does not hang the turn, shown live.\n\n_See #226, docs/adapters/capability-matrix.md (PTY rows) and docs/ARCHITECTURE.md §2._"
+    },
+    {
+      "title": "pty:claude: evaluate permissions.blockReadsOutsideWorkingDirectories as defence in depth for pasted reads",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:chore",
+        "area:adapters",
+        "area:security",
+        "agent:claude",
+        "priority:p3"
+      ],
+      "body": "#244 (PR #283) found that interactive Claude Code 2.1.319 reads an absolute image path pasted on a line of its own and attaches it as an image, **outside the checkout too**. The reader is `fci`, behind the paste handler `Qkt`, and the read is subject to the read-permission check. #283 closes that route by adding a suffix to every prompt line Claude Code would take for an image path, so nothing reaches the read any more. `CLAUDE_CODE_DISABLE_ATTACHMENTS=1` did not stop it (verified live).\n\nThe docs say `permissions.blockReadsOutsideWorkingDirectories: true` leaves out attachments from refused paths (v2.1.257+). Setting it in `pty:claude`'s `--settings` could guard that read path, and any other unasked read outside the checkout, should a route like this open again in a later Claude Code version. It was not evaluated in #244.\n\n### Tasks\n- [ ] Verify the setting from primary docs (`verify-vendor-facts`): what it covers (Read/Edit tools, attachments, `@` mentions, pasted images) and from which version.\n- [ ] Probe live with the PTY conformance setup: with #283's suffix turned off on purpose, paste an absolute image path outside the checkout on its own line with and without the setting. Check whether it is still attached, and what the Worker's own Read tool does outside the checkout.\n- [ ] If it holds and does not get in the way of what Workers legitimately do (their checkout, the paths Tacet gives them), add it to `pty:claude`'s settings file. Record the result in the capability matrix (\"PTY: pasted image paths\").\n\n### Acceptance criteria\n- The setting is either added, with a live test that an outside image pasted on its own line attaches nothing even without the suffix, or recorded as not useful, with the reason.\n\n_See #244, PR #283, docs/adapters/capability-matrix.md (\"PTY: pasted image paths\")._"
     },
     {
       "title": "tacet cancel <task> in standalone mode",

@@ -227,6 +227,9 @@ describe('ClaudeSdkAdapter conformance (real SDK, mock Messages API)', () => {
         .sort(),
     ).toEqual([...FILE_TOOLS].sort());
     expect(traces(done, 'done237').some((p) => p.endsWith(`${done}.jsonl`))).toBe(true);
+    // No plugin marketplace cloned into the Worker's config dir (#288): the SDK's sessions are
+    // not interactive launches, so Claude Code does not register the official one.
+    expect(listAll(state).filter((p) => p.includes('marketplaces'))).toEqual([]);
     await worker.discard(done, worktree);
     expect(traces(done, 'done237')).toEqual([]);
 

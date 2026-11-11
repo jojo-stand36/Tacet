@@ -13,12 +13,13 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { deflateSync } from 'node:zlib';
 import { type MockMessagesApi, startMockMessagesApi } from '@tacet/adapter-claude-sdk/testing';
 import type { SessionHandle } from '@tacet/core';
 import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { PtyAdapter } from './adapter.js';
+import { PtyAdapter, withoutImagePaths } from './adapter.js';
 import { loadPty } from './pty.js';
 import { gatedTitle, ptyGate } from './testing/pty-gate.js';
 
@@ -144,6 +145,30 @@ describe.skipIf(!gate.ok)(
       assertConformance(results);
     });
 
+    it('clones no plugin marketplace into a Worker’s config dir (#288)', {
+      timeout: 120_000,
+    }, async () => {
+      const h = await adapter.start({ cwd: worktree });
+      const tap = new EventTap(adapter.events(h));
+      const { end } = await turn(h, tap, 'SAY marketplace');
+      expect(end).toEqual({ t: 'status', state: 'idle' });
+      await adapter.close(h);
+      // The session's own config dir, under the state dir: <repo hash>/claude-pty/<session id>.
+      const state = join(root, 'state');
+      const configDirs = readdirSync(state)
+        .map((repo) => join(state, repo, 'claude-pty', h.vendorSessionId as string))
+        .filter((d) => existsSync(d));
+      expect(configDirs).toHaveLength(1);
+      // Claude Code registers (git-clones) the official marketplace on a first interactive
+      // launch, and every Worker's fresh config dir is one (seen live with 2.1.319). Without
+      // network access the clone fails before writing these, so only a run with network shows
+      // the variable at work (CI has it: this failed there without the fix).
+      expect(existsSync(join(configDirs[0] as string, 'plugins', 'marketplaces'))).toBe(false);
+      expect(existsSync(join(configDirs[0] as string, 'plugins', 'known_marketplaces.json'))).toBe(
+        false,
+      );
+    });
+
     it('reads no @path mention into a Worker prompt (#226)', { timeout: 180_000 }, async () => {
       const cwd = join(root, 'wt-at');
       mkdirSync(cwd);
@@ -175,6 +200,59 @@ describe.skipIf(!gate.ok)(
         expect(raw).not.toContain('OUTSIDE-DIR-ENTRY');
         expect(raw).not.toContain('OUTSIDE-AT-CONTENT');
         expect(raw).not.toContain('INSIDE-AT-CONTENT');
+        await adapter.close(h);
+      }
+    });
+
+    it('submits a prompt naming image files as text, and attaches none (#244)', {
+      timeout: 300_000,
+    }, async () => {
+      const cwd = join(root, 'wt-img');
+      mkdirSync(cwd);
+      writeFileSync(join(cwd, 'in.png'), testPng());
+      writeFileSync(join(cwd, 'note.txt'), 'note\n');
+      const outside = join(root, 'outside-img.png');
+      writeFileSync(outside, testPng());
+      // Each of these left the paste unsubmitted (the Enter dropped), and the absolute ones on a
+      // line of their own attached the file as an image, outside the checkout too (live, 2.1.319).
+      for (const text of [
+        'SAY see in.png',
+        'SAY see ../outside-img.png',
+        `SAY first\n${outside}`,
+        `SAY first\n${join(cwd, 'in.png')}`,
+        `SAY quoted\n"${outside}"`,
+        'SAY see a.JPG and b.webp',
+        // Several parts: an absolute image path and a path that is none.
+        `SAY both\n${outside} ${join(cwd, 'note.txt')}`,
+        // A trailing backslash, which would escape a lone space before the dot.
+        `SAY both\n${outside} ${cwd}\\`,
+      ]) {
+        const h = await adapter.start({ cwd });
+        const tap = new EventTap(adapter.events(h));
+        // The prompt's own request: Claude Code also sends side requests (a title, suggestions).
+        const promptRequest = (from: number, start: string) =>
+          api.requests.slice(from).find((r) => r.text.startsWith(start));
+        const before = api.requests.length;
+        const { end } = await turn(h, tap, text);
+        expect(end, text).toEqual({ t: 'status', state: 'idle' });
+        const sent = promptRequest(before, 'SAY ');
+        // Sent as text, with ` .` after the line that named an image, and no image in it.
+        expect(sent?.text, text).toBe(withoutImagePaths(text));
+        expect(withoutImagePaths(text)).not.toBe(text);
+        // No request of the turn carries an image: the prompt's, or a side request's.
+        for (const r of api.requests.slice(before)) {
+          expect(r.raw, text).not.toContain('"type":"image"');
+          expect(r.raw, text).not.toContain('iVBOR');
+        }
+        // The next prompt goes out on its own: nothing was left in the input box.
+        const nextFrom = api.requests.length;
+        const next = await turn(h, tap, 'SAY next');
+        expect(next.end).toEqual({ t: 'status', state: 'idle' });
+        const followed = promptRequest(nextFrom, 'SAY next');
+        expect(followed?.text).toBe('SAY next');
+        for (const r of api.requests.slice(nextFrom)) {
+          expect(r.raw).not.toContain('"type":"image"');
+        }
         await adapter.close(h);
       }
     });
@@ -268,6 +346,106 @@ describe.skipIf(!gate.ok)(
       // The resumed conversation carries the first turn.
       expect(api.requests.slice(before).some((r) => r.messages > 1)).toBe(true);
       await adapter.close(again);
+    });
+
+    it('[1m] at launch and a subagent: what the transcript holds (#289)', {
+      timeout: 180_000,
+    }, async () => {
+      const h = await adapter.start({ cwd: worktree, model: 'claude-opus-4-6[1m]' });
+      const tap = new EventTap(adapter.events(h));
+      const usage = () => tap.events.filter((e) => e.t === 'usage');
+      await turn(h, tap, 'SAY onem');
+      // Claude Code strips [1m] before the request (so the API, and the transcript, name the
+      // plain id); the 1M window comes from the launch model.
+      const call = {
+        t: 'usage',
+        inputTokens: 100,
+        outputTokens: 10,
+        contextUsed: 110,
+        contextMax: 1_000_000,
+        model: 'claude-opus-4-6',
+        source: 'reported',
+      };
+      // The prompt's own request, not a side request (title, suggestion).
+      expect(api.requests.find((r) => r.text === 'SAY onem')?.model).toBe('claude-opus-4-6');
+      await expect.poll(() => usage(), { timeout: 5000 }).toEqual([call]);
+
+      // A subagent: its calls go to a file of their own, not the session's transcript.
+      const from = tap.events.length;
+      await adapter.send(h, { text: 'SUBAGENT' });
+      const ask = await tap.waitFor((e) => e.t === 'approval.request', 60_000, from);
+      if (ask.event.t !== 'approval.request') throw new Error('no approval request');
+      // `Agent` in the pinned 2.1.319 (`Task` in older versions; the mock takes either).
+      expect(ask.event.toolName).toBe('Agent');
+      await adapter.respond(h, ask.event.id, { kind: 'allow_once', persist: false });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, ask.index + 1);
+      expect(api.requests.some((r) => r.text === 'SAY subagent')).toBe(true);
+      // The parent's two calls (the tool call, then its answer); none for the subagent.
+      await expect.poll(() => usage(), { timeout: 5000 }).toEqual([call, call, call]);
+      await adapter.close(h);
+      // Nothing more came (the poll stops at the first match): the subagent added no usage.
+      expect(usage()).toHaveLength(3);
+
+      const state = join(root, 'state');
+      const sessionDir = readdirSync(state)
+        .map((repo) => join(state, repo, 'claude-pty', h.vendorSessionId as string))
+        .find((d) => existsSync(d)) as string;
+      const files = readdirSync(sessionDir, { recursive: true, encoding: 'utf8' }).filter((f) =>
+        f.endsWith('.jsonl'),
+      );
+      const sub = files.filter(
+        (f) => f.includes(`${h.vendorSessionId}/subagents/agent-`) && f.endsWith('.jsonl'),
+      );
+      expect(sub).toHaveLength(1);
+      const lines = (f: string) =>
+        readFileSync(join(sessionDir, f), 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as { type?: string; isSidechain?: boolean; agentId?: unknown });
+      const subCalls = lines(sub[0] as string).filter((l) => l.type === 'assistant');
+      expect(subCalls.length).toBeGreaterThan(0);
+      expect(subCalls.every((l) => l.isSidechain === true)).toBe(true);
+      expect(subCalls.every((l) => typeof l.agentId === 'string' && l.agentId !== '')).toBe(true);
+      const main = files.find((f) => f.endsWith(`/${h.vendorSessionId}.jsonl`)) as string;
+      expect(lines(main).some((l) => l.type === 'assistant' && l.isSidechain)).toBe(false);
+    });
+
+    it('reports each model call’s usage from its transcript, once, across a resume (#255)', {
+      timeout: 180_000,
+    }, async () => {
+      const usage = (tap: EventTap) => tap.events.filter((e) => e.t === 'usage');
+      const h = await adapter.start({ cwd: worktree, model: 'claude-sonnet-4-5' });
+      const tap = new EventTap(adapter.events(h));
+      const first = await turn(h, tap, 'SAY usage one');
+      expect(first.end).toEqual({ t: 'status', state: 'idle' });
+      // The mock reports 100 input and 10 output tokens a call; the window is from the matrix.
+      const call = {
+        t: 'usage',
+        inputTokens: 100,
+        outputTokens: 10,
+        contextUsed: 110,
+        contextMax: 200_000,
+        model: 'claude-sonnet-4-5',
+        source: 'reported',
+      };
+      // Written to the transcript just after the turn's Stop: it follows shortly.
+      await expect.poll(() => usage(tap), { timeout: 5000 }).toEqual([call]);
+      await turn(h, tap, 'SAY usage two');
+      await expect.poll(() => usage(tap), { timeout: 5000 }).toEqual([call, call]);
+      await adapter.close(h);
+      // Resumed: the earlier calls are not reported again.
+      const again = await adapter.start({
+        cwd: worktree,
+        model: 'claude-sonnet-4-5',
+        resume: { vendorSessionId: h.vendorSessionId as string },
+      });
+      const tap2 = new EventTap(adapter.events(again));
+      await turn(again, tap2, 'SAY usage three');
+      await expect.poll(() => usage(tap2), { timeout: 5000 }).toEqual([call]);
+      await adapter.close(again);
+      // Nothing counted twice by the reads at the next prompt and at close.
+      expect(usage(tap)).toHaveLength(2);
+      expect(usage(tap2)).toHaveLength(1);
     });
 
     it('keeps hook and MCP tokens in 0600 files outside the worktree, gone after close', {
@@ -442,3 +620,41 @@ describe.skipIf(!gate.ok)(
     });
   },
 );
+
+/** A real 64x64 RGB PNG, as an image a Worker might name. */
+function testPng(): Buffer {
+  const table = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (b: Buffer) => {
+    let c = 0xffffffff;
+    for (const x of b) c = (table[(c ^ x) & 0xff] as number) ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const out = Buffer.alloc(8 + data.length + 4);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc(body), 8 + data.length);
+    return out;
+  };
+  const size = 64;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(size, 0);
+  header.writeUInt32BE(size, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // RGB
+  const rows = Buffer.alloc((size * 3 + 1) * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size * 3; x++) rows[y * (size * 3 + 1) + 1 + x] = (x * 7 + y * 3) & 0xff;
+  }
+  return Buffer.concat([
+    Buffer.from('89504e470d0a1a0a', 'hex'),
+    chunk('IHDR', header),
+    chunk('IDAT', deflateSync(rows)),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
+}

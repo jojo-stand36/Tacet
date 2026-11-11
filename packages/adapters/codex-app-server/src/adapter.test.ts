@@ -23,6 +23,7 @@ import {
 } from './adapter.js';
 import { API_KEY_PROVIDER_ID, AuthRoutingError, chooseAuthRoute, codexLaunch } from './auth.js';
 import { JsonRpcPeer, RpcError } from './jsonrpc.js';
+import { codexFixtureDir } from './testing/fixture-dir.js';
 
 // Fake values only.
 const FAKE_KEY = 'fake-key-for-tests';
@@ -244,7 +245,8 @@ describe('JsonRpcPeer', () => {
 describe('CodexAppServerAdapter with a fake app-server', () => {
   let root: string;
   beforeEach(() => {
-    root = realpathSync(mkdtempSync(join(tmpdir(), 'tacet-codex-unit-')));
+    // Not under a temp dir the sandbox leaves writable: the adapter refuses a CODEX_HOME there (#295).
+    root = codexFixtureDir('tacet-codex-unit-');
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 

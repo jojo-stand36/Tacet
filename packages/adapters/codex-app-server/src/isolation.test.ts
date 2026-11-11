@@ -3,22 +3,20 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readdirSync,
   readFileSync,
-  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { SessionHandle } from '@tacet/core';
 import { repoStateDir, SAFE_GIT_ARGS, trustedGitEnv, workerWorktree } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CodexAppServerAdapter } from './adapter.js';
+import { codexFixtureDir } from './testing/fixture-dir.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
 /**
@@ -40,12 +38,10 @@ describe('Codex Worker isolation', () => {
   beforeAll(async () => {
     api = await startMockResponsesApi();
     // Outside every temp dir: Codex makes $TMPDIR and /tmp writable in workspace-write, so a repo
-    // there would not show what the sandbox protects. Excluding them instead (as an earlier
-    // version did) breaks git on macOS, where the Xcode `git` shim writes its cache under the
-    // per-user temp dir. node_modules/.cache is gitignored.
-    const cache = fileURLToPath(new URL('../node_modules/.cache/', import.meta.url));
-    mkdirSync(cache, { recursive: true });
-    root = realpathSync(mkdtempSync(join(cache, 'tacet-codex-iso-')));
+    // there would not show what the sandbox protects (and the adapter refuses it, #293), even
+    // when this checkout is itself under /tmp. Excluding them instead (as an earlier version did)
+    // breaks git on macOS, where the Xcode `git` shim writes its cache under the per-user temp dir.
+    root = codexFixtureDir('tacet-codex-iso-');
     home = join(root, 'home');
     repo = join(root, 'repo');
     worktree = join(root, 'worktrees', 'task-1');

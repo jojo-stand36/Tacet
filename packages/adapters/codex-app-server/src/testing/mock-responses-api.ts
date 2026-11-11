@@ -251,3 +251,5 @@ export async function startMockResponsesApi(
       }),
   };
 }
+
+export { codexFixtureDir } from './fixture-dir.js';

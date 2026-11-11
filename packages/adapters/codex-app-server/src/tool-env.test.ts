@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CodexAppServerAdapter } from './adapter.js';
+import { codexFixtureDir } from './testing/fixture-dir.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
 const KEY = 'sk-tool-env-placeholder-0000000000';
@@ -19,10 +19,9 @@ describe('Codex Worker tool environment', () => {
 
   beforeAll(async () => {
     api = await startMockResponsesApi();
-    // Outside the temp dirs, as in the isolation test (the sandbox makes those writable).
-    const cache = fileURLToPath(new URL('../node_modules/.cache/', import.meta.url));
-    mkdirSync(cache, { recursive: true });
-    root = realpathSync(mkdtempSync(join(cache, 'tacet-codex-toolenv-')));
+    // Outside the temp dirs, as in the isolation test (the sandbox makes those writable, and the
+    // adapter refuses a Worker in a repo there, #293/#295), even for a checkout under /tmp.
+    root = codexFixtureDir('tacet-codex-toolenv-');
   });
   afterAll(async () => {
     await api?.close();
