@@ -7,13 +7,14 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   type AdapterCapabilities,
@@ -439,9 +440,14 @@ export class CodexAppServerAdapter implements AgentAdapter {
       }),
     ].sort((a, b) => b.length - a.length);
     if (workerTmp !== undefined) {
-      privateDir(workerTmp, 'the Worker TMPDIR');
-      // Who owns it, beside it where the Worker cannot write, for the sweep (#299).
-      writeTmpOwner(workerTmp, { host: process.pid });
+      try {
+        privateDir(workerTmp, 'the Worker TMPDIR');
+        // Who owns it, beside it where the Worker cannot write, for the sweep (#299).
+        writeTmpOwner(workerTmp, { host: process.pid });
+      } catch (err) {
+        releaseWorkerTmp(workerTmp);
+        throw err;
+      }
       // Every temp variable a tool may read: the shared ones are read-only now (#294).
       launch.env.TMPDIR = workerTmp;
       launch.env.TMP = workerTmp;
@@ -462,7 +468,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
     );
     // Its process group too: a host killed while Codex runs on leaves a dir still in use.
     if (workerTmp !== undefined && proc.pid !== undefined) {
-      writeTmpOwner(workerTmp, { host: process.pid, group: proc.pid });
+      try {
+        writeTmpOwner(workerTmp, { host: process.pid, group: proc.pid });
+      } catch {
+        // Best effort: the record naming this host still keeps the dir while the host runs.
+      }
     }
     const exitInfo: { value: Session['exit'] } = { value: undefined };
     const exited = new Promise<void>((resolve) =>
@@ -1256,20 +1266,37 @@ export function removeWorkerTree(dir: string): void {
   }
 }
 
-/** Who owns a Worker TMPDIR: the host process, and once started Codex's process group. */
+/**
+ * Who owns a Worker TMPDIR: the host process, once started Codex's process group, and where
+ * those pids mean anything (`ns`: the host name and, on Linux, the PID namespace).
+ */
 interface TmpOwner {
   host: number;
   group?: number;
+  ns: string;
 }
 
 const UUID_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-/** A Worker TMPDIR with no owner record (a host killed while making it) is swept after a day. */
+/** A Worker TMPDIR with no usable owner record (a host killed while making it) goes after a day. */
 const UNOWNED_AGE_MS = 24 * 60 * 60 * 1000;
+/** A half-written owner record (`<uuid>.owner.<pid>`) goes after ten minutes. */
+const PARTIAL_AGE_MS = 10 * 60 * 1000;
+
+/** Where this process's pids mean something: its host and, on Linux, its PID namespace. */
+export function pidNamespace(): string {
+  let ns = '';
+  try {
+    ns = readlinkSync('/proc/self/ns/pid');
+  } catch {
+    // Not Linux: the host name alone.
+  }
+  return `${hostname()}|${ns}`;
+}
 
 /** Record `owner` in `<dir>.owner`, beside the dir: written whole (temp file and rename). */
-function writeTmpOwner(dir: string, owner: TmpOwner): void {
+function writeTmpOwner(dir: string, owner: Omit<TmpOwner, 'ns'>): void {
   const tmp = `${dir}.owner.${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(owner), { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify({ ...owner, ns: pidNamespace() }), { mode: 0o600 });
   renameSync(tmp, `${dir}.owner`);
 }
 
@@ -1277,12 +1304,17 @@ function writeTmpOwner(dir: string, owner: TmpOwner): void {
 function releaseWorkerTmp(dir: string): void {
   removeWorkerTree(dir);
   if (existsSync(dir)) return;
-  rmSync(`${dir}.owner`, { force: true });
+  try {
+    rmSync(`${dir}.owner`, { force: true });
+  } catch {
+    // Left for the sweep: a record whose dir is gone.
+  }
 }
 
 /** Whether a process, or a process group, still runs. Unknown counts as running. */
 function running(pid: number, group: boolean): boolean {
-  if (!Number.isInteger(pid) || pid <= 1) return false;
+  // Group ids 0 and 1 mean something else to kill(); a host may be pid 1 (in a container).
+  if (!Number.isInteger(pid) || pid < (group ? 2 : 1)) return false;
   try {
     process.kill(group ? -pid : pid, 0);
     return true;
@@ -1291,12 +1323,27 @@ function running(pid: number, group: boolean): boolean {
   }
 }
 
+/** A well-formed owner record, or undefined. */
+function readTmpOwner(dir: string): TmpOwner | undefined {
+  try {
+    const o = JSON.parse(readFileSync(`${dir}.owner`, 'utf8')) as Partial<TmpOwner>;
+    if (!Number.isInteger(o.host) || typeof o.ns !== 'string') return undefined;
+    if (o.group !== undefined && !Number.isInteger(o.group)) return undefined;
+    return o as TmpOwner;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Remove the Worker TMPDIRs under `root` (`<state>/codex-tmp`) that hosts killed before they
  * could clean up left (#299): a `<uuid>` dir whose owner record names a host that is gone and a
- * Codex process group that is gone, or, with no record, one untouched for a day. A dir of a live
- * Worker, in this process or another, is never removed: its host or its group still runs. A
- * reused pid keeps a dir, never removes a live one. Returns how many were removed; never throws.
+ * Codex process group that is gone, both in this PID namespace, or, with no usable record, one
+ * untouched for a day. A dir of a live Worker, in this process or another, is never removed: its
+ * host or its group still runs. A reused pid keeps a dir, never removes a live one, and a record
+ * from another host or PID namespace (a container sharing the state dir) keeps it: its pids
+ * cannot be checked here. Leftover records go too: one whose dir is gone, and a half-written one
+ * after ten minutes. Returns how many dirs were removed; never throws.
  */
 export function sweepWorkerTmpdirs(root: string, now = Date.now()): number {
   let names: string[];
@@ -1305,27 +1352,33 @@ export function sweepWorkerTmpdirs(root: string, now = Date.now()): number {
   } catch {
     return 0;
   }
+  const here = pidNamespace();
   let removed = 0;
   for (const name of names) {
-    if (!UUID_NAME.test(name)) continue;
-    const dir = join(root, name);
+    const path = join(root, name);
     try {
-      const st = lstatSync(dir);
-      if (!st.isDirectory() || (process.getuid && st.uid !== process.getuid())) continue;
-      let owner: TmpOwner | undefined;
-      try {
-        owner = JSON.parse(readFileSync(`${dir}.owner`, 'utf8')) as TmpOwner;
-      } catch {
-        owner = undefined;
+      const st = lstatSync(path);
+      if (process.getuid && st.uid !== process.getuid()) continue;
+      const base = name.split('.')[0] as string;
+      if (!UUID_NAME.test(base)) continue;
+      if (name !== base) {
+        if (!st.isFile()) continue;
+        const partial = name.startsWith(`${base}.owner.`);
+        const orphan = name === `${base}.owner` && !existsSync(join(root, base));
+        if (orphan || (partial && now - st.mtimeMs > PARTIAL_AGE_MS)) rmSync(path, { force: true });
+        continue;
       }
+      if (!st.isDirectory()) continue;
+      const owner = readTmpOwner(path);
       if (owner) {
-        if (running(Number(owner.host), false)) continue;
-        if (owner.group !== undefined && running(Number(owner.group), true)) continue;
+        if (owner.ns !== here) continue;
+        if (running(owner.host, false)) continue;
+        if (owner.group !== undefined && running(owner.group, true)) continue;
       } else if (now - st.mtimeMs < UNOWNED_AGE_MS) {
         continue;
       }
-      releaseWorkerTmp(dir);
-      if (!existsSync(dir)) removed++;
+      releaseWorkerTmp(path);
+      if (!existsSync(path)) removed++;
     } catch {
       // Left for the next sweep.
     }

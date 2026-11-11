@@ -17,7 +17,7 @@ import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { CodexAppServerAdapter, removeWorkerTree } from './adapter.js';
+import { CodexAppServerAdapter, pidNamespace, removeWorkerTree } from './adapter.js';
 import { codexFixtureDir } from './testing/fixture-dir.js';
 import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-responses-api.js';
 
@@ -110,7 +110,10 @@ describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294
     const stale = join(tmps, '00000000-0000-4000-8000-000000000299');
     mkdirSync(join(stale, 'x'), { recursive: true });
     const gone = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
-    writeFileSync(`${stale}.owner`, JSON.stringify({ host: Number(String(gone.stdout)) }));
+    writeFileSync(
+      `${stale}.owner`,
+      JSON.stringify({ host: Number(String(gone.stdout)), ns: pidNamespace() }),
+    );
     // Not refused: nothing shared is left writable.
     const h = await a.start({ cwd: worktree });
     const tap = new EventTap(a.events(h));
@@ -167,8 +170,9 @@ describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294
     );
     expect(locked).toContain('LOCK-OK');
     await a.close(h);
-    // Its temp files go with the session.
+    // Its temp files go with the session, and its owner record with them.
     expect(existsSync(workerTmp)).toBe(false);
+    expect(existsSync(`${workerTmp}.owner`)).toBe(false);
 
     // Resumed: a fresh private TMPDIR, and /tmp still read-only.
     const again = await a.start({
