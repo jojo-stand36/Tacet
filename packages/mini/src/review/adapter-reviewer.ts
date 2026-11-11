@@ -159,7 +159,7 @@ export class AdapterReviewer implements Reviewer {
     if (opts.worker.authRoute !== 'api_key') {
       throw new Error('the reviewer runs unattended and must use the api_key route (#65)');
     }
-    // Agents refused for unattended sessions (codex-acp until #183) are refused here too (#188).
+    // Agents refused for unattended sessions (codex-acp, settled on #183) are refused here too (#188).
     const refused = workerRefusal(opts.worker);
     if (refused) throw new Error(`adapter ${opts.adapterId}: refused for the reviewer: ${refused}`);
     if (opts.worker.adapter.capabilities().approvals !== 'roundtrip') {
