@@ -28,5 +28,8 @@
   },
   "bin": {
     "tacet": "./dist/bin.js"
+  },
+  "devDependencies": {
+    "@xterm/headless": "6.0.0"
   }
 }

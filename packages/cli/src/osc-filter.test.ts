@@ -121,16 +121,45 @@ describe('OscFilter (#302)', () => {
   });
 
   it('removes an OSC 52 started inside another OSC, and ends that one (review of #302)', () => {
-    // U+009D inside a title restarts the OSC; the title is ended with CAN in its place.
-    expect(run(bytes(`${E}]0;t\xc2\x9d52;c;AAAA\x07x`))).toBe(`${E}]0;t\x18x`);
-    expect(run(bytes(`${E}]0;t${E}]52;c;AAAA\x07x`))).toBe(`${E}]0;t\x18x`);
+    // U+009D inside a title restarts the OSC; the title is ended with ESC \\ in its place.
+    expect(run(bytes(`${E}]0;t\xc2\x9d52;c;AAAA\x07x`))).toBe(`${E}]0;t${E}\\x`);
+    expect(run(bytes(`${E}]0;t${E}]52;c;AAAA\x07x`))).toBe(`${E}]0;t${E}\\x`);
     // Right after an introducer, before any digit.
     expect(run(bytes(`a${E}]\xc2\x9d52;c;AAAA\x07b`))).toBe('ab');
     // An empty OSC (U+009D) passed on, then OSC 52 inside it: removed, the empty one ended.
-    expect(run(bytes(`a\xc2\x9d${E}]52;c;AAAA\x07b`))).toBe('a\xc2\x9d\x18b');
-    // A title started inside another title passes, as the terminal would read it.
-    const titles = bytes(`${E}]0;t${E}]2;u\x07x`);
-    expect(run(titles)).toBe(dec(titles));
+    expect(run(bytes(`a\xc2\x9d${E}]52;c;AAAA\x07b`))).toBe(`a\xc2\x9d${E}\\b`);
+    // A title started inside another title passes, the first ended first: the same to a terminal.
+    expect(run(bytes(`${E}]0;t${E}]2;u\x07x`))).toBe(`${E}]0;t${E}\\${E}]2;u\x07x`);
+  });
+
+  it('drops tmux passthrough, whose unescaped body tmux would send on (second review of #302)', () => {
+    for (const seq of [
+      `${E}Ptmux;${E}${E}]5${E}2;c;QQ==\x07${E}\\`,
+      `${E}Ptmux;${E}${E}]${E}5${E}2;c;QQ==\x07${E}\\`,
+      `${E}P1;2$tmux;${E}${E}]52;c;QQ==\x07${E}\\`,
+      `${E}P\x01\x80tmux;${E}${E}]52;c;QQ==\x07${E}\\`,
+    ]) {
+      const input = bytes(`a${seq}b`);
+      for (let i = 0; i <= input.length; i++)
+        expect(run(input, [i]), JSON.stringify(seq)).toBe('ab');
+    }
+    // Inside it, ESC and the next byte are one byte: only ESC \ ends it.
+    expect(run(bytes(`a${E}Ptmux;x\x18\x07${E}${E}\\y${E}\\b`))).toBe('ab');
+    // Other DCS sequences pass, and a near miss of tmux's prefix too.
+    const kept = bytes(`${E}Pq#0;1;1;1;1#0~${E}\\${E}Ptmux:x${E}\\${E}P$qm${E}\\`);
+    expect(run(kept)).toBe(dec(kept));
+  });
+
+  it('keeps bytes in order around an ESC it holds back (second review of #302)', () => {
+    // Each ends in a byte that releases what is held.
+    for (const s of [`a${E}\r[31mb`, `${E}]0;t${E}\nX`, `${E}]0;t${E}\x07Z`, `${E}\x01\x02c`]) {
+      expect(run(bytes(s))).toBe(s);
+      for (let i = 0; i <= s.length; i++) expect(run(bytes(s), [i])).toBe(s);
+    }
+  });
+
+  it('takes a lone 9C as possibly not ending a title, and still ends it before a drop', () => {
+    expect(run(bytes(`${E}]0;t\x9c${E}]52;c;QQ==\x07after`))).toBe(`${E}]0;t\x9c${E}\\after`);
   });
 
   it("removes kitty's OSC 5522 and iTerm2's clipboard keys, but not iTerm2's other keys", () => {
@@ -166,9 +195,9 @@ describe('OscFilter (#302)', () => {
   it('ends an OSC left open when the stream ends, and holds nothing back after flush', () => {
     const f = new OscFilter();
     expect(dec(f.push(bytes(`${E}]0;title`)))).toBe(`${E}]0;title`);
-    expect(dec(f.flush())).toBe('\x18');
+    expect(dec(f.flush())).toBe(`${E}\\`);
     expect(dec(f.push(bytes(`${E}]5`)))).toBe('');
-    expect(dec(f.flush())).toBe('');
+    expect(dec(f.flush())).toBe(`${E}\\`);
     expect(dec(f.push(bytes('2;c;AAAA\x07ok')))).toBe('2;c;AAAA\x07ok');
   });
 });
