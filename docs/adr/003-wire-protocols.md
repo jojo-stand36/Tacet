@@ -206,7 +206,15 @@ The owner decided how the mini-conductor's MCP server handles older clients. Thi
 
 ### Addendum (2026-11-10, accepted, approved by the owner): `workspace.*` namespace (§1)
 
-`workspace.*` (`workspace.created`, `workspace.removed`) joins the event namespaces of §1: the Mini-conductor's worktree registry, moved from per-worktree state files into the log (#126). It is local to the Mini-conductor: not in the upward stream of §3, never forwarded to the Conductor, and its payloads carry ids, never paths. Additive under §2.
+`workspace.*` (`workspace.created`, `workspace.removed`) joins the event namespaces of §1: the Mini-conductor's worktree registry, moved from per-worktree state files into the log (#126). It is local to the Mini-conductor: not in the upward stream of §4, never forwarded to the Conductor, and its payloads carry ids, never paths. Additive under §2.
+
+### Addendum (2026-11-11, accepted, approved by the owner on 2026-11-11 in a comment on PR #264, https://github.com/jojo-stand36/Tacet/pull/264#issuecomment-6802110023): `maintenance.*` namespace (§1)
+
+`maintenance.*` (`maintenance.problem`: `op`, an open enum of `reconcile`, `landed`, `gc`, `unpin` with fallback `other`; `message`; optional `workspaceId`; the envelope's `taskId` when the problem is about one task) joins the event namespaces of §1: failures of the Mini-conductor's unattended upkeep (the start-time worktree reconcile, the landed sweep, idle gc, deleting finished tasks' pin refs), recorded so the user sees them (#254). Like `workspace.*`, it is local to the Mini-conductor: not on the §4 upward allowlist, so never forwarded (`isForwardable`, #256; listed in `LOCAL_EVENT_NAMESPACES`). It has no path fields; in `message`, the repo, state, worktree and home directories are replaced, secrets are redacted, and the length is bounded. Additive under §2.
+
+### Addendum (2026-11-11, accepted, approved by the owner on 2026-11-11 in a comment on PR #264, https://github.com/jojo-stand36/Tacet/pull/264#issuecomment-6802110023): local event namespaces (§1)
+
+- **Standing rule:** a new event namespace that is not on the §4 upward allowlist (local to the Mini-conductor, never forwarded) is additive under §2 and needs only a line in ARCHITECTURE §3, not another addendum here. Anything added to the upward stream still needs the owner's approval. `workspace.*` and `maintenance.*` are the first two such namespaces.
 
 ## Consequences
 

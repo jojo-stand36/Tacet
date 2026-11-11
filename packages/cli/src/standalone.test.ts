@@ -438,6 +438,36 @@ describe('tacet standalone (#21)', () => {
     expect(await escalations()).toEqual([]);
   });
 
+  it('shows a maintenance problem from the start, in run and in status (#254)', async () => {
+    // What a crash mid-plan leaves: a planner checkout, here also busy (a live merge holds it),
+    // so the start cannot remove it.
+    const paths = repoStatePaths(repo, state);
+    const { WorktreeManager } = await import('@tacet/mini');
+    const store = openEventStore(paths.events);
+    const left = await new WorktreeManager(repo, paths.worktrees, {
+      env,
+      log: { store, repo: paths.repoId, miniId: 'standalone' },
+    }).create('plan-x', undefined, { scratch: true });
+    store.close();
+    mkdirSync(join(paths.worktrees, '.tacet-locks'), { recursive: true });
+    writeFileSync(join(paths.worktrees, '.tacet-locks', `${left.id}.busy.${process.pid}.1`), '');
+
+    const r = await tacet(['run', ...user(), 'do it']);
+    expect(r.code).toBe(0);
+    expect(r.err).toContain('problem (reconcile)');
+    expect(r.err).toContain(left.id);
+    // Never the directory itself: it is under the user's home.
+    expect(r.err).not.toContain(paths.worktrees);
+
+    const status = await tacet(['status', ...user()]);
+    expect(status.out).toContain('maintenance problems (latest first):');
+    expect(status.out).toContain('problem (reconcile)');
+    const json = JSON.parse((await tacet(['status', ...user(), '--json'])).out);
+    expect(json.problems).toEqual([
+      expect.objectContaining({ op: 'reconcile', message: expect.stringContaining(left.id) }),
+    ]);
+  });
+
   describe("the live run's control port (#201)", () => {
     const runtimeFile = () => miniRuntimePath(repo, join(root, 'home', '.tacet', 'run'));
     type Status = {
