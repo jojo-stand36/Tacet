@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
   cancelStopped,
+  isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,
   miniLockHolder,
@@ -2362,6 +2363,43 @@ describe('handoff reseed (#129)', () => {
     ]);
   });
 
+  it('gives a successor without MCP tools the packet itself, redacted (#184)', async () => {
+    // The first session has the tools and hands off; its successor's adapter has none.
+    class Switching extends ScriptedAdapter {
+      mcp = true;
+      override capabilities() {
+        return { ...super.capabilities(), mcp: this.mcp };
+      }
+    }
+    const sw = new Switching('fake', (input) =>
+      input.includes('handed off') ? { do: 'reply', text: 'done' } : { do: 'hold' },
+    );
+    fake = sw;
+    const d = make();
+    const backend = backendFor(d);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('worker.vendor_session', sub).length, { timeout: 5000 }).toBe(1);
+    sw.mcp = false;
+    const secret = `sk-ant-api03-${'x'.repeat(40)}`;
+    await backend.requestHandoff(
+      { workerSessionId: minted[0] ?? '', taskId: sub },
+      {
+        reason: 'context',
+        packet: { ...packet('wire the parser'), stateSummary: `key ${secret}` },
+      },
+    );
+    await d.settled();
+    expect(tasks()[sub]?.state).toBe('completed');
+    const first = sw.sessions.at(-1)?.inputs[0] ?? '';
+    expect(first).not.toContain('read_task');
+    expect(first).toContain('"nextAction":"wire the parser"');
+    expect(first).toContain('"filesTouched":["a.ts"]');
+    expect(first).not.toContain(secret);
+    expect(minted).toHaveLength(1);
+  });
+
   it('keeps the seed for a retry when the successor fails to start', async () => {
     let starts = 0;
     fake = new ScriptedAdapter('fake', (input) =>
@@ -2445,5 +2483,184 @@ describe('handoff reseed (#129)', () => {
     // A canceled task's session is gone at once.
     await d.cancel(id);
     expect(d.handoffRefusal(minted[1] ?? '')).toMatch(/not running/);
+  });
+});
+
+describe('Workers without the Mini-conductor MCP tools (#184)', () => {
+  /** As Gemini CLI in an untrusted checkout: approvals round-trip, no MCP client. */
+  class NoMcp extends ScriptedAdapter {
+    override capabilities() {
+      return { ...super.capabilities(), mcp: false };
+    }
+  }
+
+  it('mints no MCP token, passes no server, and prompts without Tacet tools', async () => {
+    const gemini = new NoMcp('fake', script);
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+    });
+    await d.start();
+    d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(minted).toEqual([]);
+    const opts = gemini.sessions[0]?.opts;
+    expect(opts?.mcpServers).toBeUndefined();
+    expect(opts?.systemPrompt).not.toMatch(/escalate|report_progress|record_decision|MCP/);
+    expect(opts?.systemPrompt).toMatch(/no Tacet tools/);
+  });
+
+  it('asks the user for a Worker that was refused and stopped with nothing done, in the same session', async () => {
+    const gemini = new NoMcp('fake', (input) =>
+      input.includes('answer to what you said you needed')
+        ? { do: 'reply', text: 'Done with the answer.' }
+        : { do: 'approval', toolName: 'run_shell_command' },
+    );
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+      planner: new FixedPlanner([{ key: 'a', goal: 'needs a shell', acceptanceCriteria: ['ok'] }]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+    // Refused, and told to say what it needs rather than call a tool it does not have.
+    expect(gemini.approvalsAnswered).toEqual([
+      expect.objectContaining({ kind: 'reject', message: expect.not.stringMatching(/escalate/) }),
+    ]);
+    const raised = ofType('escalation.raised', sub);
+    expect(raised).toHaveLength(1);
+    const x = raised[0]?.data as { id: string; question: string; category: string };
+    expect(x.category).toBe('blocked');
+    expect(x.question).toContain('run_shell_command');
+    expect(ofType('task.result', sub)).toHaveLength(0);
+    expect(gemini.open).toBe(1);
+    d.answer(x.id, 'Skip the shell; edit the file directly.');
+    await d.settled();
+    expect(gemini.sessions).toHaveLength(1);
+    expect(gemini.sessions[0]?.inputs.at(-1)).toBe(
+      "The user's answer to what you said you needed: Skip the shell; edit the file directly.",
+    );
+    expect(tasks()[sub]?.state).toBe('completed');
+  });
+
+  it('asks the user when a fix turn after an earlier commit is refused with nothing done', async () => {
+    const COMMIT = 'c'.repeat(40);
+    let checks = 0;
+    const gemini = new NoMcp('fake', (input) =>
+      input.startsWith('Verification failed')
+        ? { do: 'approval', toolName: 'run_shell_command' }
+        : { do: 'reply', text: 'done' },
+    );
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: {
+        ...CONFIG,
+        tiers: { worker: { adapter: 'fake', model: 'cheap' } },
+        verify: ['pnpm test'],
+        workers: { ...CONFIG.workers, verify_fix_attempts: 2 },
+      },
+      // The first turn committed; the fix turn adds nothing, so the branch stays where it was.
+      integrator: {
+        integrate: async (subtaskId) => ({ commit: COMMIT, ref: `refs/heads/tacet/${subtaskId}` }),
+        combine: async () => undefined,
+        publish: async (taskId) => `refs/heads/tacet/result/${taskId}`,
+      },
+      verifier: {
+        async verify() {
+          checks += 1;
+          return checks === 1
+            ? {
+                status: 'failed',
+                commands: ['pnpm test'],
+                notes: 'x',
+                feedback: 'Verification failed.',
+              }
+            : { status: 'passed', commands: ['pnpm test'] };
+        },
+      },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+    expect(checks).toBe(1);
+    const raised = ofType('escalation.raised', sub);
+    expect(raised.map((e) => (e.data as { category: string }).category)).toEqual(['blocked']);
+    expect(raised[0]?.data).toMatchObject({ urgency: 'high' });
+  });
+
+  it('stops the Worker after 2 blocked turns in a row and waits for the user (#324)', async () => {
+    const gemini = new NoMcp('fake', (input) =>
+      input.includes('FINISH')
+        ? { do: 'reply', text: 'done' }
+        : { do: 'approval', toolName: 'run_shell_command' },
+    );
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    const raised = () =>
+      ofType('escalation.raised', sub).map((e) => e.data as { id: string; question: string });
+    await expect.poll(() => raised().length, { timeout: 5000 }).toBe(1);
+    expect(raised()[0]?.question).not.toMatch(/has been stopped/);
+    // The first answer goes to the same session; its next turn is blocked again.
+    d.answer(raised()[0]?.id ?? '', 'try again');
+    await expect.poll(() => raised().length, { timeout: 5000 }).toBe(2);
+    await expect.poll(() => ofType('worker.ended', sub).length, { timeout: 5000 }).toBe(1);
+    expect(raised()[1]?.question).toMatch(/blocked 2 turns in a row, so it has been stopped/);
+    expect(JSON.stringify(ofType('worker.ended', sub))).toContain('2 blocked turns in a row');
+    expect(tasks()[sub]?.state).toBe('input_required');
+    expect(gemini.sessions).toHaveLength(1);
+    // Nothing starts until the user answers; then a fresh session gets the answer.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(gemini.sessions).toHaveLength(1);
+    d.answer(raised()[1]?.id ?? '', 'FINISH it without a shell');
+    await d.settled();
+    expect(gemini.sessions).toHaveLength(2);
+    expect(gemini.sessions[1]?.inputs[0]).toContain('FINISH it without a shell');
+    expect(tasks()[sub]?.state).toBe('completed');
+  });
+
+  it('lets a review that was refused something finish as before', async () => {
+    const gemini = new NoMcp('fake', () => ({ do: 'approval', toolName: 'run_shell_command' }));
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+      planner: new FixedPlanner([
+        { key: 'a', goal: 'review it', acceptanceCriteria: ['ok'], kind: 'review' },
+      ]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(ofType('escalation.raised', `${id}/1`)).toHaveLength(0);
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+  });
+
+  it('refuses a Worker with neither MCP tools nor approval requests', async () => {
+    class Mute extends ScriptedAdapter {
+      override capabilities() {
+        return { ...super.capabilities(), mcp: false, approvals: 'none' as const };
+      }
+    }
+    const mute = new Mute('fake', script);
+    // Refused at construction, once, rather than on every attempt.
+    expect(() =>
+      make({
+        adapters: { fake: { adapter: mute, authRoute: 'api_key' } },
+        config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+      }),
+    ).toThrow(/fake has neither Tacet's MCP tools nor approval requests/);
+    expect(mute.sessions).toHaveLength(0);
+  });
+
+  it('never takes a tool on an empty server name for its own', () => {
+    expect(isOwnMcpTool({ toolName: 'mcp____escalate' }, '')).toBe(false);
+    expect(isOwnMcpTool({ toolName: 'mcp__tacet__escalate' }, 'tacet')).toBe(true);
   });
 });

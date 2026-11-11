@@ -74,6 +74,7 @@ export const CODEX_CAPABILITIES: AdapterCapabilities = {
   approvals: 'roundtrip',
   interrupt: 'receipt',
   resume: true,
+  mcp: true,
   fork: 'native',
   usage: { live: true, context: true, cost: 'none' },
   modelSwitch: 'per-turn',

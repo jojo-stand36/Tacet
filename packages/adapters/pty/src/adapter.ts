@@ -84,6 +84,8 @@ export const CLAUDE_PTY_CAPABILITIES: AdapterCapabilities = {
   approvals: 'roundtrip',
   interrupt: 'turn',
   resume: true,
+  // Claude Code reads Tacet's MCP config file (`--mcp-config`).
+  mcp: true,
   fork: 'none',
   usage: { live: true, context: true, cost: 'none' },
   modelSwitch: 'launch-only',
