@@ -33,10 +33,12 @@ const prompt = interactive
 // The background run of `tacet run --detach` (#201): its output is its log, kept under a cap
 // (#273). Standard output and error are the same file there.
 // Only a file: a terminal or a pipe cannot be cut.
+// So is a `tacet mini` the Conductor started (#23), whose output is its log too.
+const argv = process.argv.slice(2);
 const log =
-  isDetachedChild(process.argv.slice(2)) && fstatSync(2).isFile() ? cappedLog(2) : undefined;
+  (isDetachedChild(argv) || argv[0] === 'mini') && fstatSync(2).isFile() ? cappedLog(2) : undefined;
 
-process.exitCode = await main(process.argv.slice(2), {
+process.exitCode = await main(argv, {
   out: log ?? ((t) => process.stdout.write(`${t}\n`)),
   err: log ?? ((t) => process.stderr.write(`${t}\n`)),
   // A Worker's terminal on a terminal only: piped, `attach` prints its events instead.

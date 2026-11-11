@@ -42,6 +42,37 @@ export interface StartConductorOptions {
   now?: () => Date;
   /** Told about failures, by message only. */
   onError?: (message: string) => void;
+  /** Start Mini-conductors for registered repos (`conductor.autostart`, off by default). */
+  autostart?: AutostartOptions;
+}
+
+export { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
+
+import { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
+
+/** A Mini-conductor process the Conductor started. */
+export interface SpawnedMini {
+  pid: number;
+  /** Its exit code, or why it ended without one (a signal, no start). */
+  exited: Promise<number | string>;
+}
+
+export interface AutostartOptions {
+  /** Start `tacet mini` for the repo at `repoPath`, in the background. */
+  spawnMini(repoPath: string): SpawnedMini;
+  /**
+   * Whether a Mini-conductor already runs for the repo (its runtime file names a live pid): a
+   * `tacet run` in progress, or one about to dial in. None is started beside it.
+   */
+  isMiniLive(repoPath: string): boolean;
+  /** How often registered repos are checked, in ms. Default 30000; the first check is at start. */
+  intervalMs?: number;
+  /** First wait before starting a repo's Mini-conductor again after it ended (ms), doubled up to `maxBackoffMs`. Default 30000. */
+  backoffMs?: number;
+  /** Default 600000. */
+  maxBackoffMs?: number;
+  /** Told what auto-start did, by message. */
+  onNotice?: (message: string) => void;
 }
 
 /** A running Conductor (#23). */
@@ -141,11 +172,13 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     }
 
     const live = new Map<string, Live>();
+    let auto: ReturnType<typeof autostarter> | undefined;
     /** One decision at a time per repo, so two hellos at once cannot both be accepted. */
     const deciding = new Map<string, Promise<void>>();
 
     const accept = (conn: RpcConnection, repoId: string, repoPath: string) => {
       const hello = conn.hello as Extract<typeof conn.hello, { role: 'mini' }>;
+      auto?.connected(repoId);
       const entry: Live = { repoId, conn, missed: 0 };
       live.set(repoId, entry);
       record('registry.connected', repoId, {
@@ -243,6 +276,8 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
     }, interval);
     beat.unref();
 
+    if (o.autostart) auto = autostarter(o.autostart, registry, live, report);
+
     let closed: Promise<void> | undefined;
     return {
       port: rpc.port,
@@ -250,6 +285,7 @@ export async function startConductor(o: StartConductorOptions): Promise<Conducto
       close: () => {
         closed ??= (async () => {
           clearInterval(beat);
+          auto?.stop();
           closing = true;
           try {
             // Recorded as closed here, once, before the store goes.
@@ -299,4 +335,92 @@ function canonicalRepo(path: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+interface RepoStart {
+  /** The process this Conductor started, while it runs. */
+  child?: SpawnedMini | undefined;
+  /** Not before this time (ms), after one ended. */
+  nextAt: number;
+  delay: number;
+  /**
+   * It refused for unfinished tasks (#23): not started again until a Mini-conductor of the repo
+   * connects, which is the user resuming them (`tacet run --resume` dials in too). If tasks are
+   * still unfinished then, the next start refuses again.
+   */
+  gaveUp: boolean;
+}
+
+/**
+ * Auto-start (#23): every `intervalMs`, and at once, a Mini-conductor is started for each
+ * registered repo that has no connection, no live Mini-conductor of its own and no start of
+ * this Conductor's running. One that ends is started again after a backoff that doubles per
+ * repo; one that refuses for unfinished tasks is not, so an auto-started Mini-conductor never
+ * resumes them. Only registered repos, by the path the user registered, still a repo.
+ */
+function autostarter(
+  a: AutostartOptions,
+  registry: () => RegistryState,
+  live: ReadonlyMap<string, Live>,
+  report: (err: unknown) => void,
+) {
+  const base = a.backoffMs ?? 30_000;
+  const starts = new Map<string, RepoStart>();
+  let stopped = false;
+  const notice = (m: string) => a.onNotice?.(m);
+
+  const tick = () => {
+    if (stopped) return;
+    const { repos } = registry();
+    for (const id of starts.keys()) if (!(id in repos)) starts.delete(id);
+    for (const repo of Object.values(repos)) {
+      try {
+        const s = starts.get(repo.repoId) ?? { nextAt: 0, delay: base, gaveUp: false };
+        starts.set(repo.repoId, s);
+        if (s.gaveUp || s.child || live.has(repo.repoId) || Date.now() < s.nextAt) continue;
+        if (canonicalRepo(repo.repoPath) !== repo.repoPath) continue;
+        if (a.isMiniLive(repo.repoPath)) continue;
+        const child = a.spawnMini(repo.repoPath);
+        s.child = child;
+        notice(`started a Mini-conductor for ${repo.repoPath} (pid ${child.pid})`);
+        void child.exited.then((code) => {
+          s.child = undefined;
+          if (stopped) return;
+          if (code === MINI_EXIT_UNFINISHED) {
+            s.gaveUp = true;
+            notice(
+              `${repo.repoPath} has unfinished tasks: not started again until they are resumed with tacet run --resume`,
+            );
+            return;
+          }
+          s.nextAt = Date.now() + s.delay;
+          notice(
+            `the Mini-conductor for ${repo.repoPath} ended (${typeof code === 'number' ? `exit ${code}` : code}); starting it again in ${Math.round(s.delay / 1000)}s`,
+          );
+          s.delay = Math.min(a.maxBackoffMs ?? 600_000, s.delay * 2);
+        });
+      } catch (err) {
+        report(err);
+      }
+    }
+  };
+  const timer = setInterval(tick, a.intervalMs ?? 30_000);
+  timer.unref();
+  queueMicrotask(tick);
+  return {
+    /**
+     * A Mini-conductor of the repo is connected: its next restart starts from the first backoff,
+     * and one that refused for unfinished tasks may be tried again once this one is gone.
+     */
+    connected(repoId: string) {
+      const s = starts.get(repoId);
+      if (!s) return;
+      s.delay = base;
+      s.gaveUp = false;
+    },
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
 }

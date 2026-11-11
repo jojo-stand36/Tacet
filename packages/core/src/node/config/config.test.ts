@@ -248,6 +248,20 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ userDir, repoRoot })).toThrow(/remove_merged/);
   });
 
+  it('keeps Conductor auto-start off by default and lets only the user turn it on (#23)', () => {
+    expect(loadConfig({ userDir, repoRoot }).config.conductor).toEqual({ autostart: false });
+    write(join(userDir, 'config.yaml'), 'conductor: { autostart: true }\n');
+    expect(loadConfig({ userDir }).config.conductor?.autostart).toBe(true);
+    for (const file of ['tacet.yaml', 'local.yaml']) {
+      write(join(repoRoot, '.tacet', file), 'conductor: { autostart: true }\n');
+      expect(() => loadConfig({ userDir, repoRoot })).toThrow(/conductor: only the user layer/);
+      rmSync(join(repoRoot, '.tacet', file));
+    }
+    expect(() =>
+      loadConfig({ userDir, repoRoot, task: { conductor: { autostart: false } } }),
+    ).toThrow(/conductor: only the user layer/);
+  });
+
   it('never lets a task change the verify commands, and lets it only lower their limits (#19)', () => {
     for (const verify of [[], ['true']]) {
       expect(() => loadConfig({ userDir, repoRoot, task: { verify } })).toThrow(

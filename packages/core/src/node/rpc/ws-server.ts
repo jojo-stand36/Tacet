@@ -10,11 +10,10 @@ import { checkBearer, type Secret } from '../auth/secret.js';
 /** A JSON-RPC error a handler throws to answer with that code; its message goes to the client. */
 export class RpcError extends Error {
   override name = 'RpcError';
-  constructor(
-    readonly code: number,
-    message: string,
-  ) {
+  readonly code: number;
+  constructor(code: number, message: string) {
     super(message);
+    this.code = code;
   }
 }
 

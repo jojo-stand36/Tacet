@@ -5,14 +5,14 @@ import type { Secret } from '../auth/secret.js';
 /** An error answer from the server, or a failure to reach it. Never carries the token. */
 export class RpcClientError extends Error {
   override name = 'RpcClientError';
-  constructor(
-    message: string,
-    /** The JSON-RPC error code, when the server answered with one. */
-    readonly code?: number,
-    /** The HTTP status the server refused the upgrade with, if it did. */
-    readonly httpStatus?: number,
-  ) {
+  /** The JSON-RPC error code, when the server answered with one. */
+  readonly code: number | undefined;
+  /** The HTTP status the server refused the upgrade with, if it did. */
+  readonly httpStatus: number | undefined;
+  constructor(message: string, code?: number, httpStatus?: number) {
     super(message);
+    this.code = code;
+    this.httpStatus = httpStatus;
   }
 }
 
