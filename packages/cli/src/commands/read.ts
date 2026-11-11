@@ -174,8 +174,8 @@ export async function logs(
  * running in a live run is shown as its terminal instead, live from the run's port (#201), when
  * the output is a terminal and not `--json`: until that session ends. Its bytes go through
  * `OscFilter` (#302): clipboard writes (OSC 52, kitty's 5522, iTerm2's 1337 copy keys) are
- * removed, and only well-formed text and sequences pass; window titles, hyperlinks, colours and
- * images do.
+ * removed, and only well-formed text and sequences pass; window titles (in ASCII), hyperlinks,
+ * colours and images do.
  */
 export async function attach(
   io: Io,

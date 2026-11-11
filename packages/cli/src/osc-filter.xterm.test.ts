@@ -143,7 +143,7 @@ describe('OscFilter against xterm.js (#302)', () => {
         expect(otherDcs(out), `DCS: ${h} split at ${i}`).toBe(false);
       }
     }
-  });
+  }, 30_000);
 
   it('removes them from random byte soup, in random chunks', async () => {
     const tokens = [

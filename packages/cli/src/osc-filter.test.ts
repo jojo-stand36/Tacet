@@ -160,14 +160,15 @@ describe('OscFilter (#302)', () => {
       '1b 21 78 1b 5c',
       // ESC % @: iTerm2 switches to Latin-1 with 8-bit controls; then 9C 9D inside a title.
       '1b 25 40 1b 5d 30 3b e1 9c 9d 35 32 3b 63 3b 5a 6d 39 76 07',
-      // An intermediate no terminal sequence uses.
-      '1b 21 21 41',
     ]) {
       const out = everySplit(hex(`61 ${h} 62`));
       expect(out.includes(`${E} P`) || out.includes(`${E}%@`), h).toBe(false);
       expect(out.includes(`${E}]52`), h).toBe(false);
       expect(out.includes(`${E}k`) || out.includes(`${E}!`), h).toBe(false);
     }
+    // An intermediate no allowed ESC sequence uses: the ESC and it go, what follows is text.
+    expect(everySplit(hex('61 1b 26 41 62'))).toBe('aAb');
+    expect(everySplit(hex('61 1b 24 42 62'))).toBe('aBb');
     // Back to UTF-8, charsets, DEC line attributes and ESC SP announcers pass.
     const kept = bytes(`${E}%G${E}(0${E})B${E}#8${E} F`);
     expect(everySplit(kept)).toBe(dec(kept));
@@ -175,12 +176,12 @@ describe('OscFilter (#302)', () => {
 
   it('skips C0 controls inside a string, as terminals do, and ends it on CAN, SUB or BEL', () => {
     // A sixel image with its line breaks, and a title with a tab.
-    const sixel = bytes(`${E}Pq#0~~
--#0~~${ST}`);
+    const sixel = bytes(`${E}Pq#0~~\r\n-#0~~${ST}`);
     expect(everySplit(sixel)).toBe(`${E}Pq#0~~-#0~~${ST}`);
-    expect(everySplit(bytes(`${E}]0;a	b`))).toBe(`${E}]0;ab`);
-    expect(everySplit(bytes(`${E}]0;ab`))).toBe(`${E}]0;a${ST}b`);
-    expect(everySplit(bytes(`${E}Pq#0x`))).toBe(`${E}Pq#0${ST}x`);
+    expect(everySplit(bytes(`${E}]0;a\tb\x07`))).toBe(`${E}]0;ab\x07`);
+    expect(everySplit(bytes(`${E}]0;a\x18b`))).toBe(`${E}]0;a${ST}\x18b`);
+    expect(everySplit(bytes(`${E}Pq#0\x07x`))).toBe(`${E}Pq#0${ST}x`);
+    expect(everySplit(bytes(`${E}]0;a\x1ab`))).toBe(`${E}]0;a${ST}\x1ab`);
   });
 
   it('ends a string at a byte that may not be in it, and reads that byte as text', () => {
@@ -219,7 +220,7 @@ describe('OscFilter (#302)', () => {
   });
 
   it('drops an unterminated sequence only so far, and holds back little', () => {
-    const f = new OscFilter(undefined, 100);
+    const f = new OscFilter(100);
     expect(dec(f.push(bytes(`a${E}]52;c;`)))).toBe('a');
     // Dropped while it streams, not buffered; past the limit the rest passes as text.
     expect(dec(f.push(bytes('A'.repeat(90))))).toBe('');

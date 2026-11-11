@@ -21,7 +21,7 @@ const MAX_KEY = 'copytoclipboard'.length;
  * Clipboard writes by number (#302): OSC 52 everywhere, and kitty's OSC 5522 (kitty source,
  * `kitty/vt-parser.c`, which sends both to `clipboard_control`).
  */
-export const CLIPBOARD_OSC = new Set([52, 5522]);
+const CLIPBOARD_OSC = new Set([52, 5522]);
 /**
  * iTerm2's key=value OSCs, 1337 and the older 50 (iTerm2 source, `VT100XtermParser.m`), and the
  * keys among them that write the pasteboard (`VT100Terminal.m`): `Copy`, `CopyToClipboard` and
@@ -77,23 +77,26 @@ type Mode =
  * not try to read them each terminal's way. It passes on only well-formed text and sequences, and
  * drops or ends the rest:
  * - Text: printable characters and C0 controls pass. Bytes that are not UTF-8 become U+FFFD. C1
- *   controls (U+0080..U+009F) are dropped, one that starts a string with its string.
+ *   controls (U+0080..U+009F) are dropped: one that starts a string with its string, C1 CSI up to
+ *   its final byte.
  * - An ESC sequence passes when it is well formed with an allowed intermediate (SP # ( ) * + - .
  *   /); one that starts a string in GNU screen (a string introducer after intermediates, ESC k,
  *   ESC !, ESC ") or switches the encoding (ESC %, except ESC % G back to UTF-8) is dropped. A
  *   CSI passes when well formed; one longer than 256 bytes is dropped whole. C0 controls inside
  *   either are sent before it, as terminals run them in place; DEL inside one is dropped.
  * - An OSC passes when its number is plain digits (no leading zero, at most 5) followed by `;` or
- *   its end, and the number (or iTerm2 key) is not blocked. Its text is printable ASCII only
- *   (owner's decision on #302): other bytes, non-ASCII characters among them, are skipped; CAN,
- *   SUB or an ESC that is not ST ends it there with `ESC \`.
+ *   its end, and the number (or iTerm2 key) is not blocked. An iTerm2 key must be printable
+ *   ASCII, or the OSC is dropped. Its text is printable ASCII only (owner's decision on #302):
+ *   other bytes, non-ASCII characters among them, are skipped; CAN, SUB or an ESC that is not ST
+ *   ends it there with `ESC \`.
  * - A DCS with final byte `q`, and an APC (kitty graphics), pass the same way (BEL ends them).
  *   Other DCS, SOS and PM are dropped.
  *
  * A dropped sequence is dropped as it streams, never buffered, up to BEL, `ESC \`, U+009C, CAN,
  * SUB or the next ESC, and after `maxDrop` bytes the rest passes as text, so an unterminated one
- * cannot hide the rest of the terminal. Only a sequence's introducer, number and key are held
- * back, at most `MAX_SEQ` bytes.
+ * cannot hide the rest of the terminal (an ignored CSI swallows only its parameter bytes, never
+ * text). Only sequences are held back: an ESC or CSI sequence or DCS header until it is complete,
+ * an OSC's introducer, number and key until they are read, at most `MAX_SEQ` bytes.
  *
  * Known gaps (#311): it was tested against xterm.js and against models of kitty, tmux,
  * iTerm2 and GNU screen written from their source, never against those terminals themselves.
@@ -125,10 +128,8 @@ export class OscFilter {
   #out = new Uint8Array(0);
   #n = 0;
 
-  constructor(
-    private readonly blocked: (code: number) => boolean = (code) => CLIPBOARD_OSC.has(code),
-    private readonly maxDrop = 1024 * 1024,
-  ) {}
+  /** `maxDrop`: how many bytes of a dropped sequence are dropped before the rest passes. */
+  constructor(private readonly maxDrop = 1024 * 1024) {}
 
   /** The bytes of `chunk` that may reach the user's terminal. */
   push(chunk: Uint8Array): Uint8Array {
@@ -203,7 +204,7 @@ export class OscFilter {
             return this.#drop(false);
           }
         }
-        if (this.#seq.length >= MAX_SEQ) return this.#drop(false);
+        if (this.#seq.length >= MAX_SEQ) return this.#abort(false);
         if (b < 0x30) {
           // Intermediates: only those of charset designation, DEC line and screen attributes,
           // and ESC SP's announcers; `%` (encoding switch) is checked with its final byte.
@@ -376,7 +377,6 @@ export class OscFilter {
       // SOS, OSC, PM, APC) is dropped with its string, CSI up to its final byte.
       else if (C1_STRINGS.has(cp)) this.#drop(false);
       else if (cp === 0x9b) this.#mode = 'csiIgnore';
-      return true;
     });
     if (ok) return false;
     for (const x of REPLACEMENT) this.#emit(x);
@@ -385,11 +385,11 @@ export class OscFilter {
   }
 
   /**
-   * Reads one byte of a UTF-8 character. When it completes one, `done` gets its bytes and code
-   * point and says whether it is taken. False when the bytes are not UTF-8 (or not taken);
-   * `#utf8Broke` then says whether `b` itself is still to be looked at.
+   * Reads one byte of a UTF-8 character; when it completes one, `done` gets its bytes and code
+   * point. False when the bytes are not UTF-8; `#utf8Broke` then says whether `b` itself is still
+   * to be looked at.
    */
-  #utf8Byte(b: number, done: (bytes: number[], cp: number) => boolean): boolean {
+  #utf8Byte(b: number, done: (bytes: number[], cp: number) => void): boolean {
     this.#utf8Broke = false;
     if (this.#need > 0) {
       if (b < this.#lo || b > this.#hi) {
@@ -404,7 +404,8 @@ export class OscFilter {
       if (--this.#need > 0) return true;
       const bytes = this.#utf8;
       this.#utf8 = [];
-      return done(bytes, codePoint(bytes));
+      done(bytes, codePoint(bytes));
+      return true;
     }
     // Lead bytes, with the range their next byte must be in (no overlong forms, no surrogates).
     if (b >= 0xc2 && b <= 0xdf) this.#lead(b, 1, 0x80, 0xbf);
@@ -480,7 +481,7 @@ export class OscFilter {
   #blockedNumber(): boolean {
     const v = this.#value;
     // Also as an 8- or 16-bit parser would wrap it round.
-    return this.blocked(v) || this.blocked(v % 0x10000) || this.blocked(v % 0x100);
+    return CLIPBOARD_OSC.has(v) || CLIPBOARD_OSC.has(v % 0x10000) || CLIPBOARD_OSC.has(v % 0x100);
   }
 
   #emitSeq(): void {
