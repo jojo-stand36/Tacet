@@ -134,6 +134,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Epic: Conductor and escalation inbox** — `epic` `P0` `human`
 - [ ] **Authenticate the Conductor link** — `feature` `P1` `claude + human`
 - [ ] **Conductor daemon + mini-conductor registry** — `feature` `P0` `either`
+- [ ] **Conductor replicas: retention and an incremental tasks view** — `feature` `P2` `either`
 - [ ] **Conductor↔mini protocol implementation** — `feature` `P0` `claude`
 - [ ] **Cross-project goals: split one goal into tasks across repos** — `feature` `P1` `either`
 - [ ] **Decision inbox: dedupe, batch, rank, answer, propagate** — `feature` `P0` `either`

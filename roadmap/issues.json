@@ -1466,6 +1466,17 @@
       "body": "Global daemon (`tacet up`) that discovers/registers mini-conductors, tracks health, and routes tasks.\n\n### Tasks\n- [ ] Registration handshake with per-install token\n- [ ] Heartbeats/health, reconnect\n- [ ] Auto-start mini-conductors for registered repos\n\n### Acceptance criteria\n- Kill/restart of either side recovers cleanly\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Conductor replicas: retention and an incremental tasks view",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "The Conductor keeps one event-log replica per registered repo of what its Mini-conductor forwards (#24, ADR-003 addendum on forwarding events). Replicas are never compacted, so they grow with every repo's summary events, and `Conductor.tasks(repoId)` folds a whole replica with `tasksProjection` on every call. Make the view incremental, folding only what is new as `registry()` already does, and give replicas a retention policy that keeps task state exact after compaction, as the Mini-conductor's own log does (`DEFAULT_DROP_TYPES`). Forwarded types are summary-grade, so retention probably means pruning finished tasks after some days, configured in the user layer.\n\n### Tasks\n- [ ] `Conductor.tasks(repoId)` folds only events after the last seq it read, per replica\n- [ ] A retention policy for replicas (finished tasks older than N days), applied on start and periodically\n- [ ] Config key in the user layer, with a default\n\n### Acceptance criteria\n- A repeated `Conductor.tasks(repoId)` call reads only new events (tested)\n- After retention, the tasks of unfinished work fold exactly as before it (tested), and a replica's size stays bounded under a steady stream of finished tasks\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
       "title": "Conductor↔mini protocol implementation",
       "milestone": "M2 · Conductor & escalation",
       "labels": [
