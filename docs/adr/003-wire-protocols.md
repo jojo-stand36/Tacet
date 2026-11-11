@@ -111,7 +111,7 @@ Checked 2026-11-09. Documentation hosts for A2A, AG-UI and MCP were not reachabl
 | Sub-tasks inside a repo | Internal to the mini; not exposed as A2A tasks in v0 (sent upward only as `task.*` summary events) |
 | Status | `TaskStatus.state`: queued→`SUBMITTED`, running→`WORKING`, waiting on user→`INPUT_REQUIRED`, done and verified→`COMPLETED`, failed verification after the escalation ladder→`FAILED`, cancelled→`CANCELED`, refused by policy→`REJECTED`. `AUTH_REQUIRED` is used when a vendor CLI needs the user to log in (Tacet never handles the token; it just tells the user). |
 | Escalation that reached the user | `state: INPUT_REQUIRED`, `status.message` with the question as `text`, plus `metadata["urn:tacet:a2a-ext:escalation:v1"] = {escalationId, options?, urgency, blockedWorkers, contextRef}` |
-| User's answer | `SendMessage` with `message.taskId` set, the answer as `text`, plus `metadata["urn:tacet:a2a-ext:decision:v1"] = {escalationId, choice, rationale?, scope}` |
+| User's answer | `SendMessage` with `message.taskId` set, the answer as `text`, plus `metadata["urn:tacet:a2a-ext:decision:v1"] = {escalationId, choice, rationale?, scope, code?}`. *Proposed, pending owner approval (#269):* `code` is the escalation's one-time answer code, which a standalone Mini-conductor's control port requires; only the terminal of the run that asked shows it. |
 | Summary packet / final result | `Artifact` with a `data` part holding the packet and `mediaType: "application/vnd.tacet.summary+json"` |
 | HandoffPacket (if forwarded upward) | `Artifact` with a `data` part and `mediaType: "application/vnd.tacet.handoff+json"` |
 

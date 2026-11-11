@@ -24,12 +24,13 @@ const USAGE = `usage:
                                  run a task in this repo until it is done (standalone)
   tacet run --resume [--answer ID=TEXT]...
                                  carry on with unfinished tasks, answering escalations
-  tacet run --detach [...]       the same in the background, until its tasks are done; it waits
-                                 for answers (tacet answer) instead of stopping, and logs to
-                                 ~/.tacet/run/minis/<repo>.log
+  tacet run --detach [...]       the same in the background, until its tasks are done or
+                                 only an answer can move them on (then answer as with --resume);
+                                 it logs to ~/.tacet/run/minis/<repo>.log
   tacet cancel <task> [--json]   cancel a task and its sub-tasks (in the live run, if any)
   tacet answer <escalation> <text> [--json]
-                                 answer an open escalation in the live run
+                                 answer an open escalation in the live run; asks for the code
+                                 its tacet run terminal shows
   tacet status [--json]          tasks, sub-tasks, open escalations; whether a run is live
   tacet logs <task> [--transcript] [--json] [--follow]
                                  a task's events (--transcript adds the Workers' own)

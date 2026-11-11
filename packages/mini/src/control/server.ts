@@ -23,6 +23,7 @@ import {
 } from '@tacet/core/node';
 import type { z } from 'zod';
 import type { MiniConductor } from '../daemon/daemon.js';
+import type { AnswerCodes } from './answer-codes.js';
 
 export interface MiniControlOptions {
   mini: Pick<MiniConductor, 'answer' | 'cancel'>;
@@ -30,6 +31,11 @@ export interface MiniControlOptions {
   /** The A2A `contextId` of every task: the repo's id (a standalone task has no wider context). */
   contextId: string;
   token: Secret;
+  /**
+   * The one-time codes an answer must carry (#269): the token alone, which code a Worker wrote
+   * can read, does not answer an Escalation.
+   */
+  answerCodes: AnswerCodes;
   serverInfo?: { name: string; version: string };
   onError?: (message: string) => void;
 }
@@ -47,7 +53,8 @@ function params<T>(schema: z.ZodType<T>, value: unknown): T {
  * The standalone Mini-conductor's control port (#201, ADR-003 §4): the A2A methods a Conductor
  * would call, served to the CLI over Tacet JSON-RPC (`startRpcServer`). `ListTasks` and `GetTask`
  * answer from the log as the running Mini-conductor sees it, with the status extension; `CancelTask`
- * and `SendMessage` (an answer to an open escalation, with the decision extension) act through the
+ * and `SendMessage` (an answer to an open escalation, with the decision extension and its one-time
+ * answer code, #269) act through the
  * Mini-conductor itself, so the log keeps one writer. Sub-tasks are not A2A tasks (ADR-003 §4);
  * new tasks over the port are not offered yet (`-32004`).
  */
@@ -133,6 +140,18 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
         if (!task.escalations.some((x) => x.id === escalationId)) {
           throw new RpcError(-32602, `no open escalation ${escalationId} on task ${task.id}`);
         }
+        // The code is never echoed, logged or stored.
+        const refused = o.answerCodes.check(escalationId, decision.data.code);
+        if (refused) {
+          throw new RpcError(
+            -32602,
+            refused === 'none'
+              ? `escalation ${escalationId} has no answer code yet: the tacet run terminal shows it when it asks the question`
+              : refused === 'wrong'
+                ? `wrong answer code for escalation ${escalationId}`
+                : `too many wrong answer codes for escalation ${escalationId}: the tacet run terminal shows a new one when it asks again`,
+          );
+        }
         const text = message.parts
           .flatMap((part) => ('text' in part ? [part.text] : []))
           .join('\n')
@@ -142,6 +161,9 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
         } catch (err) {
           // Resolved meanwhile, or an empty answer: the message names the escalation only.
           throw new RpcError(-32602, (err as Error).message);
+        } finally {
+          // Used once, answered or not.
+          o.answerCodes.drop(escalationId);
         }
         return { task: toA2ATask(entry(task.id), o.contextId) };
       },
