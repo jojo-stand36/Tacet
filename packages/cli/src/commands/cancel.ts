@@ -15,8 +15,9 @@ export interface CancelOptions {
 /**
  * `tacet cancel <task>` (#202): cancel a task and its unfinished sub-tasks. During a run, the run
  * does it, asked over its control port (#201), so the log keeps one writer. With no run live, this
- * process takes the Mini-conductor's lock, ends Worker processes a crashed run left behind and
- * records each as canceled. Either way `tacet run --resume` no longer picks the task up.
+ * process takes the Mini-conductor's lock, ends Worker processes a crashed run left behind, clears
+ * the sandbox placeholders its Claude sessions left in their checkouts (#304), and records each
+ * as canceled. Either way `tacet run --resume` no longer picks the task up.
  */
 export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
@@ -25,7 +26,9 @@ export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<
     io.err(`no Tacet state for ${terminalSafe(repoRoot)}: nothing to cancel`);
     return 1;
   }
-  const { cancelStopped, miniLockHolder } = await import('@tacet/mini');
+  const { cancelStopped, GitIntegrator, miniLockHolder, WorktreeManager } = await import(
+    '@tacet/mini'
+  );
   const pid = miniLockHolder(paths.lock);
   if (pid !== undefined) {
     const client = await liveControl(io, repoRoot, paths, 'cannot cancel through it');
@@ -37,11 +40,20 @@ export async function cancel(io: Io, taskId: string, o: CancelOptions): Promise<
   }
   const store = openEventStore(paths.events);
   try {
+    const env = io.env ?? process.env;
     const { canceled, errors } = await cancelStopped(taskId, {
       store,
       lockPath: paths.lock,
       repo: paths.repoId,
       miniId: 'standalone',
+      // What a crashed Claude session of the task left in its checkout goes too (#304).
+      placeholders: {
+        workspaces: new WorktreeManager(repoRoot, paths.worktrees, {
+          env,
+          log: { store, repo: paths.repoId, miniId: 'standalone' },
+        }),
+        integrator: new GitIntegrator(repoRoot, env),
+      },
     });
     for (const e of errors) {
       io.err(`note: ${terminalSafe(e instanceof Error ? e.message : String(e))}`);
