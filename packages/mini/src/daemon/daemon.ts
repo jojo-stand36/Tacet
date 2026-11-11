@@ -190,6 +190,8 @@ interface Run {
   refused: string[];
   /** `commit` when the current turn started, so a turn's own commit can be told apart (#184). */
   turnBase?: string | undefined;
+  /** Blocked turns in a row in this session, each escalated for it (#184); capped. */
+  blockedInRow: number;
   text: string;
   /** The last complete assistant message, for the summary. */
   lastMessage?: string;
@@ -366,6 +368,8 @@ function verifyNote(status: VerificationStatus, notes?: string): string {
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
 const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
+/** Blocked turns in a row after which a Worker without Tacet's tools is stopped (#184, #324). */
+const MAX_BLOCKED_IN_ROW = 2;
 /** Session states after which a Worker's terminal shows nothing new (#201). */
 const ENDED_STATES: ReadonlySet<string> = new Set(['done', 'error', 'cancelled']);
 /** Handoffs one sub-task may request when `workers.max_handoffs` is not set (#129). */
@@ -1745,6 +1749,7 @@ export class MiniConductor {
       mcpServerName,
       mcp,
       refused: [],
+      blockedInRow: 0,
       text: '',
       turnActive: true,
       settling: false,
@@ -2028,13 +2033,25 @@ export class MiniConductor {
         !('changes' in left && left.changes.length > 0) &&
         (this.#state().kinds.get(run.subtaskId) ?? 'implement') === 'implement'
       ) {
-        this.#raise(run.subtaskId, blockedQuestion(run), {
+        run.blockedInRow += 1;
+        // Owner decision on #324: after 2 in a row the Worker is stopped and the sub-task waits
+        // for the user. Their answer starts a fresh session, with the answer in its first message.
+        const stop = run.blockedInRow >= MAX_BLOCKED_IN_ROW;
+        this.#raise(run.subtaskId, blockedQuestion(run, stop), {
           urgency: 'high',
           category: 'blocked',
         });
         run.refused = [];
+        if (stop) {
+          await this.#end(
+            run,
+            'finished',
+            `stopped after ${run.blockedInRow} blocked turns in a row; waiting for the user`,
+          );
+        }
         return;
       }
+      run.blockedInRow = 0;
       if (run.commit === undefined && 'changes' in left && left.changes.length > 0) {
         const notes = notIntegrated(run, left.changes);
         this.#o.store.append([
@@ -3160,7 +3177,7 @@ function answerText(x: EscalationRecord, mcp = true): string {
  * What the Mini-conductor asks the user for a Worker without Tacet's tools whose turn ended
  * blocked (#184): the requests refused in it and the end of its last message, redacted.
  */
-function blockedQuestion(run: Run): string {
+function blockedQuestion(run: Run, stopped = false): string {
   // Text the Worker chose, which the Mini-conductor writes as its own: redacted, no controls.
   const refused = run.refused
     .slice(0, 10)
@@ -3175,7 +3192,11 @@ function blockedQuestion(run: Run): string {
       ? ['', `Its last message: ${last.length > 2000 ? `…${last.slice(-2000)}` : last}`]
       : []),
     '',
-    'What should it do? Your answer is sent to it as its next message.',
+    ...(stopped
+      ? [
+          `It was blocked ${run.blockedInRow} turns in a row, so it has been stopped and this sub-task waits for you. Your answer starts a new Worker session on the same checkout, with your answer in its first message.`,
+        ]
+      : ['What should it do? Your answer is sent to it as its next message.']),
   ].join('\n');
 }
 

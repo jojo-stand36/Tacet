@@ -2591,6 +2591,41 @@ describe('Workers without the Mini-conductor MCP tools (#184)', () => {
     expect(raised[0]?.data).toMatchObject({ urgency: 'high' });
   });
 
+  it('stops the Worker after 2 blocked turns in a row and waits for the user (#324)', async () => {
+    const gemini = new NoMcp('fake', (input) =>
+      input.includes('FINISH')
+        ? { do: 'reply', text: 'done' }
+        : { do: 'approval', toolName: 'run_shell_command' },
+    );
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    const raised = () =>
+      ofType('escalation.raised', sub).map((e) => e.data as { id: string; question: string });
+    await expect.poll(() => raised().length, { timeout: 5000 }).toBe(1);
+    expect(raised()[0]?.question).not.toMatch(/has been stopped/);
+    // The first answer goes to the same session; its next turn is blocked again.
+    d.answer(raised()[0]?.id ?? '', 'try again');
+    await expect.poll(() => raised().length, { timeout: 5000 }).toBe(2);
+    await expect.poll(() => ofType('worker.ended', sub).length, { timeout: 5000 }).toBe(1);
+    expect(raised()[1]?.question).toMatch(/blocked 2 turns in a row, so it has been stopped/);
+    expect(JSON.stringify(ofType('worker.ended', sub))).toContain('2 blocked turns in a row');
+    expect(tasks()[sub]?.state).toBe('input_required');
+    expect(gemini.sessions).toHaveLength(1);
+    // Nothing starts until the user answers; then a fresh session gets the answer.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(gemini.sessions).toHaveLength(1);
+    d.answer(raised()[1]?.id ?? '', 'FINISH it without a shell');
+    await d.settled();
+    expect(gemini.sessions).toHaveLength(2);
+    expect(gemini.sessions[1]?.inputs[0]).toContain('FINISH it without a shell');
+    expect(tasks()[sub]?.state).toBe('completed');
+  });
+
   it('lets a review that was refused something finish as before', async () => {
     const gemini = new NoMcp('fake', () => ({ do: 'approval', toolName: 'run_shell_command' }));
     const d = make({
