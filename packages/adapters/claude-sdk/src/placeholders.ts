@@ -125,17 +125,25 @@ export function removeSandboxResidue(r: SandboxResidue): string[] {
 function removeEmptyFile(full: string): boolean {
   const aside = join(dirname(full), `.tacet-rm-${randomBytes(6).toString('hex')}`);
   renameSync(full, aside);
-  const st = lstatSync(aside);
-  if (st.isFile() && st.size === 0) {
-    unlinkSync(aside);
-    return true;
+  try {
+    const st = lstatSync(aside);
+    if (st.isFile() && st.size === 0) {
+      unlinkSync(aside);
+      return true;
+    }
+  } catch {
+    // Not removed: put back below, never left under the temporary name.
   }
   try {
     // Never over a file that took the name meanwhile: link fails rather than replace it.
     linkSync(aside, full);
     unlinkSync(aside);
   } catch {
-    renameSync(aside, `${full}.tacet-kept-${randomBytes(4).toString('hex')}`);
+    try {
+      renameSync(aside, `${full}.tacet-kept-${randomBytes(4).toString('hex')}`);
+    } catch {
+      // Left under the temporary name: still the same file, never lost.
+    }
   }
   return false;
 }
