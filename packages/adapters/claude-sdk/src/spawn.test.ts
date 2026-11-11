@@ -102,7 +102,7 @@ describe.skipIf(!posix)('Claude Code in a session of its own (#308)', () => {
           `import { spawnInOwnSession } from ${JSON.stringify(pathToFileURL(SPAWN_TS).href)};`,
           'const run = (c, name) => new Promise((r) => {',
           "  let s = ''; c.stdout.on('data', (d) => { s += d; });",
-          "  c.on('close', () => { process.stdout.write(`${name}=${s.trim()}\\n`); r(); });",
+          "  c.on('close', () => { process.stdout.write(name + '=' + s.trim() + '\\n'); r(); });",
           '  c.stdin.end();',
           '});',
           `const args = ['-c', ${JSON.stringify(probe)}];`,
