@@ -10,7 +10,10 @@ import {
 } from './adapter.js';
 import { codexFixtureDir } from './testing/fixture-dir.js';
 
-/** An unattended Codex Worker never runs on a repo under a sandbox-writable temp dir (#293). */
+/**
+ * Without a private TMPDIR (macOS, #294), an unattended Codex Worker never runs on a repo, or
+ * with a CODEX_HOME, under a sandbox-writable temp dir (#293, #295).
+ */
 describe('repos under the sandbox temp dirs (#293)', () => {
   const dirs: string[] = [];
   afterEach(() => {
@@ -82,6 +85,8 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     dirs.push(parent, state);
     const { repo, wt } = repoIn(parent);
     const adapter = new CodexAppServerAdapter({
+      // The shared temp dirs, as on macOS (#294 lifts these refusals elsewhere).
+      privateTmpdir: false,
       repoRoot: repo,
       stateDir: state,
       // Never run: the refusal comes first.
@@ -106,6 +111,8 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     const { repo, wt } = repoIn(outside);
     const state = join(tmp, 'state');
     const adapter = new CodexAppServerAdapter({
+      // The shared temp dirs, as on macOS (#294 lifts these refusals elsewhere).
+      privateTmpdir: false,
       repoRoot: repo,
       stateDir: state,
       codexPath: join(outside, 'no-codex-here'),
@@ -144,6 +151,8 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     const state = codexFixtureDir('tacet-295-norepo-state-');
     dirs.push(state);
     const adapter = new CodexAppServerAdapter({
+      // The shared temp dirs, as on macOS (#294 lifts these refusals elsewhere).
+      privateTmpdir: false,
       stateDir: state,
       codexPath: join(elsewhere, 'no-codex-here'),
       baseEnv: {

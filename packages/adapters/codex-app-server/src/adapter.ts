@@ -105,6 +105,15 @@ export interface CodexAdapterOptions {
   approvalPolicy?: 'untrusted' | 'on-request' | 'never';
   /** Codex sandbox mode. Default `workspace-write`. */
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  /**
+   * Give each unattended Worker its own `TMPDIR` (a fresh 0700 dir in the repo's state dir,
+   * removed when the session ends) and take `/tmp` out of the sandbox's writable roots, so no
+   * shared temp dir is writable and a repo or state dir under `/tmp` is protected (#294). Default
+   * on, except on macOS: there the Xcode `git` shim writes under the per-user temp dir, which has
+   * not been checked against a private `TMPDIR`, so macOS keeps the shared temp dirs and refuses
+   * a repo or CODEX_HOME under them instead (#293, #295).
+   */
+  privateTmpdir?: boolean;
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */
   codexPath?: string;
   /**
@@ -333,10 +342,15 @@ export class CodexAppServerAdapter implements AgentAdapter {
       this.#opts.apiBaseUrl !== undefined ? { baseUrl: this.#opts.apiBaseUrl } : {},
     );
     const home = launch.env.HOME ?? homedir();
-    // Before anything is created for the Worker: the sandbox could not protect its repo (#293),
-    // or the repo enclosing its cwd when no repoRoot is given (#295).
-    if (unattended) refuseGitInSandboxTemp(opts.cwd, this.#opts.repoRoot, launch.env.TMPDIR);
+    // A private TMPDIR, and /tmp read-only: no shared temp dir is left writable (#294).
+    const privateTmp = unattended && (this.#opts.privateTmpdir ?? process.platform !== 'darwin');
+    // Without it, before anything is created for the Worker: the sandbox could not protect its
+    // repo (#293), or the repo enclosing its cwd when no repoRoot is given (#295).
+    if (unattended && !privateTmp) {
+      refuseGitInSandboxTemp(opts.cwd, this.#opts.repoRoot, launch.env.TMPDIR);
+    }
     let codexHome: string;
+    let workerTmp: string | undefined;
     if (unattended) {
       // Nothing inherited may point a Worker's git somewhere else.
       for (const k of GIT_LOCATION_VARS) delete launch.env[k];
@@ -357,13 +371,21 @@ export class CodexAppServerAdapter implements AgentAdapter {
       );
       // Its own CODEX_HOME, which the next Worker's app-server reads outside the sandbox, must be
       // out of the sandbox's reach too (#295).
-      refuseInSandboxTemp(
-        'its CODEX_HOME',
-        codexHome,
-        launch.env.TMPDIR,
-        'Set a state dir (`events.state_dir`, or the stateDir option) or HOME outside /tmp and $TMPDIR.',
-      );
+      if (!privateTmp) {
+        refuseInSandboxTemp(
+          'its CODEX_HOME',
+          codexHome,
+          launch.env.TMPDIR,
+          'Set a state dir (`events.state_dir`, or the stateDir option) or HOME outside /tmp and $TMPDIR.',
+        );
+      }
       privateDir(codexHome);
+      if (privateTmp) {
+        // Beside CODEX_HOME, never inside it: the Worker writes here.
+        workerTmp = join(dirname(codexHome), 'codex-tmp', randomUUID());
+        privateDir(workerTmp);
+        launch.env.TMPDIR = workerTmp;
+      }
       launch.env.CODEX_HOME = codexHome;
       // Codex trusts a repo by itself at the first thread that can write it, and a trusted
       // project's `.codex/config.toml` (MCP servers that run commands, instructions, rules,
@@ -513,7 +535,16 @@ export class CodexAppServerAdapter implements AgentAdapter {
           // Codex keeps a linked worktree's git dir read-only; the Worker's own one is made
           // writable, and nothing else of the repo's .git (#116). Thread config keys are dotted
           // override paths, so this sets only `writable_roots` and keeps the rest of the table.
-          ...(gitDir !== undefined ? { 'sandbox_workspace_write.writable_roots': [gitDir] } : {}),
+          ...(gitDir !== undefined || workerTmp !== undefined
+            ? {
+                'sandbox_workspace_write.writable_roots': [
+                  ...(gitDir !== undefined ? [gitDir] : []),
+                  ...(workerTmp !== undefined ? [workerTmp] : []),
+                ],
+              }
+            : {}),
+          // Its own TMPDIR is writable (it is $TMPDIR and a writable root); /tmp is not (#294).
+          ...(workerTmp !== undefined ? { 'sandbox_workspace_write.exclude_slash_tmp': true } : {}),
           // The commands a Worker runs get its environment (already an allowlist, #147) without
           // the API key Codex itself uses (#150): Codex's default passes everything, key included.
           ...(unattended ? { 'shell_environment_policy.exclude': [...KEY_VARS] } : {}),
@@ -562,6 +593,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
       rpc.fail(new Error('start failed'));
       proc.stdin?.end();
       await this.#terminate(proc, exited, () => exitInfo.value !== undefined);
+      if (workerTmp !== undefined) rmSync(workerTmp, { recursive: true, force: true });
       if (err instanceof ProfileRefusedError) throw err;
       // Codex's error text can quote the thread config, which holds the MCP headers.
       throw new Error(
@@ -572,9 +604,11 @@ export class CodexAppServerAdapter implements AgentAdapter {
     this.#sessions.set(handle.id, session);
     // Ended at once, so nothing more is sent to it; reported only once its whole process group is
     // gone, so nothing of it still runs (or writes into the worktree) after the error (#198).
-    session.gone = exited.then(() => {
+    session.gone = exited.then(async () => {
       this.#exited(session);
-      return this.#reapGroup(proc);
+      await this.#reapGroup(proc);
+      // Nothing of the Worker runs any more: its temp files go (#294).
+      if (workerTmp !== undefined) rmSync(workerTmp, { recursive: true, force: true });
     });
     void session.gone.then(() => this.#onExit(session));
 
