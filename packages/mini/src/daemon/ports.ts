@@ -275,8 +275,8 @@ export interface WorkerMcp {
 }
 
 /**
- * Why an adapter may not run unattended sessions (an ACP agent's `workerRefused`, e.g. codex-acp
- * until #183 is decided), or `undefined`. Read by duck typing, so any adapter can declare it.
+ * Why an adapter may not run unattended sessions (an ACP agent's `workerRefused`, e.g. codex-acp,
+ * settled on #183), or `undefined`. Read by duck typing, so any adapter can declare it.
  */
 export function workerRefusal(w: WorkerAdapter): string | undefined {
   const r = (w.adapter as { workerRefused?: unknown }).workerRefused;

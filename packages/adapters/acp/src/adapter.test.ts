@@ -294,6 +294,15 @@ describe('AcpAdapter (fake ACP agent)', () => {
     expect(names).toContain('CODEX_OTHER');
     expect(names).not.toContain('CODEX_CONFIG');
     expect(names).not.toContain('CODEX_PATH');
+    // Interactive, with the user's whole environment: still not (#183).
+    rmSync(logFile, { force: true });
+    const all = make(CODEX_ACP_AGENT, user, { envPolicy: { inherit: 'all' } });
+    const ha = await all.start({ cwd: join(root, 'wt') });
+    await all.close(ha);
+    const allNames = (received()[0] as { envNames?: string[] }).envNames ?? [];
+    expect(allNames).toContain('CODEX_OTHER');
+    expect(allNames).not.toContain('CODEX_CONFIG');
+    expect(allNames).not.toContain('CODEX_PATH');
     // Set by the spec itself: passed.
     rmSync(logFile, { force: true });
     const set = make(
