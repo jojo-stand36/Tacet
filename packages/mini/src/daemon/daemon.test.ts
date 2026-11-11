@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
   cancelStopped,
+  isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,
   miniLockHolder,
@@ -2445,5 +2446,105 @@ describe('handoff reseed (#129)', () => {
     // A canceled task's session is gone at once.
     await d.cancel(id);
     expect(d.handoffRefusal(minted[1] ?? '')).toMatch(/not running/);
+  });
+});
+
+describe('Workers without the Mini-conductor MCP tools (#184)', () => {
+  /** As Gemini CLI in an untrusted checkout: approvals round-trip, no MCP client. */
+  class NoMcp extends ScriptedAdapter {
+    override capabilities() {
+      return { ...super.capabilities(), mcp: false };
+    }
+  }
+
+  it('mints no MCP token, passes no server, and prompts without Tacet tools', async () => {
+    const gemini = new NoMcp('fake', script);
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+    });
+    await d.start();
+    d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(minted).toEqual([]);
+    const opts = gemini.sessions[0]?.opts;
+    expect(opts?.mcpServers).toBeUndefined();
+    expect(opts?.systemPrompt).not.toMatch(/escalate|report_progress|record_decision|MCP/);
+    expect(opts?.systemPrompt).toMatch(/no Tacet tools/);
+  });
+
+  it('asks the user for a Worker that was refused and stopped with nothing done, in the same session', async () => {
+    const gemini = new NoMcp('fake', (input) =>
+      input.includes('Answer to your escalation')
+        ? { do: 'reply', text: 'Done with the answer.' }
+        : { do: 'approval', toolName: 'run_shell_command' },
+    );
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+      planner: new FixedPlanner([{ key: 'a', goal: 'needs a shell', acceptanceCriteria: ['ok'] }]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+    // Refused, and told to say what it needs rather than call a tool it does not have.
+    expect(gemini.approvalsAnswered).toEqual([
+      expect.objectContaining({ kind: 'reject', message: expect.not.stringMatching(/escalate/) }),
+    ]);
+    const raised = ofType('escalation.raised', sub);
+    expect(raised).toHaveLength(1);
+    const x = raised[0]?.data as { id: string; question: string; category: string };
+    expect(x.category).toBe('blocked');
+    expect(x.question).toContain('run_shell_command');
+    expect(ofType('task.result', sub)).toHaveLength(0);
+    expect(gemini.open).toBe(1);
+    d.answer(x.id, 'Skip the shell; edit the file directly.');
+    await d.settled();
+    expect(gemini.sessions).toHaveLength(1);
+    expect(gemini.sessions[0]?.inputs.at(-1)).toBe(
+      `Answer to your escalation ${x.id}: Skip the shell; edit the file directly.`,
+    );
+    expect(tasks()[sub]?.state).toBe('completed');
+  });
+
+  it('lets a review that was refused something finish as before', async () => {
+    const gemini = new NoMcp('fake', () => ({ do: 'approval', toolName: 'run_shell_command' }));
+    const d = make({
+      adapters: { fake: { adapter: gemini, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+      planner: new FixedPlanner([
+        { key: 'a', goal: 'review it', acceptanceCriteria: ['ok'], kind: 'review' },
+      ]),
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(ofType('escalation.raised', `${id}/1`)).toHaveLength(0);
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+  });
+
+  it('refuses a Worker with neither MCP tools nor approval requests', async () => {
+    class Mute extends ScriptedAdapter {
+      override capabilities() {
+        return { ...super.capabilities(), mcp: false, approvals: 'none' as const };
+      }
+    }
+    const mute = new Mute('fake', script);
+    const d = make({
+      adapters: { fake: { adapter: mute, authRoute: 'api_key' } },
+      config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(mute.sessions).toHaveLength(0);
+    expect(tasks()[`${id}/1`]?.state).toBe('failed');
+    expect(JSON.stringify(ofType('worker.ended', `${id}/1`))).toContain('neither');
+  });
+
+  it('never takes a tool on an empty server name for its own', () => {
+    expect(isOwnMcpTool({ toolName: 'mcp____escalate' }, '')).toBe(false);
+    expect(isOwnMcpTool({ toolName: 'mcp__tacet__escalate' }, 'tacet')).toBe(true);
   });
 });

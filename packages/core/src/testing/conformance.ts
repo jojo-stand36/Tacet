@@ -237,6 +237,25 @@ const PROBES: Probe[] = [
       }),
   },
   {
+    // An adapter that declares no MCP client must refuse servers, not drop them unseen (#184).
+    id: 'mcp',
+    priority: 'P0',
+    run: async (ctx) => {
+      if (ctx.caps.mcp) return skip('declares mcp: needs an MCP probe server to check');
+      let h: SessionHandle;
+      try {
+        h = await ctx.adapter.start({
+          ...ctx.sc.session,
+          mcpServers: [{ name: 'probe', url: 'http://127.0.0.1:9/mcp' }],
+        });
+      } catch {
+        return pass('declares no MCP and refuses mcpServers');
+      }
+      await ctx.adapter.close(h).catch(() => {});
+      return drift('declares no MCP but took mcpServers');
+    },
+  },
+  {
     id: 'approval-roundtrip',
     priority: 'P0',
     run: async (ctx) => {

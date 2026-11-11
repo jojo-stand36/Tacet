@@ -45,6 +45,11 @@ process.stdin.on('data', () => {
  * the CLI's standalone suite).
  */
 class NoMcpPty extends PtyCliAdapter {
+  // Says it takes the server it drops, so the Mini-conductor runs it at all (#184): a generic
+  // CLI has neither MCP nor approval requests, and is refused as a Worker otherwise.
+  override capabilities() {
+    return { ...super.capabilities(), mcp: true };
+  }
   override start(opts: SessionOptions) {
     const { mcpServers: _ignored, ...rest } = opts;
     return super.start(rest);

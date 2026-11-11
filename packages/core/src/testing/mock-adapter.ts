@@ -37,6 +37,8 @@ export interface MockLies {
   effort?: boolean;
   /** Starts with any `contextWindow`, even one it does not list, and never applies it. */
   contextWindow?: boolean;
+  /** Declares no MCP client but takes `mcpServers` without a word (#184). */
+  mcp?: boolean;
 }
 
 export interface MockAdapterOptions {
@@ -100,6 +102,9 @@ export class MockAdapter implements AgentAdapter {
 
   async start(opts: SessionOptions): Promise<SessionHandle> {
     if (opts.resume && !this.#caps.resume) throw new Error('resume not supported');
+    if (opts.mcpServers?.length && !this.#caps.mcp && !this.#lie.mcp) {
+      throw new Error('no MCP client: mcpServers refused');
+    }
     if (
       opts.contextWindow !== undefined &&
       !this.#lie.contextWindow &&
