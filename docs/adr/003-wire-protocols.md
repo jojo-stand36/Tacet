@@ -261,7 +261,7 @@ Also recorded:
 
 ### Addendum (2026-11-10): live terminal attach, `/pty/<sessionId>` (#201)
 
-Status of this addendum: **accepted** on 2026-11-11, approved by the owner (decision relayed by the coordinator session). The owner also decided that the attach client strips OSC 52 (clipboard writes) from the Worker's terminal bytes; window titles stay allowed. That filter is #302. §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
+Status of this addendum: **accepted** on 2026-11-11, approved by the owner on PR #267 ([comment 6802114697](https://github.com/jojo-stand36/Tacet/pull/267#issuecomment-6802114697): "Approved: /pty ADR-003 addendum"). The owner also decided that the attach client strips OSC 52 (clipboard writes) from the Worker's terminal bytes; window titles stay allowed. That filter is #302. §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
 
 1. **What `<sessionId>` names.** The Worker session id, the one in `worker.started` (AG-UI `runId`), not the `sessionId` a hello returns. It is a plain token (`[A-Za-z0-9._-]`, at most 128 characters); any other path is 404.
 2. **Authenticated at the upgrade only, no hello.** The upgrade passes the same checks as `/`, in this order: Host and Origin, then the bearer token, then the path, so nobody without the token learns which sessions exist. No hello is said: no protocol message travels on the socket, and the protocol version is the runtime file's `protocolVersions`. This is the one exception to §3.6.
