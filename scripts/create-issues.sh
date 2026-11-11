@@ -18,9 +18,14 @@ set -euo pipefail
 
 REPO="${1:?usage: $0 OWNER/REPO [--dry-run]}"
 DRY="${2:-}"
+# Anything else (a typo such as --dryrun) would otherwise be a real run.
+[[ -z "$DRY" || "$DRY" == "--dry-run" ]] || { echo "usage: $0 OWNER/REPO [--dry-run]" >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# Tests only: another roadmap file.
+# Tests only: another roadmap file, and the pause between created issues.
 DATA="${TACET_ROADMAP_JSON:-$ROOT/roadmap/issues.json}"
+[[ -z "${TACET_ROADMAP_JSON:-}" ]] || echo "using roadmap: $DATA"
+DELAY="${TACET_CREATE_DELAY:-1}"
+[[ "$DELAY" =~ ^[0-9]+$ ]] || { echo "TACET_CREATE_DELAY must be a whole number of seconds" >&2; exit 2; }
 API="repos/$REPO"
 
 command -v jq >/dev/null || { echo "jq is required"; exit 1; }
@@ -33,11 +38,16 @@ if [[ $have_gh == 0 ]]; then
 fi
 
 # All items of a list endpoint (PATH may carry a query), as one JSON array, a page at a time.
+# Always called in $(...), where set -e does not apply: a failed page exits explicitly, so the
+# caller never goes on with a partial list (and creates what was on the missing page).
 list_all() {
   local path="$1" sep="?" page=1 out="[]" chunk
   [[ "$path" == *\?* ]] && sep="&"
   while :; do
-    chunk=$(gh api "$API/$path${sep}per_page=100&page=$page")
+    chunk=$(gh api "$API/$path${sep}per_page=100&page=$page") ||
+      { echo "error: listing $path (page $page) failed; nothing more is done" >&2; exit 1; }
+    jq -e 'type == "array"' <<<"$chunk" >/dev/null 2>&1 ||
+      { echo "error: $path (page $page) is not a JSON list; nothing more is done" >&2; exit 1; }
     [[ $(jq 'length' <<<"$chunk") -gt 0 ]] || break
     out=$(jq -s 'add' <(printf '%s' "$out") <(printf '%s' "$chunk"))
     page=$((page + 1))
@@ -50,13 +60,13 @@ existing_labels=""
 [[ $have_gh == 0 ]] || existing_labels=$(list_all "labels" | jq -r '.[].name')
 jq -c '.labels[]' "$DATA" | while read -r l; do
   name=$(jq -r .name <<<"$l"); color=$(jq -r .color <<<"$l")
-  if grep -Fxq "$name" <<<"$existing_labels"; then
-    if dry; then echo "  [dry-run] label exists (color set): $name"; continue; fi
+  if grep -Fxq -e "$name" <<<"$existing_labels"; then
+    if dry; then echo "  [dry-run] label exists, would set color: $name"; continue; fi
     enc=$(jq -rn --arg s "$name" '$s|@uri')
     gh api -X PATCH "$API/labels/$enc" -f color="$color" >/dev/null
     echo "  label updated: $name"
   else
-    if dry; then echo "  [dry-run] label: $name"; continue; fi
+    if dry; then echo "  [dry-run] would create label: $name"; continue; fi
     gh api "$API/labels" -f name="$name" -f color="$color" >/dev/null
     echo "  label: $name"
   fi
@@ -86,7 +96,7 @@ existing_issues=""
 count=0
 while read -r i; do
   title=$(jq -r .title <<<"$i")
-  if grep -Fxq "$title" <<<"$existing_issues"; then
+  if grep -Fxq -e "$title" <<<"$existing_issues"; then
     echo "  skip (exists): $title"; continue
   fi
   if dry; then echo "  [dry-run] issue: $title"; count=$((count+1)); continue; fi
@@ -97,6 +107,6 @@ while read -r i; do
     | gh api "$API/issues" --input - >/dev/null
   echo "  issue: $title"
   count=$((count+1))
-  sleep "${TACET_CREATE_DELAY:-1}"   # stay well under secondary rate limits
+  sleep "$DELAY"   # stay well under secondary rate limits
 done < <(jq -c '.issues[]' "$DATA")
 echo "Done: $count issue(s) ${DRY:+would be }created."
