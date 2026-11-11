@@ -104,8 +104,9 @@ export function detachedLogFor(io: Io, repoRoot: string): string {
 
 /**
  * `tacet run --detach` (#201): the same run in the background. A child `tacet run` with
- * `--detached-child` hosts the Mini-conductor, with no terminal: it waits for answers given with
- * `tacet answer` instead of stopping at an escalation, and ends when its tasks do. Its output goes
+ * `--detached-child` hosts the Mini-conductor, with no terminal: it ends when its tasks do, or,
+ * as a run without a terminal, when only an answer can move them on (exit 3; no terminal shows
+ * it the code an answer over its port needs, #269). Its output goes
  * to a log file (mode 0600, new for each run) beside its runtime file. This process returns once
  * the child's control port is up, with the task, the child's pid and the log's path. The child
  * gets the user's environment unchanged and makes its port's token itself: no secret is passed

@@ -12,7 +12,6 @@ import {
   readState,
   repoRootFrom,
   rootTasks,
-  sleep,
   statePaths,
   subtasksOf,
 } from '../state.js';
@@ -29,7 +28,7 @@ export interface RunOptions {
   /** `<escalation id>=<answer>`, given before the run continues. */
   answer?: string[];
   json?: boolean;
-  /** The background run `tacet run --detach` started (#201): waits for answers, never asks. */
+  /** The background run `tacet run --detach` started (#201): never asks; stops for an answer (#269). */
   'detached-child'?: boolean;
 }
 
@@ -38,8 +37,9 @@ export const EXIT = { done: 0, failed: 1, usage: 2, waiting: 3, interrupted: 130
 
 /**
  * `tacet run "<task>"` (#21): host a standalone Mini-conductor in this process until the task is
- * done. On a terminal it asks the user each open escalation; without one it stops with exit code
- * 3 and the escalation ids, for `tacet run --resume --answer <id>=<text>`. Interrupted (SIGINT),
+ * done. On a terminal it asks the user each open escalation, showing the one-time code an answer
+ * from another terminal (`tacet answer`) needs (#269); without one it stops with exit code 3 and
+ * the escalation ids, for `tacet run --resume --answer <id>=<text>`. Interrupted (SIGINT),
  * open Worker sessions are recorded as `restart` and resume with `--resume`.
  */
 export async function run(io: Io, goal: string | undefined, o: RunOptions): Promise<number> {
@@ -168,8 +168,6 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
       }
     };
 
-    /** Escalations the background run has already said it waits on. */
-    const told = new Set<string>();
     for (;;) {
       // Short waits, so an interrupt is noticed and progress is shown while Workers run.
       for (;;) {
@@ -192,19 +190,9 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
       const open = roots.filter((r) => !DONE_STATES.has(state.tasks[r]?.state ?? ''));
       if (open.length === 0) return report(io, sa, roots, o.json);
 
+      // In the background nobody is at a terminal, and an answer over the control port needs a
+      // code only a terminal may show (#269): it stops as a run without a terminal does.
       const pending = open.flatMap((r) => pendingEscalations(state, r));
-      if (pending.length > 0 && o['detached-child']) {
-        // In the background nobody is at a terminal: say once what waits, then wait for an
-        // answer over the control port (`tacet answer`), a cancel, or a signal.
-        for (const x of pending) {
-          if (told.has(x.id)) continue;
-          told.add(x.id);
-          io.err(terminalSafe(`escalation ${x.id} (${x.taskId}) waits: ${x.question}`));
-          io.err(`answer it with: tacet answer ${x.id} <answer>`);
-        }
-        await sleep(io.pollMs ?? 1000, io.signal);
-        continue;
-      }
       if (pending.length > 0) {
         let answered = 0;
         if (io.prompt) io.err('answer each question, or press Enter to leave it for later');
@@ -212,12 +200,18 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
           // Answered meanwhile over the run's control port (`tacet answer`, #201): not asked again.
           const now = readState(sa.store);
           if (!open.flatMap((r) => pendingEscalations(now, r)).some((y) => y.id === x.id)) continue;
-          const answer = await io.prompt?.(terminalSafe(`${x.taskId} asks: ${x.question}\n> `));
+          // The one-time code an answer from another terminal needs (#269): shown here only, on
+          // the terminal this run asks on, never in its log or the event log.
+          const code = sa.answerCodes.issue(x.id);
+          const answer = await io.prompt?.(
+            `${terminalSafe(`${x.taskId} asks: ${x.question}`)}\n(from another terminal: tacet answer ${terminalSafe(x.id)} <answer>, with code ${code})\n> `,
+          );
           // End of input: nobody is there to ask.
           if (answer === undefined || io.signal?.aborted) break;
           if (answer.trim() === '') continue;
           try {
             sa.mini.answer(x.id, answer);
+            sa.answerCodes.drop(x.id);
             answered += 1;
           } catch (err) {
             io.err(terminalSafe((err as Error).message));

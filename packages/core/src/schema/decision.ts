@@ -45,6 +45,13 @@ export const DecisionExt = z.object({
   choice: z.string().min(1),
   rationale: z.string().optional(),
   scope: DecisionScope,
+  code: z
+    .string()
+    .max(64)
+    .optional()
+    .describe(
+      "The Escalation's one-time answer code, which only the terminal of the run that asked shows: a Mini-conductor's control port takes no answer without it (#269). Never stored, logged or forwarded",
+    ),
 });
 export type DecisionExt = z.infer<typeof DecisionExt>;
 

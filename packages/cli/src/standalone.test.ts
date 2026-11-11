@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import {
   chmodSync,
   closeSync,
@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -13,8 +14,10 @@ import {
   writeFileSync,
   writeSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { newUlid } from '@tacet/core';
 import {
   miniRuntimePath,
@@ -475,6 +478,47 @@ describe('tacet standalone (#21)', () => {
     const status = async () =>
       JSON.parse((await tacet(['status', ...user(), '--json'])).out) as Status;
 
+    /**
+     * What code a Worker ran can do with the control token (#269): a separate process reads the
+     * runtime file, connects and says hello as the CLI, then answers the escalation without a
+     * code and with a guessed one. Each line is what one step got.
+     */
+    const workerAnswers = (file: string, escalationId: string, taskId: string) => {
+      const wsPath = createRequire(
+        fileURLToPath(new URL('../../core/package.json', import.meta.url)),
+      ).resolve('ws');
+      const script = join(root, 'worker-answers.mjs');
+      writeFileSync(
+        script,
+        `import { readFileSync } from 'node:fs';
+const [file, wsPath, escalationId, taskId] = process.argv.slice(2);
+const WebSocket = (await import(wsPath)).default;
+const info = JSON.parse(readFileSync(file, 'utf8'));
+const ws = new WebSocket('ws://127.0.0.1:' + info.port + '/', { headers: { authorization: 'Bearer ' + info.token } });
+let id = 0;
+const waiting = new Map();
+ws.on('message', (d) => { const m = JSON.parse(String(d)); waiting.get(m.id)?.(m); });
+const call = (method, params) => new Promise((resolve) => { id += 1; waiting.set(id, resolve); ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })); });
+await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+const out = [];
+const hello = await call('tacet/hello', { protocolVersions: [1], role: 'cli', clientInfo: { name: 'worker', version: '0' }, capabilities: {} });
+out.push(hello.result ? 'hello ok' : 'hello refused');
+const answer = (code) => call('SendMessage', { message: { messageId: 'm' + id, taskId, role: 'ROLE_USER', parts: [{ text: 'Worker decided' }], extensions: ['urn:tacet:a2a-ext:decision:v1'], metadata: { 'urn:tacet:a2a-ext:decision:v1': { escalationId, choice: 'Worker decided', scope: 'task', ...(code ? { code } : {}) } } } });
+for (const code of [undefined, 'AAAAAAAA']) { const r = await answer(code); out.push(r.error ? r.error.message : 'ANSWERED'); }
+console.log(JSON.stringify(out));
+ws.close();
+`,
+      );
+      return new Promise<string[]>((resolve, reject) =>
+        execFile(
+          process.execPath,
+          [script, file, wsPath, escalationId, taskId],
+          { timeout: 15_000 },
+          (err, stdout) => (err ? reject(err) : resolve(JSON.parse(stdout) as string[])),
+        ),
+      );
+    };
+
     it('answers status and takes an answer while the run waits, writing the log from the run only', async () => {
       const paths = repoStatePaths(repo, state);
       let escId = '';
@@ -486,17 +530,49 @@ describe('tacet standalone (#21)', () => {
         escId = raise(paths.events, 'Which database?');
         return { do: 'reply', text: 'waiting' };
       };
-      const seen: { live?: Status; human?: string; wrong?: number; answer?: number } = {};
+      const seen: {
+        live?: Status;
+        human?: string;
+        wrong?: number;
+        noCode?: string;
+        badCode?: string;
+        worker?: string[];
+        answer?: number;
+        asked?: string;
+      } = {};
+      let code = '';
       const r = await tacet(['run', ...user(), 'pick a database'], {
-        prompt: async () => {
+        prompt: async (question) => {
+          seen.asked = question;
+          // The run's terminal shows the escalation's one-time code (#269).
+          code = /with code ([0-9A-Z]{8})\)/.exec(question)?.[1] ?? '';
           seen.live = await status();
           seen.human = (await tacet(['status', ...user()])).out;
           seen.wrong = (await tacet(['answer', ...user(), '01JCX5Z9Q4W8E7R6T5Y4V3K2M9', 'x'])).code;
-          seen.answer = (await tacet(['answer', ...user(), escId, 'Postgres'])).code;
+          // A process a Worker ran, holding the control token, cannot answer (#269).
+          seen.worker = await workerAnswers(runtimeFile(), escId, seen.live?.tasks[0]?.id ?? '');
+          // Without a terminal to type the code on, or with a wrong one, nothing is answered.
+          seen.noCode = (await tacet(['answer', ...user(), escId, 'MySQL'])).err;
+          seen.badCode = (
+            await tacet(['answer', ...user(), escId, 'MySQL'], { prompt: async () => 'ZZZZZZZZ' })
+          ).err;
+          seen.answer = (
+            await tacet(['answer', ...user(), escId, 'Postgres'], { prompt: async () => code })
+          ).code;
           // Left on the terminal: it was answered over the port meanwhile.
           return '';
         },
       });
+      expect(code).toMatch(/^[0-9A-Z]{8}$/);
+      expect(seen.asked).toContain(`tacet answer ${escId} <answer>`);
+      // The token gets it in; the answer, with no code or a guessed one, does not.
+      expect(seen.worker).toEqual([
+        'hello ok',
+        `wrong answer code for escalation ${escId}`,
+        `wrong answer code for escalation ${escId}`,
+      ]);
+      expect(seen.noCode).toContain('needs a terminal');
+      expect(seen.badCode).toContain('wrong answer code');
       expect(seen.live?.source).toBe('run');
       expect(seen.live?.running).toBe(process.pid);
       expect(seen.live?.tasks[0]?.escalations.map((x) => x.id)).toEqual([escId]);
@@ -518,6 +594,17 @@ describe('tacet standalone (#21)', () => {
         .map((e) => e.envelope.data);
       store.close();
       expect(resolved).toEqual([expect.objectContaining({ escalationId: escId, source: 'user' })]);
+      expect(git(repo, ['show', `${branch}:work.txt`])).not.toBe('MySQL');
+      // The code is in no file: not the event log, the runtime file or the state dir.
+      const inFiles = (dir: string): boolean =>
+        readdirSync(dir, { withFileTypes: true }).some((d) =>
+          d.isDirectory()
+            ? inFiles(join(dir, d.name))
+            : d.isFile() && readFileSync(join(dir, d.name)).includes(code),
+        );
+      expect(inFiles(root)).toBe(false);
+      expect(r.err).not.toContain(code);
+      expect(r.out).not.toContain(code);
       // The port is gone with the run: status reads the log again.
       expect(existsSync(runtimeFile())).toBe(false);
       expect(await status()).toMatchObject({ running: null, source: 'log' });
@@ -799,7 +886,7 @@ describe('tacet standalone (#21)', () => {
       child = undefined;
     });
 
-    it('runs in the background, waits for an answer instead of stopping, and passes no secret', async () => {
+    it('runs in the background, stops for an answer as a run without a terminal does, and passes no secret', async () => {
       const paths = repoStatePaths(repo, state);
       let escId = '';
       script = (cwd, input) => {
@@ -829,17 +916,6 @@ describe('tacet standalone (#21)', () => {
       expect(started[0]?.env).toBe(env);
       expect(statSync(logFile()).mode & 0o777).toBe(0o600);
 
-      // It waits for the answer: no terminal, and it does not stop.
-      await vi.waitFor(() => expect(escId).not.toBe(''), { timeout: 10_000 });
-      let ended = false;
-      void child?.then(() => {
-        ended = true;
-      });
-      await vi.waitFor(() =>
-        expect(readFileSync(logFile(), 'utf8')).toContain(`tacet answer ${escId}`),
-      );
-      await new Promise((r) => setTimeout(r, 300));
-      expect(ended).toBe(false);
       const secret = readRuntimeFile(runtimeFile()).token.reveal();
       // A second background run beside it is refused.
       const again = await tacet(['run', ...user(), '--detach', 'another'], {
@@ -849,9 +925,16 @@ describe('tacet standalone (#21)', () => {
       expect(again.err).toContain('already live');
       expect(started).toHaveLength(1);
 
-      const a = await tacet(['answer', ...user(), escId, 'Postgres']);
+      // No terminal shows it an answer code, so an answer cannot come over its port (#269): once
+      // only the answer can move the task on, it stops (exit 3) and says how to answer.
+      expect(await child).toBe(3);
+      expect(escId).not.toBe('');
+      const log = readFileSync(logFile(), 'utf8');
+      expect(log).toContain(`escalation ${escId}`);
+      expect(log).toContain('tacet run --resume --answer');
+      expect(existsSync(runtimeFile())).toBe(false);
+      const a = await tacet(['run', ...user(), '--resume', '--answer', `${escId}=Postgres`]);
       expect(a.code, a.err).toBe(0);
-      expect(await child).toBe(0);
       const branch = git(repo, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/tacet/'])
         .split('\n')
         .find((b) => b.includes(id)) as string;

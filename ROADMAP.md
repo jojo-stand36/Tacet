@@ -98,6 +98,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Scrub Worker tokens split across streamed message deltas** — `feature` `P2` `either`
 - [ ] **Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)** — `feature` `P1` `claude`
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
+- [ ] **Start the Claude SDK's Claude Code in a session of its own, and verify #269's terminal assumptions per OS** — `feature` `P2` `claude`
 - [ ] **Submodules and nested repos for unattended Codex Workers** — `feature` `P2` `claude + human`
 - [ ] **Sweep stale Worker MCP config files at startup** — `feature` `P2` `either`
 - [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`

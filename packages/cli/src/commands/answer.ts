@@ -14,7 +14,9 @@ export interface AnswerOptions {
 /**
  * `tacet answer <escalation> <text>` (#201): answer an open escalation in the live run, over its
  * control port, so only the run writes the log. The answer reaches the Worker as its next turn.
- * With no run live, `tacet run --resume --answer ID=TEXT` answers as the run starts.
+ * It asks for the escalation's one-time code, which only the `tacet run` terminal shows (#269):
+ * typed in, never an argument, which other processes of the user could read. With no run live,
+ * `tacet run --resume --answer ID=TEXT` answers as the run starts.
  */
 export async function answer(
   io: Io,
@@ -43,6 +45,19 @@ export async function answer(
       io.err(`no open escalation ${terminalSafe(escalationId)} (see tacet status)`);
       return 1;
     }
+    if (!io.prompt) {
+      io.err(
+        'tacet answer asks for the answer code the tacet run terminal shows, so it needs a terminal',
+      );
+      return 2;
+    }
+    const code = await io.prompt(
+      `answer code for ${terminalSafe(escalationId)} (the tacet run terminal shows it): `,
+    );
+    if (code === undefined || code.trim() === '') {
+      io.err('no answer code given: nothing was answered');
+      return 1;
+    }
     await client.call('SendMessage', {
       message: {
         messageId: randomUUID(),
@@ -50,7 +65,7 @@ export async function answer(
         role: 'ROLE_USER',
         parts: [{ text }],
         extensions: [DECISION_EXT_URI],
-        metadata: { [DECISION_EXT_URI]: { escalationId, choice: text, scope: 'task' } },
+        metadata: { [DECISION_EXT_URI]: { escalationId, choice: text, scope: 'task', code } },
       },
     });
     if (o.json) io.out(safeJson({ answered: escalationId, taskId: task.id }));
