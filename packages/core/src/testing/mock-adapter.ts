@@ -18,6 +18,7 @@ export const MOCK_CAPABILITIES: AdapterCapabilities = {
   approvals: 'roundtrip',
   interrupt: 'receipt',
   resume: true,
+  mcp: true,
   fork: 'native',
   usage: { live: true, context: true, cost: 'estimated' },
   modelSwitch: 'mid-session',

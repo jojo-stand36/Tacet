@@ -29,6 +29,8 @@ export interface MockGeminiRequest {
 export interface MockGeminiApi {
   url: string;
   requests: MockGeminiRequest[];
+  /** Paths of requests to anything else (e.g. an MCP endpoint pointed here, #184). */
+  otherPaths: string[];
   close(): Promise<void>;
 }
 
@@ -118,7 +120,12 @@ function script(model: string, body: Body): { chunks: Part[][]; delayMs: number 
   return { chunks: words.map((w) => [{ text: w }]), delayMs: 20 };
 }
 
-async function handle(req: IncomingMessage, res: ServerResponse, log: MockGeminiRequest[]) {
+async function handle(
+  req: IncomingMessage,
+  res: ServerResponse,
+  log: MockGeminiRequest[],
+  others: string[],
+) {
   let raw = '';
   for await (const c of req) raw += c;
   let body: Body = {};
@@ -149,19 +156,22 @@ async function handle(req: IncomingMessage, res: ServerResponse, log: MockGemini
     // The CLI's model router asks for a JSON choice; any reasonable one will do.
     return json(200, chunk([{ text: '{"reasoning":"mock","model_choice":"flash"}' }], true));
   }
+  others.push(url.split('?')[0] ?? '');
   json(404, { error: { code: 404, message: 'mock', status: 'NOT_FOUND' } });
 }
 
 export async function startMockGeminiApi(): Promise<MockGeminiApi> {
   const requests: MockGeminiRequest[] = [];
+  const otherPaths: string[] = [];
   const server: Server = createServer((req, res) => {
-    handle(req, res, requests).catch(() => res.destroy());
+    handle(req, res, requests, otherPaths).catch(() => res.destroy());
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   const { port } = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${port}`,
     requests,
+    otherPaths,
     close: () =>
       new Promise<void>((r) => {
         server.closeAllConnections();

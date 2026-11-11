@@ -227,6 +227,10 @@ export class AcpAdapter implements AgentAdapter {
       throw new ProfileRefusedError('contextWindow', `${spec.id} over ACP has one context size`);
     }
     if (opts.resume && !caps.resume) throw new Error(`${spec.id} does not resume sessions`);
+    // Declared `mcp: false` (#184): its servers would be dropped without a word, so refuse.
+    if (opts.mcpServers?.length && !caps.mcp) {
+      throw new Error(`${spec.id} does not connect the MCP servers it is given (capabilities.mcp)`);
+    }
     if (opts.resume?.fork && caps.fork !== 'native') {
       throw new ForkRefusedError(spec.id, `${spec.id} does not fork sessions over ACP`);
     }

@@ -47,6 +47,7 @@ describe('conformance bench with the mock adapter', () => {
       approvals: 'predecided',
       interrupt: 'kill',
       resume: false,
+      mcp: true,
       fork: 'emulated',
       usage: { live: true, context: false, cost: 'none' },
       modelSwitch: 'launch-only',
