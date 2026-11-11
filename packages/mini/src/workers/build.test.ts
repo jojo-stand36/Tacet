@@ -548,7 +548,7 @@ describe('buildWorkerAdapters', () => {
 });
 
 describe('a Codex Worker built from config (#186)', () => {
-  it('starts in a linked worktree of the repo, with a CODEX_HOME keyed by the repo root', {
+  it('starts in a linked worktree of the repo, with a CODEX_HOME keyed by the repo root, under the state dir (#23)', {
     timeout: 120_000,
   }, async () => {
     const api = await startMockResponsesApi();
@@ -580,6 +580,8 @@ describe('a Codex Worker built from config (#186)', () => {
         { tiers: { worker: { adapter: 'codex-app-server', model: 'gpt-5.5' } } },
         {
           repoRoot: repo,
+          // The resolved `events.state_dir`, given once for every adapter (owner, on #23).
+          stateDir: join(root, 'state'),
           baseEnv: { ...gitEnv, OPENAI_API_KEY: 'placeholder-not-a-real-key' },
           codex: { apiBaseUrl: api.url },
         },
@@ -598,7 +600,9 @@ describe('a Codex Worker built from config (#186)', () => {
       await close();
       expect(end.event).toMatchObject({ state: 'idle' });
       expect(api.requests.some((r) => r.text === 'SAY built')).toBe(true);
-      expect(existsSync(join(repoStateDir(repo, defaultStateDir(home)), 'codex'))).toBe(true);
+      expect(existsSync(join(repoStateDir(repo, join(root, 'state')), 'codex'))).toBe(true);
+      // Not split across two roots: nothing under the default state dir.
+      expect(existsSync(defaultStateDir(home))).toBe(false);
       // It ran in the worktree as an unattended Worker: the adapter detached its HEAD (#116).
       expect(() =>
         execFileSync('git', ['-C', wt, 'symbolic-ref', '-q', 'HEAD'], {

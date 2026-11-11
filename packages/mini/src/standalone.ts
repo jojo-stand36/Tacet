@@ -106,9 +106,8 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       withPlanner: !o.singleStep,
       ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
       ...(o.onWarning ? { onWarning: o.onWarning } : {}),
-      codex: { ...o.workers?.codex, stateDir },
-      acp: { ...o.workers?.acp, stateDir },
-      claude: { ...o.workers?.claude, stateDir },
+      // Every adapter's per-repo state beside the event log (#23), `pty:claude` included.
+      stateDir,
     });
   const tiers = config.tiers ?? {};
   // First: the worktree registry lives in the log (#126). The manager writes to it only once
