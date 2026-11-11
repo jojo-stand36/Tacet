@@ -184,10 +184,15 @@ describe('OscFilter (#302)', () => {
   });
 
   it('ends a string at a byte that may not be in it, and reads that byte as text', () => {
-    // An ESC that is not ST, invalid UTF-8 or a C1 control inside a title.
+    // An ESC that is not ST ends a title; non-ASCII bytes in it (a C1 control here) are skipped.
     expect(everySplit(bytes(`${E}]0;t${E}]52;c;QQ==\x07after`))).toBe(`${E}]0;t${ST}after`);
     expect(everySplit(bytes(`${E}]0;t\xc2\x9d52;c;QQ==\x07after`))).toBe(
-      `${E}]0;t${ST}52;c;QQ==\x07after`,
+      `${E}]0;t52;c;QQ==\x07after`,
+    );
+    // Titles are ASCII only (owner's decision on #302): GNU screen keeps one byte per character,
+    // so U+0107 U+011B U+015D would reach the outer terminal as BEL ESC ].
+    expect(everySplit(enc(`${E}]0;caf\u00e9 \u0107\u011b\u015d52;c;Zm9v\x07x`))).toBe(
+      `${E}]0;caf 52;c;Zm9v\x07x`,
     );
     expect(everySplit(bytes(`${E}]0;t\x9c${E}]52;c;QQ==\x07after`))).toBe(`${E}]0;t${ST}after`);
     expect(everySplit(bytes(`${E}]0;t${E}cX`))).toBe(`${E}]0;t${ST}${E}cX`);

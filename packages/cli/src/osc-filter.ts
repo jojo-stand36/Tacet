@@ -84,20 +84,19 @@ type Mode =
  *   CSI passes when well formed; one longer than 256 bytes is dropped whole. C0 controls inside
  *   either are sent before it, as terminals run them in place; DEL inside one is dropped.
  * - An OSC passes when its number is plain digits (no leading zero, at most 5) followed by `;` or
- *   its end, and the number (or iTerm2 key) is not blocked. Its text may hold printable or UTF-8
- *   characters from U+00A0 up; C0 controls and DEL in it are skipped; CAN, SUB, an ESC that is
- *   not ST, or a byte that is not UTF-8 ends it there with `ESC \`.
- * - A DCS with final byte `q`, and an APC (kitty graphics), pass the same way with printable
- *   ASCII text (other bytes skipped; BEL ends them). Other DCS, SOS and PM are dropped.
+ *   its end, and the number (or iTerm2 key) is not blocked. Its text is printable ASCII only
+ *   (owner's decision on #302): other bytes, non-ASCII characters among them, are skipped; CAN,
+ *   SUB or an ESC that is not ST ends it there with `ESC \`.
+ * - A DCS with final byte `q`, and an APC (kitty graphics), pass the same way (BEL ends them).
+ *   Other DCS, SOS and PM are dropped.
  *
  * A dropped sequence is dropped as it streams, never buffered, up to BEL, `ESC \`, U+009C, CAN,
  * SUB or the next ESC, and after `maxDrop` bytes the rest passes as text, so an unterminated one
  * cannot hide the rest of the terminal. Only a sequence's introducer, number and key are held
  * back, at most `MAX_SEQ` bytes.
  *
- * Open (#302): GNU screen keeps only the low byte of each character of an OSC title and re-sends
- * it to the outer terminal, so a title of characters whose low bytes are control bytes can still
- * reach it as an escape sequence. Whether titles give up characters for that is the owner's call.
+ * Known gaps (#311): it was tested against xterm.js and against models of kitty, tmux,
+ * iTerm2 and GNU screen written from their source, never against those terminals themselves.
  */
 export class OscFilter {
   #mode: Mode = 'ground';
@@ -304,19 +303,6 @@ export class OscFilter {
           return true;
         }
         const osc = this.#mode === 'oscBody';
-        if (osc && (this.#need > 0 || b >= 0x80)) {
-          const ok = this.#utf8Byte(b, (bytes, cp) => {
-            if (cp < 0xa0) return false;
-            for (const x of bytes) this.#emit(x);
-            return true;
-          });
-          if (ok) return false;
-          this.#utf8 = [];
-          this.#need = 0;
-          this.#close();
-          // The broken character is dropped; a byte that broke it is read as text.
-          return this.#utf8Broke;
-        }
         if (b === ESC) {
           this.#stringEsc = true;
           return false;
@@ -336,8 +322,9 @@ export class OscFilter {
           this.#close();
           return false;
         }
-        // Other C0 controls and DEL (and, in DCS or APC, bytes from 80): skipped, as terminals
-        // skip C0 inside a string; iTerm2 would take some bytes from 80 as 8-bit controls.
+        // Other C0 controls, DEL and bytes from 80: skipped. Terminals skip C0 inside a string;
+        // text is ASCII only (owner's decision on #302), since GNU screen keeps only the low
+        // byte of each title character and iTerm2 can take bytes from 80 as 8-bit controls.
         if (b !== CAN && b !== SUB) return false;
         // CAN and SUB end it (not in kitty or tmux): ended with ST for all, then sent as text.
         this.#close();

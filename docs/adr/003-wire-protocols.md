@@ -273,7 +273,7 @@ Status of this addendum: **accepted** on 2026-11-11, approved by the owner on PR
 
 - Text: bytes that are not UTF-8 become U+FFFD, and C1 controls are dropped.
 - ESC and CSI sequences pass only when well formed and allowed. ESC sequences that start a string in GNU screen, and `ESC %` encoding switches other than `ESC % G`, are dropped.
-- An OSC passes only with a plain number: digits, no leading zero, at most 5. Its text must be printable.
+- An OSC passes only with a plain number: digits, no leading zero, at most 5. Its text is printable ASCII only (the owner's decision on #302): other bytes, non-ASCII title characters among them, are dropped.
 
 Within that, it drops:
 
@@ -283,7 +283,7 @@ Within that, it drops:
 - Every DCS but `q` (sixel, DECRQSS, XTGETTCAP). This covers tmux passthrough, which tmux and iTerm2 unwrap, and iTerm2's `p` hooks. It also drops images a Worker sends through tmux.
 - SOS and PM.
 
-iTerm2's other keys, inline images among them, and kitty's APC graphics pass. The facts are in capability matrix §5b. It assumes the user's terminal decodes UTF-8, and it keeps a Worker from switching it away (`ESC % @`). Attach sends `ESC \` when it ends, to close a string a Worker left open. Well-formed output is not read alike everywhere: GNU screen keeps only the low byte of each character of an OSC title and re-sends it, so a title can still reach the outer terminal as an escape sequence. This is open in #302, for the owner to decide (titles in ASCII only, or characters whose low byte is a control byte replaced). §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
+iTerm2's other keys, inline images among them, and kitty's APC graphics pass. The facts are in capability matrix §5b. It assumes the user's terminal decodes UTF-8, and it keeps a Worker from switching it away (`ESC % @`). Attach sends `ESC \` when it ends, to close a string a Worker left open. ASCII-only text is what makes it safe under GNU screen, which keeps only the low byte of each title character and re-sends the title to the outer terminal. Known risks: GNU screen's behaviour was modelled from its source, never run. The filter has been tested against xterm.js and against models of kitty, tmux, iTerm2 and screen, never against those terminals themselves. Real-terminal testing, and restoring non-ASCII titles safely, are #311. §5 names the path and its binary frames; §3.6 says the first frame after any upgrade is `tacet/hello`. This fixes how the path works on a standalone Mini-conductor's port:
 
 1. **What `<sessionId>` names.** The Worker session id, the one in `worker.started` (AG-UI `runId`), not the `sessionId` a hello returns. It is a plain token (`[A-Za-z0-9._-]`, at most 128 characters); any other path is 404.
 2. **Authenticated at the upgrade only, no hello.** The upgrade passes the same checks as `/`, in this order: Host and Origin, then the bearer token, then the path, so nobody without the token learns which sessions exist. No hello is said: no protocol message travels on the socket, and the protocol version is the runtime file's `protocolVersions`. This is the one exception to §3.6.
