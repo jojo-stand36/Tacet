@@ -43,7 +43,10 @@ export type SpawnDetached = (
   logFd: number,
 ) => DetachedChild;
 
-/** The internal flag the background run gets: it waits for answers instead of exiting. */
+/**
+ * The internal flag the background run gets: no terminal, so it never asks, and it stops (exit 3)
+ * when only an answer can move its tasks on (#269).
+ */
 export const DETACHED_CHILD = '--detached-child';
 
 /**
