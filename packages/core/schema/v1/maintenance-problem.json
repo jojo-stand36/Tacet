@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:maintenance-problem:v1",
+  "title": "Tacet maintenance.problem payload",
+  "type": "object",
+  "properties": {
+    "op": {
+      "enum": [
+        "reconcile",
+        "landed",
+        "gc",
+        "unpin",
+        "other"
+      ],
+      "x-tacet-fallback": "other",
+      "type": "string"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000
+    },
+    "workspaceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  },
+  "required": [
+    "op",
+    "message"
+  ]
+}

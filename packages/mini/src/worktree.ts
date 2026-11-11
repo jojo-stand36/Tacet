@@ -107,7 +107,18 @@ export interface WorktreeGcOptions {
 export interface WorktreeGcResult {
   removed: string[];
   skipped: Array<{ id: string; reason: string }>;
+  /** Removals git refused (also in `skipped`), with git's error: a problem, not a kept checkout. */
+  failed: Array<{ id: string; message: string }>;
 }
+
+/** How long gc trusts its last "kept" verdict on an unchanged checkout (#254). */
+const keptRecheckMs = 86_400_000;
+/** Verdicts about the checkout's own work or files (#254): not passing states such as a merge. */
+const cachedKeptReasons = new Set([
+  'worktree contains local or ignored files',
+  'Worker has unintegrated private commits',
+  'Worker has commits no other ref contains',
+]);
 
 /**
  * Where the worktree registry lives (#126): the Mini-conductor's event log, as `workspace.*`
@@ -611,10 +622,14 @@ export class WorktreeManager implements Workspaces {
     if (!Number.isSafeInteger(now) || now < 0)
       throw new Error('now must be a non-negative safe integer');
     const active = new Set(options.activeWorktreeIds ?? []);
-    const result: WorktreeGcResult = { removed: [], skipped: [] };
+    const result: WorktreeGcResult = { removed: [], skipped: [], failed: [] };
     await this.sweepLockLitter();
+    // Every ref and its tip (#254): a kept checkout is checked again once any of them moves, its
+    // own tacet/<id> branch (an integration) included.
+    const refs = await this.refsDigest().catch(() => undefined);
 
-    for (const info of await this.list()) {
+    const listed = await this.list();
+    for (const info of listed) {
       if (active.has(info.id)) {
         result.skipped.push({ id: info.id, reason: 'active' });
         continue;
@@ -633,16 +648,49 @@ export class WorktreeManager implements Workspaces {
         result.skipped.push({ id: info.id, reason: 'not stale' });
         continue;
       }
+      // Kept last time, and nothing it could depend on changed since (#254): not checked again.
+      const kept = this.#kept.get(info.id);
+      if (
+        kept &&
+        refs !== undefined &&
+        kept.used === used &&
+        kept.refs === refs &&
+        now - kept.at >= 0 &&
+        now - kept.at < keptRecheckMs
+      ) {
+        result.skipped.push({ id: info.id, reason: kept.reason });
+        continue;
+      }
       try {
         await this.removeWorktree(info, false);
+        this.#kept.delete(info.id);
         result.removed.push(info.id);
       } catch (error) {
-        const reason =
-          error instanceof WorktreeKeptError ? error.reason : 'Git refused to remove the worktree';
-        result.skipped.push({ id: info.id, reason });
+        if (error instanceof WorktreeKeptError) {
+          if (refs !== undefined && cachedKeptReasons.has(error.reason)) {
+            this.#kept.set(info.id, { used, refs, at: now, reason: error.reason });
+          }
+          result.skipped.push({ id: info.id, reason: error.reason });
+        } else {
+          this.#kept.delete(info.id);
+          result.skipped.push({ id: info.id, reason: 'Git refused to remove the worktree' });
+          result.failed.push({
+            id: info.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     }
+    // Verdicts on checkouts gone since (removed elsewhere) are no longer needed.
+    const live = new Set(listed.map(({ id }) => id));
+    for (const id of this.#kept.keys()) if (!live.has(id)) this.#kept.delete(id);
     return result;
+  }
+
+  /** A digest of every ref in the repository and its tip. */
+  private async refsDigest(): Promise<string> {
+    const out = await this.git(['for-each-ref', '--format=%(objectname) %(refname)']);
+    return createHash('sha256').update(out).digest('hex');
   }
 
   async checkConflicts(worktreeId: string, targetBranch: string): Promise<string[]> {
@@ -1483,6 +1531,8 @@ export class WorktreeManager implements Workspaces {
 
   /** In-memory registry, when there is no event log: never written anywhere. */
   readonly #memory = new Map<string, WorktreeInfo>();
+  /** gc's last "kept" verdicts (#254): by id, with what they depended on. */
+  readonly #kept = new Map<string, { used: number; refs: string; at: number; reason: string }>();
   readonly #memoryRemoved = new Set<string>();
   #view: { seq: number; state: WorkspacesState } | undefined;
   /** Ids between their recorded intent and the end of `git worktree add`: never reconciled. */
