@@ -35,6 +35,50 @@ function filtered(input: Uint8Array, cuts: number[]): Uint8Array {
   return Buffer.concat(parts);
 }
 
+/**
+ * kitty's reading of the same bytes (kitty source, `kitty/vt-parser.c`): an OSC runs from `ESC ]`
+ * to BEL or `ESC \` (nothing else ends it), and its number is at most the first five bytes, as
+ * far as they are digits. Counts the clipboard writes (52, 5522) it would run.
+ */
+function kittyClipboardWrites(bytes: Uint8Array): number {
+  let n = 0;
+  for (let i = 0; i + 1 < bytes.length; i++) {
+    if (bytes[i] !== 0x1b || bytes[i + 1] !== 0x5d) continue;
+    let code = 0;
+    let j = i + 2;
+    while (
+      j < bytes.length &&
+      j < i + 7 &&
+      (bytes[j] as number) >= 0x30 &&
+      (bytes[j] as number) <= 0x39
+    ) {
+      code = code * 10 + ((bytes[j] as number) - 0x30);
+      j++;
+    }
+    let end = j;
+    while (
+      end < bytes.length &&
+      bytes[end] !== 0x07 &&
+      !(bytes[end] === 0x1b && bytes[end + 1] === 0x5c)
+    )
+      end++;
+    if (end < bytes.length && (code === 52 || code === 5522)) n++;
+    i = end;
+  }
+  return n;
+}
+
+/** Whether a DCS other than `q` is in the bytes (tmux and iTerm2 unwrap tmux's; iTerm2 hooks `p`). */
+function otherDcs(bytes: Uint8Array): boolean {
+  for (let i = 0; i + 1 < bytes.length; i++) {
+    if (bytes[i] !== 0x1b || bytes[i + 1] !== 0x50) continue;
+    let j = i + 2;
+    while (j < bytes.length && (bytes[j] as number) >= 0x20 && (bytes[j] as number) <= 0x3f) j++;
+    if (j < bytes.length && bytes[j] !== 0x71) return true;
+  }
+  return false;
+}
+
 const hex = (h: string) => Uint8Array.from(Buffer.from(h.replace(/ /g, ''), 'hex'));
 
 /** Deterministic, so a failure reproduces. */
@@ -50,9 +94,12 @@ function prng(seed: number): (n: number) => number {
 }
 
 describe('OscFilter against xterm.js (#302)', () => {
-  it('lets the parser see a clipboard write when unfiltered (the check works)', async () => {
+  it('sees a clipboard write when unfiltered (the checks work)', async () => {
     expect(await clipboardWrites(hex('1b 5d 35 32 3b 63 3b 51 51 3d 3d 07'))).toBe(1);
     expect(await clipboardWrites(hex('1b 5d 35 80 32 3b 63 3b 51 51 3d 3d 07'))).toBe(1);
+    expect(kittyClipboardWrites(hex('1b 5d 30 30 30 35 32 31 63 3b 51 07'))).toBe(1);
+    expect(otherDcs(hex('1b 50 74 6d 75 78 3b 1b 5c'))).toBe(true);
+    expect(otherDcs(hex('1b 50 71 23 30 1b 5c'))).toBe(false);
   });
 
   it('removes every sequence the reviews and fuzzing found, at every split', async () => {
@@ -78,12 +125,22 @@ describe('OscFilter against xterm.js (#302)', () => {
       '1a 1b 50 c2 9d 9c 35 32 1b 5c',
       'c2 9d 32 7f 1a 1b 1b 5d 9d 5d 35 32 ff 07',
       '07 1b 5d 35 1b 5d 9d 32 1b 5b c3 30 07',
-      // kitty's clipboard protocol.
+      // kitty's clipboard protocol, and numbers kitty reads from five bytes.
       '1b 5d 35 35 32 32 3b 74 79 70 65 3d 77 72 69 74 65 07',
+      '1b 5d 30 30 30 35 32 31 63 3b 51 51 3d 3d 07',
+      '1b 5d 35 32 01 30 63 3b 51 51 3d 3d 07',
+      // An ESC held past the cap (third review); tmux passthrough with an escaped prefix.
+      `1b ${'01 '.repeat(63)} 5d 35 32 3b 63 3b 51 51 3d 3d 07`,
+      `1b ${'80 '.repeat(63)} 5d 35 32 3b 63 3b 51 51 3d 3d 07`,
+      '1b 50 74 1b 6d 75 78 3b 1b 1b 5d 35 1b 32 3b 63 3b 51 51 3d 3d 07 1b 5c',
+      '1b 50 1b 74 6d 75 78 3b 1b 1b 5d 35 32 3b 63 3b 51 51 3d 3d 07 1b 5c',
     ]) {
       const input = hex(h);
       for (let i = 0; i <= input.length; i++) {
-        expect(await clipboardWrites(filtered(input, [i])), `${h} split at ${i}`).toBe(0);
+        const out = filtered(input, [i]);
+        expect(await clipboardWrites(out), `${h} split at ${i}`).toBe(0);
+        expect(kittyClipboardWrites(out), `kitty: ${h} split at ${i}`).toBe(0);
+        expect(otherDcs(out), `DCS: ${h} split at ${i}`).toBe(false);
       }
     }
   });
@@ -133,7 +190,10 @@ describe('OscFilter against xterm.js (#302)', () => {
         cuts.push(at);
       }
       const out = filtered(input, cuts);
-      expect(await clipboardWrites(out), Buffer.from(input).toString('hex')).toBe(0);
+      const h = Buffer.from(input).toString('hex');
+      expect(await clipboardWrites(out), h).toBe(0);
+      expect(kittyClipboardWrites(out), `kitty: ${h}`).toBe(0);
+      expect(otherDcs(out), `DCS: ${h}`).toBe(false);
     }
   }, 60_000);
 });

@@ -3,24 +3,20 @@ const BEL = 0x07;
 const CAN = 0x18;
 const SUB = 0x1a;
 const DEL = 0x7f;
-/** UTF-8 lead byte of U+0080..U+00BF: the C1 controls OSC (U+009D) and ST (U+009C). */
-const C2 = 0xc2;
-const C1_OSC = 0x9d;
-const C1_ST = 0x9c;
-const RIGHT_BRACKET = 0x5d;
 const BACKSLASH = 0x5c;
-const DCS_P = 0x50;
-/** What follows `t`, a tmux passthrough DCS's final byte (tmux source, `input.c`). */
-const TMUX_REST = [0x6d, 0x75, 0x78, 0x3b]; // "mux;"
-/**
- * At most this many bytes of an introducer, number and key are held back. Past it an OSC is
- * dropped; an ESC or DCS introducer is passed on.
- */
-const MAX_HELD = 64;
-/** A number with more significant digits than this is dropped: no OSC uses one, and a terminal's
- * own parser may wrap it round to any value (4294967348 is 52 in 32 bits). */
-const MAX_SIGNIFICANT = 5;
 const SEMICOLON = 0x3b;
+const EQUALS = 0x3d;
+/** U+FFFD, in place of bytes that are not UTF-8. */
+const REPLACEMENT = [0xef, 0xbf, 0xbd];
+/** String terminator: ends an OSC, DCS or APC in every terminal (kitty ignores CAN in one). */
+const ST = [ESC, BACKSLASH];
+/** An ESC or CSI sequence (or DCS header) longer than this is dropped. */
+const MAX_SEQ = 256;
+/** An OSC number has at most this many digits (kitty reads no more), with no leading zero. */
+const MAX_DIGITS = 5;
+/** An iTerm2 key longer than this cannot be a blocked one. */
+const MAX_KEY = 'copytoclipboard'.length;
+
 /**
  * Clipboard writes by number (#302): OSC 52 everywhere, and kitty's OSC 5522 (kitty source,
  * `kitty/vt-parser.c`, which sends both to `clipboard_control`).
@@ -34,91 +30,78 @@ export const CLIPBOARD_OSC = new Set([52, 5522]);
  */
 const KEYED_OSC = new Set([50, 1337]);
 const CLIPBOARD_KEYS = new Set(['copy', 'copytoclipboard', 'endcopy']);
-const MAX_KEY = 'copytoclipboard'.length;
+/**
+ * DCS sequences passed on, by final byte: `q` (sixel graphics, DECRQSS, XTGETTCAP). Every other
+ * DCS is dropped, among them tmux passthrough (`t`, `tmux;`), which tmux and iTerm2 unwrap and
+ * read as terminal input, and iTerm2's `p` hooks (tmux -CC, its SSH conductor), which re-read
+ * encoded output.
+ */
+const DCS_FINALS = new Set([0x71]);
+/** C1 controls that start a string: DCS, SOS, OSC, PM, APC. */
+const C1_STRINGS = new Set([0x90, 0x98, 0x9d, 0x9e, 0x9f]);
 
 type Mode =
-  | 'text'
+  | 'ground'
   | 'esc'
-  | 'escC2'
-  | 'dcsC2'
-  | 'c2'
-  | 'dcs'
-  | 'dcsT'
-  | 'tmux'
-  | 'tmuxEsc'
-  | 'intro'
-  | 'introC2'
-  | 'key'
-  | 'keyEsc'
-  | 'pass'
+  | 'csi'
+  | 'csiIgnore'
+  | 'oscNumber'
+  | 'oscKey'
+  | 'oscBody'
+  | 'dcsHeader'
+  | 'stringBody'
   | 'drop'
-  | 'dropEsc'
-  | 'dropC2';
-
-/**
- * In the ESC state a terminal runs C0 controls and ignores DEL, still waiting for the rest of the
- * sequence (the DEC/VT parser that xterm, VTE and tmux follow); CAN, SUB and ESC end it.
- */
-const escIgnores = (b: number) => (b < 0x20 && b !== CAN && b !== SUB && b !== ESC) || b === DEL;
-/** Inside an OSC a terminal skips C0 controls (BEL ends it; CAN, SUB and ESC abort it). DEL is
- * taken as skipped too, the stricter reading. */
-const oscIgnores = (b: number) => escIgnores(b) && b !== BEL;
-const isDigit = (b: number) => b >= 0x30 && b <= 0x39;
-const isLetter = (b: number) => (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
-const isContinuation = (b: number) => b >= 0x80 && b <= 0xbf;
-/** How many UTF-8 continuation bytes the lead byte `b` starts; 0 for any other byte. */
-const utf8Need = (b: number) =>
-  b >= 0xc2 && b <= 0xdf ? 1 : b >= 0xe0 && b <= 0xef ? 2 : b >= 0xf0 && b <= 0xf4 ? 3 : 0;
-/** Ends an OSC (or DCS) in every terminal (kitty ignores CAN inside one); a no-op outside one. */
-const ST = [ESC, BACKSLASH];
+  | 'dropEsc';
 
 /**
  * Removes clipboard writes from a stream of terminal bytes, as they arrive, wherever chunks split
- * them (#302): OSC sequences with a blocked number (by default 52, and kitty's 5522), iTerm2's
- * OSC 1337 (or 50) with a `Copy`, `CopyToClipboard` or `EndCopy` key, and tmux passthrough
- * (`ESC P tmux; ...`), whose unescaped body tmux would hand the outer terminal. Everything else
- * passes through unchanged and in order, other OSC sequences (window titles, iTerm2 inline
- * images) included.
+ * them (#302): OSC 52, kitty's OSC 5522, iTerm2's OSC 1337 (or 50) with a `Copy`,
+ * `CopyToClipboard` or `EndCopy` key, and every DCS but `q` (tmux passthrough among them).
  *
- * It assumes the user's terminal decodes UTF-8 (ADR-003). Where terminals' parsers differ, it
- * drops a sequence when any plausible reading gives a blocked one:
- * - An OSC starts with `ESC ]`, the C1 control U+009D (UTF-8 `C2 9D`), or a lone `9D` byte that
- *   is not part of a UTF-8 character (the 8-bit form), also right after an ESC. C0 controls, DEL
- *   and bytes from 80 up may come between ESC and `]` (xterm.js drops invalid UTF-8 bytes). One
- *   starting inside another OSC starts afresh.
- * - Its number skips C0 controls, DEL, bytes from 80 up and one `]` before it starts; leading
- *   zeros do not count. A number of more than 5 significant digits, one that wraps round to a
- *   blocked number in 8 or 16 bits, or an introducer and number longer than 64 bytes is dropped.
- * - The key of an iTerm2 key=value OSC is read up to `=` or anything but a letter, in any case,
- *   skipping C0 controls, DEL, U+009D's byte and `ESC ]` (iTerm2 skips that pair inside an OSC).
- * - It ends with BEL, `ESC \` or U+009C; CAN, SUB or another ESC abort it, so a reset (`ESC c`)
- *   after an unfinished sequence still gets through.
- * - A DCS whose final byte is `t` and whose data then starts `mux;` (tmux reads parameters,
- *   intermediates, C0 and bytes from 7F up before it) is dropped up to `ESC \`; inside it,
- *   `ESC` and the next byte are one escaped byte, as tmux reads them.
+ * Terminals read malformed sequences in different ways (xterm.js drops invalid UTF-8 bytes inside
+ * one, kitty reads at most five bytes of an OSC number, tmux and iTerm2 unwrap `ESC x` inside a
+ * DCS, iTerm2 skips `ESC ]` inside an OSC, 8-bit terminals take a lone 9D for an OSC), so it does
+ * not try to read them each terminal's way. It passes on only well-formed text and sequences,
+ * which every terminal reads alike, and drops or ends the rest:
+ * - Text: printable characters and C0 controls pass. Bytes that are not UTF-8 become U+FFFD. C1
+ *   controls (U+0080..U+009F) are dropped, one that starts a string with its string.
+ * - An ESC or CSI sequence passes when it is well formed. C0 controls inside one are sent before
+ *   it, as terminals run them in place; DEL inside one is dropped; anything else drops it.
+ * - An OSC passes when its number is plain digits (no leading zero, at most 5) followed by `;` or
+ *   its end, and the number (or iTerm2 key) is not blocked. Its text must be printable or UTF-8
+ *   characters from U+00A0 up; anything else ends it there with `ESC \` and is read as text.
+ * - A DCS with final byte `q`, and an APC (kitty graphics), pass the same way with printable
+ *   ASCII text. Other DCS, SOS and PM are dropped.
  *
- * Only introducers, numbers and keys are held back; a dropped sequence is dropped as it streams,
- * never buffered, and after `maxDrop` bytes with no terminator the rest passes as text, so an
- * unterminated one cannot hide the rest of the terminal. When a dropped sequence starts inside an
- * OSC already passed on, `ESC \` is sent in its place to end that one in the user's terminal.
+ * A dropped sequence is dropped as it streams, never buffered, up to BEL, `ESC \` or the next
+ * ESC, and after `maxDrop` bytes the rest passes as text, so an unterminated one cannot hide the
+ * rest of the terminal. Only a sequence's introducer, number and key are held back, at most
+ * `MAX_SEQ` bytes.
  */
 export class OscFilter {
-  #mode: Mode = 'text';
-  /** The raw bytes held back: an ESC and what follows it, or an OSC's introducer, number, key. */
-  #held: number[] = [];
+  #mode: Mode = 'ground';
+  /** The bytes of the sequence being read, held until it is known to pass. */
+  #seq: number[] = [];
+  /** A CSI has had an intermediate byte. */
+  #csiIntermediate = false;
   #value = 0;
-  #significant = 0;
-  /** One `]` may still be skipped before the number (after `ESC 9D`, as xterm.js reads it). */
-  #bracketOk = false;
+  #digits = 0;
   /** The key read so far of an iTerm2 key=value OSC, in lower case. */
   #key = '';
-  /** How much of tmux's `mux;` has been read. */
-  #tmux = 0;
-  #dropped = 0;
-  /** The user's terminal is inside an OSC passed on to it, not yet ended. */
-  #inOsc = false;
-  /** UTF-8 continuation bytes still expected. */
+  /** A string (OSC, DCS, APC) passed on is open in the user's terminal. */
+  #open = false;
+  /** An ESC inside an open string, held until the next byte says whether it ends it. */
+  #stringEsc = false;
+  /** The UTF-8 character being read, and the range its next byte must be in. */
+  #utf8: number[] = [];
   #need = 0;
+  #lo = 0x80;
+  #hi = 0xbf;
+  /** The last byte broke a UTF-8 character and is still to be looked at on its own. */
+  #utf8Broke = false;
+  #dropped = 0;
+  /** The byte dropped before this one. */
+  #dropPrev = 0;
   #out = new Uint8Array(0);
   #n = 0;
 
@@ -129,9 +112,8 @@ export class OscFilter {
 
   /** The bytes of `chunk` that may reach the user's terminal. */
   push(chunk: Uint8Array): Uint8Array {
-    // Usually enough: each input byte is emitted at most once, plus what an earlier chunk held
-    // back and an ST per dropped sequence. `#emit` grows it otherwise.
-    this.#out = new Uint8Array(chunk.length + MAX_HELD + 8);
+    // Usually enough (input bytes, what an earlier chunk held back, a few added); `#emit` grows it.
+    this.#out = new Uint8Array(chunk.length + MAX_SEQ + 16);
     this.#n = 0;
     for (let i = 0; i < chunk.length; i++) {
       const b = chunk[i] as number;
@@ -142,308 +124,337 @@ export class OscFilter {
   }
 
   /**
-   * Ends the stream: drops whatever is held back (an unfinished introducer) and returns `ESC \`,
-   * which ends an OSC or DCS the Worker left open in the user's terminal (or tmux) and does
-   * nothing otherwise. Then starts afresh.
+   * Ends the stream: drops whatever is held back (an unfinished sequence or character) and ends a
+   * string left open in the user's terminal. Then starts afresh.
    */
   flush(): Uint8Array {
-    this.#mode = 'text';
-    this.#held = [];
-    this.#inOsc = false;
+    this.#out = new Uint8Array(4);
+    this.#n = 0;
+    if (this.#open) this.#close();
+    this.#mode = 'ground';
+    this.#seq = [];
+    this.#stringEsc = false;
+    this.#utf8 = [];
     this.#need = 0;
-    return Uint8Array.from(ST);
+    return this.#out.subarray(0, this.#n);
   }
 
   /** Handles one byte; true if the same byte must be handled again in the new state. */
   #step(b: number): boolean {
     switch (this.#mode) {
-      case 'text':
-      case 'pass':
-        if (this.#continues(b)) this.#emit(b);
-        else if (b === ESC) this.#toEsc();
-        else if (b === C2) this.#mode = 'c2';
-        else if (b === C1_OSC) this.#startOsc([b]);
-        else {
-          this.#emit(b);
-          // A lone 9C ends an OSC only in an 8-bit terminal: the OSC is taken as still open.
-          if (this.#mode === 'pass' && (b === BEL || b === CAN || b === SUB)) this.#toText();
-        }
+      case 'ground':
+        if (this.#need > 0 || b >= 0x80) return this.#text(b);
+        if (b === ESC) this.#toEsc();
+        else this.#emit(b);
         return false;
+
       case 'esc':
-        if (this.#held.length >= MAX_HELD) return this.#releaseEsc();
-        if (b === RIGHT_BRACKET) this.#startOsc([...this.#held, b]);
-        else if (b === C1_OSC) this.#startOsc([...this.#held, b]);
-        else if (b === DCS_P) {
-          this.#held.push(b);
-          this.#mode = 'dcs';
-        } else if (b === C2) {
-          this.#held.push(b);
-          this.#mode = 'escC2';
-        } else if (escIgnores(b) || b >= 0x80) this.#held.push(b);
-        else return this.#releaseEsc();
-        return false;
-      case 'escC2':
-      case 'dcsC2':
-        if (b === C1_OSC) {
-          this.#startOsc([...this.#held, b]);
-          return false;
-        }
-        this.#mode = this.#mode === 'escC2' ? 'esc' : 'dcs';
-        if (isContinuation(b)) {
-          this.#held.push(b);
-          return false;
-        }
-        return true;
-      case 'c2':
-        if (b === C1_OSC) this.#startOsc([C2, b]);
-        else {
-          this.#emit(C2);
-          if (b === C1_ST) {
-            this.#emit(b);
-            this.#toText();
+        if (b < 0x20) return this.#control(b);
+        if (b === DEL) return false;
+        if (b >= 0x80) return this.#abort();
+        if (this.#seq.length === 1) {
+          if (b === 0x5b) {
+            this.#seq.push(b);
+            this.#csiIntermediate = false;
+            this.#mode = 'csi';
             return false;
           }
-          this.#need = 1;
-          this.#mode = this.#inOsc ? 'pass' : 'text';
-          return true;
-        }
-        return false;
-      case 'dcs':
-        // tmux's dcs_enter, dcs_parameter and dcs_intermediate states, up to the final byte.
-        if (this.#held.length >= MAX_HELD) return this.#releaseEsc();
-        if (b === 0x74) {
-          this.#held.push(b);
-          this.#tmux = 0;
-          this.#mode = 'dcsT';
-        } else if (b === C1_OSC) this.#startOsc([...this.#held, b]);
-        else if (b === C2) {
-          // U+009D starts an OSC in any state (xterm.js); anything else here is skipped.
-          this.#held.push(b);
-          this.#mode = 'dcsC2';
-        } else if (escIgnores(b) || (b >= 0x20 && b <= 0x3f) || b >= 0x80) this.#held.push(b);
-        else return this.#releaseEsc();
-        return false;
-      case 'dcsT':
-        if (b !== TMUX_REST[this.#tmux]) return this.#releaseEsc();
-        this.#held.push(b);
-        if (++this.#tmux === TMUX_REST.length) {
-          this.#held = [];
-          this.#endOpenOsc();
-          this.#dropped = 0;
-          this.#mode = 'tmux';
-        }
-        return false;
-      case 'tmux':
-      case 'tmuxEsc':
-        if (++this.#dropped > this.maxDrop) {
-          this.#toText();
-          return true;
-        }
-        if (this.#mode === 'tmuxEsc') this.#mode = b === BACKSLASH ? 'text' : 'tmux';
-        else if (b === ESC) this.#mode = 'tmuxEsc';
-        return false;
-      case 'intro':
-        if (this.#held.length >= MAX_HELD) {
-          this.#decide(true);
-          return true;
-        }
-        if (isDigit(b)) {
-          this.#held.push(b);
-          this.#bracketOk = false;
-          if (this.#value > 0 || b !== 0x30) {
-            this.#significant++;
-            if (this.#significant <= MAX_SIGNIFICANT) this.#value = this.#value * 10 + (b - 0x30);
+          if (b === 0x5d) {
+            this.#seq.push(b);
+            this.#value = 0;
+            this.#digits = 0;
+            this.#mode = 'oscNumber';
+            return false;
           }
-        } else if (b === RIGHT_BRACKET && this.#bracketOk) {
-          this.#held.push(b);
-          this.#bracketOk = false;
-        } else if (b === C1_OSC) this.#startOsc([b]);
-        else if (b === C2) this.#mode = 'introC2';
-        else if (oscIgnores(b) || b >= 0x80) this.#held.push(b);
-        else if (b === SEMICOLON && this.#keyed()) {
-          // iTerm2's key=value: whether it is blocked depends on the key.
-          this.#held.push(b);
+          if (b === 0x50) {
+            this.#seq.push(b);
+            this.#mode = 'dcsHeader';
+            return false;
+          }
+          if (b === 0x5f) {
+            // APC (kitty graphics): its text is checked as it streams.
+            this.#seq.push(b);
+            this.#pass();
+            this.#mode = 'stringBody';
+            return false;
+          }
+          // SOS, PM.
+          if (b === 0x58 || b === 0x5e) return this.#drop(false);
+        }
+        if (this.#seq.length >= MAX_SEQ) return this.#drop(false);
+        this.#seq.push(b);
+        // 20..2F are intermediates; anything else is the final byte.
+        if (b >= 0x30) {
+          this.#emitSeq();
+          this.#mode = 'ground';
+        }
+        return false;
+
+      case 'csi':
+        if (b < 0x20) return this.#control(b);
+        if (b === DEL) return false;
+        if (b >= 0x80) return this.#abort();
+        if (b >= 0x40) {
+          this.#seq.push(b);
+          this.#emitSeq();
+          this.#mode = 'ground';
+          return false;
+        }
+        if (this.#seq.length >= MAX_SEQ || (b >= 0x30 && this.#csiIntermediate)) {
+          // Malformed or too long: terminals ignore it up to its final byte, and so does this.
+          this.#seq = [];
+          this.#mode = 'csiIgnore';
+          return false;
+        }
+        if (b < 0x30) this.#csiIntermediate = true;
+        this.#seq.push(b);
+        return false;
+
+      case 'csiIgnore':
+        if (b < 0x20) return this.#control(b);
+        if (b >= 0x80) return this.#abort();
+        if (b >= 0x40 && b !== DEL) this.#mode = 'ground';
+        return false;
+
+      case 'oscNumber':
+        if (b >= 0x30 && b <= 0x39) {
+          // A leading zero, or a sixth digit, is read differently by different terminals.
+          if ((this.#digits > 0 && this.#value === 0) || this.#digits === MAX_DIGITS) {
+            return this.#drop();
+          }
+          this.#seq.push(b);
+          this.#value = this.#value * 10 + (b - 0x30);
+          this.#digits++;
+          return false;
+        }
+        if (b !== SEMICOLON && b !== BEL && b !== ESC) return this.#drop();
+        if (this.#digits === 0 || this.#blockedNumber()) return this.#drop();
+        if (b === SEMICOLON && KEYED_OSC.has(this.#value)) {
+          this.#seq.push(b);
           this.#key = '';
-          this.#mode = 'key';
-        } else {
-          this.#decide(false);
-          return true;
-        }
-        return false;
-      case 'introC2':
-        if (b === C1_OSC) {
-          this.#startOsc([C2, b]);
+          this.#mode = 'oscKey';
           return false;
         }
-        if (b === C1_ST) {
-          // U+009C ends the OSC: decided on the number so far, then handled as an ST.
-          if (this.#decide(false)) {
-            this.#dropped++;
-            this.#mode = 'dropC2';
-          } else this.#mode = 'c2';
-          return true;
-        }
-        // Another U+0080..U+00BF, or a broken character (dropped by xterm.js): skipped.
-        this.#held.push(C2);
-        this.#mode = 'intro';
-        if (isContinuation(b)) {
-          this.#held.push(b);
-          return false;
-        }
+        this.#pass();
+        this.#mode = 'oscBody';
         return true;
-      case 'key':
-        if (this.#held.length >= MAX_HELD) {
-          this.#decide(true);
-          return true;
-        }
-        if (isLetter(b)) {
-          this.#held.push(b);
+
+      case 'oscKey':
+        if (b >= 0x20 && b <= 0x7e && b !== EQUALS) {
+          this.#seq.push(b);
           this.#key += String.fromCharCode(b).toLowerCase();
-          // Longer than any blocked key: it is not one.
-          if (this.#key.length > MAX_KEY) this.#decide(false);
-        } else if (oscIgnores(b) || b === C1_OSC) {
-          // Skipped, as a terminal skips them (or might): they do not end the key.
-          this.#held.push(b);
-        } else if (b === ESC) this.#mode = 'keyEsc';
-        else {
-          // `=`, a terminator or anything else ends the key.
-          this.#decide(false, CLIPBOARD_KEYS.has(this.#key));
-          return true;
-        }
-        return false;
-      case 'keyEsc':
-        if (b === RIGHT_BRACKET) {
-          // iTerm2 skips `ESC ]` inside an OSC: the key goes on.
-          this.#held.push(ESC, b);
-          this.#mode = 'key';
+          if (this.#key.length > MAX_KEY) {
+            // Longer than any blocked key: it is not one.
+            this.#pass();
+            this.#mode = 'oscBody';
+          }
           return false;
         }
-        // The ESC ends the key; it is handled as the first byte after it.
-        if (this.#decide(false, CLIPBOARD_KEYS.has(this.#key))) {
-          this.#dropped++;
-          this.#mode = 'dropEsc';
-        } else this.#toEsc();
+        // Only `=` or the OSC's end ends a key cleanly; anything else drops it.
+        if (b !== EQUALS && b !== BEL && b !== ESC) return this.#drop();
+        if (CLIPBOARD_KEYS.has(this.#key)) return this.#drop();
+        this.#pass();
+        this.#mode = 'oscBody';
         return true;
+
+      case 'oscBody':
+      case 'stringBody': {
+        if (this.#stringEsc) {
+          this.#stringEsc = false;
+          this.#close();
+          // ESC \ ended it; any other byte starts a new sequence with that ESC.
+          if (b === BACKSLASH) return false;
+          this.#toEsc();
+          return true;
+        }
+        const osc = this.#mode === 'oscBody';
+        if (osc && (this.#need > 0 || b >= 0x80)) {
+          const ok = this.#utf8Byte(b, (bytes, cp) => {
+            if (cp < 0xa0) return false;
+            for (const x of bytes) this.#emit(x);
+            return true;
+          });
+          if (ok) return false;
+          this.#utf8 = [];
+          this.#need = 0;
+          this.#close();
+          // The broken character is dropped; a byte that broke it is read as text.
+          return this.#utf8Broke;
+        }
+        if (b === ESC) {
+          this.#stringEsc = true;
+          return false;
+        }
+        if (osc && b === BEL) {
+          this.#emit(b);
+          this.#open = false;
+          this.#mode = 'ground';
+          return false;
+        }
+        if (b >= 0x20 && b < DEL) {
+          this.#emit(b);
+          return false;
+        }
+        // Anything else may not be in it: it ends there, and the byte is read as text.
+        this.#close();
+        return true;
+      }
+
+      case 'dcsHeader':
+        if (b === ESC || b === CAN || b === SUB) return this.#control(b);
+        if (b >= 0x40 && b <= 0x7e) {
+          if (!DCS_FINALS.has(b)) return this.#drop(false);
+          this.#seq.push(b);
+          this.#pass();
+          this.#mode = 'stringBody';
+          return false;
+        }
+        // Parameters and intermediates; anything else (C0, DEL, bytes from 80) drops it.
+        if (b < 0x20 || b >= DEL || this.#seq.length >= MAX_SEQ) return this.#drop(false);
+        this.#seq.push(b);
+        return false;
+
       case 'drop':
         if (++this.#dropped > this.maxDrop) {
-          this.#toText();
+          this.#mode = 'ground';
           return true;
         }
-        if (this.#continues(b)) return false;
-        // A lone 9C ends it for an 8-bit terminal; nothing of it reached a UTF-8 one either way.
-        if (b === BEL || b === CAN || b === SUB || b === C1_ST) this.#toText();
-        else if (b === ESC) this.#mode = 'dropEsc';
-        else if (b === C2) this.#mode = 'dropC2';
-        else if (b === C1_OSC) this.#startOsc([b]);
+        // U+009C (C2 9C) ends it too.
+        if (b === BEL || b === CAN || b === SUB || (b === 0x9c && this.#dropPrev === 0xc2)) {
+          this.#mode = 'ground';
+        } else if (b === ESC) this.#mode = 'dropEsc';
+        this.#dropPrev = b;
         return false;
+
       case 'dropEsc':
         if (b === BACKSLASH) {
-          this.#toText();
+          this.#mode = 'ground';
           return false;
         }
         // The ESC starts whatever comes next.
         this.#toEsc();
         return true;
-      case 'dropC2':
-        if (b === C1_ST) {
-          this.#toText();
-          return false;
-        }
-        if (b === C1_OSC) {
-          this.#startOsc([C2, b]);
-          return false;
-        }
-        this.#mode = 'drop';
-        this.#need = 1;
-        return true;
     }
   }
 
-  /** Whether `b` continues a UTF-8 character; otherwise notes what it starts. */
-  #continues(b: number): boolean {
-    if (isContinuation(b) && this.#need > 0) {
-      this.#need--;
+  /** A byte from 80 up, or one inside a UTF-8 character, in text. */
+  #text(b: number): boolean {
+    const ok = this.#utf8Byte(b, (bytes, cp) => {
+      if (cp >= 0xa0) for (const x of bytes) this.#emit(x);
+      // C1 controls are dropped, since some terminals run them; one that starts a string (DCS,
+      // SOS, OSC, PM, APC) is dropped with its string, CSI up to its final byte.
+      else if (C1_STRINGS.has(cp)) this.#drop(false);
+      else if (cp === 0x9b) this.#mode = 'csiIgnore';
       return true;
+    });
+    if (ok) return false;
+    for (const x of REPLACEMENT) this.#emit(x);
+    // A byte that broke a character is looked at again on its own; one that starts none is gone.
+    return this.#utf8Broke;
+  }
+
+  /**
+   * Reads one byte of a UTF-8 character. When it completes one, `done` gets its bytes and code
+   * point and says whether it is taken. False when the bytes are not UTF-8 (or not taken);
+   * `#utf8Broke` then says whether `b` itself is still to be looked at.
+   */
+  #utf8Byte(b: number, done: (bytes: number[], cp: number) => boolean): boolean {
+    this.#utf8Broke = false;
+    if (this.#need > 0) {
+      if (b < this.#lo || b > this.#hi) {
+        this.#utf8 = [];
+        this.#need = 0;
+        this.#utf8Broke = true;
+        return false;
+      }
+      this.#utf8.push(b);
+      this.#lo = 0x80;
+      this.#hi = 0xbf;
+      if (--this.#need > 0) return true;
+      const bytes = this.#utf8;
+      this.#utf8 = [];
+      return done(bytes, Buffer.from(bytes).toString('utf8').codePointAt(0) ?? 0);
     }
-    this.#need = utf8Need(b);
-    return false;
-  }
-
-  /** An ESC: held, with what follows it, until it is known what it starts. */
-  #toEsc(): void {
-    this.#held = [ESC];
-    this.#mode = 'esc';
-  }
-
-  /** The held ESC starts nothing blocked: passed on as it came, then the byte is looked at. */
-  #releaseEsc(): true {
-    for (const x of this.#held) this.#emit(x);
-    this.#held = [];
-    this.#need = 0;
-    // The ESC ended any OSC the terminal was in.
-    this.#toText();
+    // Lead bytes, with the range their next byte must be in (no overlong forms, no surrogates).
+    if (b >= 0xc2 && b <= 0xdf) this.#lead(b, 1, 0x80, 0xbf);
+    else if (b === 0xe0) this.#lead(b, 2, 0xa0, 0xbf);
+    else if (b === 0xed) this.#lead(b, 2, 0x80, 0x9f);
+    else if (b >= 0xe1 && b <= 0xef) this.#lead(b, 2, 0x80, 0xbf);
+    else if (b === 0xf0) this.#lead(b, 3, 0x90, 0xbf);
+    else if (b >= 0xf1 && b <= 0xf3) this.#lead(b, 3, 0x80, 0xbf);
+    else if (b === 0xf4) this.#lead(b, 3, 0x80, 0x8f);
+    else return false;
     return true;
   }
 
-  #startOsc(held: number[]): void {
-    // A new OSC ends one passed on before: say so at once. Otherwise, if this one's introducer is
-    // later dropped or replaced (a lone 9D, which xterm.js drops), the user's terminal would run
-    // the old one on into the bytes that follow, its number included.
-    this.#endOpenOsc();
-    this.#held = held;
-    this.#value = 0;
-    this.#significant = 0;
-    // After a lone 9D, which xterm.js drops, a `]` may make `ESC ]` with an ESC already sent.
-    const last = held.length - 1;
-    this.#bracketOk = held[last] === C1_OSC && held[last - 1] !== C2;
-    this.#need = 0;
-    this.#mode = 'intro';
+  #lead(b: number, need: number, lo: number, hi: number): void {
+    this.#utf8 = [b];
+    this.#need = need;
+    this.#lo = lo;
+    this.#hi = hi;
   }
 
-  /** Whether the number read is one of iTerm2's key=value OSCs (and not blocked as a number). */
-  #keyed(): boolean {
-    return (
-      this.#significant <= MAX_SIGNIFICANT && KEYED_OSC.has(this.#value) && !this.#blockedNumber()
-    );
+  /** A C0 control inside an ESC sequence or CSI: runs in place, as terminals run it. */
+  #control(b: number): boolean {
+    if (b === ESC) {
+      this.#toEsc();
+      return false;
+    }
+    if (b === CAN || b === SUB) {
+      // Ends the sequence, which was never passed on.
+      this.#seq = [];
+      this.#mode = 'ground';
+    }
+    this.#emit(b);
+    return false;
+  }
+
+  /** The sequence is malformed: dropped, and the byte read as text. */
+  #abort(): true {
+    this.#seq = [];
+    this.#mode = 'ground';
+    return true;
+  }
+
+  /**
+   * The sequence is dropped up to its end. `again`: the byte that showed it is looked at again in
+   * drop mode (it may be its end); otherwise it is dropped with it.
+   */
+  #drop(again = true): boolean {
+    this.#seq = [];
+    this.#dropped = 0;
+    this.#dropPrev = 0;
+    this.#mode = 'drop';
+    return again;
+  }
+
+  #toEsc(): void {
+    this.#seq = [ESC];
+    this.#mode = 'esc';
+  }
+
+  /** The held introducer passes: sent, and the string it starts is open. */
+  #pass(): void {
+    this.#emitSeq();
+    this.#open = true;
+  }
+
+  /** Ends the open string in the user's terminal. */
+  #close(): void {
+    for (const x of ST) this.#emit(x);
+    this.#open = false;
+    this.#mode = 'ground';
   }
 
   #blockedNumber(): boolean {
     const v = this.#value;
-    return (
-      this.#significant > MAX_SIGNIFICANT ||
-      this.blocked(v) ||
-      this.blocked(v % 0x10000) ||
-      this.blocked(v % 0x100)
-    );
+    // Also as an 8- or 16-bit parser would wrap it round.
+    return this.blocked(v) || this.blocked(v % 0x10000) || this.blocked(v % 0x100);
   }
 
-  /** The user's terminal may still be inside an OSC passed on to it: end it. */
-  #endOpenOsc(): void {
-    if (this.#inOsc) for (const x of ST) this.#emit(x);
-    this.#inOsc = false;
-  }
-
-  /** The number (and any key) is read: pass the OSC on, or drop it (true). */
-  #decide(tooLong: boolean, blockedKey = false): boolean {
-    const held = this.#held;
-    this.#held = [];
-    this.#need = 0;
-    if (tooLong || blockedKey || this.#blockedNumber()) {
-      // Or the passed OSC would run on into what follows the dropped one.
-      this.#endOpenOsc();
-      this.#dropped = 0;
-      this.#mode = 'drop';
-      return true;
-    }
-    for (const x of held) this.#emit(x);
-    this.#inOsc = true;
-    this.#mode = 'pass';
-    return false;
-  }
-
-  #toText(): void {
-    this.#mode = 'text';
-    this.#inOsc = false;
+  #emitSeq(): void {
+    for (const x of this.#seq) this.#emit(x);
+    this.#seq = [];
   }
 
   #emit(b: number): void {
