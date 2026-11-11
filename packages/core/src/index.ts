@@ -11,6 +11,7 @@ export * from './adapter/redact.js';
 export type * from './adapter/types.js';
 export * from './adapter/vendor.js';
 export * from './config/index.js';
+export * from './events/escalation-stats.js';
 export * from './events/projection.js';
 export * from './events/status.js';
 export * from './schema/index.js';
