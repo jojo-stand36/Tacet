@@ -56,6 +56,12 @@ import {
 import { type HookBody, HookServer } from './hook-server.js';
 import { loadPty, type Pty, type SpawnPty } from './pty.js';
 import { TerminalBuffer } from './terminal.js';
+import {
+  contextWindow,
+  findTranscript,
+  type TranscriptCall,
+  TranscriptReader,
+} from './transcript.js';
 
 /**
  * What interactive Claude Code in a PTY honestly supports (#15), verified on 2.1.319:
@@ -205,6 +211,12 @@ interface Session {
   exit?: { exitCode: number; signal?: number };
   closing: boolean;
   ended: boolean;
+  /** The session's own transcript, read for token usage when a turn ends (#255). */
+  transcript: TranscriptReader;
+  /** The context window for a call's model. */
+  contextMax: (model: string | undefined) => number | undefined;
+  /** Polls the transcript for a turn's last call, written just after its `Stop`. */
+  usageTimer: NodeJS.Timeout | undefined;
 }
 
 const ESC = '\x1b';
@@ -437,8 +449,13 @@ export class PtyAdapter implements AgentAdapter {
         exited,
         closing: false,
         ended: false,
+        transcript: new TranscriptReader(() => findTranscript(configDir, vendorSessionId)),
+        contextMax: (model) => contextWindow(model, opts.model, ptyEnv),
+        usageTimer: undefined,
       };
       const session = s;
+      // A resumed session's earlier calls were reported by the run that made them.
+      if (opts.resume) session.transcript.skip();
       // The terminal itself is not an event stream; it is drained so the child never blocks, and
       // watched only for the moment the interface takes input (see below). The tail of the last
       // chunk is kept so the sequence is found across chunk boundaries.
@@ -567,6 +584,9 @@ export class PtyAdapter implements AgentAdapter {
     clearTimeout(s.ackTimer);
     this.#releaseApprovals(s);
     await this.#terminate(s, true);
+    clearInterval(s.usageTimer);
+    // Claude Code has exited: its transcript is complete.
+    this.#usage(s);
     for (const f of s.files) removeSessionFile(f);
     if (s.placeholders) removeSandboxPlaceholders(s.placeholders.cwd, s.placeholders.before);
     await this.#hooks.unregister(s.hookKey);
@@ -724,6 +744,10 @@ export class PtyAdapter implements AgentAdapter {
       reply();
       return;
     }
+    // Every turn's end, a cancelled or stale one's too: its calls were made and billed. Before a
+    // new turn, whatever the last one left unread.
+    if (ev.hook_event_name === 'Stop' || ev.hook_event_name === 'StopFailure') this.#afterStop(s);
+    else if (ev.hook_event_name === 'UserPromptSubmit') this.#usage(s);
     const promptId = typeof body.prompt_id === 'string' ? body.prompt_id : undefined;
     const turnHook =
       ev.hook_event_name !== 'SessionStart' && ev.hook_event_name !== 'UserPromptSubmit';
@@ -897,6 +921,52 @@ export class PtyAdapter implements AgentAdapter {
     }
   }
 
+  /**
+   * Usage for the model calls the transcript gained since the last read (#255): one event per
+   * call, as the SDK adapter emits them. The context gauge follows the main conversation only;
+   * a subagent's call has its own context.
+   */
+  #usage(s: Session): boolean {
+    let calls: TranscriptCall[];
+    try {
+      calls = s.transcript.read();
+    } catch {
+      return false;
+    }
+    for (const c of calls) {
+      const max = c.sidechain ? undefined : s.contextMax(c.model);
+      this.#emit(s, {
+        t: 'usage',
+        inputTokens: c.inputTokens,
+        outputTokens: c.outputTokens,
+        ...(max !== undefined
+          ? { contextUsed: c.inputTokens + c.outputTokens, contextMax: max }
+          : {}),
+        ...(c.model !== undefined ? { model: c.model } : {}),
+        source: 'reported',
+      });
+    }
+    return calls.some((c) => !c.sidechain);
+  }
+
+  /**
+   * A turn ended. Claude Code 2.1.319 writes the turn's last call to the transcript only after
+   * its `Stop` hook has returned (seen live: tens of milliseconds later), so the transcript is
+   * read now and then polled briefly until a main-conversation call shows up. Its usage may
+   * therefore follow the turn's `idle`. The next prompt, and the session's end, read it too.
+   */
+  #afterStop(s: Session): void {
+    clearInterval(s.usageTimer);
+    this.#usage(s);
+    const until = Date.now() + 2000;
+    s.usageTimer = setInterval(() => {
+      if (s.ended || s.closing || this.#usage(s) || Date.now() > until) {
+        clearInterval(s.usageTimer);
+      }
+    }, 50);
+    s.usageTimer.unref();
+  }
+
   /** Mark a turn's id stale; the set keeps the latest few. */
   #stale(s: Session, id: string): void {
     s.staleIds.add(id);
@@ -939,6 +1009,8 @@ export class PtyAdapter implements AgentAdapter {
     if (s.closing || s.ended || !this.#sessions.has(s.handle.id)) return;
     s.ended = true;
     s.approvals.clear();
+    clearInterval(s.usageTimer);
+    this.#usage(s);
     this.#setState(s, 'error', `claude exited (code ${s.exit?.exitCode ?? 'unknown'})`);
     s.events.end();
     s.screen.end();

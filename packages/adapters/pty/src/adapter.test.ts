@@ -18,6 +18,7 @@ import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { PtyAdapter, promptText, samePrompt } from './adapter.js';
 import type { Pty, PtySpawnOptions } from './pty.js';
+import { assistantLine } from './testing/transcript-line.js';
 
 const KEY = 'sk-ant-placeholder-not-a-real-key-0123456789';
 const unpaste = (data: string) => data.replaceAll('\x1b[200~', '').replaceAll('\x1b[201~', '');
@@ -343,6 +344,78 @@ describe('PtyAdapter (fake claude)', () => {
     });
     await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
     expect(texts(tap)).toEqual([`token [redacted] then ${f.token.slice(0, 5)}`]);
+    await adapter.close(h);
+  });
+
+  it('reports usage from its own transcript, never the one a hook names (#255)', async () => {
+    const adapter = make();
+    const h = await adapter.start({ cwd: join(root, 'wt'), model: 'claude-opus-4-6[1m]' });
+    const tap = new EventTap(adapter.events(h));
+    const f = fake();
+    const configDir = f.opts.env.CLAUDE_CONFIG_DIR as string;
+    // A file the Worker could write, named by a hook: never read.
+    const decoy = join(root, 'decoy.jsonl');
+    writeFileSync(
+      decoy,
+      assistantLine('d1', { input: 666, output: 666 }, { sessionId: f.sessionId }),
+    );
+    const usage = () => tap.events.filter((e) => e.t === 'usage');
+
+    // No transcript yet: the turn ends with no usage, whatever the hook says.
+    await adapter.send(h, { text: 'HANG' });
+    await expect.poll(() => f.submitted).toBeDefined();
+    await f.hook('Stop', { transcript_path: decoy, last_assistant_message: 'one' });
+    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
+    expect(usage()).toEqual([]);
+
+    const dir = join(configDir, 'projects', '-wt');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${f.sessionId}.jsonl`),
+      assistantLine(
+        'm1',
+        { input: 2, created: 300, read: 5000, output: 1 },
+        { model: 'claude-opus-4-6', sessionId: f.sessionId },
+      ) +
+        assistantLine(
+          'm1',
+          { input: 2, created: 300, read: 5000, output: 80 },
+          { model: 'claude-opus-4-6', sessionId: f.sessionId },
+        ) +
+        assistantLine(
+          's1',
+          { input: 9, output: 3 },
+          { model: 'claude-haiku-4-5', sidechain: true, sessionId: f.sessionId },
+        ),
+    );
+    const from = tap.events.length;
+    f.submitted = undefined;
+    await adapter.send(h, { text: 'HANG' });
+    await expect.poll(() => f.submitted).toBeDefined();
+    await f.hook('Stop', { transcript_path: decoy, last_assistant_message: 'two' });
+    const end = await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from + 1);
+    expect(usage()).toEqual([
+      {
+        t: 'usage',
+        inputTokens: 5302,
+        outputTokens: 80,
+        contextUsed: 5382,
+        // Opus 4.6 has 1M in Claude Code only when launched with [1m].
+        contextMax: 1_000_000,
+        model: 'claude-opus-4-6',
+        source: 'reported',
+      },
+      // A subagent's call is counted; it is not the conversation's context.
+      {
+        t: 'usage',
+        inputTokens: 9,
+        outputTokens: 3,
+        model: 'claude-haiku-4-5',
+        source: 'reported',
+      },
+    ]);
+    // Reported before the turn's end.
+    expect(tap.events.findIndex((e) => e.t === 'usage')).toBeLessThan(end.index);
     await adapter.close(h);
   });
 
