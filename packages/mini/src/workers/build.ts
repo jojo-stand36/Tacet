@@ -31,6 +31,13 @@ export interface BuildWorkerAdaptersOptions {
    */
   repoRoot?: string;
   /**
+   * The repo's resolved state root (`events.state_dir`): where every adapter keeps its per-repo
+   * state (Claude SDK config dirs, Codex's `CODEX_HOME`, ACP agent homes, Claude PTY sessions),
+   * beside the event log, never split across two roots (#23). A per-adapter `stateDir` below
+   * overrides it. Default: each adapter's own default (`~/.tacet/state`).
+   */
+  stateDir?: string;
+  /**
    * The user's environment: what Workers get an allowlist of, and where `{ env }` secret
    * references are read. One snapshot for both. Default `process.env`.
    */
@@ -51,7 +58,7 @@ export interface BuildWorkerAdaptersOptions {
   >;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs' | 'stateDir'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
-  /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
+  /** For the built-in `pty:claude` (Claude Code in a terminal); its `stateDir` overrides the top-level one. */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
   ptyCli?: Pick<PtyCliAdapterOptions, 'spawn' | 'quietMs' | 'startTimeoutMs' | 'killTimeoutMs'>;
@@ -147,6 +154,7 @@ export function buildWorkerAdapters(
       return new ClaudeSdkAdapter({
         ...(days !== undefined ? { retentionDays: days } : {}),
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...(opts.stateDir !== undefined ? { stateDir: opts.stateDir } : {}),
         ...opts.claude,
         ...common,
         ...warned,
@@ -159,6 +167,7 @@ export function buildWorkerAdapters(
         // An unattended Codex Worker in a git checkout needs it: its own CODEX_HOME is keyed by
         // the repo, and its worktree is checked against it before git runs (#116, #186).
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...(opts.stateDir !== undefined ? { stateDir: opts.stateDir } : {}),
         ...opts.codex,
         ...common,
         authRoute: 'api_key',
@@ -172,6 +181,7 @@ export function buildWorkerAdapters(
       return new AcpAdapter({
         ...(days !== undefined ? { retentionDays: days } : {}),
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...(opts.stateDir !== undefined ? { stateDir: opts.stateDir } : {}),
         ...opts.acp,
         ...common,
         ...warned,
@@ -187,6 +197,7 @@ export function buildWorkerAdapters(
       return new PtyAdapter({
         ...(days !== undefined ? { retentionDays: days } : {}),
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
+        ...(opts.stateDir !== undefined ? { stateDir: opts.stateDir } : {}),
         ...opts.claudePty,
         ...common,
         ...warned,
