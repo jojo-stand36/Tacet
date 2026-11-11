@@ -518,8 +518,9 @@ export class AcpAdapter implements AgentAdapter {
   // ---- internals -------------------------------------------------------------------------
 
   /**
-   * The agent's environment: the allowlist of the user's (#147), then the agent's fixed additions
-   * and the session's own variables, unfiltered.
+   * The agent's environment: the allowlist of the user's (#147) without the spec's
+   * `userEnvDeny`, then the agent's fixed additions and the session's own variables, unfiltered;
+   * `envDeny` goes from all of it.
    */
   #env(opts: SessionOptions): Record<string, string> {
     const spec = this.#opts.agent;
@@ -533,8 +534,10 @@ export class AcpAdapter implements AgentAdapter {
     );
     // Reported before the key check below: a missing key is when the names help most.
     this.#opts.onEnvDropped?.(filtered.dropped);
+    const user: Record<string, string | undefined> = { ...filtered.env };
+    for (const k of spec.userEnvDeny ?? []) delete user[k];
     const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries({ ...filtered.env, ...spec.env, ...opts.env })) {
+    for (const [k, v] of Object.entries({ ...user, ...spec.env, ...opts.env })) {
       if (v !== undefined) env[k] = v;
     }
     for (const k of spec.envDeny ?? []) delete env[k];
