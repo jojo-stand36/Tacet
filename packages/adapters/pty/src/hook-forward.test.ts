@@ -108,13 +108,6 @@ describe('hook-forward: the command hook relay (#164)', () => {
 });
 
 describe('claudeHookSettings (#164)', () => {
-  it('refuses reads outside the working directory (#284)', () => {
-    const s = claudeHookSettings({ forward: "'/node' '/relay.js' '/f'" }) as {
-      permissions?: Record<string, unknown>;
-    };
-    expect(s.permissions).toEqual({ blockReadsOutsideWorkingDirectories: true });
-  });
-
   it('relays every event through a command hook, with no token in the settings', () => {
     const s = claudeHookSettings({ forward: "'/node' '/relay.js' '/run/s.hook.json'" }) as {
       hooks: Record<

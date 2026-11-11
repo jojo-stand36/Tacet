@@ -20,12 +20,11 @@ import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { PtyAdapter, withoutImagePaths } from './adapter.js';
-import { loadPty, type Pty } from './pty.js';
+import { loadPty } from './pty.js';
 import { gatedTitle, ptyGate } from './testing/pty-gate.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** The Claude Code binary the pinned Agent SDK bundles for this platform. */
 function claudeBinary(): string {
@@ -53,8 +52,6 @@ describe.skipIf(!gate.ok)(
 
     /** The terminal output of the sessions started, so a failing test shows what was on screen. */
     const screens: string[] = [];
-    /** The latest session's terminal, to type into it past the adapter (#284). */
-    let lastPty: Pty | undefined;
 
     beforeAll(async () => {
       // node-pty loaded (the gate above): in CI a PTY test that quietly skipped would prove nothing.
@@ -71,7 +68,6 @@ describe.skipIf(!gate.ok)(
         sessionFileDir: join(root, 'run', 'mcp'),
         spawn: (file, args, opts) => {
           const pty = spawn(file, args, opts);
-          lastPty = pty;
           const i = screens.push('') - 1;
           pty.onData((d) => {
             screens[i] = ((screens[i] ?? '') + d).slice(-20_000);
@@ -259,65 +255,6 @@ describe.skipIf(!gate.ok)(
         }
         await adapter.close(h);
       }
-    });
-
-    it('refuses reads outside the checkout, even an image pasted raw (#284)', {
-      timeout: 180_000,
-    }, async () => {
-      const cwd = join(root, 'wt-block');
-      mkdirSync(cwd);
-      writeFileSync(join(cwd, 'inside.txt'), 'INSIDE-284\n');
-      const outsideImg = join(root, 'outside-284.png');
-      writeFileSync(outsideImg, testPng());
-      const outsideTxt = join(root, 'outside-284.txt');
-      writeFileSync(outsideTxt, 'OUTSIDE-284\n');
-      const h = await adapter.start({ cwd });
-      const tap = new EventTap(adapter.events(h));
-      const pty = lastPty as Pty;
-
-      // Past the adapter, so without #244's suffix: an outside image path on a line of its own,
-      // which Claude Code attached when the setting was off (live, 2.1.319).
-      const before = api.requests.length;
-      pty.write(`\x1b[200~SAY raw\n${outsideImg}\x1b[201~`);
-      await sleep(1500);
-      // Without the suffix the first Enter can be dropped (#244): press until it is sent.
-      for (
-        let i = 0;
-        i < 3 && !api.requests.slice(before).some((r) => r.text.startsWith('SAY raw'));
-        i++
-      ) {
-        pty.write('\r');
-        await sleep(1500);
-      }
-      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, 1);
-      const sent = api.requests.slice(before).find((r) => r.text.startsWith('SAY raw'));
-      expect(sent?.text).toBe(`SAY raw\n${outsideImg}`);
-      for (const r of api.requests.slice(before)) {
-        expect(r.raw).not.toContain('"type":"image"');
-        expect(r.raw).not.toContain('iVBOR');
-      }
-
-      // The Worker's own Read outside the checkout: refused before any approval is asked.
-      const readFrom = api.requests.length;
-      const outside = await turn(h, tap, `READ_TOOL ${outsideTxt}`);
-      expect(outside.end).toEqual({ t: 'status', state: 'idle' });
-      expect(outside.events.some((e) => e.t === 'approval.request')).toBe(false);
-      const after = api.requests.slice(readFrom);
-      for (const r of after) expect(r.raw).not.toContain('OUTSIDE-284');
-      expect(after.some((r) => r.toolOutput?.includes('blockReadsOutsideWorkingDirectories'))).toBe(
-        true,
-      );
-
-      // Inside the checkout, reads go on as before (asked for, as every tool call is).
-      const insideFrom = api.requests.length;
-      const from = tap.events.length;
-      await adapter.send(h, { text: `READ_TOOL ${join(cwd, 'inside.txt')}` });
-      const ask = await tap.waitFor((e) => e.t === 'approval.request', 60_000, from);
-      if (ask.event.t !== 'approval.request') throw new Error('no approval request');
-      await adapter.respond(h, ask.event.id, { kind: 'allow_once', persist: false });
-      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, ask.index + 1);
-      expect(api.requests.slice(insideFrom).some((r) => r.raw.includes('INSIDE-284'))).toBe(true);
-      await adapter.close(h);
     });
 
     it('reports running, waiting and idle from the hooks', { timeout: 120_000 }, async () => {

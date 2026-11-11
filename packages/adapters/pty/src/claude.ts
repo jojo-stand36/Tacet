@@ -33,8 +33,7 @@ const WITH_MATCHER = new Set([
 export const PERMISSION_TIMEOUT_S = 600;
 
 /**
- * The `--settings` file for one session: reads outside the checkout refused (#284), and a
- * `command` hook per event that relays it to Tacet's
+ * The `--settings` file for one session: a `command` hook per event that relays it to Tacet's
  * hook endpoint (`forward <event> <timeout>`, which reads the URL and token from the session's
  * 0600 file, so neither the token nor anything else secret is in the settings or on a command
  * line). Command hooks, not `http` ones: under Claude Code's Linux sandbox (#150) an `http` hook
@@ -57,17 +56,7 @@ export function claudeHookSettings(opts: {
       },
     ];
   }
-  return {
-    hooks,
-    // Claude Code's file tools refuse reads outside the working directory (the Worker's checkout),
-    // in every permission mode and before any approval, and it leaves out `@` mentions and pasted
-    // or dragged image paths from refused paths (code.claude.com/docs/en/settings-reference and
-    // /permissions, checked 2026-11-11; v2.1.257+). Defence in depth behind `withoutImagePaths`
-    // (#244) and CLAUDE_CODE_DISABLE_FILE_MENTIONS (#226): verified live on 2.1.319 that an outside
-    // image pasted raw attaches nothing and an outside `Read` is refused with no approval asked
-    // (#284). Bash is not covered; the Worker's reads inside its checkout are unchanged.
-    permissions: { blockReadsOutsideWorkingDirectories: true },
-  };
+  return { hooks };
 }
 
 /** Claude Code's launch arguments for a Worker session. */
