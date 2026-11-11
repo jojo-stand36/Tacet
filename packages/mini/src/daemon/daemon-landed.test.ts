@@ -833,6 +833,70 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(problems).toEqual([{ op: 'landed', message: 'cannot read the target', taskId: id }]);
     });
 
+    it("records a failure to clear a crashed Claude session's placeholders (#285)", async () => {
+      const left = await manager.create('crashed-session');
+      const id = 'crashed-claude-task';
+      const envelope = (type: string, data: unknown) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId: id,
+        type,
+        data,
+      });
+      // A Claude Worker session a crash left open, in a task the user then canceled.
+      store.append([
+        envelope('task.created', {
+          id,
+          goal: 'g',
+          acceptanceCriteria: ['ok'],
+          priority: 'p2',
+          createdAt: new Date().toISOString(),
+        }),
+        envelope('task.status', { state: 'canceled' }),
+        envelope('worker.started', {
+          sessionId: 's-crashed',
+          adapter: 'claude-sdk',
+          workspaceId: left.id,
+          baseCommit: left.baseCommit,
+        }),
+      ]);
+      class Unreadable extends GitIntegrator {
+        override async tracked(): Promise<never> {
+          throw new Error('cannot list the checkout');
+        }
+      }
+      daemon = new MiniConductor({
+        store,
+        config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+        adapters: {
+          fake: {
+            adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+            authRoute: 'api_key',
+          },
+        },
+        workspaces: manager,
+        integrator: new Unreadable(repo, env),
+        planner: new SingleStepPlanner(),
+        mcp: {
+          workerConfig: () => ({
+            config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+            revoke: () => {},
+          }),
+        },
+        lockPath: join(root, 'mini.lock'),
+      });
+      await daemon.start();
+      const problems = store.query({ typePrefix: 'maintenance' }).map((e) => ({
+        ...(e.envelope.data as object),
+        taskId: e.envelope.taskId,
+      }));
+      expect(problems).toEqual([
+        { op: 'reconcile', message: 'cannot list the checkout', workspaceId: left.id, taskId: id },
+      ]);
+    });
+
     it('runs no gc with idle_days 0', async () => {
       const calls: GcOptions[] = [];
       await runTask(commitWork, { remove_merged: false, idle_days: 0 }, undefined, {
