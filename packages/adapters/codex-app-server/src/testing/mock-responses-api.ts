@@ -7,7 +7,11 @@ import type { AddressInfo } from 'node:net';
  * text, like the Claude adapter's mock:
  * - `SAY <word>`: streams `You said <word>.` in several deltas.
  * - `RUN_TOOL`: calls the shell tool Codex offers (`exec_command`) with `touch tool-ran.txt`.
- * - `RUN_CMD <shell command>`: calls the same tool with the rest of the line.
+ * - `RUN_CMD <shell command>`: calls the same tool with the rest of the line, waiting as long as
+ *   `exec_command` allows for it to finish (`yield_time_ms: 30000`): by default Codex 0.167
+ *   returns after 10 s with "Process running with session ID …", which a slow first `git` on a
+ *   macOS runner reached (#251; the default and the 250-30000 ms range are from the tool's own
+ *   declaration in Codex 0.167.0's requests).
  * - `RUN_ESCALATED`: as `RUN_TOOL`, asking to run outside the sandbox
  *   (`sandbox_permissions: "require_escalated"` with a `justification`, both in Codex 0.166's
  *   `exec_command` schema): with `on-request` approvals Codex asks before it runs.
@@ -170,7 +174,7 @@ async function handle(
     const args =
       name && name !== 'exec_command'
         ? { command: ['sh', '-c', cmd], ...escalate }
-        : { cmd, ...escalate };
+        : { cmd, ...(runCmd !== undefined ? { yield_time_ms: 30_000 } : {}), ...escalate };
     const item = {
       type: 'function_call',
       id: `fc_mock_${n}`,

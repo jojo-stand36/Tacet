@@ -28,7 +28,14 @@ import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
 import { TempWorkspaces } from '../daemon/testing.js';
-import { buildWorkerAdapters, commandWords, runs, runsGemini, WorkerConfigError } from './build.js';
+import {
+  buildWorkerAdapters,
+  commandWords,
+  runs,
+  runsCodex,
+  runsGemini,
+  WorkerConfigError,
+} from './build.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
 const gate = await ptyGate();
@@ -170,6 +177,38 @@ describe('buildWorkerAdapters', () => {
     expect(escapes(['sh', '-c', 'cd x && exec gemini'])).toBe(true);
     expect(escapes(['aider'])).toBe(false);
     expect(escapes(['aider', '--model', 'gemini'])).toBe(false);
+  });
+
+  it('recognises a PTY preset running Codex CLI, whose pastes are made safe for its composer (#249)', () => {
+    for (const w of [
+      'codex',
+      '/usr/local/bin/codex',
+      '@openai/codex',
+      '@openai/codex@0.167.0',
+      '/x/node_modules/@openai/codex/bin/codex.js',
+    ]) {
+      expect(runsCodex(w), w).toBe(true);
+    }
+    for (const w of ['codex-acp', '@zed-industries/codex-acp', 'my-codex', 'gemini', 'codexify']) {
+      expect(runsCodex(w), w).toBe(false);
+    }
+    const preset = (command: string[]) => {
+      const { adapter } =
+        buildWorkerAdapters(
+          {
+            tiers: { worker: { adapter: 'pty:mine' } },
+            agents: { mine: { kind: 'pty', command } },
+          },
+          { baseEnv: {} },
+        )['pty:mine'] ?? {};
+      if (!(adapter instanceof PtyCliAdapter)) throw new Error('not a PTY CLI adapter');
+      return adapter.preset;
+    };
+    expect(preset(['codex', '-c', 'features.daemon_auto_start=false']).codexPaste).toBe(true);
+    expect(preset(['npx', '-y', '@openai/codex@0.167.0']).codexPaste).toBe(true);
+    expect(preset(['sh', '-c', 'exec codex']).codexPaste).toBe(true);
+    expect(preset(['gemini']).codexPaste).toBeUndefined();
+    expect(preset(['aider']).codexPaste).toBeUndefined();
   });
 
   it('catches a CLI behind launchers it does not model, failing closed (#245 review)', () => {
