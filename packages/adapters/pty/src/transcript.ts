@@ -1,5 +1,6 @@
 import {
   closeSync,
+  constants,
   fstatSync,
   lstatSync,
   openSync,
@@ -14,24 +15,55 @@ import { join, sep } from 'node:path';
  * stream, but Claude Code writes every model call to `<CLAUDE_CONFIG_DIR>/projects/<project>/
  * <session id>.jsonl` (seen live with 2.1.319, recorded in the capability matrix). An assistant
  * line carries `message.id`, `message.model` and `message.usage`; a call with several content
- * blocks is written as several lines with the same id.
+ * blocks is written as several lines with the same id, and only the last has the final count.
  *
  * The transcript is found here, under the session's own config dir, and never taken from a
  * hook's `transcript_path`: a hook body is the Worker's word, and a path in it could point
- * Tacet at any file.
+ * Tacet at any file. Every read opens the file without following a symlink, without blocking on
+ * a FIFO, and checks it is still the very file found first (device and inode): a file or
+ * directory swapped in later is refused.
  */
 
-/** One model call. */
+/** Usage to report for one model call: what it added since it was last reported. */
 export interface TranscriptCall {
   /** Input tokens, cache writes and reads included (as the SDK adapter counts them). */
   inputTokens: number;
   outputTokens: number;
+  /** The call's whole input plus output so far: the conversation's context after it. */
+  contextUsed: number;
   model: string | undefined;
-  /** A subagent's call: counted, but not the main conversation's context. */
-  sidechain: boolean;
+}
+
+/** A transcript found under the config dir, and which file it is. */
+export interface TranscriptFile {
+  path: string;
+  dev: number;
+  ino: number;
 }
 
 const NAME = /^[0-9a-f-]{36}$/;
+// O_NONBLOCK: opening a FIFO for reading would otherwise wait for a writer, on the event loop.
+const OPEN_FLAGS = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+/** Open `path` as the regular file `expect` names (any regular file when absent), or undefined. */
+function openChecked(path: string, expect?: { dev: number; ino: number }) {
+  let fd: number;
+  try {
+    fd = openSync(path, OPEN_FLAGS);
+  } catch {
+    return undefined;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (st.isFile() && (!expect || (st.dev === expect.dev && st.ino === expect.ino))) {
+      return { fd, dev: st.dev, ino: st.ino, size: st.size };
+    }
+  } catch {
+    // Treated as not there.
+  }
+  closeSync(fd);
+  return undefined;
+}
 
 /**
  * The session's transcript: the one regular file `<id>.jsonl` directly in a project directory
@@ -39,7 +71,7 @@ const NAME = /^[0-9a-f-]{36}$/;
  * when there is more than one (the session ran in several directories): which is current cannot
  * be told, so no usage is read rather than the wrong one.
  */
-export function findTranscript(configDir: string, sessionId: string): string | undefined {
+export function findTranscript(configDir: string, sessionId: string): TranscriptFile | undefined {
   if (!NAME.test(sessionId)) return undefined;
   const projects = join(configDir, 'projects');
   let root: string;
@@ -51,101 +83,200 @@ export function findTranscript(configDir: string, sessionId: string): string | u
   } catch {
     return undefined;
   }
-  const found: string[] = [];
+  const found: TranscriptFile[] = [];
   for (const d of dirs) {
     const dir = join(projects, d);
-    const file = join(dir, `${sessionId}.jsonl`);
+    const path = join(dir, `${sessionId}.jsonl`);
     try {
-      if (!lstatSync(dir).isDirectory() || !lstatSync(file).isFile()) continue;
-      if (!realpathSync(file).startsWith(root + sep)) continue;
+      if (!lstatSync(dir).isDirectory() || !lstatSync(path).isFile()) continue;
+      if (!realpathSync(path).startsWith(root + sep)) continue;
     } catch {
       continue;
     }
-    found.push(file);
+    const f = openChecked(path);
+    if (!f) continue;
+    closeSync(f.fd);
+    found.push({ path, dev: f.dev, ino: f.ino });
   }
   return found.length === 1 ? found[0] : undefined;
 }
 
+/** The most one read takes in; the rest waits for the next read. */
+const MAX_READ = 16 * 1024 * 1024;
+/** A longer line is dropped, not kept. */
 const MAX_LINE = 4 * 1024 * 1024;
+const CHUNK = 1024 * 1024;
+/** Calls whose reported usage is remembered, to report later lines as deltas. */
+const MAX_CALLS = 4096;
+
+interface Reported {
+  input: number;
+  output: number;
+}
 
 /**
- * Reads a transcript as it grows, from where the last read stopped, and returns the model calls
- * not returned before. Call it when a turn has ended: a call whose lines are still being written
- * is taken with the usage its last line has so far.
+ * Reads a transcript as it grows, from where the last read stopped, a line at a time, and returns
+ * the usage not returned before: a new call in full, a call already reported by what its later
+ * lines added (`usage` events are deltas).
  */
 export class TranscriptReader {
+  #file: TranscriptFile | undefined;
   #offset = 0;
-  #partial = Buffer.alloc(0);
-  #seen = new Set<string>();
-  #file: string | undefined;
+  #partial: Buffer[] = [];
+  #partialBytes = 0;
+  /** Dropping an over-long line until its end. */
+  #dropping = false;
+  #reported = new Map<string, Reported>();
+  #skipPending = false;
 
-  constructor(private readonly locate: () => string | undefined) {}
+  constructor(private readonly locate: () => TranscriptFile | undefined) {}
 
-  /** Take what the transcript holds now as already reported (a resumed session's history). */
-  skip(): void {
-    this.read();
-  }
-
-  read(): TranscriptCall[] {
+  /** The transcript has been found. */
+  get found(): boolean {
     this.#file ??= this.locate();
-    if (this.#file === undefined) return [];
-    const lines = this.#newLines(this.#file);
-    // The last line of each call holds its final usage.
-    const calls = new Map<string, TranscriptCall>();
-    for (const line of lines) {
-      const call = parseCall(line);
-      if (!call || this.#seen.has(call.id)) continue;
-      calls.delete(call.id);
-      calls.set(call.id, call.call);
-    }
-    for (const id of calls.keys()) {
-      this.#seen.add(id);
-      if (this.#seen.size > 4096) {
-        const oldest = this.#seen.values().next().value;
-        if (oldest !== undefined) this.#seen.delete(oldest);
-      }
-    }
-    return [...calls.values()];
+    return this.#file !== undefined;
   }
 
-  #newLines(file: string): string[] {
-    let fd: number;
+  /**
+   * Take what the transcript holds now as already reported (a resumed session's history). If it
+   * cannot be found yet, this applies when it first is.
+   */
+  skip(): void {
+    this.#skipPending = true;
+    this.#open();
+  }
+
+  /** The usage the transcript gained since the last read; main-conversation calls only. */
+  read(): TranscriptCall[] {
+    const opened = this.#open();
+    if (!opened) return [];
+    const { fd, size } = opened;
+    const lines: string[] = [];
     try {
-      fd = openSync(file, 'r');
-    } catch {
-      return [];
-    }
-    try {
-      const size = fstatSync(fd).size;
       if (size < this.#offset) {
-        // Rewritten from the start: read it again; seen ids keep calls from counting twice.
+        // Cut short and rewritten: read it again; remembered calls only report what they add.
         this.#offset = 0;
-        this.#partial = Buffer.alloc(0);
+        this.#partial = [];
+        this.#partialBytes = 0;
+        this.#dropping = false;
       }
-      const chunks: Buffer[] = [this.#partial];
-      while (this.#offset < size) {
-        const buf = Buffer.alloc(Math.min(size - this.#offset, 1024 * 1024));
-        const n = readSync(fd, buf, 0, buf.length, this.#offset);
+      const end = Math.min(size, this.#offset + MAX_READ);
+      const buf = Buffer.alloc(Math.min(CHUNK, Math.max(0, end - this.#offset)));
+      while (this.#offset < end) {
+        const n = readSync(fd, buf, 0, Math.min(buf.length, end - this.#offset), this.#offset);
         if (n === 0) break;
         this.#offset += n;
-        chunks.push(buf.subarray(0, n));
+        this.#lines(buf.subarray(0, n), lines);
       }
-      const all = Buffer.concat(chunks);
-      const end = all.lastIndexOf(10);
-      this.#partial = end < 0 ? all : all.subarray(end + 1);
-      // A line that never ends is not kept without bound.
-      if (this.#partial.length > MAX_LINE) this.#partial = Buffer.alloc(0);
-      return end < 0 ? [] : all.subarray(0, end).toString('utf8').split('\n');
     } finally {
       closeSync(fd);
     }
+    return this.#calls(lines);
   }
+
+  /** Open the transcript, first finding it; applies a pending skip. */
+  #open(): { fd: number; size: number } | undefined {
+    this.#file ??= this.locate();
+    if (!this.#file) return undefined;
+    const f = openChecked(this.#file.path, this.#file);
+    if (!f) return undefined;
+    if (this.#skipPending) {
+      this.#skipPending = false;
+      // From the end; a line still being written there is dropped up to its end.
+      this.#offset = f.size;
+      this.#partial = [];
+      this.#partialBytes = 0;
+      this.#dropping = f.size > 0 && !endsWithNewline(f.fd, f.size);
+      closeSync(f.fd);
+      return undefined;
+    }
+    return { fd: f.fd, size: f.size };
+  }
+
+  /** Split a chunk into whole lines, keeping the unfinished end for the next chunk. */
+  #lines(chunk: Buffer, out: string[]): void {
+    let start = 0;
+    for (let nl = chunk.indexOf(10); nl >= 0; nl = chunk.indexOf(10, start)) {
+      const piece = chunk.subarray(start, nl);
+      start = nl + 1;
+      if (this.#dropping) {
+        this.#dropping = false;
+        continue;
+      }
+      if (this.#partialBytes + piece.length > MAX_LINE) {
+        this.#partial = [];
+        this.#partialBytes = 0;
+        continue;
+      }
+      out.push(Buffer.concat([...this.#partial, piece]).toString('utf8'));
+      this.#partial = [];
+      this.#partialBytes = 0;
+    }
+    const rest = chunk.subarray(start);
+    if (rest.length === 0 || this.#dropping) return;
+    if (this.#partialBytes + rest.length > MAX_LINE) {
+      this.#partial = [];
+      this.#partialBytes = 0;
+      this.#dropping = true;
+      return;
+    }
+    // Copied: the chunk's buffer is reused.
+    this.#partial.push(Buffer.from(rest));
+    this.#partialBytes += rest.length;
+  }
+
+  #calls(lines: string[]): TranscriptCall[] {
+    // The last line read of each call holds its usage so far.
+    const latest = new Map<string, Parsed>();
+    for (const line of lines) {
+      const p = parseCall(line);
+      if (!p) continue;
+      latest.delete(p.id);
+      latest.set(p.id, p);
+    }
+    const out: TranscriptCall[] = [];
+    for (const p of latest.values()) {
+      const before = this.#reported.get(p.id);
+      const input = Math.max(p.input, before?.input ?? 0);
+      const output = Math.max(p.output, before?.output ?? 0);
+      if (before && input === before.input && output === before.output) continue;
+      this.#reported.delete(p.id);
+      this.#reported.set(p.id, { input, output });
+      if (this.#reported.size > MAX_CALLS) {
+        const oldest = this.#reported.keys().next().value;
+        if (oldest !== undefined) this.#reported.delete(oldest);
+      }
+      // A subagent's calls are left out, as the claude-sdk adapter leaves them out.
+      if (p.sidechain) continue;
+      out.push({
+        inputTokens: input - (before?.input ?? 0),
+        outputTokens: output - (before?.output ?? 0),
+        contextUsed: input + output,
+        model: p.model,
+      });
+    }
+    return out;
+  }
+}
+
+function endsWithNewline(fd: number, size: number): boolean {
+  const b = Buffer.alloc(1);
+  return readSync(fd, b, 0, 1, size - 1) === 1 && b[0] === 10;
 }
 
 const count = (v: unknown): number =>
   typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : 0;
 
-function parseCall(line: string): { id: string; call: TranscriptCall } | undefined {
+interface Parsed {
+  id: string;
+  input: number;
+  output: number;
+  model: string | undefined;
+  sidechain: boolean;
+}
+
+function parseCall(line: string): Parsed | undefined {
+  // Only a fast path past the other line types; the parse below decides.
   if (!line.includes('"assistant"')) return undefined;
   let j: unknown;
   try {
@@ -166,15 +297,13 @@ function parseCall(line: string): { id: string; call: TranscriptCall } | undefin
   const u = m.usage as Record<string, unknown>;
   return {
     id: m.id,
-    call: {
-      inputTokens:
-        count(u.input_tokens) +
-        count(u.cache_creation_input_tokens) +
-        count(u.cache_read_input_tokens),
-      outputTokens: count(u.output_tokens),
-      model: typeof m.model === 'string' && m.model !== '' ? m.model : undefined,
-      sidechain: o.isSidechain === true,
-    },
+    input:
+      count(u.input_tokens) +
+      count(u.cache_creation_input_tokens) +
+      count(u.cache_read_input_tokens),
+    output: count(u.output_tokens),
+    model: typeof m.model === 'string' && m.model !== '' ? m.model : undefined,
+    sidechain: o.isSidechain === true,
   };
 }
 
@@ -208,21 +337,18 @@ const WINDOWS: ReadonlyArray<readonly [string, number | 'suffix']> = [
 ];
 
 /**
- * The context window for a call's model, or undefined when the model is not in the table.
- * `launchModel` is the `--model` the session started with (`[1m]` there selects 1M for the 4.6
- * models); `env` is the Worker's environment, whose `CLAUDE_CODE_MAX_CONTEXT_TOKENS` overrides
- * the window and whose `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` caps it at 200K, as Claude Code's
- * model-config docs say.
+ * The context window for a call's model, or undefined when it is not known. `launchModel` is the
+ * model the session started with (`--model`, else `ANTHROPIC_MODEL`): `[1m]` there selects 1M
+ * for the 4.6 models. `env` is the Worker's environment, as the matrix records from Claude Code's
+ * model-config docs: `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` caps every window at 200K, and
+ * `CLAUDE_CODE_MAX_CONTEXT_TOKENS` sets the window of a model Claude Code does not know (applied
+ * here only to models not in the table, the scope verified).
  */
 export function contextWindow(
   model: string | undefined,
   launchModel: string | undefined,
   env: Readonly<Record<string, string | undefined>>,
 ): number | undefined {
-  const override = Number(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS);
-  if (env.CLAUDE_CODE_MAX_CONTEXT_TOKENS && Number.isSafeInteger(override) && override > 0) {
-    return override;
-  }
   if (model === undefined) return undefined;
   // Provider forms: `us.anthropic.claude-…`, `…@20250929`, `…-20250929-v1:0`, `…[1m]`.
   const id = model
@@ -233,7 +359,12 @@ export function contextWindow(
     .replace(/-v\d+(?::\d+)?$/, '')
     .replace(/-\d{8}$/, '');
   const entry = WINDOWS.find(([name]) => name === id)?.[1];
-  if (entry === undefined) return undefined;
+  if (entry === undefined) {
+    const override = Number(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS);
+    return env.CLAUDE_CODE_MAX_CONTEXT_TOKENS && Number.isSafeInteger(override) && override > 0
+      ? override
+      : undefined;
+  }
   const window =
     entry === 'suffix' ? (launchModel?.toLowerCase().endsWith('[1m]') ? M : K200) : entry;
   return env.CLAUDE_CODE_DISABLE_1M_CONTEXT === '1' ? Math.min(window, K200) : window;

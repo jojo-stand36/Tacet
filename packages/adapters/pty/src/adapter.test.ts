@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -12,7 +13,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ForkRefusedError, ProfileRefusedError } from '@tacet/core';
+import { ForkRefusedError, ProfileRefusedError, type SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
 import { EventTap } from '@tacet/core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -21,6 +22,7 @@ import type { Pty, PtySpawnOptions } from './pty.js';
 import { assistantLine } from './testing/transcript-line.js';
 
 const KEY = 'sk-ant-placeholder-not-a-real-key-0123456789';
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const unpaste = (data: string) => data.replaceAll('\x1b[200~', '').replaceAll('\x1b[201~', '');
 
 /**
@@ -347,76 +349,175 @@ describe('PtyAdapter (fake claude)', () => {
     await adapter.close(h);
   });
 
-  it('reports usage from its own transcript, never the one a hook names (#255)', async () => {
-    const adapter = make();
-    const h = await adapter.start({ cwd: join(root, 'wt'), model: 'claude-opus-4-6[1m]' });
-    const tap = new EventTap(adapter.events(h));
-    const f = fake();
-    const configDir = f.opts.env.CLAUDE_CONFIG_DIR as string;
-    // A file the Worker could write, named by a hook: never read.
-    const decoy = join(root, 'decoy.jsonl');
-    writeFileSync(
-      decoy,
-      assistantLine('d1', { input: 666, output: 666 }, { sessionId: f.sessionId }),
-    );
-    const usage = () => tap.events.filter((e) => e.t === 'usage');
+  describe('usage from the transcript (#255)', () => {
+    /** The session's transcript, where Claude Code writes it, and a line for one call. */
+    const transcriptOf = (f: FakeClaude) => {
+      const dir = join(f.opts.env.CLAUDE_CONFIG_DIR as string, 'projects', '-wt');
+      mkdirSync(dir, { recursive: true });
+      return join(dir, `${f.sessionId}.jsonl`);
+    };
+    const line = (f: FakeClaude, id: string, input: number, output: number, model?: string) =>
+      assistantLine(id, { input, output }, { sessionId: f.sessionId, ...(model ? { model } : {}) });
+    const usage = (tap: EventTap) => tap.events.filter((e) => e.t === 'usage');
+    const sonnet = (input: number, output: number) => ({
+      t: 'usage',
+      inputTokens: input,
+      outputTokens: output,
+      contextUsed: input + output,
+      contextMax: 200_000,
+      model: 'claude-sonnet-4-5',
+      source: 'reported',
+    });
+    /** A turn that ends with `Stop`, after `beforeStop`; resolves at its end. */
+    async function stopTurn(
+      adapter: PtyAdapter,
+      h: SessionHandle,
+      tap: EventTap,
+      stop: object = {},
+      beforeStop: () => void = () => {},
+    ) {
+      const f = fake();
+      const from = tap.events.length;
+      f.submitted = undefined;
+      await adapter.send(h, { text: 'HANG' });
+      await expect.poll(() => f.submitted).toBeDefined();
+      beforeStop();
+      await f.hook('Stop', { last_assistant_message: 'reply', ...stop });
+      return tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from + 1);
+    }
 
-    // No transcript yet: the turn ends with no usage, whatever the hook says.
-    await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.submitted).toBeDefined();
-    await f.hook('Stop', { transcript_path: decoy, last_assistant_message: 'one' });
-    await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, 1);
-    expect(usage()).toEqual([]);
+    it('reads its own transcript, never the one a hook names', async () => {
+      const adapter = make();
+      const h = await adapter.start({ cwd: join(root, 'wt'), model: 'claude-opus-4-6[1m]' });
+      const tap = new EventTap(adapter.events(h));
+      const f = fake();
+      // A file the Worker could write, named by a hook: never read.
+      const decoy = join(root, 'decoy.jsonl');
+      writeFileSync(decoy, line(f, 'd1', 666, 666));
 
-    const dir = join(configDir, 'projects', '-wt');
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(
-      join(dir, `${f.sessionId}.jsonl`),
-      assistantLine(
-        'm1',
-        { input: 2, created: 300, read: 5000, output: 1 },
-        { model: 'claude-opus-4-6', sessionId: f.sessionId },
-      ) +
+      // No transcript yet: the turn ends with no usage, whatever the hook says.
+      await stopTurn(adapter, h, tap, { transcript_path: decoy });
+      expect(usage(tap)).toEqual([]);
+
+      const file = transcriptOf(f);
+      writeFileSync(
+        file,
         assistantLine(
           'm1',
-          { input: 2, created: 300, read: 5000, output: 80 },
+          { input: 2, created: 300, read: 5000, output: 1 },
           { model: 'claude-opus-4-6', sessionId: f.sessionId },
         ) +
-        assistantLine(
-          's1',
-          { input: 9, output: 3 },
-          { model: 'claude-haiku-4-5', sidechain: true, sessionId: f.sessionId },
-        ),
-    );
-    const from = tap.events.length;
-    f.submitted = undefined;
-    await adapter.send(h, { text: 'HANG' });
-    await expect.poll(() => f.submitted).toBeDefined();
-    await f.hook('Stop', { transcript_path: decoy, last_assistant_message: 'two' });
-    const end = await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 5000, from + 1);
-    expect(usage()).toEqual([
-      {
-        t: 'usage',
-        inputTokens: 5302,
-        outputTokens: 80,
-        contextUsed: 5382,
-        // Opus 4.6 has 1M in Claude Code only when launched with [1m].
-        contextMax: 1_000_000,
-        model: 'claude-opus-4-6',
-        source: 'reported',
-      },
-      // A subagent's call is counted; it is not the conversation's context.
-      {
-        t: 'usage',
-        inputTokens: 9,
-        outputTokens: 3,
-        model: 'claude-haiku-4-5',
-        source: 'reported',
-      },
-    ]);
-    // Reported before the turn's end.
-    expect(tap.events.findIndex((e) => e.t === 'usage')).toBeLessThan(end.index);
-    await adapter.close(h);
+          assistantLine(
+            'm1',
+            { input: 2, created: 300, read: 5000, output: 80 },
+            { model: 'claude-opus-4-6', sessionId: f.sessionId },
+          ) +
+          // A subagent's call is left out, as the claude-sdk adapter leaves it out.
+          assistantLine('s1', { input: 9, output: 3 }, { sidechain: true, sessionId: f.sessionId }),
+      );
+      const end = await stopTurn(adapter, h, tap, { transcript_path: decoy });
+      expect(usage(tap)).toEqual([
+        {
+          t: 'usage',
+          inputTokens: 5302,
+          outputTokens: 80,
+          contextUsed: 5382,
+          // Opus 4.6 has 1M in Claude Code only when launched with [1m].
+          contextMax: 1_000_000,
+          model: 'claude-opus-4-6',
+          source: 'reported',
+        },
+      ]);
+      expect(tap.events.findIndex((e) => e.t === 'usage')).toBeLessThan(end.index);
+      await adapter.close(h);
+    });
+
+    it('waits for a call written just after Stop, and reports it before the turn ends', async () => {
+      const adapter = make();
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      const f = fake();
+      const file = transcriptOf(f);
+      writeFileSync(file, `${JSON.stringify({ type: 'last-prompt' })}\n`);
+      // As Claude Code 2.1.319 does (#255): the call lands after the hook has returned.
+      const end = await stopTurn(adapter, h, tap, {}, () => {
+        setTimeout(() => appendFileSync(file, line(f, 'm1', 100, 10)), 150);
+      });
+      expect(usage(tap)).toEqual([sonnet(100, 10)]);
+      expect(tap.events.findIndex((e) => e.t === 'usage')).toBeLessThan(end.index);
+      await adapter.close(h);
+    });
+
+    it('ends the turn without usage when none comes, after the wait', async () => {
+      const adapter = make({}, { usageWaitMs: 200 });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      writeFileSync(transcriptOf(fake()), `${JSON.stringify({ type: 'last-prompt' })}\n`);
+      const started = Date.now();
+      await stopTurn(adapter, h, tap);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(150);
+      expect(usage(tap)).toEqual([]);
+      await adapter.close(h);
+    });
+
+    it('a close during the wait reports what was written, then ends, with no idle', async () => {
+      const adapter = make({}, { usageWaitMs: 60_000 });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      const f = fake();
+      const file = transcriptOf(f);
+      writeFileSync(file, `${JSON.stringify({ type: 'last-prompt' })}\n`);
+      f.submitted = undefined;
+      await adapter.send(h, { text: 'HANG' });
+      await expect.poll(() => f.submitted).toBeDefined();
+      await f.hook('Stop', { last_assistant_message: 'reply' });
+      await sleep(50);
+      // Written while the turn's end waits, read by the close itself or the wait.
+      appendFileSync(file, line(f, 'm1', 100, 10));
+      await adapter.close(h);
+      expect(usage(tap)).toEqual([sonnet(100, 10)]);
+      expect(states(tap).slice(-2)).toEqual(['running', 'done']);
+      await sleep(100);
+      expect(tap.events.at(-1)).toEqual({ t: 'status', state: 'done' });
+    });
+
+    it('does not report a resumed session’s earlier calls again', async () => {
+      const adapter = make();
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      const f = fake();
+      const file = transcriptOf(f);
+      await stopTurn(adapter, h, tap, {}, () => appendFileSync(file, line(f, 'm1', 100, 10)));
+      expect(usage(tap)).toEqual([sonnet(100, 10)]);
+      await adapter.close(h);
+
+      const again = await adapter.start({
+        cwd: join(root, 'wt'),
+        resume: { vendorSessionId: h.vendorSessionId as string },
+      });
+      const tap2 = new EventTap(adapter.events(again));
+      const f2 = fake();
+      expect(f2.sessionId).toBe(f.sessionId);
+      await stopTurn(adapter, again, tap2, {}, () => appendFileSync(file, line(f2, 'm2', 200, 20)));
+      expect(usage(tap2)).toEqual([sonnet(200, 20)]);
+      await adapter.close(again);
+    });
+
+    it('takes the launch model from ANTHROPIC_MODEL when no --model is given', async () => {
+      const adapter = make({ ANTHROPIC_MODEL: 'claude-sonnet-4-6[1m]' });
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const tap = new EventTap(adapter.events(h));
+      const f = fake();
+      expect(f.opts.env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6[1m]');
+      const file = transcriptOf(f);
+      await stopTurn(adapter, h, tap, {}, () =>
+        appendFileSync(file, line(f, 'm1', 100, 10, 'claude-sonnet-4-6')),
+      );
+      expect(usage(tap)).toEqual([
+        { ...sonnet(100, 10), contextMax: 1_000_000, model: 'claude-sonnet-4-6' },
+      ]);
+      await adapter.close(h);
+    });
   });
 
   it('drops hooks of an interrupted turn that arrive late', async () => {
