@@ -222,6 +222,21 @@ describe('tacet init (#20)', () => {
       expect(existsSync(join(plain, '.tacet'))).toBe(false);
     }
 
+    // A Claude Code sandbox skeleton (`.git` with config, hooks and info but no
+    // HEAD) above a plain directory does not make it a repo (#326).
+    const skel = join(dir, 'skel');
+    mkdirSync(join(skel, '.git', 'info', '.claude-sandbox-noreplace'), { recursive: true });
+    mkdirSync(join(skel, '.git', 'hooks'));
+    writeFileSync(join(skel, '.git', 'config'), '');
+    const under = join(skel, 'plain');
+    mkdirSync(under);
+    expect(repoRootFrom(under)).not.toBe(skel);
+    if (repoRootFrom(under) === under) {
+      expect((await tacet(['init', '--repo', under])).code).toBe(1);
+      expect(existsSync(join(under, '.tacet'))).toBe(false);
+      expect(existsSync(join(skel, '.tacet'))).toBe(false);
+    }
+
     const elsewhere = join(dir, 'elsewhere');
     mkdirSync(elsewhere);
     symlinkSync(elsewhere, join(repo, '.tacet'));

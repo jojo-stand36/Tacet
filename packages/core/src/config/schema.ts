@@ -78,6 +78,17 @@ export const AgentPreset = z.strictObject({
   command: z.array(NonEmpty).min(1).describe('argv; the first element is the executable'),
   env: z.record(z.string(), SecretRef).optional().describe('Environment from secret references'),
   ready_prompt: z.string().optional().describe('PTY: text that shows the CLI is ready for input'),
+  capabilities: z
+    .strictObject({
+      mcp: z
+        .boolean()
+        .optional()
+        .describe(
+          "ACP: the agent connects the MCP servers passed in session/new, so its Workers get the Mini-conductor's MCP tools. Default false (#184): set it only once verified for that agent",
+        ),
+    })
+    .optional()
+    .describe('ACP: what the agent supports beyond the ACP baseline'),
   resume_flag: z
     .union([NonEmpty, z.array(NonEmpty).min(1)])
     .optional()

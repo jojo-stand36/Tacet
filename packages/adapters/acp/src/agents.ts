@@ -120,6 +120,8 @@ const ACP_BASE: AdapterCapabilities = {
   approvals: 'roundtrip',
   interrupt: 'turn',
   resume: false,
+  // Declared per agent: an agent may not connect the servers it is given (#184).
+  mcp: false,
   fork: 'none',
   usage: { live: false, context: false, cost: 'none' },
   modelSwitch: 'launch-only',
@@ -149,6 +151,10 @@ export const GEMINI_AGENT: AcpAgentSpec = {
   capabilities: {
     ...ACP_BASE,
     resume: true,
+    // In an untrusted checkout (Tacet never trusts one) Gemini CLI never starts the MCP servers
+    // it is passed (verified live on 0.67.0, #181; source: `McpClientManager` returns early when
+    // `isTrustedFolder()` is false). Its Workers run without Tacet's tools (#184).
+    mcp: false,
     usage: { live: true, context: true, cost: 'none' },
   },
   verifiedVersion: '@google/gemini-cli 0.67.0',
@@ -186,6 +192,8 @@ export const CLAUDE_ACP_AGENT: AcpAgentSpec = {
     ...ACP_BASE,
     resume: true,
     fork: 'native',
+    // It connects the servers passed in `session/new` (Tacet's MCP tools, tested in #181).
+    mcp: true,
     usage: { live: true, context: true, cost: 'none' },
   },
   verifiedVersion: '@agentclientprotocol/claude-agent-acp 0.101.0',
@@ -303,7 +311,9 @@ export const CODEX_ACP_AGENT: AcpAgentSpec = {
   envAllow: { prefixes: ['CODEX_', 'OPENAI_'] },
   apiKeyEnv: ['OPENAI_API_KEY'],
   apiKeyAuthMethods: [],
-  capabilities: { ...ACP_BASE, usage: { live: true, context: true, cost: 'none' } },
+  // `mcp`: it passes the `session/new` servers through, http only (capability matrix §5, "Codex
+  // ACP adapter", #62); Tacet's server is http.
+  capabilities: { ...ACP_BASE, mcp: true, usage: { live: true, context: true, cost: 'none' } },
   verifiedVersion: '@agentclientprotocol/codex-acp 2.6.0',
   home: { env: 'CODEX_HOME', files: { 'config.toml': codexAcpConfig() } },
   // `CODEX_API_KEY` would be a second key route besides the provider's `env_key` (#145).
@@ -339,7 +349,7 @@ export interface CustomAcpAgentConfig {
    * resume (by `session/resume` or `session/load`) and usage reporting. Fork is declared only by
    * a built-in spec whose agent's fork was verified (#146).
    */
-  capabilities?: Partial<Pick<AdapterCapabilities, 'resume' | 'usage'>>;
+  capabilities?: Partial<Pick<AdapterCapabilities, 'resume' | 'usage' | 'mcp'>>;
 }
 
 const SLUG = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -360,6 +370,8 @@ export function customAcpAgent(slug: string, cfg: CustomAcpAgentConfig): AcpAgen
       ...ACP_BASE,
       ...(cfg.capabilities?.resume !== undefined ? { resume: cfg.capabilities.resume } : {}),
       ...(cfg.capabilities?.usage ? { usage: { ...cfg.capabilities.usage } } : {}),
+      // Not declared unless the caller verified it (#184).
+      ...(cfg.capabilities?.mcp !== undefined ? { mcp: cfg.capabilities.mcp } : {}),
     },
   };
 }

@@ -49,16 +49,24 @@ function params<T>(schema: z.ZodType<T>, value: unknown): T {
   return parsed.data;
 }
 
+/** The methods a Mini-conductor serves the Conductor over its link (#24): reading and cancelling. */
+export const LINK_METHODS = ['ListTasks', 'GetTask', 'CancelTask'] as const;
+
+/** What the task methods need: the log and the Mini-conductor that acts on it. */
+export interface TaskMethodsOptions {
+  mini: Pick<MiniConductor, 'cancel'>;
+  store: EventStore;
+  /** The A2A `contextId` of every task: the repo's id (a standalone task has no wider context). */
+  contextId: string;
+}
+
 /**
- * The standalone Mini-conductor's control port (#201, ADR-003 §4): the A2A methods a Conductor
- * would call, served to the CLI over Tacet JSON-RPC (`startRpcServer`). `ListTasks` and `GetTask`
- * answer from the log as the running Mini-conductor sees it, with the status extension; `CancelTask`
- * and `SendMessage` (an answer to an open escalation, with the decision extension and its one-time
- * answer code, #269) act through the
- * Mini-conductor itself, so the log keeps one writer. Sub-tasks are not A2A tasks (ADR-003 §4);
- * new tasks over the port are not offered yet (`-32004`).
+ * `ListTasks`, `GetTask` and `CancelTask` (ADR-003 §4), as the control port serves them to the CLI
+ * and the Conductor link serves them to the Conductor (#24): answers from the log as the running
+ * Mini-conductor sees it, with the status extension; a cancel acts through the Mini-conductor, so
+ * the log keeps one writer. Sub-tasks are not A2A tasks.
  */
-export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer> {
+export function taskMethods(o: TaskMethodsOptions) {
   let cached: { count: number; state: TasksState } | undefined;
   const state = (): TasksState => {
     const count = o.store.count();
@@ -77,6 +85,62 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
     return e;
   };
 
+  // Context-free, so the control port and the Conductor link can both serve them.
+  const handlers: Record<(typeof LINK_METHODS)[number], (params: unknown) => unknown> = {
+    ListTasks: (p) => {
+      const req = params(A2AListTasksRequest, p);
+      // Every task here shares the one context.
+      const inContext = !req.contextId || req.contextId === o.contextId;
+      const all = entries().filter(
+        (e) => inContext && (!req.status || toA2AState(e.state) === req.status),
+      );
+      const size = req.pageSize ?? PAGE_SIZE;
+      const start = req.pageToken ? Number.parseInt(req.pageToken, 10) : 0;
+      if (!Number.isInteger(start) || start < 0 || String(start) !== (req.pageToken ?? '0')) {
+        throw new RpcError(-32602, 'invalid page token');
+      }
+      const page = all.slice(start, start + size);
+      return {
+        tasks: page.map((e) => toA2ATask(e, o.contextId, req.historyLength)),
+        ...(start + size < all.length ? { nextPageToken: String(start + size) } : {}),
+        pageSize: size,
+        totalSize: all.length,
+      };
+    },
+    GetTask: (p) => {
+      const req = params(A2AGetTaskRequest, p);
+      return toA2ATask(entry(req.id), o.contextId, req.historyLength);
+    },
+    CancelTask: async (p) => {
+      const req = params(A2ACancelTaskRequest, p);
+      if (DONE_STATES.has(entry(req.id).state)) {
+        throw new RpcError(A2A_ERRORS.taskNotCancelable, `task ${req.id} has already ended`);
+      }
+      try {
+        await o.mini.cancel(req.id);
+      } catch (err) {
+        // Ended meanwhile, or another reason the Mini-conductor gives: its message names ids only.
+        throw new RpcError(A2A_ERRORS.taskNotCancelable, (err as Error).message);
+      }
+      return toA2ATask(entry(req.id), o.contextId);
+    },
+  };
+  return { handlers, entry };
+}
+
+/**
+ * The standalone Mini-conductor's control port (#201, ADR-003 §4): the A2A methods a Conductor
+ * would call, served to the CLI over Tacet JSON-RPC (`startRpcServer`). `ListTasks` and `GetTask`
+ * answer from the log as the running Mini-conductor sees it, with the status extension; `CancelTask`
+ * and `SendMessage` (an answer to an open escalation, with the decision extension and its one-time
+ * answer code, #269) act through the
+ * Mini-conductor itself, so the log keeps one writer. Sub-tasks are not A2A tasks (ADR-003 §4);
+ * new tasks over the port are not offered yet (`-32004`). The read and cancel methods are
+ * `taskMethods`, shared with the Conductor link.
+ */
+export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer> {
+  const { handlers: read, entry } = taskMethods(o);
+
   return startRpcServer({
     token: o.token,
     // The CLI only: a Mini-conductor dials the Conductor, never another Mini-conductor.
@@ -88,43 +152,7 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
     serverInfo: o.serverInfo ?? { name: 'tacet-mini', version: '0.0.0' },
     ...(o.onError ? { onError: o.onError } : {}),
     handlers: {
-      ListTasks: (p) => {
-        const req = params(A2AListTasksRequest, p);
-        // Every task here shares the one context.
-        const inContext = !req.contextId || req.contextId === o.contextId;
-        const all = entries().filter(
-          (e) => inContext && (!req.status || toA2AState(e.state) === req.status),
-        );
-        const size = req.pageSize ?? PAGE_SIZE;
-        const start = req.pageToken ? Number.parseInt(req.pageToken, 10) : 0;
-        if (!Number.isInteger(start) || start < 0 || String(start) !== (req.pageToken ?? '0')) {
-          throw new RpcError(-32602, 'invalid page token');
-        }
-        const page = all.slice(start, start + size);
-        return {
-          tasks: page.map((e) => toA2ATask(e, o.contextId, req.historyLength)),
-          ...(start + size < all.length ? { nextPageToken: String(start + size) } : {}),
-          pageSize: size,
-          totalSize: all.length,
-        };
-      },
-      GetTask: (p) => {
-        const req = params(A2AGetTaskRequest, p);
-        return toA2ATask(entry(req.id), o.contextId, req.historyLength);
-      },
-      CancelTask: async (p) => {
-        const req = params(A2ACancelTaskRequest, p);
-        if (DONE_STATES.has(entry(req.id).state)) {
-          throw new RpcError(A2A_ERRORS.taskNotCancelable, `task ${req.id} has already ended`);
-        }
-        try {
-          await o.mini.cancel(req.id);
-        } catch (err) {
-          // Ended meanwhile, or another reason the Mini-conductor gives: its message names ids only.
-          throw new RpcError(A2A_ERRORS.taskNotCancelable, (err as Error).message);
-        }
-        return toA2ATask(entry(req.id), o.contextId);
-      },
+      ...read,
       SendMessage: (p) => {
         const { message } = params(A2ASendMessageRequest, p);
         if (!message.taskId) {

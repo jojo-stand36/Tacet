@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -11,6 +11,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Io } from './io.js';
 import { main } from './main.js';
+import { repoRootFrom } from './state.js';
 
 /** `tacet up` and `tacet conductor status` (#23). */
 describe('tacet up: the Conductor', () => {
@@ -68,8 +69,32 @@ describe('tacet up: the Conductor', () => {
     const plain = join(root, 'plain');
     mkdirSync(plain);
     const r = await tacet(['up', '--add', plain]);
+    // The repo is found by walking up to a `.git`, so a stray one above the temp dir (a `/tmp/.git`)
+    // makes `plain` part of it: then it is registered as that repo, which the output says.
+    const around = repoRootFrom(plain);
+    if (around === plain) {
+      expect(r.code).toBe(1);
+      expect(r.err).toContain('not a git repository');
+    } else {
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`(the repo containing ${plain})`);
+    }
+  });
+
+  it('does not take a sandbox placeholder skeleton above a directory for a repo (#326)', async (ctx) => {
+    // What the Claude Code sandbox plants at `.git`: config, hooks and info, but no HEAD.
+    const skel = join(root, 'skel');
+    mkdirSync(join(skel, '.git', 'info', '.claude-sandbox-noreplace'), { recursive: true });
+    mkdirSync(join(skel, '.git', 'hooks'));
+    writeFileSync(join(skel, '.git', 'config'), '');
+    const plain = join(skel, 'plain');
+    mkdirSync(plain);
+    const found = repoRootFrom(plain);
+    if (found !== plain) ctx.skip(`a parent directory of the temp dir is a git repo (${found})`);
+    const r = await tacet(['up', '--add', plain]);
     expect(r.code).toBe(1);
     expect(r.err).toContain('not a git repository');
+    expect((await status()).repos).toEqual([]);
   });
 
   it('refuses a mistyped path rather than register the repo around it, and both flags at once', async () => {

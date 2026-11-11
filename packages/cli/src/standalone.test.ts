@@ -16,7 +16,7 @@ import {
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { newUlid } from '@tacet/core';
 import {
@@ -32,6 +32,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SpawnDetached } from './commands/detach.js';
 import type { Io } from './io.js';
 import { main } from './main.js';
+import { repoRootFrom } from './state.js';
 
 /**
  * `tacet run / status / logs / attach` end to end (#21), with scripted Workers in real git
@@ -278,19 +279,23 @@ describe('tacet standalone (#21)', () => {
   });
 
   it('refuses a directory outside git before starting anything', async (ctx) => {
-    const plain = join(root, 'plain');
+    // A Claude Code sandbox skeleton (`.git` with config, hooks and info, no HEAD) above the
+    // directory does not make it a repo (#326).
+    const skel = join(root, 'skel');
+    mkdirSync(join(skel, '.git', 'info', '.claude-sandbox-noreplace'), { recursive: true });
+    mkdirSync(join(skel, '.git', 'hooks'));
+    writeFileSync(join(skel, '.git', 'config'), '');
+    const plain = join(skel, 'plain');
     mkdirSync(plain);
-    // `tacet run` finds the repo by walking up to a `.git`: a stray one above the temp dir (a
-    // `/tmp/.git` in some containers) makes every directory under it a repo, so there is no
-    // "outside git" to test there.
-    for (let d = dirname(plain); d !== dirname(d); d = dirname(d)) {
-      if (d !== repo && existsSync(join(d, '.git'))) {
-        ctx.skip(`a parent directory of the temp dir is a git repo (${d}/.git)`);
-      }
-    }
+    // `tacet run` finds the repo by walking up to a real checkout: one above the temp dir makes
+    // every directory under it a repo, so there is no "outside git" to test there.
+    const found = repoRootFrom(plain);
+    if (found !== plain) ctx.skip(`a parent directory of the temp dir is a git repo (${found})`);
     const r = await tacet(['run', ...user(), 'x'], { cwd: plain });
     expect(r.code).toBe(1);
     expect(r.err).toContain('not in a git repository');
+    expect(existsSync(join(plain, '.tacet'))).toBe(false);
+    expect(existsSync(join(skel, '.tacet'))).toBe(false);
   });
 
   it('warns, and still runs, when the repo is on a Windows drive inside WSL (#193)', async () => {
