@@ -1,6 +1,8 @@
 // Test only (#23): lets a child `node` process run the workspace's TypeScript sources, as Vitest
 // does, so the recovery tests can SIGKILL a real Conductor or Mini-conductor without a build.
-// Imports name `.js` files (ESM, NodeNext); the sources are `.ts`.
+// Node strips the types itself; this only maps the `.js` names imports use (ESM, NodeNext) to the
+// `.ts` sources. The child also needs `--conditions=@tacet/source`, so workspace packages resolve
+// to their sources.
 import { registerHooks } from 'node:module';
 
 registerHooks({

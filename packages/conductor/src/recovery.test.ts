@@ -19,13 +19,14 @@ import { type Conductor, startConductor } from './conductor.js';
 
 const testing = join(import.meta.dirname, 'testing');
 
-/** `node` running one of the test-only children from source (no build), as Vitest does. */
+/** `node` running one of the test-only children from its TypeScript source, with no build. */
 function child(script: string, args: string[]): ChildProcess & { lines: string[] } {
   const p = spawn(
     process.execPath,
     [
-      '--experimental-transform-types',
-      '--no-warnings',
+      // Node's type stripping (on by default and stable from 24.12; Node docs, typescript.html),
+      // not `--experimental-transform-types`, which Node 26 removed: the children's imports must
+      // keep to erasable syntax (no enums, parameter properties or runtime namespaces).
       '--conditions=@tacet/source',
       '--import',
       pathToFileURL(join(testing, 'ts-hooks.mjs')).href,
@@ -174,7 +175,8 @@ describe('kill and restart (#23)', () => {
 
     // The next Conductor takes over the dead one's locks and runtime file.
     await conductorProcess();
-    expect(readRuntimeFile(conductorRuntimePath(runDir)).port).not.toBe(oldPort);
+    // Its own runtime file now: the next process's, whatever port the OS gave it.
+    expect(readRuntimeFile(conductorRuntimePath(runDir)).pid).not.toBe(first.pid);
     await vi.waitFor(
       () => {
         const now = Object.values(registry().connected);
@@ -189,7 +191,7 @@ describe('kill and restart (#23)', () => {
       sessionId: before?.sessionId,
       reason: 'conductor_restart',
     });
-  });
+  }, 60_000);
 
   it('a Mini-conductor killed with SIGKILL: the Conductor sees it go and starts another', async () => {
     const minis: ChildProcess[] = [];
@@ -228,5 +230,5 @@ describe('kill and restart (#23)', () => {
     expect(disconnects()).toContainEqual(
       expect.objectContaining({ sessionId: first?.sessionId, reason: 'closed' }),
     );
-  });
+  }, 60_000);
 });

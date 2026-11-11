@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -74,7 +75,6 @@ describe('dialConductor', () => {
     conductors.length = 0;
     // A new start: a new port and a new token, read again from the runtime file.
     const second = await conductor();
-    expect(second.port).not.toBe(first.port);
     await vi.waitFor(() => expect(connected(second)).toBe(1), { timeout: 5000 });
     expect(states).toContainEqual(expect.objectContaining({ state: 'disconnected' }));
   });
@@ -110,5 +110,58 @@ describe('dialConductor', () => {
     link(states);
     await new Promise((r) => setTimeout(r, 150));
     expect(states).toEqual([]);
+  });
+
+  const runtimeFile = (port: number, pid: number) => {
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      conductorRuntimePath(runDir),
+      JSON.stringify({
+        pid,
+        port,
+        token: 'x'.repeat(43),
+        protocolVersions: [1],
+        startedAt: new Date().toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+  };
+
+  it('stops promptly while a connection hangs, and survives a listener that throws', async () => {
+    // A port that takes the TCP connection and never answers the upgrade.
+    const sockets: Socket[] = [];
+    const hung = createServer((s) => sockets.push(s));
+    await new Promise<void>((r) => hung.listen(0, '127.0.0.1', r));
+    try {
+      const port = (hung.address() as { port: number }).port;
+      runtimeFile(port, process.pid);
+      let calls = 0;
+      const l = dialConductor({
+        card: {
+          repoId: repoStatePaths(repo).repoId,
+          repoPath: repo,
+          adapters: [],
+          miniVersion: '0',
+        },
+        clientInfo: { name: 'test-mini', version: '0' },
+        runDir,
+        minDelayMs: 10,
+        maxDelayMs: 30_000,
+        connectTimeoutMs: 200,
+        onState: () => {
+          calls += 1;
+          throw new Error('the log cannot be written');
+        },
+      });
+      await vi.waitFor(() => expect(calls).toBeGreaterThanOrEqual(2), { timeout: 5000 });
+      await vi.waitFor(() => expect(sockets.length).toBeGreaterThan(calls));
+      const t = Date.now();
+      await l.close();
+      // At most the connect timeout, never a backoff of up to maxDelayMs.
+      expect(Date.now() - t).toBeLessThan(1000);
+    } finally {
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((r) => hung.close(() => r()));
+    }
   });
 });

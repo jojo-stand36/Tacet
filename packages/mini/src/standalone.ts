@@ -68,7 +68,9 @@ export interface StandaloneOptions {
    * included, shows in `tacet conductor status`. No Conductor running is the normal standalone
    * case and changes nothing. `false` for tests that must not reach a Conductor.
    */
-  conductor?: false | { onState?: (s: ConductorLinkState) => void; minDelayMs?: number };
+  conductor?:
+    | false
+    | { onState?: (s: ConductorLinkState) => void; minDelayMs?: number; settleMs?: number };
 }
 
 /** A running standalone Mini-conductor and what it owns. */
@@ -235,6 +237,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
         clientInfo: { name: 'tacet-mini', version: MINI_VERSION },
         runDir: o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
         ...(o.conductor?.minDelayMs !== undefined ? { minDelayMs: o.conductor.minDelayMs } : {}),
+        ...(o.conductor?.settleMs !== undefined ? { settleMs: o.conductor.settleMs } : {}),
         ...(o.conductor?.onState ? { onState: o.conductor.onState } : {}),
       });
     }

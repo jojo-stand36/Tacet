@@ -61,7 +61,7 @@ describe('tacet mini and conductor.autostart', () => {
             authRoute: 'api_key',
           },
         },
-        conductor: { minDelayMs: 20 },
+        conductor: { minDelayMs: 20, settleMs: 50 },
       },
       ...more,
     });
@@ -140,10 +140,13 @@ describe('tacet mini and conductor.autostart', () => {
     );
     // It serves its control port, as a run does.
     expect(existsSync(miniRuntimePath(repo, join(home, '.tacet', 'run')))).toBe(true);
+    // Past the link's settle time, so it has said so.
+    await new Promise((r) => setTimeout(r, 200));
     stopMini.abort();
     const m = await mini;
     expect(m.code).toBe(MINI_EXIT.stopped);
     expect(m.err).toContain('Mini-conductor running for');
+    expect(m.err).toContain('connected to the Conductor');
     await vi.waitFor(async () =>
       expect((await status()).repos[0]).toMatchObject({ connected: false }),
     );

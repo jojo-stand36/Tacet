@@ -32,13 +32,15 @@ export interface DialConductorOptions {
    * Conductor's 2 s probe of a duplicate. Default 2500.
    */
   settleMs?: number;
+  /** Milliseconds for the connection and hello. Default 5000. */
+  connectTimeoutMs?: number;
   onState?: (s: ConductorLinkState) => void;
   /** For tests: 0 ≤ x < 1. Default `Math.random`. */
   random?: () => number;
 }
 
 export interface ConductorLink {
-  /** The live connection, if there is one now. */
+  /** The live connection, once it has outlived the Conductor's duplicate probe. */
   current(): RpcClient | undefined;
   /** Stop dialing and close the connection. */
   close(): Promise<void>;
@@ -60,11 +62,24 @@ export function dialConductor(o: DialConductorOptions): ConductorLink {
   const random = o.random ?? Math.random;
   let stopped = false;
   let client: RpcClient | undefined;
+  /** The connection, once it has outlived the probe: not before (a hello is not acceptance). */
+  let settled: RpcClient | undefined;
   let wake: (() => void) | undefined;
   let timer: NodeJS.Timeout | undefined;
 
+  /** Never throws: a failing listener (a log that cannot be written) must not end the loop. */
+  const tell = (s: ConductorLinkState) => {
+    if (stopped) return;
+    try {
+      o.onState?.(s);
+    } catch {
+      // Reported nowhere: the listener itself is what failed.
+    }
+  };
+
   const sleep = (ms: number) =>
     new Promise<void>((resolve) => {
+      if (stopped) return resolve();
       wake = resolve;
       timer = setTimeout(resolve, ms);
       timer.unref();
@@ -102,9 +117,12 @@ export function dialConductor(o: DialConductorOptions): ConductorLink {
           role: 'mini',
           card: o.card,
           silenceTimeoutMs: o.silenceTimeoutMs ?? 30_000,
+          // Bounds how long a close waits on a Conductor that accepts and never answers.
+          timeoutMs: o.connectTimeoutMs ?? 5000,
         });
       } catch (err) {
-        if (!stopped) o.onState?.({ state: 'failed', message: (err as Error).message });
+        if (stopped) break;
+        tell({ state: 'failed', message: (err as Error).message });
         await backoff();
         continue;
       }
@@ -114,26 +132,31 @@ export function dialConductor(o: DialConductorOptions): ConductorLink {
         break;
       }
       const reported = { yes: false };
+      // A 4409 or 1008 comes within the Conductor's 2 s probe (per repo, one hello at a time; with
+      // several dialers it can come later, and is then reported as a disconnect, which is harmless).
       const settle = setTimeout(() => {
         reported.yes = true;
+        settled = c;
         delay = min;
-        o.onState?.({ state: 'connected', sessionId: c.hello.sessionId });
+        tell({ state: 'connected', sessionId: c.hello.sessionId });
       }, o.settleMs ?? 2500);
       settle.unref();
       const { code } = await c.closed;
       clearTimeout(settle);
       client = undefined;
+      settled = undefined;
       if (stopped) break;
-      if (code === CLOSE_CONFLICT) o.onState?.({ state: 'refused', code });
-      else if (reported.yes) o.onState?.({ state: 'disconnected', code });
-      else o.onState?.({ state: 'failed', message: `closed at once (${code})` });
+      if (code === CLOSE_CONFLICT) tell({ state: 'refused', code });
+      else if (reported.yes) tell({ state: 'disconnected', code });
+      else tell({ state: 'failed', message: `closed at once (${code})` });
       await backoff();
     }
   };
-  const done = loop();
+  // The loop catches what it can; anything else must not become an unhandled rejection.
+  const done = loop().catch(() => {});
 
   return {
-    current: () => client,
+    current: () => settled,
     close: async () => {
       stopped = true;
       wake?.();

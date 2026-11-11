@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
 import type { Io } from '../io.js';
 import { terminalSafe } from '../render.js';
 import { DONE_STATES, openLog, readState, repoRootFrom, rootTasks, statePaths } from '../state.js';
@@ -14,7 +15,12 @@ export interface MiniOptions {
  * the repo has tasks only the user may resume (`tacet run --resume`), never an auto-started
  * Mini-conductor (owner decision on #23, until #24 and #26).
  */
-export const MINI_EXIT = { stopped: 0, failed: 1, usage: 2, unfinished: 4 } as const;
+export const MINI_EXIT = {
+  stopped: 0,
+  failed: 1,
+  usage: 2,
+  unfinished: MINI_EXIT_UNFINISHED,
+} as const;
 
 /**
  * `tacet mini` (#23): a Mini-conductor for one repo that takes no task of its own. It holds the
@@ -59,15 +65,20 @@ export async function mini(io: Io, o: MiniOptions): Promise<number> {
       ...(io.env ? { baseEnv: io.env } : {}),
       ...(io.home ? { home: io.home } : {}),
       onError: (m) => io.err(`mini: ${terminalSafe(m)}`),
-      conductor: {
-        onState: (s) => {
-          if (s.state === 'connected') io.err('connected to the Conductor');
-          else if (s.state === 'refused')
-            io.err('the Conductor has another Mini-conductor for this repo');
-          else if (s.state === 'disconnected') io.err('lost the Conductor; dialing again');
-        },
-      },
       ...io.standalone,
+      // Tests may tune the link; its states are reported here either way.
+      conductor:
+        io.standalone?.conductor === false
+          ? false
+          : {
+              ...io.standalone?.conductor,
+              onState: (s) => {
+                if (s.state === 'connected') io.err('connected to the Conductor');
+                else if (s.state === 'refused')
+                  io.err('the Conductor has another Mini-conductor for this repo');
+                else if (s.state === 'disconnected') io.err('lost the Conductor; dialing again');
+              },
+            },
     });
   } catch (err) {
     io.err(terminalSafe(err instanceof Error ? err.message : String(err)));

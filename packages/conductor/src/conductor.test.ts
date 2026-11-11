@@ -349,5 +349,21 @@ describe('the Conductor daemon (#23)', () => {
       expect(minis.started).toHaveLength(3);
       expect(notices.at(-1)).toMatch(/unfinished tasks: not started again/);
     });
+
+    it('tries again once the user has resumed the tasks, which connects a Mini-conductor', async () => {
+      const api = repo('api');
+      register(api);
+      const minis = fakeMinis();
+      const c = await start({ autostart: minis.options() });
+      await vi.waitFor(() => expect(minis.started).toHaveLength(1));
+      minis.started[0]?.exit(MINI_EXIT_UNFINISHED);
+      await new Promise((r) => setTimeout(r, 150));
+      expect(minis.started).toHaveLength(1);
+      // `tacet run --resume` dials in, finishes, and goes.
+      const run = await dial(c, api);
+      await vi.waitFor(() => expect(Object.keys(c.registry().connected)).toHaveLength(1));
+      await run.close();
+      await vi.waitFor(() => expect(minis.started).toHaveLength(2));
+    });
   });
 });

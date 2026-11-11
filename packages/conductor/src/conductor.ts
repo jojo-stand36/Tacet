@@ -46,8 +46,9 @@ export interface StartConductorOptions {
   autostart?: AutostartOptions;
 }
 
-/** Exit code of `tacet mini` when the repo has unfinished tasks: never started again (#23). */
-export const MINI_EXIT_UNFINISHED = 4;
+export { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
+
+import { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
 
 /** A Mini-conductor process the Conductor started. */
 export interface SpawnedMini {
@@ -342,7 +343,11 @@ interface RepoStart {
   /** Not before this time (ms), after one ended. */
   nextAt: number;
   delay: number;
-  /** It refused for unfinished tasks: never again, until the user resumes them (#23). */
+  /**
+   * It refused for unfinished tasks (#23): not started again until a Mini-conductor of the repo
+   * connects, which is the user resuming them (`tacet run --resume` dials in too). If tasks are
+   * still unfinished then, the next start refuses again.
+   */
   gaveUp: boolean;
 }
 
@@ -384,7 +389,7 @@ function autostarter(
           if (code === MINI_EXIT_UNFINISHED) {
             s.gaveUp = true;
             notice(
-              `${repo.repoPath} has unfinished tasks: not started again; resume them with tacet run --resume`,
+              `${repo.repoPath} has unfinished tasks: not started again until they are resumed with tacet run --resume`,
             );
             return;
           }
@@ -403,10 +408,15 @@ function autostarter(
   timer.unref();
   queueMicrotask(tick);
   return {
-    /** A Mini-conductor of the repo is connected: its next restart starts from the first backoff. */
+    /**
+     * A Mini-conductor of the repo is connected: its next restart starts from the first backoff,
+     * and one that refused for unfinished tasks may be tried again once this one is gone.
+     */
     connected(repoId: string) {
       const s = starts.get(repoId);
-      if (s) s.delay = base;
+      if (!s) return;
+      s.delay = base;
+      s.gaveUp = false;
     },
     stop() {
       stopped = true;
