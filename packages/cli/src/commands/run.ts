@@ -7,6 +7,7 @@ import type { Io } from '../io.js';
 import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
 import {
   DONE_STATES,
+  isGitCheckout,
   isSubtaskOf,
   pendingEscalations,
   readState,
@@ -58,7 +59,7 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
   }
 
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
-  if (!existsSync(join(repoRoot, '.git'))) {
+  if (!isGitCheckout(repoRoot)) {
     io.err(`${terminalSafe(repoRoot)} is not in a git repository: Tacet works on a git repo`);
     return EXIT.failed;
   }

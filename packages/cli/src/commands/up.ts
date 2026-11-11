@@ -25,7 +25,7 @@ import {
 } from '@tacet/core/node';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
-import { repoRootFrom } from '../state.js';
+import { isGitCheckout, repoRootFrom } from '../state.js';
 import { spawnDetachedWith } from './detach.js';
 
 export interface UpOptions {
@@ -143,7 +143,7 @@ async function register(
     return 1;
   }
   const root = repoRootFrom(given);
-  if (!existsSync(join(root, '.git'))) {
+  if (!isGitCheckout(root)) {
     io.err(`not a git repository: ${terminalSafe(path)}`);
     return 1;
   }

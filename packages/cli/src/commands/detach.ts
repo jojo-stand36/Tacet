@@ -1,20 +1,13 @@
 import { spawn } from 'node:child_process';
-import {
-  chmodSync,
-  closeSync,
-  constants,
-  existsSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-} from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, closeSync, constants, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { readRuntimeFile } from '@tacet/core/node';
 import { liveControl, liveStatus, runtimeFileFor } from '../control.js';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
 import {
   DONE_STATES,
+  isGitCheckout,
   openLog,
   readState,
   repoRootFrom,
@@ -117,7 +110,7 @@ export function detachedLogFor(io: Io, repoRoot: string): string {
  */
 export async function detach(io: Io, goal: string | undefined, o: RunOptions): Promise<number> {
   const repoRoot = repoRootFrom(o.repo ?? io.cwd);
-  if (!existsSync(join(repoRoot, '.git'))) {
+  if (!isGitCheckout(repoRoot)) {
     io.err(`${terminalSafe(repoRoot)} is not in a git repository: Tacet works on a git repo`);
     return 1;
   }
