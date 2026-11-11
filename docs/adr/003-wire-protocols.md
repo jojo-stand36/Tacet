@@ -299,3 +299,17 @@ Within that, it drops:
 - SOS and PM.
 
 iTerm2's other keys, inline images among them, and kitty's APC graphics pass. The facts are in capability matrix §5b. It assumes the user's terminal decodes UTF-8, and it keeps a Worker from switching it away (`ESC % @`). Attach sends `ESC \` when it ends, to close a string a Worker left open. ASCII-only text is what makes it safe under GNU screen, which keeps only the low byte of each title character and re-sends the title to the outer terminal. Known risks: GNU screen's behaviour was modelled from its source, never run. The filter has been tested against xterm.js and against models of kitty, tmux, iTerm2 and screen, never against those terminals themselves. Real-terminal testing, and restoring non-ASCII titles safely, are #311.
+
+### Addendum (2026-11-11): Workers without an MCP client (#184)
+
+Status of this addendum: **proposed**. The owner decided the direction on #184 (option (a), relayed by the coordinator): Gemini Workers run without the Mini-conductor's MCP tools, escalation goes through ACP permission requests only, and the checkout stays untrusted. The mechanism below awaits approval.
+
+§6 assumes every Worker reaches the Mini-conductor through its MCP tools. Gemini CLI in an untrusted checkout never starts the MCP servers it is passed (capability matrix §5, #184), and a generic PTY CLI has no way to take them. So:
+
+1. **A capability, not a list of adapters.** `AdapterCapabilities.mcp` (`@tacet/core`) says whether an adapter connects `SessionOptions.mcpServers`. One that declares `false` refuses them rather than drop them, and the conformance bench checks this (probe `mcp`, P0).
+2. **No tools, no token.** For a Worker whose adapter declares `mcp: false`, the Mini-conductor mints no Worker token and passes no server. Its system prompt names no Tacet tool: blocked on a decision or a refused tool, it ends its turn saying what it needs. Refusal and answer messages say the same, and a handoff packet goes into its first message instead of `read_task`.
+3. **Approval requests are its only channel.** Such a Worker must have round-trip approvals; one with neither (a generic PTY CLI) is refused at start. Each approval request is still decided at once by the tool policy, never held open for a person: that would be the blocking `escalate` §6 rejects.
+4. **The Mini-conductor escalates for it.** A turn of such a Worker that had at least one refused request, and ended with no commit and no change, on an `implement` sub-task, makes the Mini-conductor raise an Escalation itself. It has category `blocked` and names the refused tools and the end of the Worker's last message, redacted. The session is kept, and the answer is its next message, as for `escalate`. Any other turn goes through verification as before.
+
+Gemini Workers cannot change code until a tool policy covers Gemini's tool names (#25), since every request but Claude's file tools is refused today. Until then their `implement` turns end in this escalation. MCP-only folder trust is asked of gemini-cli upstream (draft on #184).
+
