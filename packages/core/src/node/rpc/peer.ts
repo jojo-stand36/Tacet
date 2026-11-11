@@ -31,26 +31,32 @@ export class RpcCallError extends Error {
 /** A parsed frame: a request or notification (with `method`), or a response (without). */
 export type RpcFrame = Record<string, unknown>;
 
-/** Parse one text frame; undefined when it is not a JSON object. */
-export function parseFrame(data: RawData | string): RpcFrame | undefined {
+/**
+ * Parse one text frame: an object, `'parse'` when it is not JSON (`-32700`), or `'invalid'` when
+ * it is JSON but not an object, such as a batch (`-32600`; Tacet sends no batches).
+ */
+export function parseFrame(data: RawData | string): RpcFrame | 'parse' | 'invalid' {
   let msg: unknown;
   try {
     msg = JSON.parse(typeof data === 'string' ? data : data.toString('utf8'));
   } catch {
-    return undefined;
+    return 'parse';
   }
   return typeof msg === 'object' && msg !== null && !Array.isArray(msg)
     ? (msg as RpcFrame)
-    : undefined;
+    : 'invalid';
 }
 
-/** A response to a request: no `method`, an id, and a result or an error. */
+/**
+ * A response: no `method`, and a result or an error, with an id (`null` only on an error the peer
+ * could not tie to a request, such as its own parse error). Never answered.
+ */
 export function isResponse(msg: RpcFrame): boolean {
-  return (
-    msg.method === undefined &&
-    (typeof msg.id === 'string' || typeof msg.id === 'number') &&
-    ('result' in msg || 'error' in msg)
-  );
+  if (msg.method !== undefined) return false;
+  if (typeof msg.id === 'string' || typeof msg.id === 'number') {
+    return 'result' in msg || 'error' in msg;
+  }
+  return msg.id === null && 'error' in msg;
 }
 
 /** Requests this side sent and waits on. */
@@ -136,9 +142,10 @@ export interface IncomingOptions<C> {
   /** Requests in flight at once; more get `-32000`. Default 32. */
   maxInFlight?: number;
   /**
-   * Notifications queued at once. They run one at a time, in order, and are never refused (a
-   * notification has no answer, so a refusal would lose it): past this, the socket stops being
-   * read until the queue drains. Default 16.
+   * Notifications queued at once. They run one at a time, in order, and are never answered. A
+   * peer past this is closed (1008): refusing one would lose it silently, and pausing the socket
+   * would also stop pongs and close frames, so a busy peer would look dead. A sender keeps its own
+   * backpressure and resumes from its cursor after a reconnect. Default 64.
    */
   maxQueued?: number;
   /** Methods never served here, e.g. `tacet/hello` after the hello. */
@@ -149,7 +156,9 @@ export interface IncomingOptions<C> {
 
 /**
  * Requests and notifications the peer sends. Requests run concurrently up to `maxInFlight`;
- * notifications run serially, and reading pauses while too many wait (backpressure, never loss).
+ * notifications run serially, in order, up to `maxQueued` waiting. A request may overtake an
+ * earlier notification. Notification handlers should be quick and must not wait on a call to the
+ * peer whose answer would queue behind them.
  */
 export function incoming<C>(ws: WebSocket, o: IncomingOptions<C>) {
   let inFlight = 0;
@@ -184,14 +193,21 @@ export function incoming<C>(ws: WebSocket, o: IncomingOptions<C>) {
 
   return {
     /** Handle one frame that is not a response. */
-    handle(msg: RpcFrame | undefined): void {
-      if (!msg) {
+    handle(msg: RpcFrame | 'parse' | 'invalid'): void {
+      if (msg === 'parse') {
         send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } });
         return;
       }
+      if (msg === 'invalid') {
+        send({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'invalid request' } });
+        return;
+      }
       if (msg.id === undefined) {
+        if (queued >= (o.maxQueued ?? 64)) {
+          ws.close(1008, 'too many notifications');
+          return;
+        }
         queued++;
-        if (queued >= (o.maxQueued ?? 16)) ws.pause();
         chain = chain
           .then(() => run(msg))
           .then(
@@ -200,7 +216,6 @@ export function incoming<C>(ws: WebSocket, o: IncomingOptions<C>) {
           )
           .finally(() => {
             queued--;
-            if (ws.isPaused && queued < (o.maxQueued ?? 16)) ws.resume();
           });
         return;
       }

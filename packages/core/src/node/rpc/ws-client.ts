@@ -1,18 +1,22 @@
 import { WebSocket } from 'ws';
 import { HelloResult } from '../../schema/hello.js';
 import type { Secret } from '../auth/secret.js';
-import { incoming, isResponse, outgoing, type PeerHandler, parseFrame } from './peer.js';
+import {
+  incoming,
+  isResponse,
+  outgoing,
+  type PeerHandler,
+  parseFrame,
+  RpcCallError,
+} from './peer.js';
 
 /** An error answer from the server, or a failure to reach it. Never carries the token. */
-export class RpcClientError extends Error {
+export class RpcClientError extends RpcCallError {
   override name = 'RpcClientError';
-  /** The JSON-RPC error code, when the server answered with one. */
-  readonly code: number | undefined;
   /** The HTTP status the server refused the upgrade with, if it did. */
   readonly httpStatus: number | undefined;
   constructor(message: string, code?: number, httpStatus?: number) {
-    super(message);
-    this.code = code;
+    super(message, code);
     this.httpStatus = httpStatus;
   }
 }
@@ -95,7 +99,7 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
   ws.on('message', (data, isBinary) => {
     if (isBinary) return;
     const msg = parseFrame(data);
-    if (!msg) return;
+    if (typeof msg === 'string') return;
     if (isResponse(msg)) {
       out.settle(msg);
       return;
@@ -105,6 +109,8 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
       // held until then, in order (a few at most; the server sends after the hello).
       if (peer) peer.handle(msg);
       else if (early.length < 64) early.push(msg);
+      // Never dropped quietly: a server that floods before the hello is done is closed.
+      else ws.close(1008, 'too many requests before the hello');
     }
   });
   const closed = new Promise<{ code: number; reason: string }>((resolve) => {
@@ -152,7 +158,9 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
       ctx,
       ...(o.maxInFlight !== undefined ? { maxInFlight: o.maxInFlight } : {}),
       reserved: ['tacet/hello'],
-      ...(o.onError ? { report: (e: unknown) => o.onError?.((e as Error).message) } : {}),
+      ...(o.onError
+        ? { report: (e: unknown) => o.onError?.(e instanceof Error ? e.message : String(e)) }
+        : {}),
     });
     for (const msg of early.splice(0)) peer.handle(msg);
     return {

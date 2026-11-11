@@ -39,8 +39,8 @@ export interface RpcServerOptions {
   /** Requests one socket may have in flight; more get `-32000`. Default 32. */
   maxInFlight?: number;
   /**
-   * Notifications one socket may have queued; past this its reads pause until they drain (never
-   * an answer, never a drop). Default 16.
+   * Notifications one socket may have queued; a peer past this is closed (1008), never answered
+   * and never silently dropped. Default 64.
    */
   maxQueued?: number;
   /**
@@ -253,7 +253,7 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
       const msg = parseFrame(data);
       // An answer to a request this side sent: matched by id, never dispatched. One that answers
       // nothing of ours is dropped (JSON-RPC never answers a response).
-      if (msg && isResponse(msg)) {
+      if (typeof msg !== 'string' && isResponse(msg)) {
         out.settle(msg);
         return;
       }

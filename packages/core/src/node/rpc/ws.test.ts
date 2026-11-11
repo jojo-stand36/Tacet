@@ -534,6 +534,7 @@ describe('both directions on one socket (#24, ADR-003 §4)', () => {
     onConn?: (c: Conn) => void,
   ) => {
     const conns: Conn[] = [];
+    const clientErrors: string[] = [];
     const { server, token, errors } = await serve(randomToken(), {
       onConnection: (c) => {
         conns.push(c);
@@ -548,9 +549,10 @@ describe('both directions on one socket (#24, ADR-003 §4)', () => {
       timeoutMs: 5000,
       ...(handlers ? { handlers } : {}),
       capabilities: { methods: Object.keys(handlers ?? {}) },
+      onError: (m) => clientErrors.push(m),
     });
     await vi.waitFor(() => expect(conns).toHaveLength(1));
-    return { c, conn: conns[0] as Conn, server, token, errors };
+    return { c, conn: conns[0] as Conn, server, token, errors, clientErrors };
   };
 
   it('lets the server call the client while the client calls the server', async () => {
@@ -570,8 +572,7 @@ describe('both directions on one socket (#24, ADR-003 §4)', () => {
   });
 
   it("answers the server with the client's errors, never its internals", async () => {
-    const errors: string[] = [];
-    const { conn, c } = await pair({
+    const { conn, c, clientErrors } = await pair({
       refuse: () => {
         throw new RpcError(-32001, 'task not found');
       },
@@ -583,13 +584,13 @@ describe('both directions on one socket (#24, ADR-003 §4)', () => {
       code: -32001,
       message: 'task not found',
     });
-    await expect(conn.call('boom')).rejects.toMatchObject({
-      code: -32603,
-      message: 'internal error',
-    });
+    const boom = await conn.call('boom').catch((e: unknown) => e);
+    expect(boom).toMatchObject({ code: -32603, message: 'internal error' });
+    // Reported where it happened, by message; the server never sees the path.
+    expect(clientErrors).toEqual(['/private/path in a message']);
+    expect(String((boom as Error).message)).not.toContain('/private');
     await expect(conn.call('SendMessage')).rejects.toMatchObject({ code: -32601 });
     await expect(conn.call('tacet/hello')).rejects.toMatchObject({ code: -32600 });
-    expect(errors).toEqual([]);
     await c.close();
   });
 
@@ -633,24 +634,67 @@ describe('both directions on one socket (#24, ADR-003 §4)', () => {
     ws.close();
   });
 
-  it('runs notifications in order and never answers or drops one, however many come', async () => {
+  /** A raw socket past its hello, collecting every frame the server sends. */
+  const helloed = async (extra: Partial<Parameters<typeof startRpcServer>[0]>) => {
+    const { server, token } = await serve(randomToken(), extra);
+    const ws = await rawSocket(server.port, token);
+    const got: unknown[] = [];
+    const done = new Promise<number>((r) => ws.once('close', (code) => r(code)));
+    ws.on('message', (d) => got.push(JSON.parse(d.toString())));
+    ws.send(hello());
+    await vi.waitFor(() => expect(got).toHaveLength(1));
+    got.length = 0;
+    return { ws, got, done };
+  };
+
+  it('runs notifications in order, and never answers one', async () => {
     const seen: number[] = [];
-    const { server, token } = await serve(randomToken(), {
-      maxQueued: 2,
-      maxInFlight: 1,
+    const { ws, got } = await helloed({
+      maxQueued: 50,
       handlers: {
+        echo: (p) => p,
         'tacet/event': async (p) => {
-          await new Promise((r) => setTimeout(r, 2));
+          await new Promise((r) => setTimeout(r, 1));
           seen.push((p as { n: number }).n);
         },
       },
     });
-    const c = await client(server.port, token);
-    for (let n = 0; n < 40; n++) await c.notify('tacet/event', { n });
+    // One burst, then a request: the request's answer is the only frame that comes back.
+    for (let n = 0; n < 40; n++) {
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'tacet/event', params: { n } }));
+    }
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'echo', params: 'done' }));
     await vi.waitFor(() => expect(seen).toHaveLength(40), { timeout: 5000 });
     expect(seen).toEqual([...Array(40).keys()]);
-    // The reads resumed: a request still gets through.
-    expect(await c.call('tacet/event', { n: 99 })).toBeNull();
-    await c.close();
+    expect(got).toEqual([{ jsonrpc: '2.0', id: 7, result: 'done' }]);
+    ws.close();
+  });
+
+  it('closes a peer that queues more notifications than it may, rather than drop one', async () => {
+    const { ws, done } = await helloed({
+      maxQueued: 2,
+      handlers: { 'tacet/event': () => new Promise(() => {}) },
+    });
+    for (let n = 0; n < 5; n++) {
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'tacet/event', params: { n } }));
+    }
+    expect(await done).toBe(1008);
+  });
+
+  it('answers JSON that is not a request -32600, and what is not JSON -32700', async () => {
+    const { ws, got } = await helloed({});
+    ws.send('[]');
+    ws.send('5');
+    ws.send('{not json');
+    await vi.waitFor(() => expect(got).toHaveLength(3));
+    expect(got.map((m) => (m as { error: { code: number } }).error.code)).toEqual([
+      -32600, -32600, -32700,
+    ]);
+    // An error answer the peer could not tie to a request is a response: never answered.
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'x' } }));
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'echo', params: 'still here' }));
+    await vi.waitFor(() => expect(got).toHaveLength(4));
+    expect(got[3]).toEqual({ jsonrpc: '2.0', id: 8, result: 'still here' });
+    ws.close();
   });
 });

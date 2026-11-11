@@ -479,6 +479,8 @@ function miniLink(conn: RpcConnection): MiniLink {
         }),
         'GetTask',
       ),
-    cancelTask: async (id) => parse(A2ATask, await conn.call('CancelTask', { id }), 'CancelTask'),
+    // A cancel ends the task's Worker sessions first, which can take a while.
+    cancelTask: async (id) =>
+      parse(A2ATask, await conn.call('CancelTask', { id }, { timeoutMs: 60_000 }), 'CancelTask'),
   };
 }
