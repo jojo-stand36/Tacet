@@ -1,6 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { newUlid, type SummaryPacket, type TacetConfig, type TaskLanded } from '@tacet/core';
@@ -10,7 +18,7 @@ import { GitIntegrator } from '../git/integrate.js';
 import { CheckoutPlanner } from '../standalone.js';
 import { CommandVerifier } from '../verify/command-verifier.js';
 import { WorktreeManager } from '../worktree.js';
-import { MiniConductor } from './daemon.js';
+import { cancelStopped, MiniConductor } from './daemon.js';
 import { SingleStepPlanner } from './planner.js';
 import type { Planner, Workspaces } from './ports.js';
 import { type Script, ScriptedAdapter } from './testing.js';
@@ -1107,6 +1115,104 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       await severalSweeps();
       expect(state(id)).not.toBe('completed');
       expect(pinOf(id)).toBe(head);
+    });
+  });
+
+  describe("canceling while no run is live clears a crashed Claude session's placeholders (#304)", () => {
+    /** A Claude session on `<id>/1` in `checkout`, whose end was never recorded (a crash). */
+    function crashedClaudeSession(id: string, checkout: { id: string; baseCommit: string }) {
+      const envelope = (taskId: string, type: string, data: unknown, sessionId?: string) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId,
+        ...(sessionId ? { sessionId } : {}),
+        type,
+        data,
+      });
+      const created = (taskId: string, parentId?: string) =>
+        envelope(taskId, 'task.created', {
+          id: taskId,
+          ...(parentId ? { parentId } : {}),
+          goal: 'g',
+          acceptanceCriteria: ['ok'],
+          priority: 'p2',
+          createdAt: new Date().toISOString(),
+        });
+      store.append([
+        created(id),
+        created(`${id}/1`, id),
+        envelope(
+          `${id}/1`,
+          'worker.started',
+          {
+            sessionId: `s-${id}`,
+            adapter: 'claude-sdk',
+            workspaceId: checkout.id,
+            baseCommit: checkout.baseCommit,
+          },
+          `s-${id}`,
+        ),
+      ]);
+    }
+    const placeholders = (integrator = new GitIntegrator(repo, env)) => ({
+      workspaces: manager,
+      integrator,
+    });
+
+    it('removes them, and nothing else, then records the cancel', async () => {
+      // A placeholder name the base commit tracks is the repo's own file: never removed.
+      writeFileSync(join(repo, '.npmrc'), '');
+      git(repo, ['add', '.npmrc']);
+      git(repo, ['commit', '-qm', 'npmrc']);
+      const checkout = await manager.create('crashed');
+      for (const f of ['.env', 'package.json']) writeFileSync(join(checkout.path, f), '');
+      mkdirSync(join(checkout.path, 'node_modules'));
+      // Not empty, or not a placeholder: the Worker's, kept.
+      writeFileSync(join(checkout.path, '.env.local'), 'SECRET_NAME=1\n');
+      writeFileSync(join(checkout.path, 'empty-note.txt'), '');
+      crashedClaudeSession('t1', checkout);
+
+      const { canceled, errors } = await cancelStopped('t1', {
+        store,
+        lockPath: join(root, 'mini.lock'),
+        placeholders: placeholders(),
+      });
+      expect(errors).toEqual([]);
+      expect(canceled).toEqual(['t1/1', 't1']);
+      for (const gone of ['.env', 'package.json', 'node_modules']) {
+        expect(existsSync(join(checkout.path, gone)), gone).toBe(false);
+      }
+      for (const kept of ['.npmrc', '.env.local', 'empty-note.txt', 'README']) {
+        expect(existsSync(join(checkout.path, kept)), kept).toBe(true);
+      }
+      const ended = store
+        .query({ typePrefix: 'worker.ended' })
+        .map((e) => e.envelope.data as { sessionId: string; reason: string });
+      expect(ended).toEqual([expect.objectContaining({ sessionId: 's-t1', reason: 'canceled' })]);
+    });
+
+    it('still cancels when the checkout cannot be read, and says why', async () => {
+      const checkout = await manager.create('unreadable');
+      writeFileSync(join(checkout.path, '.env'), '');
+      crashedClaudeSession('t2', checkout);
+      class Unreadable extends GitIntegrator {
+        override async tracked(): Promise<never> {
+          throw new Error('cannot list the checkout');
+        }
+      }
+      const { canceled, errors } = await cancelStopped('t2', {
+        store,
+        lockPath: join(root, 'mini.lock'),
+        placeholders: placeholders(new Unreadable(repo, env)),
+      });
+      expect(canceled).toEqual(['t2/1', 't2']);
+      expect(errors.map((e) => (e as Error).message)).toEqual([
+        expect.stringContaining('cannot list the checkout'),
+      ]);
+      // Not removed when what the checkout had to begin with cannot be told.
+      expect(existsSync(join(checkout.path, '.env'))).toBe(true);
     });
   });
 });

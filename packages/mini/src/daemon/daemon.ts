@@ -2569,22 +2569,18 @@ export class MiniConductor {
    * or directory (`removeSandboxPlaceholders`), as the adapter's close would have.
    */
   async #removeCrashPlaceholders(): Promise<void> {
-    const tracked = this.#o.integrator?.tracked?.bind(this.#o.integrator);
-    if (!tracked) return;
-    for (const s of this.#state().sessions.values()) {
-      if (s.ended !== undefined || !s.adapter || !CLAUDE_SANDBOXED.has(s.adapter)) continue;
-      // Without a base, what the checkout had to begin with is unknown: nothing is removed.
-      if (!s.workspaceId || s.baseCommit === undefined) continue;
-      try {
-        const ws = await this.#o.workspaces.get(s.workspaceId);
-        if (!ws) continue;
-        const keep = await tracked(ws, s.baseCommit, SANDBOX_PLACEHOLDERS);
-        if (keep) removeSandboxPlaceholders(ws.path, keep);
-      } catch (err) {
-        // Recorded (#285); the session is recorded as ended next, so this is not tried again.
-        this.#problem('reconcile', err, { taskId: s.taskId, workspaceId: s.workspaceId });
-      }
-    }
+    const integrator = this.#o.integrator;
+    if (!integrator) return;
+    await clearCrashPlaceholders(
+      this.#state().sessions.values(),
+      { workspaces: this.#o.workspaces, integrator },
+      // Recorded (#285); the session is recorded as ended next, so this is not tried again.
+      (err, s) =>
+        this.#problem('reconcile', err, {
+          taskId: s.taskId,
+          ...(s.workspaceId ? { workspaceId: s.workspaceId } : {}),
+        }),
+    );
   }
 
   /**
@@ -2803,6 +2799,12 @@ function cancelEvents(
 
 export interface CancelStoppedOptions {
   store: EventStore;
+  /**
+   * The checkouts and git integration, to clear the sandbox placeholders a crashed Claude session
+   * of the task left in its checkout before its end is recorded (#304): after that, nothing would
+   * clear them. Without it, they stay until the checkout is removed.
+   */
+  placeholders?: PlaceholderPorts;
   /** The repo's Mini-conductor lock: taken for the change, so no Mini-conductor runs meanwhile. */
   lockPath: string;
   /** Default `<lockPath>.workers`, as for `MiniConductor`. */
@@ -2810,6 +2812,42 @@ export interface CancelStoppedOptions {
   repo?: string;
   miniId?: string;
   now?: () => Date;
+}
+
+/** What clearing a crashed Claude session's sandbox placeholders needs (#263, #304). */
+export interface PlaceholderPorts {
+  workspaces: Pick<Workspaces, 'get'>;
+  integrator: Pick<Integrator, 'tracked'>;
+}
+
+/**
+ * Remove the empty placeholders Claude Code's sandbox left in the checkouts of `sessions` that
+ * never closed (no `worker.ended`: a crash), which their adapter removes only at a close (#263).
+ * Only for those adapters, and never a path the checkout's base commit or its HEAD has (none at
+ * all when that cannot be told): each `SANDBOX_PLACEHOLDERS` entry still an empty file or
+ * directory goes (`removeSandboxPlaceholders`), as the adapter's close would have. The caller
+ * must have ended the sessions' processes. A failure is passed to `onError`, per session.
+ */
+async function clearCrashPlaceholders(
+  sessions: Iterable<SessionRecord>,
+  ports: PlaceholderPorts,
+  onError: (err: unknown, session: SessionRecord) => void,
+): Promise<void> {
+  const tracked = ports.integrator.tracked?.bind(ports.integrator);
+  if (!tracked) return;
+  for (const s of sessions) {
+    if (s.ended !== undefined || !s.adapter || !CLAUDE_SANDBOXED.has(s.adapter)) continue;
+    // Without a base, what the checkout had to begin with is unknown: nothing is removed.
+    if (!s.workspaceId || s.baseCommit === undefined) continue;
+    try {
+      const ws = await ports.workspaces.get(s.workspaceId);
+      if (!ws) continue;
+      const keep = await tracked(ws, s.baseCommit, SANDBOX_PLACEHOLDERS);
+      if (keep) removeSandboxPlaceholders(ws.path, keep);
+    } catch (err) {
+      onError(err, s);
+    }
+  }
 }
 
 /**
@@ -2836,6 +2874,19 @@ export async function cancelStopped(
     } catch (err) {
       rmSync(tmp, { force: true });
       errors.push(err);
+    }
+    if (o.placeholders) {
+      // The processes are ended; the sessions about to be recorded as canceled are the task's own.
+      const own = [...readView(o.store).sessions.values()].filter(
+        (s) => s.taskId === taskId || s.taskId.startsWith(`${taskId}/`),
+      );
+      await clearCrashPlaceholders(own, o.placeholders, (err) =>
+        errors.push(
+          new Error(
+            `could not clear the sandbox placeholders of a crashed Claude session: ${(err as Error).message ?? String(err)}`,
+          ),
+        ),
+      );
     }
     const env: MakeEnvelope = (t, type, data, sessionId) =>
       envelope(o, o.now?.() ?? new Date(), t, type, data, sessionId);
