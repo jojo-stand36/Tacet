@@ -24,5 +24,9 @@
   },
   "dependencies": {
     "@tacet/core": "workspace:*"
+  },
+  "devDependencies": {
+    "ws": "8.22.1",
+    "@types/ws": "8.18.1"
   }
 }

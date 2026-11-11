@@ -23,6 +23,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
+    "@tacet/conductor": "workspace:*",
     "@tacet/core": "workspace:*",
     "@tacet/mini": "workspace:*"
   },

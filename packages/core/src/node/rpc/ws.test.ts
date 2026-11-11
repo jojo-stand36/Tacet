@@ -464,3 +464,63 @@ describe('/pty/<session> (#201, ADR-003 §5)', () => {
     ws.terminate();
   });
 });
+
+describe('connections a daemon keeps (#23)', () => {
+  const card = {
+    repoId: '0123456789abcdef',
+    repoPath: '/repo',
+    adapters: ['claude-sdk'],
+    miniVersion: '0',
+  };
+  const mini = (
+    port: number,
+    token: Secret,
+    more: Partial<Parameters<typeof connectRpc>[0]> = {},
+  ) =>
+    connectRpc({
+      port,
+      token,
+      clientInfo: { name: 'test', version: '0' },
+      role: 'mini',
+      card,
+      timeoutMs: 5000,
+      ...more,
+    });
+
+  it("hands each connection over after its hello, with the mini's card", async () => {
+    const conns: import('./ws-server.js').RpcConnection[] = [];
+    const { server, token } = await serve(randomToken(), { onConnection: (c) => conns.push(c) });
+    const c = await mini(server.port, token);
+    await vi.waitFor(() => expect(conns).toHaveLength(1));
+    const conn = conns[0];
+    expect(conn?.sessionId).toBe(c.hello.sessionId);
+    expect(conn?.hello).toMatchObject({ role: 'mini', ...card });
+    // The client answers pings by itself.
+    expect(await conn?.ping(2000)).toBe(true);
+    // Closed with a code the client sees.
+    conn?.close(4409, 'repo already connected');
+    expect(await c.closed).toEqual({ code: 4409, reason: 'repo already connected' });
+    expect(await conn?.closed).toMatchObject({ code: 4409 });
+    expect(await conn?.ping(500)).toBe(false);
+  });
+
+  it('refuses a mini hello without its card, before connecting', async () => {
+    const { server, token } = await serve();
+    await expect(
+      connectRpc({
+        port: server.port,
+        token,
+        clientInfo: { name: 't', version: '0' },
+        role: 'mini',
+      }),
+    ).rejects.toThrow(/card/);
+  });
+
+  it('lets a client give up on a server that has gone silent', async () => {
+    const { server, token } = await serve();
+    const c = await mini(server.port, token, { silenceTimeoutMs: 200 });
+    // The server never pings on its own: the client closes after the silence.
+    const closed = await c.closed;
+    expect(closed.code).toBe(1006);
+  });
+});

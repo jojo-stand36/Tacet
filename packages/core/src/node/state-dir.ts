@@ -104,3 +104,17 @@ function canonical(path: string): string {
     return path;
   }
 }
+
+/** Where the Conductor keeps its state (#23), under the user layer's `events.state_dir`. */
+export interface ConductorStatePaths {
+  dir: string;
+  /** Its event log: the registry of Mini-conductors (`registry.*`). */
+  events: string;
+  /** Its single-instance lock. */
+  lock: string;
+}
+
+export function conductorStatePaths(stateDir: string = defaultStateDir()): ConductorStatePaths {
+  const dir = join(stateDir, 'conductor');
+  return { dir, events: join(dir, 'events.db'), lock: join(dir, 'conductor.lock') };
+}

@@ -259,6 +259,9 @@ importers:
 
   packages/cli:
     dependencies:
+      '@tacet/conductor':
+        specifier: workspace:*
+        version: link:../conductor
       '@tacet/core':
         specifier: workspace:*
         version: link:../core
@@ -275,6 +278,13 @@ importers:
       '@tacet/core':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
+      '@types/ws':
+        specifier: 8.18.1
+        version: 8.18.1
+      ws:
+        specifier: 8.22.1
+        version: 8.22.1
 
   packages/core:
     dependencies:
