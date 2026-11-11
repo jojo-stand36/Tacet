@@ -24,8 +24,9 @@ import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-res
 /**
  * A private TMPDIR per unattended Worker, with /tmp out of the sandbox's writable roots (#294),
  * against the real `codex app-server`: a repo, HOME and state dir all under /tmp are protected,
- * where without it the adapter has to refuse them (#293, #295). Off on macOS (the Xcode `git`
- * shim and the per-user temp dir are unchecked there), so this runs elsewhere only.
+ * where without it the adapter has to refuse them (#293, #295). On Linux and macOS: on macOS
+ * CI the first `git` inside the sandbox (the Xcode shim) works with it, and
+ * `getconf DARWIN_USER_TEMP_DIR` there names the private TMPDIR (#294).
  */
 const DENIED = /Read-only file system|Permission denied|Operation not permitted/;
 
@@ -114,15 +115,10 @@ describe('Codex Worker private TMPDIR (#294)', () => {
     expect(own).toBeDefined();
     const workerTmp = join(tmps, own as string);
 
-    // #299 experiment: what the first git inside the sandbox needs on this OS.
-    const probe = await run(
-      a,
-      h,
-      tap,
-      'echo "UTD=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) UCD=$(getconf DARWIN_USER_CACHE_DIR 2>/dev/null)"; git --version; git status --short && echo GIT-OK',
-    );
-    console.log(`[#299 probe ${process.platform}]`, JSON.stringify(probe));
-    expect(probe, probe).toContain('GIT-OK');
+    // The first git inside the sandbox works: on macOS the Xcode shim writes its cache under
+    // the per-user temp dir, which inside the sandbox is the private TMPDIR (#294).
+    const first = await run(a, h, tap, 'git --version && git status --short && echo GIT-OK');
+    expect(first, first).toContain('GIT-OK');
     const mine = await run(
       a,
       h,
