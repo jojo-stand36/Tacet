@@ -392,6 +392,12 @@ export class PtyAdapter implements AgentAdapter {
         // (code.claude.com/docs/en/env-vars, checked 2026-11-10). Set here, last, so no base
         // environment can unset it; Claude Code ignores it in project settings anyway (#226).
         CLAUDE_CODE_DISABLE_FILE_MENTIONS: '1',
+        // Every Worker's config dir is fresh, so each start is a "first interactive launch", on
+        // which Claude Code git-clones the official plugin marketplace into it: a network fetch
+        // and plugin content Tacet never asked for. Seen live on 2.1.319; the switch is on
+        // code.claude.com/docs/en/env-vars (checked 2026-11-11), and the broader
+        // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC does not cover it (#288). Set last, as above.
+        CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: '1',
         TERM: env.TERM ?? 'xterm-256color',
         // The hook endpoint is local: never through a proxy the user has set.
         NO_PROXY: [env.NO_PROXY, '127.0.0.1'].filter(Boolean).join(','),

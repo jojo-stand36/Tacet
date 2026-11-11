@@ -145,6 +145,28 @@ describe.skipIf(!gate.ok)(
       assertConformance(results);
     });
 
+    it('clones no plugin marketplace into a Worker’s config dir (#288)', {
+      timeout: 120_000,
+    }, async () => {
+      const h = await adapter.start({ cwd: worktree });
+      const tap = new EventTap(adapter.events(h));
+      const { end } = await turn(h, tap, 'SAY marketplace');
+      expect(end).toEqual({ t: 'status', state: 'idle' });
+      await adapter.close(h);
+      // The session's own config dir, under the state dir: <repo hash>/claude-pty/<session id>.
+      const state = join(root, 'state');
+      const configDirs = readdirSync(state)
+        .map((repo) => join(state, repo, 'claude-pty', h.vendorSessionId as string))
+        .filter((d) => existsSync(d));
+      expect(configDirs).toHaveLength(1);
+      // Claude Code registers (git-clones) the official marketplace on a first interactive
+      // launch, and every Worker's fresh config dir is one (seen live with 2.1.319).
+      expect(existsSync(join(configDirs[0] as string, 'plugins', 'marketplaces'))).toBe(false);
+      expect(existsSync(join(configDirs[0] as string, 'plugins', 'known_marketplaces.json'))).toBe(
+        false,
+      );
+    });
+
     it('reads no @path mention into a Worker prompt (#226)', { timeout: 180_000 }, async () => {
       const cwd = join(root, 'wt-at');
       mkdirSync(cwd);
