@@ -833,6 +833,91 @@ describe('MiniConductor: removing worktrees once their task landed (#210)', () =
       expect(problems).toEqual([{ op: 'landed', message: 'cannot read the target', taskId: id }]);
     });
 
+    it("records a failure to clear a crashed Claude session's placeholders, once (#285)", async () => {
+      const left = await manager.create('crashed-session');
+      const id = 'crashed-claude-task';
+      const sub = `${id}/1`;
+      const envelope = (taskId: string, type: string, data: unknown, sessionId?: string) => ({
+        v: 1 as const,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini' as const, id: 'mini' },
+        taskId,
+        ...(sessionId ? { sessionId } : {}),
+        type,
+        data,
+      });
+      const created = (taskId: string, parentId?: string) =>
+        envelope(taskId, 'task.created', {
+          id: taskId,
+          ...(parentId ? { parentId } : {}),
+          goal: 'g',
+          acceptanceCriteria: ['ok'],
+          priority: 'p2',
+          createdAt: new Date().toISOString(),
+        });
+      // A Claude Worker session on a sub-task whose end was never recorded (a crash). The task is
+      // marked canceled only so that nothing resumes it here: no `claude-sdk` adapter is built.
+      store.append([
+        created(id),
+        created(sub, id),
+        envelope(
+          sub,
+          'worker.started',
+          {
+            sessionId: 's-crashed',
+            adapter: 'claude-sdk',
+            workspaceId: left.id,
+            baseCommit: left.baseCommit,
+          },
+          's-crashed',
+        ),
+        envelope(id, 'task.status', { state: 'canceled' }),
+        envelope(sub, 'task.status', { state: 'canceled' }),
+      ]);
+      class Unreadable extends GitIntegrator {
+        override async tracked(): Promise<never> {
+          throw new Error('cannot list the checkout');
+        }
+      }
+      const start = () =>
+        new MiniConductor({
+          store,
+          config: { tiers: { worker: { adapter: 'fake', model: 'cheap' } } },
+          adapters: {
+            fake: {
+              adapter: new ScriptedAdapter('fake', (): Script => ({ do: 'reply', text: 'done' })),
+              authRoute: 'api_key',
+            },
+          },
+          workspaces: manager,
+          integrator: new Unreadable(repo, env),
+          planner: new SingleStepPlanner(),
+          mcp: {
+            workerConfig: () => ({
+              config: { name: 'tacet', url: 'http://127.0.0.1:1/mcp' },
+              revoke: () => {},
+            }),
+          },
+          lockPath: join(root, 'mini.lock'),
+        });
+      const problems = () =>
+        store.query({ typePrefix: 'maintenance' }).map((e) => ({
+          ...(e.envelope.data as object),
+          taskId: e.envelope.taskId,
+        }));
+      daemon = start();
+      await daemon.start();
+      expect(problems()).toEqual([
+        { op: 'reconcile', message: 'cannot list the checkout', workspaceId: left.id, taskId: sub },
+      ]);
+      // The session is recorded as ended at that start, so the next one does not try again.
+      await daemon.stop();
+      daemon = start();
+      await daemon.start();
+      expect(problems()).toHaveLength(1);
+    });
+
     it('runs no gc with idle_days 0', async () => {
       const calls: GcOptions[] = [];
       await runTask(commitWork, { remove_merged: false, idle_days: 0 }, undefined, {

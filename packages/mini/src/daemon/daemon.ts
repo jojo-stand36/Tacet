@@ -2581,8 +2581,8 @@ export class MiniConductor {
         const keep = await tracked(ws, s.baseCommit, SANDBOX_PLACEHOLDERS);
         if (keep) removeSandboxPlaceholders(ws.path, keep);
       } catch (err) {
-        // Logged; the session is recorded as ended next, so this is not tried again.
-        this.#errors.push(err);
+        // Recorded (#285); the session is recorded as ended next, so this is not tried again.
+        this.#problem('reconcile', err, { taskId: s.taskId, workspaceId: s.workspaceId });
       }
     }
   }
