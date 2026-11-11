@@ -84,6 +84,12 @@ function running(pid: number): boolean {
   }
 }
 
+/** Gemini's spec as if it connected MCP servers: for the fake agent, which takes them (#184). */
+const GEMINI_WITH_MCP: AcpAgentSpec = {
+  ...GEMINI_AGENT,
+  capabilities: { ...GEMINI_AGENT.capabilities, mcp: true },
+};
+
 describe('AcpAdapter (fake ACP agent)', () => {
   let root: string;
   let logFile: string;
@@ -330,8 +336,26 @@ describe('AcpAdapter (fake ACP agent)', () => {
     expect(methods().some((m) => m.method === 'authenticate')).toBe(false);
   });
 
-  it('passes the Worker MCP server in session/new only: never in argv or on disk', async () => {
+  it('refuses MCP servers for an agent that declares it will not connect them (#184)', async () => {
     const adapter = make(GEMINI_AGENT, { GEMINI_API_KEY: 'placeholder' });
+    await expect(
+      adapter.start({
+        cwd: join(root, 'wt'),
+        mcpServers: [{ name: 'tacet', url: 'http://127.0.0.1:9/mcp' }],
+      }),
+    ).rejects.toThrow(/does not connect the MCP servers/);
+    // Nothing was started for it.
+    expect(received()).toEqual([]);
+    // A custom agent declares none unless told to.
+    expect(customAcpAgent('mine', { command: ['x'] }).capabilities.mcp).toBe(false);
+    expect(
+      customAcpAgent('mine', { command: ['x'], capabilities: { mcp: true } }).capabilities.mcp,
+    ).toBe(true);
+    expect(CLAUDE_ACP_AGENT.capabilities.mcp).toBe(true);
+  });
+
+  it('passes the Worker MCP server in session/new only: never in argv or on disk', async () => {
+    const adapter = make(GEMINI_WITH_MCP, { GEMINI_API_KEY: 'placeholder' });
     const headers = mcpAuthHeaders(new Secret(TOKEN));
     const h = await adapter.start({
       cwd: join(root, 'wt'),
@@ -369,7 +393,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
   it('hands stderr to the Worker log, scrubbed', async () => {
     const lines: string[] = [];
     const adapter = make(
-      GEMINI_AGENT,
+      GEMINI_WITH_MCP,
       { GEMINI_API_KEY: 'placeholder', FAKE_STDERR: `debug: token ${TOKEN}` },
       { stderr: (text: string) => lines.push(text) },
     );
@@ -635,7 +659,7 @@ describe('AcpAdapter (fake ACP agent)', () => {
       // As a built-in spec declares it: custom agents may not declare fork.
       const forking = (fork: 'native' | 'none'): AcpAgentSpec => {
         const base = customAcpAgent('forker', { command: ['forker'] });
-        return { ...base, capabilities: { ...base.capabilities, resume: true, fork } };
+        return { ...base, capabilities: { ...base.capabilities, resume: true, fork, mcp: true } };
       };
       const fork = { vendorSessionId: 'src-1', fork: true };
 

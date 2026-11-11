@@ -216,6 +216,12 @@ export function buildWorkerAdapters(
         );
       }
       refusePtyForWorkers(ptySlug, where);
+      if (preset.capabilities !== undefined) {
+        // A generic PTY CLI takes no MCP servers from Tacet (#184): the setting would do nothing.
+        throw new WorkerConfigError(
+          `${where}: agents.${ptySlug}.capabilities is for kind acp only; a PTY preset never gets Tacet's MCP server`,
+        );
+      }
       const env = resolveEnv(ptySlug, preset.env);
       return new PtyCliAdapter({
         ...opts.ptyCli,
@@ -289,7 +295,14 @@ export function buildWorkerAdapters(
     }
     const env = resolveEnv(slug, preset.env);
     return {
-      agent: customAcpAgent(slug, { command: preset.command, env }),
+      agent: customAcpAgent(slug, {
+        command: preset.command,
+        env,
+        // Declared only when the config says so (#184): by default no MCP tools.
+        ...(preset.capabilities?.mcp !== undefined
+          ? { capabilities: { mcp: preset.capabilities.mcp } }
+          : {}),
+      }),
       secrets: Object.values(env),
     };
   }
