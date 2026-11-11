@@ -33,8 +33,7 @@ const USAGE = `usage:
                                  answer an open escalation in the live run, with the
                                  one-time code its tacet run terminal shows (asked for here;
                                  under tmux or screen, or with session logging, any process
-                                 of yours can read that terminal); asks for the code
-                                 its tacet run terminal shows
+                                 of yours can read that terminal)
   tacet status [--json]          tasks, sub-tasks, open escalations; whether a run is live
   tacet logs <task> [--transcript] [--json] [--follow]
                                  a task's events (--transcript adds the Workers' own)
