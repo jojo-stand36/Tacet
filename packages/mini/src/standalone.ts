@@ -18,6 +18,7 @@ import {
   WorkerTokens,
   writeRuntimeFile,
 } from '@tacet/core/node';
+import { AnswerCodes } from './control/answer-codes.js';
 import { startMiniControl } from './control/server.js';
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
@@ -41,6 +42,8 @@ export interface StandaloneOptions {
   home?: string;
   /** Told the names (never values) of variables a Worker's environment left out. */
   onEnvDropped?: (adapterId: string, names: string[]) => void;
+  /** Told when a Worker starts with a risk to know about (#291). */
+  onWarning?: (adapterId: string, message: string) => void;
   /** Plan every task as one sub-task, even when `tiers.mini` is set. */
   singleStep?: boolean;
   /** Told about MCP server failures (message only). */
@@ -67,6 +70,11 @@ export interface Standalone {
   paths: RepoStatePaths;
   /** The control port (#201) and its runtime file, which holds the port's token (mode 0600). */
   control: { port: number; runtimeFile: string };
+  /**
+   * The one-time codes the control port wants with an answer (#269). Only the run's own
+   * terminal may show one (`issue`): never a log, a file or a Worker's environment.
+   */
+  answerCodes: AnswerCodes;
   /**
    * Remove the runtime file and close the control port, then stop the Mini-conductor (open
    * sessions recorded as `restart`), then the MCP server and log.
@@ -97,6 +105,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       baseEnv,
       withPlanner: !o.singleStep,
       ...(o.onEnvDropped ? { onEnvDropped: o.onEnvDropped } : {}),
+      ...(o.onWarning ? { onWarning: o.onWarning } : {}),
       codex: { ...o.workers?.codex, stateDir },
       acp: { ...o.workers?.acp, stateDir },
       claude: { ...o.workers?.claude, stateDir },
@@ -151,6 +160,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
   let runtimeFile: string | undefined;
   let started: MiniConductor | undefined;
   const token = randomToken();
+  const answerCodes = new AnswerCodes();
   try {
     server = await MiniMcpServer.start({
       backend: new EventLogBackend({
@@ -194,6 +204,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       store,
       contextId: paths.repoId,
       token,
+      answerCodes,
       ...(o.onError ? { onError: (m) => o.onError?.(`control: ${m}`) } : {}),
     });
     runtimeFile = miniRuntimePath(
@@ -211,6 +222,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       config,
       paths,
       control: { port: port.port, runtimeFile: file },
+      answerCodes,
       close: () => {
         closed ??= (async () => {
           try {

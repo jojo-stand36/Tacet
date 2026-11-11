@@ -115,6 +115,8 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
       baseEnv: { PATH: '/bin', ANTHROPIC_API_KEY: FAKE_KEY },
       mcpConfigDir: join(root, 'mcp'),
       stateDir: join(root, 'state'),
+      // Not the machine's own (#291): a Claude Code cloud container has one.
+      hostTokenFile: join(root, 'no-host-token'),
       ...extra,
     });
 

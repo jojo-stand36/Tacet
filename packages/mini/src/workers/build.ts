@@ -40,6 +40,8 @@ export interface BuildWorkerAdaptersOptions {
    * on every session start, so a caller that logs it should log each adapter's names once.
    */
   onEnvDropped?: (adapterId: string, names: string[]) => void;
+  /** Told when a Claude Worker starts with a risk to know about (#291), each time. */
+  onWarning?: (adapterId: string, message: string) => void;
   /** How `{ keychain }` secret references are read (#160); replaced in tests. */
   keychain?: KeychainOptions;
   /** Passed through to the adapters as they are built; for tests and the entry point. */
@@ -135,6 +137,8 @@ export function buildWorkerAdapters(
   function build(id: string, where: string): AgentAdapter {
     const dropped = (names: string[]) => opts.onEnvDropped?.(id, names);
     const common = { baseEnv, envPolicy, onEnvDropped: dropped };
+    // Claude Code's host token in a cloud container (#291): the Claude-running adapters say so.
+    const warned = opts.onWarning ? { onWarning: (m: string) => opts.onWarning?.(id, m) } : {};
     if (id === 'claude-sdk') {
       // Unattended: file tools only, no shell, reads asked about too (#206; policy #200).
       // Each session's config dir lives under the repo's state dir, keyed by the main checkout,
@@ -145,6 +149,7 @@ export function buildWorkerAdapters(
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.claude,
         ...common,
+        ...warned,
         authRoute: 'api_key',
         fileToolsOnly: true,
       });
@@ -169,6 +174,7 @@ export function buildWorkerAdapters(
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.acp,
         ...common,
+        ...warned,
         agent,
         secrets,
       });
@@ -183,6 +189,7 @@ export function buildWorkerAdapters(
         ...(opts.repoRoot !== undefined ? { repoRoot: opts.repoRoot } : {}),
         ...opts.claudePty,
         ...common,
+        ...warned,
       });
     }
     if (ptySlug !== undefined) {
