@@ -10,10 +10,12 @@ import {
   openSync,
   readdirSync,
   readSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inflateSync, constants as zlibConstants } from 'node:zlib';
 import {
@@ -23,6 +25,7 @@ import {
   workerWorktree,
 } from '@tacet/core/node';
 import { type Integrator, type Workspace, WorktreeRefusedError } from '../daemon/ports.js';
+import { protectedConfig } from '../daemon/tool-policy.js';
 import { amendedInReflog, branchTip, detectLanded, isReplacement, type Landed } from './landed.js';
 import { combineCommits, setTaskBranch } from './merge.js';
 
@@ -434,11 +437,358 @@ function readRegular(dir: OpenDir, name: string, budget: number): Buffer {
   }
 }
 
+/** A path in a Worker's checkout that differs from the commit it was compared with (#261). */
+export interface UncommittedChange {
+  path: string;
+  /** New and not ignored, rather than changed or deleted. */
+  untracked: boolean;
+}
+
+/** Git 2.41 added `--attr-source`, which the comparison needs (#261). */
+const ATTR_SOURCE_GIT = '2.41';
+
+/**
+ * What the Worker's checkout has that `commit` does not (#261): files changed, deleted or added
+ * (untracked and not ignored), compared without the Worker's own index, config, HEAD or objects.
+ * `commit` must be one the repo already has: the integrated one, else the Worker's HEAD (read as
+ * data). A throwaway index of it is built in a directory Tacet owns and refreshed against the
+ * checkout, from the main repo (`GIT_DIR` = its common dir, `SAFE_GIT_ARGS`, only PATH and HOME).
+ * Attributes come from `commit`, never the checkout (`--attr-source`, git 2.41), so a Worker's
+ * `.gitattributes` cannot make git run a filter. Those `commit`'s attributes name still run, and
+ * `commit` may be the Worker's integrated one, so its attributes may be the Worker's: only filter
+ * drivers the user configured can be named, which a checkout of the work would run anyway. Ignore rules are the checkout's, so any `.gitignore` the Worker added, changed or
+ * hid is itself reported. Submodules are not looked into.
+ *
+ * Throws `WorktreeRefusedError` for a forged worktree, and an error when git fails (older than
+ * 2.41, say) or times out. Undefined when it cannot tell: `cwd` is not a worktree of the repo, or
+ * there is no commit to compare with. Stops at `maxPaths` paths (then there may be more).
+ */
+export async function uncommittedChanges(opts: {
+  cwd: string;
+  repoRoot: string;
+  /** Without one, the Worker's HEAD (read as data), when the repo has that commit. */
+  commit?: string | undefined;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+  maxPaths?: number;
+}): Promise<UncommittedChange[] | undefined> {
+  if (opts.commit !== undefined && !COMMIT_ID.test(opts.commit)) throw new Error('bad commit');
+  let wt: WorkerWorktree | undefined;
+  try {
+    wt = workerWorktree(opts.cwd, opts.repoRoot);
+  } catch (err) {
+    throw new WorktreeRefusedError((err as Error).message);
+  }
+  if (!wt) return undefined;
+  const env = opts.env ?? process.env;
+  const maxPaths = opts.maxPaths ?? 1000;
+  const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+  const tmp = mkdtempSync(join(tmpdir(), 'tacet-status-'));
+  try {
+    const gitEnv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.commonDir,
+      GIT_INDEX_FILE: join(tmp, 'index'),
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
+      GIT_ATTR_NOSYSTEM: '1',
+    };
+    let attrs: string[] = [];
+    const git = (args: string[], o: { maxNul?: number } = {}) => {
+      const left = deadline - Date.now();
+      if (left <= 0) return Promise.reject(new Error('checking the checkout timed out'));
+      return run(
+        ['git', ...attrs, ...SAFE_GIT_ARGS, '-c', 'core.attributesFile=/dev/null', ...args],
+        {
+          cwd: opts.repoRoot,
+          env: gitEnv,
+          timeoutMs: left,
+          raw: true,
+          ...(o.maxNul !== undefined ? { maxNul: o.maxNul } : {}),
+        },
+      );
+    };
+    const commit =
+      opts.commit ?? (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    if (commit === undefined) return undefined;
+    // Only a commit the repo already has: a Worker's own commit is never read from its store.
+    if (
+      !(await git(['cat-file', '-e', `${commit}^{commit}`]).then(
+        () => true,
+        () => false,
+      ))
+    ) {
+      return undefined;
+    }
+    attrs = [`--attr-source=${commit}`];
+    await git(['read-tree', commit]).catch((err: Error) => {
+      throw /attr-source/.test(err.message)
+        ? new Error(`checking for uncommitted changes needs git ${ATTR_SOURCE_GIT} or later`)
+        : err;
+    });
+    // Hashes every tracked file once (the index has no stat data yet); `-q` goes on past changes.
+    await git(['update-index', '-q', '--refresh', '--ignore-submodules']);
+    const changes: UncommittedChange[] = [];
+    const seen = new Set<string>();
+    const add = (path: string, untracked: boolean) => {
+      if (changes.length >= maxPaths || path === '' || seen.has(path)) return;
+      seen.add(path);
+      changes.push({ path, untracked });
+    };
+    // `M\0path\0` or `D\0path\0`, …: the checkout against the index, which holds exactly `commit`.
+    const diff = (
+      await git(['diff-files', '-z', '--name-status', '--no-renames', '--ignore-submodules=all'], {
+        maxNul: 2 * maxPaths,
+      })
+    ).split('\0');
+    for (let i = 0; i + 1 < diff.length; i += 2) add(diff[i + 1] as string, false);
+    for (const p of (
+      await git(['ls-files', '-z', '-o', '--exclude-standard'], { maxNul: maxPaths })
+    ).split('\0')) {
+      add(p, true);
+    }
+    // A new `.gitignore` can ignore itself and everything else: an ignored one is a change too.
+    for (const p of (
+      await git(
+        ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--', ':(glob)**/.gitignore'],
+        {
+          maxNul: maxPaths,
+        },
+      )
+    ).split('\0')) {
+      add(p, true);
+    }
+    return changes;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** The author and committer of the commits Tacet makes for Workers (#260): never the user's. */
+export const TACET_WORKER_IDENTITY = { name: 'Tacet Worker', email: 'worker@tacet.invalid' };
+
+/** Why Tacet did not commit a Worker's changes (#260). */
+export type CommitRefusal =
+  | { why: 'protected'; paths: string[] }
+  | { why: 'too-big'; bytes: number; files: number };
+
+export interface CommitWorktreeOptions {
+  cwd: string;
+  repoRoot: string;
+  /** The task branch to point at the commit (under `refs/heads/tacet/`). */
+  ref: string;
+  /** The parent: the run's last commit; without one, the Worker's HEAD (read as data). */
+  parent?: string | undefined;
+  message: string;
+  /** Paths that are not committed, as if absent (the sandbox's empty placeholders, #263). */
+  skip?: (change: UncommittedChange) => boolean;
+  /** Paths whose change Tacet refuses to commit: agent, hook and tool config (#200, #227). */
+  protectedPath: (path: string) => boolean;
+  /** Most bytes (sum of the changed files' sizes) and files in one commit. */
+  maxBytes?: number;
+  maxFiles?: number;
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+}
+
+/**
+ * Commit a Worker's uncommitted changes for it (#260), for Workers that cannot run git
+ * (claude-sdk and the other Claude and Gemini routes, which have no shell). From the main repo,
+ * as `uncommittedChanges` reads them: a throwaway index of the parent in a directory Tacet owns,
+ * `git add` of exactly the changed paths (their contents read as data; a symlink is stored as a
+ * link, never followed), `write-tree`, and `commit-tree` with the parent, unsigned, by
+ * `TACET_WORKER_IDENTITY`; the objects go to the shared store and the Worker's own store is never
+ * read. Then `ref` points at the commit, and the Worker's index and HEAD (detached) at it too,
+ * so the checkout is clean at the commit, as after a commit of its own. Refuses, committing
+ * nothing, when a changed path is protected config or the change is too big. Undefined when there is nothing to commit or no
+ * parent the repo has.
+ */
+export async function commitWorktree(
+  opts: CommitWorktreeOptions,
+): Promise<
+  { commit: string; ref: string; paths: string[] } | { refused: CommitRefusal } | undefined
+> {
+  if (!opts.ref.startsWith(TASK_REF_PREFIX)) {
+    throw new Error(`integration only writes branches under ${TASK_REF_PREFIX}`);
+  }
+  const changes = await uncommittedChanges({
+    cwd: opts.cwd,
+    repoRoot: opts.repoRoot,
+    commit: opts.parent,
+    ...(opts.env ? { env: opts.env } : {}),
+    maxPaths: (opts.maxFiles ?? 5000) + 1,
+  });
+  let wt: WorkerWorktree | undefined;
+  try {
+    wt = workerWorktree(opts.cwd, opts.repoRoot);
+  } catch (err) {
+    throw new WorktreeRefusedError((err as Error).message);
+  }
+  if (!changes || !wt) return undefined;
+  // A nested repository (`dir/`) is not committed: it stays in the checkout, and is reported as
+  // left out (#261).
+  const paths = changes.filter((c) => !opts.skip?.(c) && !c.path.endsWith('/')).map((c) => c.path);
+  if (paths.length === 0) return undefined;
+  const blocked = paths.filter((p) => opts.protectedPath(p));
+  if (blocked.length > 0) return { refused: { why: 'protected', paths: blocked } };
+  let bytes = 0;
+  for (const p of paths) {
+    try {
+      const st = lstatSync(join(opts.cwd, p));
+      bytes += st.isFile() ? st.size : 0;
+    } catch {
+      // Deleted: no bytes.
+    }
+  }
+  if (paths.length > (opts.maxFiles ?? 5000) || bytes > (opts.maxBytes ?? 50 * 1024 * 1024)) {
+    return { refused: { why: 'too-big', bytes, files: paths.length } };
+  }
+  const env = opts.env ?? process.env;
+  const tmp = mkdtempSync(join(tmpdir(), 'tacet-commit-'));
+  try {
+    const gitEnv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.commonDir,
+      GIT_INDEX_FILE: join(tmp, 'index'),
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
+      GIT_ATTR_NOSYSTEM: '1',
+      GIT_AUTHOR_NAME: TACET_WORKER_IDENTITY.name,
+      GIT_AUTHOR_EMAIL: TACET_WORKER_IDENTITY.email,
+      GIT_COMMITTER_NAME: TACET_WORKER_IDENTITY.name,
+      GIT_COMMITTER_EMAIL: TACET_WORKER_IDENTITY.email,
+    };
+    let attrs: string[] = [];
+    const git = (args: string[], input?: string) =>
+      run(
+        [
+          'git',
+          ...attrs,
+          ...SAFE_GIT_ARGS,
+          '-c',
+          'core.symlinks=true',
+          '-c',
+          'core.attributesFile=/dev/null',
+          ...args,
+        ],
+        { cwd: opts.repoRoot, env: gitEnv, timeoutMs: opts.timeoutMs ?? 120_000, input },
+      );
+    const head = (await workerHead(wt, async (a) => (await git(a)).trim()))?.commit;
+    const parent = opts.parent ?? head;
+    if (parent === undefined || !COMMIT_ID.test(parent)) return undefined;
+    // As in `uncommittedChanges`: attributes from the parent, so no Worker-named filter runs.
+    // Paths are literal: a name with `*` or `:(` is that file, never a pattern or magic.
+    attrs = [`--attr-source=${parent}`, '--literal-pathspecs'];
+    await git(['read-tree', parent]);
+    // `--force`: a `.gitignore` that ignores itself is part of the change (#261 reports it).
+    await git(
+      ['add', '-A', '--force', '--pathspec-from-file=-', '--pathspec-file-nul'],
+      paths.join('\0'),
+    );
+    const tree = await git(['write-tree']);
+    const commit = await git([
+      'commit-tree',
+      '--no-gpg-sign',
+      tree,
+      '-p',
+      parent,
+      '-m',
+      opts.message,
+    ]);
+    if (!COMMIT_ID.test(commit)) throw new Error('commit-tree gave no commit id');
+    await setTaskBranch(opts.ref, commit, { repoRoot: opts.repoRoot, env });
+    // Then the checkout is at the commit, as a Worker's own commit would leave it: its index and
+    // HEAD, in its git dir, which Tacet writes from outside (a Worker with no shell cannot reach
+    // it). Not through the Worker's object store: the commit is in the shared one. The branch
+    // comes first, and the index before HEAD: if either step fails, HEAD is still the parent, so
+    // the next turn finds the changes again and commits them again.
+    const wenv: Record<string, string> = {
+      ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+      ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      GIT_DIR: wt.gitDir,
+      GIT_COMMON_DIR: wt.commonDir,
+      GIT_WORK_TREE: realpathSync.native(opts.cwd),
+      GIT_ATTR_NOSYSTEM: '1',
+    };
+    const inWorker = (args: string[]) =>
+      run(
+        [
+          'git',
+          `--attr-source=${parent}`,
+          ...SAFE_GIT_ARGS,
+          '-c',
+          'core.attributesFile=/dev/null',
+          ...args,
+        ],
+        { cwd: opts.repoRoot, env: wenv, timeoutMs: opts.timeoutMs ?? 120_000 },
+      );
+    // No refresh: it would hash files with the commit's attributes, which may be the Worker's.
+    await inWorker(['read-tree', commit]);
+    await inWorker([
+      'update-ref',
+      '--no-deref',
+      'HEAD',
+      commit,
+      ...(head !== undefined ? [head] : []),
+    ]);
+    return { commit, ref: opts.ref, paths };
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 interface RunOptions {
   cwd: string;
   env: Record<string, string>;
   timeoutMs: number;
   input?: string | undefined;
+  /** Stdout as is, not trimmed (porcelain output starts with significant spaces). */
+  raw?: boolean;
+  /**
+   * Stop reading after this many NUL-terminated entries (or about 4 KiB an entry), kill the command and
+   * resolve with the entries read so far.
+   */
+  maxNul?: number;
+}
+
+/**
+ * Which of `paths` `commit` has, as a file, a link or a directory (#263), read from the repo's own
+ * object store: only PATH and HOME from `env`, `SAFE_GIT_ARGS`, literal paths.
+ */
+export async function trackedPaths(opts: {
+  repoRoot: string;
+  commit: string;
+  paths: readonly string[];
+  env?: Record<string, string | undefined>;
+  timeoutMs?: number;
+}): Promise<Set<string>> {
+  if (!COMMIT_ID.test(opts.commit)) throw new Error('bad commit');
+  const env = opts.env ?? process.env;
+  const out = await run(
+    [
+      'git',
+      '--literal-pathspecs',
+      ...SAFE_GIT_ARGS,
+      'ls-tree',
+      '-r',
+      '-t',
+      '-z',
+      '--name-only',
+      `${opts.commit}^{tree}`,
+      '--',
+      ...opts.paths,
+    ],
+    {
+      cwd: opts.repoRoot,
+      env: {
+        ...(env.PATH !== undefined ? { PATH: env.PATH } : {}),
+        ...(env.HOME !== undefined ? { HOME: env.HOME } : {}),
+      },
+      timeoutMs: opts.timeoutMs ?? 30_000,
+    },
+  );
+  const wanted = new Set(opts.paths);
+  return new Set(out.split('\0').filter((p) => wanted.has(p)));
 }
 
 /** Run a command; resolves with its trimmed stdout, rejects with its stderr or a timeout. */
@@ -452,7 +802,30 @@ function run(argv: string[], o: RunOptions): Promise<string> {
     const out: Buffer[] = [];
     const err: Buffer[] = [];
     let errBytes = 0;
-    child.stdout.on('data', (c: Buffer) => out.push(c));
+    let outBytes = 0;
+    let nuls = 0;
+    let capped = false;
+    child.stdout.on('data', (c: Buffer) => {
+      if (capped) return;
+      if (o.maxNul === undefined) {
+        out.push(c);
+        return;
+      }
+      // Keep whole entries only, up to the cap.
+      let end = c.length;
+      for (let i = c.indexOf(0); i !== -1; i = c.indexOf(0, i + 1)) {
+        nuls += 1;
+        if (nuls >= o.maxNul) {
+          end = i + 1;
+          capped = true;
+          break;
+        }
+      }
+      outBytes += end;
+      if (!capped && outBytes > o.maxNul * 4200) capped = true;
+      out.push(c.subarray(0, end));
+      if (capped) child.kill('SIGKILL');
+    });
     child.stderr.on('data', (c: Buffer) => {
       if (errBytes < 4096) err.push(c);
       errBytes += c.length;
@@ -464,8 +837,12 @@ function run(argv: string[], o: RunOptions): Promise<string> {
     });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
-      if (code === 0) resolve(Buffer.concat(out).toString('utf8').trim());
-      else {
+      if (code === 0 || capped) {
+        let text = Buffer.concat(out).toString('utf8');
+        // A capped read ends at the last whole entry.
+        if (capped) text = text.slice(0, text.lastIndexOf('\0') + 1);
+        resolve(o.raw ? text : text.trim());
+      } else {
         const why = signal === 'SIGKILL' ? 'timed out' : Buffer.concat(err).toString('utf8').trim();
         reject(new Error(`${argv.slice(0, 5).join(' ')}: ${why.slice(0, 500)}`));
       }
@@ -571,6 +948,40 @@ export class GitIntegrator implements Integrator {
     return combineCommits(commits, { repoRoot: this.#repoRoot, env: this.#env });
   }
 
+  async tracked(
+    workspace: Workspace,
+    base: string,
+    paths: readonly string[],
+  ): Promise<Set<string> | undefined> {
+    const o = { repoRoot: this.#repoRoot, paths, env: this.#env };
+    const keep = await trackedPaths({ ...o, commit: base });
+    // What its HEAD has too (an earlier session may have committed): read as data, and only a
+    // commit the repo already has; otherwise it cannot tell.
+    let wt: WorkerWorktree | undefined;
+    try {
+      wt = workerWorktree(workspace.path, this.#repoRoot);
+    } catch (err) {
+      throw new WorktreeRefusedError((err as Error).message);
+    }
+    if (!wt) return undefined;
+    const env = {
+      ...(this.#env.PATH !== undefined ? { PATH: this.#env.PATH } : {}),
+      ...(this.#env.HOME !== undefined ? { HOME: this.#env.HOME } : {}),
+    };
+    const git = (args: string[]) =>
+      run(['git', ...SAFE_GIT_ARGS, ...args], { cwd: this.#repoRoot, env, timeoutMs: 30_000 });
+    const head = (await workerHead(wt, git))?.commit;
+    if (head === undefined) return undefined;
+    if (head === base) return keep;
+    const has = await git(['cat-file', '-e', `${head}^{commit}`]).then(
+      () => true,
+      () => false,
+    );
+    if (!has) return undefined;
+    for (const p of await trackedPaths({ ...o, commit: head })) keep.add(p);
+    return keep;
+  }
+
   /** Results found not landed, by result and target, with the target tip they were checked at. */
   readonly #notLanded = new Map<string, string>();
 
@@ -597,6 +1008,32 @@ export class GitIntegrator implements Integrator {
       return false;
     }
     return wt ? amendedInReflog(join(wt.gitDir, 'logs', 'HEAD'), later) : false;
+  }
+
+  commitFor(
+    subtaskId: string,
+    workspace: Workspace,
+    o: { parent?: string; message: string; skip?: (c: UncommittedChange) => boolean },
+  ): ReturnType<typeof commitWorktree> {
+    return commitWorktree({
+      cwd: workspace.path,
+      repoRoot: this.#repoRoot,
+      ref: taskBranch(subtaskId),
+      parent: o.parent,
+      message: o.message,
+      ...(o.skip ? { skip: o.skip } : {}),
+      protectedPath: protectedConfig,
+      env: this.#env,
+    });
+  }
+
+  uncommitted(workspace: Workspace, commit?: string): Promise<UncommittedChange[] | undefined> {
+    return uncommittedChanges({
+      cwd: workspace.path,
+      repoRoot: this.#repoRoot,
+      commit,
+      env: this.#env,
+    });
   }
 
   async publish(taskId: string, commit: string): Promise<string> {

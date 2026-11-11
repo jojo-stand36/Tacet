@@ -244,6 +244,13 @@ describe('CommandVerifier (#19)', () => {
     writeFileSync(join(wt, 'new.txt'), 'x');
     r = await verifier([cmd]).verify(TASK, ws(), ctx());
     expect(r.feedback).toMatch(/1 untracked file/);
+    // One the Mini-conductor vouches for (a sandbox placeholder, #260) does not count.
+    r = await verifier(['true']).verify(
+      TASK,
+      ws(),
+      ctx({ ignoreUntracked: (p: string) => p === 'new.txt' }),
+    );
+    expect(r.status).toBe('passed');
     rmSync(join(wt, 'new.txt'));
     execFileSync('mkdir', ['-p', join(wt, 'node_modules')]);
     writeFileSync(join(wt, 'node_modules', 'dep.js'), 'x');

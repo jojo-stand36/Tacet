@@ -212,6 +212,8 @@ export function buildWorkerAdapters(
           // Gemini CLI reads an `@path` in a prompt unasked, or after a Yes-by-default question
           // (#245): its prompts are typed with every `@` escaped.
           ...(runs(preset.command, runsGemini) ? { escapeAt: true } : {}),
+          // Codex CLI reads a trailing `@token` and a lone image path in a paste (#249).
+          ...(runs(preset.command, runsCodex) ? { codexPaste: true } : {}),
         },
       });
     }
@@ -465,6 +467,20 @@ export function runsGemini(word: string): boolean {
       .pop()
       ?.replace(/@[^@/]*$/, '') ?? '';
   return base === 'gemini' || /(^|\/)@google\/gemini-cli(\/|@|$)/.test(word);
+}
+
+/**
+ * Whether a command word runs Codex CLI: the `codex` bin (by name or path) or its npm package
+ * `@openai/codex` (`npx @openai/codex`, `node .../@openai/codex/bin/codex.js`). `codex-acp` is
+ * another program. A wrapper script that hides it is not caught.
+ */
+export function runsCodex(word: string): boolean {
+  const base =
+    word
+      .split('/')
+      .pop()
+      ?.replace(/@[^@/]*$/, '') ?? '';
+  return base === 'codex' || /(^|\/)@openai\/codex(\/|@|$)/.test(word);
 }
 
 /** Whether one word of a command runs `bin` (by name, path or npm package). */

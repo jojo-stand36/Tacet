@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -9,6 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-claude-sdk/launch';
 import {
   type AgentEvent,
   type AgentTerminal,
@@ -246,6 +248,104 @@ function withReview(v: VerifyResult, r: ReviewResult): VerifyResult {
 }
 
 const TERMINAL: ReadonlySet<TaskState> = new Set(['completed', 'failed', 'canceled', 'rejected']);
+
+/** Adapters whose Workers run in Claude Code's Linux sandbox, which leaves placeholders (#263). */
+const CLAUDE_SANDBOXED: ReadonlySet<string> = new Set(['claude-sdk', 'pty:claude']);
+/** Adapters whose Workers cannot run git, so Tacet commits their work (#260). */
+const CANNOT_COMMIT: ReadonlySet<string> = new Set([
+  'claude-sdk',
+  'pty:claude',
+  'acp:claude-acp',
+  'acp:gemini',
+]);
+
+/**
+ * An empty file at one of the paths Claude Code's Linux sandbox leaves placeholders at (#263),
+ * in a checkout that sandbox ran in.
+ */
+function isSandboxPlaceholder(run: Run, path: string): boolean {
+  if (!CLAUDE_SANDBOXED.has(run.adapterId) || !SANDBOX_PLACEHOLDERS.includes(path)) return false;
+  try {
+    const st = lstatSync(join(run.workspace.path, path));
+    return st.isFile() && st.size === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** What a checkout has left uncommitted (#261), or why that is not known. */
+type Uncommitted = { changes: { path: string; untracked: boolean }[] } | { unknown: string };
+
+/** Why a sub-task that changed files but made no commit failed (#261). */
+function notIntegrated(run: Run, left: readonly { path: string }[]): string {
+  const why = CANNOT_COMMIT.has(run.adapterId)
+    ? `${run.adapterId} Workers cannot run git, and Tacet did not commit for it, #260`
+    : 'the Worker must commit its work';
+  return `nothing was integrated: the Worker changed ${pathsNote(left)} but made no commit, so the change never left its checkout (${why})`;
+}
+
+/** The message of a commit Tacet makes for a Worker (#260): the goal's first line, and who. */
+function commitMessage(task: Task, run: Run): string {
+  const line = (task.goal.split('\n')[0] ?? '').replace(CONTROL, ' ').trim() || 'Worker changes';
+  // By code points, so a surrogate pair is never split.
+  const chars = [...line];
+  const subject = chars.length > 72 ? `${chars.slice(0, 69).join('')}...` : line;
+  return `${subject}\n\nCommitted by Tacet for a Worker that cannot run git (#260).\n\nTacet-Task: ${run.subtaskId}\nTacet-Session: ${run.sessionId}\n`;
+}
+
+/** Control and bidi characters, kept out of messages that quote Worker-chosen text. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching them is the point.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/** At most this many paths are looked for; reaching it means there may be more. */
+const MAX_UNCOMMITTED = 1000;
+
+/**
+ * A few of `left`'s paths, and how many there are. The paths are the Worker's choice: each is
+ * quoted (no control characters get through), redacted and cut short.
+ */
+function pathsNote(left: readonly { path: string }[]): string {
+  const shown = left.slice(0, 5).map((c) => {
+    const p = redactSecrets(c.path);
+    return JSON.stringify(p.length > 120 ? `${p.slice(0, 117)}...` : p);
+  });
+  const count = left.length >= MAX_UNCOMMITTED ? `${left.length} or more` : `${left.length}`;
+  const more = left.length > shown.length ? `, and ${left.length - shown.length} more` : '';
+  return `${count} file${left.length === 1 ? '' : 's'} (${shown.join(', ')}${more})`;
+}
+
+/** The status message of a completed sub-task, when there is anything to say (#261). */
+function completedNote(
+  v: VerifyResult,
+  committed: boolean,
+  left: Uncommitted,
+): { message?: string } {
+  const parts = [
+    ...(v.status !== 'passed' ? [verifyNote(v.status, v.notes)] : []),
+    ...(!committed && !('unknown' in left) ? ['no change: the Worker made no commit'] : []),
+    ...(!committed && 'unknown' in left
+      ? [`the Worker made no commit, and its checkout could not be checked (${left.unknown})`]
+      : []),
+    ...(committed && 'unknown' in left
+      ? [`could not check for changes left uncommitted (${left.unknown})`]
+      : []),
+    ...(committed && 'changes' in left && left.changes.length > 0
+      ? [`${pathsNote(left.changes)} left uncommitted, not in the result`]
+      : []),
+  ];
+  return parts.length > 0 ? { message: parts.join('; ') } : {};
+}
+
+/** What a completed sub-task's verification status means, in words, when it is not `passed`. */
+function verifyNote(status: VerificationStatus, notes?: string): string {
+  const what =
+    status === 'not_run'
+      ? 'verification did not run'
+      : status === 'partial'
+        ? 'verification ran only in part'
+        : `verification ${status}`;
+  return notes ? `${what} (${notes.slice(0, 300)})` : what;
+}
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
 const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
@@ -335,6 +435,8 @@ export class MiniConductor {
     }
     // Under the lock, before a checkout is looked up: the registry catches up with the disk.
     await this.#o.workspaces.reconcile?.().catch((err: unknown) => this.#errors.push(err));
+    // Before any session resumes in them: what crashed Claude sessions left in their checkouts.
+    await this.#removeCrashPlaceholders();
     this.#started = true;
     this.#gen += 1;
     this.#abort = new AbortController();
@@ -931,6 +1033,13 @@ export class MiniConductor {
         outcome: done ? 'completed' : 'failed',
         summary: [
           ...subs.map((t) => `${t.task.id} ${t.state}: ${t.task.goal}`),
+          // Plainly, when the work was not (fully) checked (#261).
+          ...results
+            .filter((r) => r.outcome === 'completed' && r.verification?.status !== 'passed')
+            .map(
+              (r) =>
+                `${r.taskId}: ${verifyNote(r.verification?.status ?? 'not_run', r.verification?.notes)}`,
+            ),
           ...(published?.ref
             ? [`Combined work: ${published.ref.replace(/^refs\/heads\//, '')}`]
             : []),
@@ -1811,6 +1920,69 @@ export class MiniConductor {
       }
       // Ended meanwhile (canceled, say): nothing more is run in its checkout.
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // A Worker that cannot run git gets its changes committed by Tacet (#260); a change Tacet
+      // will not commit waits on the user, with the session kept for the answer.
+      let committed: 'done' | 'waiting' | 'ended' | { failed: string };
+      try {
+        committed = await this.#commitFor(run, view.task);
+      } catch (err) {
+        if (!(err instanceof WorktreeRefusedError)) throw err;
+        ended = true;
+        await this.#refused(run);
+        return;
+      }
+      if (committed === 'ended') {
+        ended = true;
+        return;
+      }
+      if (committed === 'waiting') return;
+      if (typeof committed === 'object') {
+        // As a failed integration: a failed attempt, retried in the same checkout.
+        this.#o.store.append(
+          this.#env(
+            run.subtaskId,
+            'task.result',
+            this.#summary(run, 'failed', {
+              status: 'failed',
+              commands: [],
+              notes: committed.failed,
+            }),
+          ),
+        );
+        ended = true;
+        await this.#end(run, 'failed', 'integration failed');
+        this.#afterFailure(run.subtaskId);
+        return;
+      }
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // Work left in the checkout, not in a commit, never reaches the repo (#261). With no commit
+      // at all, the sub-task did not do its work: it fails, not retried (a Worker that cannot
+      // commit, #260, would only fail again). A sub-task that changed nothing (a review) is fine.
+      let left: Uncommitted;
+      try {
+        left = await this.#uncommitted(run);
+      } catch (err) {
+        if (!(err instanceof WorktreeRefusedError)) throw err;
+        this.#errors.push(err);
+        ended = true;
+        await this.#refused(run);
+        return;
+      }
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      if (run.commit === undefined && 'changes' in left && left.changes.length > 0) {
+        const notes = notIntegrated(run, left.changes);
+        this.#o.store.append([
+          this.#env(
+            run.subtaskId,
+            'task.result',
+            this.#summary(run, 'failed', { status: 'not_run', commands: [], notes }),
+          ),
+          this.#env(run.subtaskId, 'task.status', { state: 'failed', message: notes }),
+        ]);
+        ended = true;
+        await this.#end(run, 'failed', 'nothing was integrated');
+        return;
+      }
       // One round per check: the commands and the review of the same commit share it.
       const round = this.#verifyRounds(run);
       let verification: VerifyResult;
@@ -1844,7 +2016,12 @@ export class MiniConductor {
       }
       this.#o.store.append([
         this.#env(run.subtaskId, 'task.result', this.#summary(run, 'completed', verification)),
-        this.#env(run.subtaskId, 'task.status', { state: 'completed' }),
+        this.#env(run.subtaskId, 'task.status', {
+          state: 'completed',
+          // Said where the state is read, not only in the result (#261): work not checked, no
+          // change at all, or changes left out of the commit.
+          ...completedNote(verification, run.commit !== undefined, left),
+        }),
       ]);
       // Roll up and schedule dependents while the session closes.
       this.#kick();
@@ -1878,6 +2055,96 @@ export class MiniConductor {
       verification,
       openQuestions: [],
     };
+  }
+
+  /**
+   * What the run's checkout has that its integrated commit (or, with none, its HEAD, when the
+   * repo has that commit) does not (#261), leaving out the empty placeholders Claude Code's Linux sandbox makes for paths it
+   * protects (#263), which the adapter removes when the session closes. `unknown`, with why, when
+   * it cannot tell; throws `WorktreeRefusedError` for a checkout that failed the integrity checks.
+   */
+  async #uncommitted(run: Run): Promise<Uncommitted> {
+    // Without an integrated commit, against the checkout's own HEAD, not its base: a HEAD moved
+    // to a commit the repo already has (the same work done before) is no uncommitted change.
+    const at = run.commit;
+    if (!this.#o.integrator?.uncommitted) return { unknown: 'no integrator' };
+    let changes: { path: string; untracked: boolean }[] | undefined;
+    try {
+      changes = await this.#o.integrator.uncommitted(run.workspace, at);
+    } catch (err) {
+      if (err instanceof WorktreeRefusedError) throw err;
+      this.#errors.push(err);
+      // Git's message can echo the Worker's paths: no control characters get through.
+      const why = redactSecrets((err as Error).message).replace(CONTROL, ' ');
+      return { unknown: why.slice(0, 200) };
+    }
+    if (changes === undefined) {
+      return { unknown: 'no commit to compare with, or not a worktree of the repo' };
+    }
+    return {
+      changes: changes.filter((c) => !(c.untracked && isSandboxPlaceholder(run, c.path))),
+    };
+  }
+
+  /**
+   * Commit the checkout's changes for a Worker that cannot run git (#260), onto the run's last
+   * commit (or its HEAD), as `worker.integrated`. `waiting` when a change is protected config or
+   * too big: the user is asked, and the answer goes to the same session. `failed` when git failed,
+   * which fails the attempt as a failed integration does; throws `WorktreeRefusedError` for a
+   * checkout that fails the integrity checks.
+   */
+  async #commitFor(
+    run: Run,
+    task: Task,
+  ): Promise<'done' | 'waiting' | 'ended' | { failed: string }> {
+    const integrator = this.#o.integrator;
+    if (!integrator?.commitFor || !CANNOT_COMMIT.has(run.adapterId)) return 'done';
+    let result: Awaited<ReturnType<NonNullable<Integrator['commitFor']>>>;
+    try {
+      result = await integrator.commitFor(run.subtaskId, run.workspace, {
+        ...(run.commit !== undefined ? { parent: run.commit } : {}),
+        message: commitMessage(task, run),
+        skip: (c) => c.untracked && isSandboxPlaceholder(run, c.path),
+      });
+    } catch (err) {
+      if (err instanceof WorktreeRefusedError) throw err;
+      this.#errors.push(err);
+      if (this.#runs.get(run.subtaskId) !== run || !this.#started) return 'ended';
+      const why = redactSecrets((err as Error).message)
+        .replace(CONTROL, ' ')
+        .slice(0, 300);
+      return { failed: `Tacet's commit of the Worker's changes failed: ${why}` };
+    }
+    if (this.#runs.get(run.subtaskId) !== run || !this.#started) return 'ended';
+    if (result === undefined) return 'done';
+    if ('refused' in result) {
+      const r = result.refused;
+      const what =
+        r.why === 'protected'
+          ? `changed agent, hook or tool config, which Tacet does not commit for a Worker: ${pathsNote(r.paths.map((path) => ({ path })))}`
+          : `changed ${r.files} files (${r.bytes} bytes), more than Tacet commits for a Worker at once`;
+      // Paths outside the checkout stay out: the checkout is named by its id.
+      const next =
+        r.why === 'protected'
+          ? `The Worker cannot change those paths itself: revert them in checkout ${run.workspace.id}, then answer to go on, or cancel the task.`
+          : 'Your answer goes to the Worker: say what it should do (split the work, say, or remove what should not be there).';
+      this.#raise(
+        run.subtaskId,
+        `The Worker for ${run.subtaskId} ${what}. Nothing was committed. ${next}`,
+        { urgency: 'high', category: 'blocked' },
+      );
+      return 'waiting';
+    }
+    run.commit = result.commit;
+    this.#o.store.append(
+      this.#env(
+        run.subtaskId,
+        'worker.integrated',
+        { sessionId: run.sessionId, commit: result.commit, ref: result.ref, by: 'tacet' },
+        run.sessionId,
+      ),
+    );
+    return 'done';
   }
 
   /**
@@ -1966,6 +2233,8 @@ export class MiniConductor {
         run.workspace,
         {
           ...(run.commit !== undefined ? { commit: run.commit } : {}),
+          // The sandbox's empty placeholders, left out of Tacet's commits (#260, #263).
+          ignoreUntracked: (path) => isSandboxPlaceholder(run, path),
           signal: AbortSignal.any([abort.signal, this.#abort.signal]),
           marker,
           onCommand: (r) => {
@@ -2282,6 +2551,32 @@ export class MiniConductor {
     } catch (err) {
       rmSync(tmp, { force: true });
       this.#errors.push(err);
+    }
+  }
+
+  /**
+   * Remove the empty placeholders Claude Code's sandbox left in the checkouts of sessions that
+   * never closed (a crash), which their adapter removes only at a close (#263). Only for those
+   * adapters, after the sessions' processes are ended, and never a path the checkout's base
+   * commit or its HEAD has (none at all when its HEAD cannot be told): what is removed is each `SANDBOX_PLACEHOLDERS` entry that is still an empty file
+   * or directory (`removeSandboxPlaceholders`), as the adapter's close would have.
+   */
+  async #removeCrashPlaceholders(): Promise<void> {
+    const tracked = this.#o.integrator?.tracked?.bind(this.#o.integrator);
+    if (!tracked) return;
+    for (const s of this.#state().sessions.values()) {
+      if (s.ended !== undefined || !s.adapter || !CLAUDE_SANDBOXED.has(s.adapter)) continue;
+      // Without a base, what the checkout had to begin with is unknown: nothing is removed.
+      if (!s.workspaceId || s.baseCommit === undefined) continue;
+      try {
+        const ws = await this.#o.workspaces.get(s.workspaceId);
+        if (!ws) continue;
+        const keep = await tracked(ws, s.baseCommit, SANDBOX_PLACEHOLDERS);
+        if (keep) removeSandboxPlaceholders(ws.path, keep);
+      } catch (err) {
+        // Logged; the session is recorded as ended next, so this is not tried again.
+        this.#errors.push(err);
+      }
     }
   }
 
