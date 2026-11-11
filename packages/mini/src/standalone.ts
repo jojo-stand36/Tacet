@@ -4,7 +4,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { TacetConfig, Task } from '@tacet/core';
 import {
+  type ConductorLink,
+  type ConductorLinkState,
   defaultRunDir,
+  dialConductor,
   type EventStore,
   loadConfig,
   miniRuntimePath,
@@ -60,6 +63,14 @@ export interface StandaloneOptions {
    * `<home>/.tacet/run` when `home` is given, else `~/.tacet/run`.
    */
   runDir?: string;
+  /**
+   * Dial the Conductor (#23): on by default, so every live Mini-conductor, `tacet run`'s
+   * included, shows in `tacet conductor status`. No Conductor running is the normal standalone
+   * case and changes nothing. `false` for tests that must not reach a Conductor.
+   */
+  conductor?:
+    | false
+    | { onState?: (s: ConductorLinkState) => void; minDelayMs?: number; settleMs?: number };
 }
 
 /** A running standalone Mini-conductor and what it owns. */
@@ -211,6 +222,24 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
     );
     writeRuntimeFile({ path: runtimeFile, port: control.port, protocolVersions: [1], token });
+    // Last: the Conductor sees a Mini-conductor only once it holds its lock and serves its port.
+    let link: ConductorLink | undefined;
+    if (o.conductor !== false) {
+      const repoPath = realpathSync(o.repoRoot);
+      link = dialConductor({
+        card: {
+          repoId: repoStatePaths(repoPath).repoId,
+          repoPath,
+          adapters: Object.keys(adapters).sort(),
+          miniVersion: MINI_VERSION,
+        },
+        clientInfo: { name: 'tacet-mini', version: MINI_VERSION },
+        runDir: o.runDir ?? (o.home ? join(o.home, '.tacet', 'run') : defaultRunDir()),
+        ...(o.conductor?.minDelayMs !== undefined ? { minDelayMs: o.conductor.minDelayMs } : {}),
+        ...(o.conductor?.settleMs !== undefined ? { settleMs: o.conductor.settleMs } : {}),
+        ...(o.conductor?.onState ? { onState: o.conductor.onState } : {}),
+      });
+    }
     const mcp = server;
     const port = control;
     const file = runtimeFile;
@@ -225,6 +254,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       close: () => {
         closed ??= (async () => {
           try {
+            await link?.close();
             try {
               removeRuntimeFile(file, token);
             } catch (err) {
@@ -255,6 +285,9 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
     throw err;
   }
 }
+
+/** The version a Mini-conductor gives in its hello and Agent Card. */
+export const MINI_VERSION = '0.0.0';
 
 /**
  * Plans each task in a throwaway detached checkout of the repo's HEAD, removed afterwards. The

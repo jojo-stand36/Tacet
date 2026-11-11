@@ -5,12 +5,11 @@ import { KeychainError, type KeychainOptions, readKeychain } from './keychain.js
 /** A secret reference in config that could not be resolved. Says where, never a value. */
 export class SecretRefError extends Error {
   override name = 'SecretRefError';
-  constructor(
-    /** The config path, e.g. `agents.goose.env.GOOSE_API_KEY`. */
-    readonly path: string,
-    message: string,
-  ) {
+  /** The config path, e.g. `agents.goose.env.GOOSE_API_KEY`. */
+  readonly path: string;
+  constructor(path: string, message: string) {
     super(`${path}: ${message}`);
+    this.path = path;
   }
 }
 

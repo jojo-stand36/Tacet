@@ -112,6 +112,12 @@ export function mergeConfig(
       layerErrors.push(...taskRaisesWorkers(merged, layer), ...taskSetsTierBounds(layer));
     }
     layerErrors.push(...workerEnvErrors(layer));
+    if (layer.name !== 'default' && layer.name !== 'user' && layer.data.conductor !== undefined) {
+      // The Conductor is the user's, across repos: only their own config may make it start processes (#23).
+      layerErrors.push(
+        `conductor: only the user layer may set it, not ${layer.name} (${layer.origin})`,
+      );
+    }
     if (layer.name === 'task' && layer.data.verify !== undefined) {
       // A task could otherwise turn every check off (`[]`) or run shell outside any Worker (#19).
       layerErrors.push(
