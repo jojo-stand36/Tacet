@@ -417,6 +417,62 @@ describe('tacet standalone (#21)', () => {
     expect((await tacet(['cancel', ...user()])).code).toBe(2);
   });
 
+  it("clears a crashed Claude session's sandbox placeholders when canceling with no run live (#304)", async () => {
+    const paths = repoStatePaths(repo, state);
+    const { WorktreeManager } = await import('@tacet/mini');
+    const store = openEventStore(paths.events);
+    const checkout = await new WorktreeManager(repo, paths.worktrees, {
+      env,
+      log: { store, repo: paths.repoId, miniId: 'standalone' },
+    }).create('crashed');
+    // What Claude's sandbox leaves when its session dies without closing: empty placeholders.
+    writeFileSync(join(checkout.path, '.env'), '');
+    writeFileSync(join(checkout.path, 'notes.txt'), '');
+    const id = 'crashed-task';
+    const envelope = (taskId: string, type: string, data: unknown, sessionId?: string) => ({
+      v: 1 as const,
+      id: newUlid(),
+      ts: new Date().toISOString(),
+      source: { kind: 'mini' as const, id: 'standalone' },
+      taskId,
+      ...(sessionId ? { sessionId } : {}),
+      type,
+      data,
+    });
+    const created = (taskId: string, parentId?: string) =>
+      envelope(taskId, 'task.created', {
+        id: taskId,
+        ...(parentId ? { parentId } : {}),
+        goal: 'g',
+        acceptanceCriteria: ['ok'],
+        priority: 'p2',
+        createdAt: new Date().toISOString(),
+      });
+    store.append([
+      created(id),
+      created(`${id}/1`, id),
+      envelope(
+        `${id}/1`,
+        'worker.started',
+        {
+          sessionId: 's1',
+          adapter: 'claude-sdk',
+          workspaceId: checkout.id,
+          baseCommit: checkout.baseCommit,
+        },
+        's1',
+      ),
+    ]);
+    store.close();
+
+    const c = await tacet(['cancel', ...user(), '--json', id]);
+    expect(c.code).toBe(0);
+    expect(JSON.parse(c.out)).toEqual({ canceled: [`${id}/1`, id] });
+    expect(existsSync(join(checkout.path, '.env'))).toBe(false);
+    // Not a placeholder: the Worker's.
+    expect(existsSync(join(checkout.path, 'notes.txt'))).toBe(true);
+  });
+
   it('drops the open escalations of a canceled task from status (#202)', async () => {
     const paths = repoStatePaths(repo, state);
     script = () => {
