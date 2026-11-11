@@ -800,9 +800,13 @@ ws.close();
     const text = () => Buffer.concat(got).toString('utf8');
     const attaching = tacet(['attach', ...user(), `${id}/1`], { raw: (b) => got.push(b) });
     await vi.waitFor(() => expect(text()).toBe('$ make test\r\n'));
-    screen.push('\x1b[32mok\x1b[0m 12 tests');
-    // The terminal's own bytes, escape sequences and all.
-    await vi.waitFor(() => expect(text()).toBe('$ make test\r\n\x1b[32mok\x1b[0m 12 tests'));
+    // A clipboard write (OSC 52), split across two chunks, and a window title (#302).
+    screen.push('\x1b]0;tests\x07\x1b[32mok\x1b]52;c;cm0gLXJm');
+    screen.push('IH4K\x07\x1b[0m 12 tests');
+    // The terminal's own bytes, escape sequences and all, but no clipboard write.
+    await vi.waitFor(() =>
+      expect(text()).toBe('$ make test\r\n\x1b]0;tests\x07\x1b[32mok\x1b[0m 12 tests'),
+    );
 
     const secret = readRuntimeFile(runtimeFile).token.reveal();
 
@@ -815,7 +819,10 @@ ws.close();
     expect(a.code, a.err).toBe(0);
     expect(a.err).toContain('the Worker session ended');
     expect(a.out).toBe('');
-    expect(text().startsWith('$ make test\r\n\x1b[32mok\x1b[0m 12 tests')).toBe(true);
+    expect(text().startsWith('$ make test\r\n\x1b]0;tests\x07\x1b[32mok\x1b[0m 12 tests')).toBe(
+      true,
+    );
+    expect(text()).not.toContain(']52;');
     expect(
       text().endsWith(
         '\x1b[0m\x1b[?25h\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l',

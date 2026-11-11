@@ -36,7 +36,9 @@ const USAGE = `usage:
                                  a task's events (--transcript adds the Workers' own)
   tacet attach <session | task/n> [--json]
                                  follow one Worker session as it runs (a PTY Worker's own
-                                 terminal, live, when a run is live and this is a terminal)
+                                 terminal, live, when a run is live and this is a terminal;
+                                 its clipboard writes, OSC 52 and the like, and tmux
+                                 passthrough are left out)
   tacet config explain [--json]  the effective configuration and where each value comes from
 
 Every command takes --repo DIR (default: the repo of the current directory) and --user-dir DIR.
