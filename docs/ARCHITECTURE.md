@@ -65,6 +65,7 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 - Conductor dedupes/batches across repos and puts them in the **decision inbox**, ranked by urgency × blocked-workers.
 - User answers once; the answer is recorded as a **decision** (reusable precedent) and flows back down.
 - Escalation strictness is a per-user/per-repo dial (`autonomy: low | medium | high`).
+- **Escalation rate** (#25): `escalationStats` in `@tacet/core` counts, from the log, the escalations Workers raised, how each was resolved (by the gate: `policy`, `precedent` or `mini`; by the user; with no recorded source, in logs from before it was written; or still open), and those the Mini-conductor raised itself, apart. The rate is the share of Worker escalations that reached the user. `tacet status` shows it for the last 7 days and in all (`--json`: `escalations.last7Days`, `escalations.total`). It reads only summary-grade events, so retention does not change it.
 
 ### 2.3 Handoff flow
 - Context usage tracked per session; at the `handoff` band the worker is asked for a typed **HandoffPacket** (see RESEARCH.md §5).
