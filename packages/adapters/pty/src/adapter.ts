@@ -521,7 +521,7 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.effort !== undefined) {
       throw new ProfileRefusedError('effort', 'the PTY adapter does not set an effort');
     }
-    const text = promptText(input.text);
+    const text = withoutImagePaths(promptText(input.text));
     if (s.typing || s.state === 'running' || s.state === 'waiting_input') {
       s.queue.push(text);
       return;
@@ -1032,6 +1032,44 @@ function promptKey(text: string): string {
  * leading `!` runs it with no `UserPromptSubmit`, `PreToolUse` or `PermissionRequest`; a leading
  * space or zero-width character does not stop `/`), so it is refused.
  */
+/** Claude Code 2.1.319's split of a pasted line: before a space and a path (`Mr`). */
+const PASTE_SEGMENT = / (?=["']?(?:\/|[A-Za-z]:\\))/;
+/** Its image-file test (`f4t`). */
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp)$/i;
+
+/**
+ * Whether interactive Claude Code 2.1.319 would take a pasted line, or a part of it, for an image
+ * file (#244): split before a space and a path, each part trimmed, unquoted (matching quotes)
+ * and unescaped (backslash escapes) as its paste handler does, then tested against its image
+ * extensions. Such a part is read when absolute (and permitted) and attached as an image, inside
+ * the checkout or not; read or not, the Enter typed with the paste is dropped, so the prompt is
+ * never submitted. Errs towards yes: Claude Code also keeps a line of several parts that are not
+ * all paths as text.
+ */
+export function claudeReadsImagePath(line: string): boolean {
+  return line.split(PASTE_SEGMENT).some((part) => {
+    let p = part.trim();
+    if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+      p = p.slice(1, -1);
+    }
+    const unescaped = p.replaceAll('\\\\', '\0').replace(/\\(.)/g, '$1').replaceAll('\0', '\\');
+    return IMAGE_FILE.test(unescaped);
+  });
+}
+
+/**
+ * `text` with ` .` after each line Claude Code would take for an image path (#244): that line's
+ * last part then ends in `.`, and a line of several parts is kept as text, so nothing is read or
+ * attached and the paste is submitted. Verified live on Claude Code 2.1.319 (capability matrix,
+ * "PTY: pasted image paths").
+ */
+export function withoutImagePaths(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => (claudeReadsImagePath(line) ? `${line} .` : line))
+    .join('\n');
+}
+
 export function promptText(text: string): string {
   const clean = [...text.replace(/\r\n?/g, '\n')]
     .filter((c) => {
