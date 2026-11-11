@@ -20,7 +20,7 @@ import { basename, delimiter, dirname, join, resolve, sep } from 'node:path';
 import { TacetConfig } from '@tacet/core';
 import type { Io } from '../io.js';
 import { safeJson, terminalSafe } from '../render.js';
-import { repoRootFrom } from '../state.js';
+import { isGitCheckout, repoRootFrom } from '../state.js';
 import { applyState, planState, type StatePlan, type StateResult } from './purge-state.js';
 
 // The symlink-safe file checks, `wx` writes, PATH detection and the uninstall backup layout are
@@ -446,7 +446,7 @@ function userDirOf(io: Io, o: { 'user-dir'?: string }): string {
  */
 function repoFor(io: Io, o: { repo?: string; 'user-dir'?: string }): string {
   const root = repoRootFrom(o.repo ?? io.cwd);
-  if (!existsSync(join(root, '.git'))) {
+  if (!isGitCheckout(root)) {
     throw new InitError(`${root} is not in a git repository: Tacet works on a git repo`);
   }
   const tacetDir = canonical(join(root, '.tacet'));
