@@ -1110,6 +1110,18 @@
       "body": "In standalone mode (#21), `tacet run` hosts the Mini-conductor in its own process. `status`, `logs` and `attach` read the event log read-only. ADR-003 §4 says a standalone Mini-conductor serves the Conductor's methods on its own port, for the CLI and the UI. Building that port replaces the interim design.\n\n### Tasks\n- [ ] Serve the ADR-003 methods on a loopback port with a token (`tacet/hello` with role `cli`, the runtime file).\n- [ ] A background mode (`tacet up` for one repo, or `tacet run --detach`).\n- [ ] `tacet status` and `tacet attach` over the port, and live terminal attach for PTY Workers (`/pty/<sessionId>`, ADR-003).\n- [ ] Answering escalations and cancelling over the port, so a second process never writes the log.\n\n### Acceptance criteria\n- `tacet attach <worker>` shows a PTY Worker's terminal live.\n- `tacet status` answers from the running Mini-conductor, and falls back to the log when none is running.\n- The port binds to 127.0.0.1 only and refuses a request without the token.\n\n_See #21, docs/adr/003-wire-protocols.md §4 and docs/ARCHITECTURE.md §1._"
     },
     {
+      "title": "Start the Claude SDK's Claude Code in a session of its own, and verify #269's terminal assumptions per OS",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:security",
+        "area:adapters",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up of #269 (owner decision on PR #305, comment 6803381213). Answers over the control port need a one-time code that only the `tacet run` terminal shows. That holds only while no Worker-run process can read or write that terminal or the run's memory, which docs/ARCHITECTURE.md §6 lists as unverified assumptions.\n\nThe Claude Agent SDK starts Claude Code with piped stdio and no session of its own, so it keeps `tacet run`'s controlling terminal (verify commands, Codex, ACP and PTY Workers already run detached). That is acceptable only while SDK Workers run no shell, hook or settings from the checkout.\n\n### Tasks\n- [ ] Start Claude Code through the SDK's `spawnClaudeCodeProcess` with `detached: true` (a session of its own), keeping what the SDK's own spawn does (env, stdio, abort signal, exit), and end its process group on close.\n- [ ] Verify, per OS (Ubuntu, macOS, WSL2), from primary sources and a live check: whether a descendant of `tacet run` can read its memory (Yama `ptrace_scope` on Linux; macOS task ports); whether `TIOCSTI` can inject input into a terminal the process shares (`dev.tty.legacy_tiocsti`); record each in docs/ARCHITECTURE.md §6.\n- [ ] Note what terminal multiplexers and session logging expose (tmux `capture-pane`, screen `hardcopy`, scrollback files) in the user docs for `tacet answer`.\n\n### Acceptance criteria\n- A test shows a Claude SDK Worker's Claude Code process has no controlling terminal (not in `tacet run`'s session).\n- Each assumption in ARCHITECTURE §6's #269 entry is marked verified (with its source) or listed as a residual risk for the owner.\n\n_See #269, #53, PR #305 and docs/ARCHITECTURE.md §6._"
+    },
+    {
       "title": "Submodules and nested repos for unattended Codex Workers",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
