@@ -90,6 +90,16 @@ export interface PtyPreset {
    * its API (capability matrix, "Generic PTY presets: `@path` mentions").
    */
   escapeAt?: boolean;
+  /**
+   * For Codex CLI (#249), whose composer reads two things into a paste. A paste that ends in an
+   * `@token` leaves its Mentions popup open, and the Enter Tacet types then inserts a completion
+   * instead of submitting; a trailing space keeps it closed, and Codex trims it, so the text is
+   * sent unchanged. A paste that Codex reads as one image path (`codexReadsAsPath`) is attached
+   * as an image, inside the checkout or not; such a prompt gets a first line saying it is text,
+   * after which it is several words. Verified live on Codex CLI 0.167.0 against a local mock of
+   * its API (capability matrix, "Generic PTY presets: `@path` mentions").
+   */
+  codexPaste?: boolean;
 }
 
 /** `vendorSessionId` of a session whose CLI resumes by `resumeArgs`: there is no real id. */
@@ -333,7 +343,9 @@ export class PtyCliAdapter implements AgentAdapter {
       throw new ProfileRefusedError('effort', `${this.id} does not set an effort`);
     }
     const typed = promptText(input.text);
-    const text = this.#opts.preset.escapeAt ? `. ${typed.replaceAll('@', '\\@')} .` : typed;
+    const escaped = this.#opts.preset.escapeAt ? `. ${typed.replaceAll('@', '\\@')} .` : typed;
+    // Both can be set (a command running both CLIs): the escaped text is several words, so safe.
+    const text = this.#opts.preset.codexPaste ? codexPasteText(escaped) : escaped;
     // A stalled turn may be asking something (a `[y/N]`): the input is its answer, typed now.
     if (s.stalled) {
       s.stalled = false;
@@ -454,7 +466,8 @@ export class PtyCliAdapter implements AgentAdapter {
 
   #type(s: Session, text: string): void {
     const line = this.#line(s, text);
-    s.typed = s.pasteMode ? text : line;
+    // A space a preset adds at the end (`codexPaste`) is not echoed: matched without it.
+    s.typed = s.pasteMode ? text.trimEnd() : line;
     s.turnOutput = '';
     s.inTurn = true;
     s.stalled = false;
@@ -579,4 +592,73 @@ export function stripEcho(reply: string, typed: string): string {
     if (j === typed.length) return reply.slice(i);
   }
   return reply;
+}
+
+/** What Codex CLI is pasted for `text` (`PtyPreset.codexPaste`, #249). */
+export function codexPasteText(text: string): string {
+  // Before the text, so the paste starts with neither a quote, `file:` nor a drive letter.
+  const body = codexReadsAsPath(text)
+    ? `(This message is text, not a file to attach.)\n${text}`
+    : text;
+  return `${body} `;
+}
+
+/** Extensions the `image` crate 0.25.9 (Codex 0.167.0's) decodes: `ImageFormat::from_extension`. */
+const IMAGE_EXTENSION =
+  /\.(avif|jpe?g|jfif|a?png|gif|webp|tiff?|tga|dds|bmp|ico|hdr|exr|p[abgnp]m|ff|qoi)$/i;
+
+/**
+ * Whether Codex CLI 0.167.0 would attach a paste of `text` as an image (#249). Its composer
+ * (`apply_paste` in `chat_composer/paste_input.rs`) checks a paste of 2 to 1000 characters with
+ * `normalize_pasted_path` (`clipboard_paste.rs`): after trimming, a string in matching quotes, a
+ * `file:` URL (the URL parser drops tabs and newlines anywhere), a Windows path, or exactly one
+ * word as the Rust `shlex` crate splits it (a `#` starting a word comments out its line). It then
+ * attaches the file when the `image` crate decodes it, whose format comes from the extension
+ * alone (`ImageReader::open`). So: any `file:` URL (it can hide its extension), or such a path
+ * ending in an image extension once quotes, backslashes, tabs and newlines are taken out. Errs
+ * towards yes; a word like `continue` or `y` is not one.
+ */
+export function codexReadsAsPath(text: string): boolean {
+  const t = text.trim();
+  if (/^file:/i.test(t.replace(/[\t\n\r]/g, ''))) return true;
+  const onePath =
+    /^(["'])[\s\S]*\1$/.test(t) || /^[A-Za-z]:[\\/]|^\\\\/.test(t) || shellWords(t) <= 1;
+  return onePath && IMAGE_EXTENSION.test(t.replace(/[\t\n\r\\'"]/g, ''));
+}
+
+/** How many words a POSIX shell splitter like the Rust `shlex` crate yields before an error. */
+function shellWords(text: string): number {
+  let words = 0;
+  let i = 0;
+  const n = text.length;
+  const space = (c: string | undefined) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+  while (i < n) {
+    while (i < n && space(text[i])) i++;
+    if (i >= n) break;
+    if (text[i] === '#') {
+      while (i < n && text[i] !== '\n') i++;
+      continue;
+    }
+    // One word, up to unquoted whitespace.
+    while (i < n && !space(text[i])) {
+      const c = text[i];
+      if (c === '\\') {
+        if (i + 1 >= n) return words; // A trailing backslash is an error: no more words.
+        i += 2;
+      } else if (c === "'") {
+        const end = text.indexOf("'", i + 1);
+        if (end < 0) return words;
+        i = end + 1;
+      } else if (c === '"') {
+        i++;
+        while (i < n && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+        if (i >= n) return words;
+        i++;
+      } else {
+        i++;
+      }
+    }
+    words++;
+  }
+  return words;
 }

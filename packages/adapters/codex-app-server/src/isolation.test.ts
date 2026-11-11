@@ -63,6 +63,9 @@ describe('Codex Worker isolation', () => {
     git(repo, 'init', '-q', '-b', 'main');
     git(repo, 'commit', '-q', '--allow-empty', '-m', 'init');
     git(repo, 'worktree', 'add', '-q', worktree, '-b', 'tacet/task-1');
+    // Outside the sandbox, a first-run shim (Xcode's on macOS) starts here, not in a measured
+    // step (#251).
+    execFileSync('git', ['--version'], { env: gitEnv });
   });
 
   afterAll(async () => {
@@ -103,8 +106,10 @@ describe('Codex Worker isolation', () => {
     let at = start + 1;
     // A hung turn fails here with what happened so far. Measured on macOS CI (#124): the first
     // `git` inside Seatbelt costs about 4 s before git starts (the Xcode shim via xcrun), while
-    // `git add` + `git commit` take about 35 ms; 15 s leaves room for that and still fails a hang.
-    const deadline = Date.now() + 15_000;
+    // `git add` + `git commit` take about 35 ms; a cold runner took over 10 s (#251). The mock
+    // lets a command run up to 30 s (`exec_command`'s longest wait) before Codex returns without
+    // its exit; 45 s leaves room for that and still fails a hang.
+    const deadline = Date.now() + 45_000;
     for (;;) {
       const next = await tap
         .waitFor(
@@ -173,7 +178,7 @@ describe('Codex Worker isolation', () => {
   // Several real Codex turns: each has its own deadline in `run`, so a hang still fails with a
   // dump; the test as a whole needs more than the 5 s default.
   it('unattended: commits without approval into its own store, never writes the shared .git', {
-    timeout: 30_000,
+    timeout: 180_000,
   }, async () => {
     const shared = join(repo, '.git');
     const refsBefore = git(repo, 'for-each-ref');
@@ -188,6 +193,9 @@ describe('Codex Worker isolation', () => {
       const r = await run(a, h, `${stamp}; ${cmd}; ${stamp}`);
       return r;
     };
+    // Git's first run inside the sandbox (the Xcode shim's, on macOS) lands here, unmeasured.
+    const warm = await probe('git --version');
+    expect(warm.output, warm.output).toContain('git version');
     const commit = await probe(
       'command -v git; echo hi > work.txt && git add work.txt && git commit -qm work && echo COMMITTED',
     );
