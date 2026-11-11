@@ -38,7 +38,12 @@ import { defaultStateDir, repoStateDir } from '@tacet/core/node';
 import { authEnv, type ClaudeAuthRoute, claudeEnvAllow, withSubprocessScrub } from './auth.js';
 import { isOwnDir, removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 import { removeMcpConfig, sweepStaleMcpConfigs, writeMcpConfig } from './mcp-config.js';
-import { placeholderSnapshot, removeSandboxPlaceholders } from './placeholders.js';
+import {
+  removeSandboxResidue,
+  residueSnapshot,
+  SANDBOX_ENV,
+  type SandboxResidue,
+} from './placeholders.js';
 
 /** Vendor session ids are UUIDs: they name each session's config directory. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -171,8 +176,8 @@ interface Session {
   ended: boolean;
   /** Literal secrets of this session (MCP header values), scrubbed from every event. */
   secrets: string[];
-  /** Under the scrub: the checkout and which sandbox placeholder paths it had before (#263). */
-  placeholders: { cwd: string; before: Set<string> } | undefined;
+  /** Under the scrub: the checkout and HOME, and which placeholder paths they had (#263). */
+  placeholders: SandboxResidue | undefined;
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
   model: string | undefined;
@@ -269,11 +274,10 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     // An API-key Worker's commands never see the key (#150); a login session has none to hide.
     const scrub =
       route === 'api_key' && !(this.#opts.subprocessScrub === false && this.#opts.query);
-    const env = scrub ? withSubprocessScrub(routed) : routed;
-    // The sandbox the scrub turns on leaves empty placeholders in the checkout; removed at close.
-    const placeholders = scrub
-      ? { cwd: opts.cwd, before: placeholderSnapshot(opts.cwd) }
-      : undefined;
+    const env = scrub ? { ...withSubprocessScrub(routed), ...SANDBOX_ENV } : routed;
+    // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
+    // runs with; removed at close (#263).
+    const placeholders = scrub ? residueSnapshot(opts.cwd, env.HOME ?? homedir()) : undefined;
     // Tacet owns the effort: this variable overrides the `effort` option and later
     // `applyFlagSettings` calls without any sign that it did.
     delete env.CLAUDE_CODE_EFFORT_LEVEL;
@@ -589,7 +593,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       await s.loop;
     } finally {
       if (s.mcpConfigPath) removeMcpConfig(s.mcpConfigPath);
-      if (s.placeholders) removeSandboxPlaceholders(s.placeholders.cwd, s.placeholders.before);
+      if (s.placeholders) removeSandboxResidue(s.placeholders);
       this.#setState(s, 'done');
       s.events.end();
       this.#sessions.delete(h.id);

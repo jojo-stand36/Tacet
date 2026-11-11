@@ -13,7 +13,12 @@ export {
 export { removeClaudeConfigDir, repoOf, sweepClaudeConfigDirs } from './config-dirs.js';
 export { removeMcpConfig, writeMcpConfig } from './mcp-config.js';
 export {
+  HOME_PLACEHOLDERS,
   placeholderSnapshot,
   removeSandboxPlaceholders,
+  removeSandboxResidue,
+  residueSnapshot,
+  SANDBOX_ENV,
   SANDBOX_PLACEHOLDERS,
+  type SandboxResidue,
 } from './placeholders.js';

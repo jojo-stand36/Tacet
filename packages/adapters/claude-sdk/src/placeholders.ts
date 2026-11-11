@@ -33,6 +33,77 @@ export const SANDBOX_PLACEHOLDERS: readonly string[] = [
   'yarn.lock',
 ];
 
+/**
+ * Paths in the user's `HOME` where the same sandbox leaves an empty placeholder (a file, or a
+ * directory: `.claude/ssh`, `.config/{anthropic,gh,git,glab-cli,pip}`, `.pip`) when it was
+ * missing (#263), observed live on Claude Code 2.1.319 with bubblewrap and socat (the dotfiles
+ * its protected-path list names, which the bundled binary holds as `/.gitconfig` … `/.yarnrc.yml`),
+ * and `.npm`, the directory npm makes for the `npm root --global` Claude Code runs as it starts:
+ * empty when npm writes no log (`npm_config_logs_max=0`, set by the adapters under the scrub).
+ */
+export const HOME_PLACEHOLDERS: readonly string[] = [
+  '.bash_aliases',
+  '.bash_profile',
+  '.bashrc',
+  '.bunfig.toml',
+  '.gitconfig',
+  '.netrc',
+  '.npmrc',
+  '.profile',
+  '.yarnrc',
+  '.yarnrc.yml',
+  '.zshrc',
+  '.npm',
+  // Empty directories, children before their parents.
+  '.claude/ssh',
+  '.claude',
+  '.config/anthropic',
+  '.config/gh',
+  '.config/git',
+  '.config/glab-cli',
+  '.config/pip',
+  '.config',
+  '.pip',
+];
+
+/**
+ * The environment the adapters add under the scrub (#263): npm writes no debug log for the
+ * `npm root --global` Claude Code runs as it starts, nor for a Worker's own npm commands
+ * ("If set to 0, no log files will be written for the current run", npm 10's `logs-max`).
+ */
+export const SANDBOX_ENV: Readonly<Record<string, string>> = { npm_config_logs_max: '0' };
+
+/** What a session's sandbox may leave behind, and what was there before it started (#263). */
+export interface SandboxResidue {
+  cwd: string;
+  before: Set<string>;
+  home: string;
+  homeBefore: Set<string>;
+}
+
+/** Snapshot the checkout and `home` before a session under the sandbox starts. */
+export function residueSnapshot(cwd: string, home: string): SandboxResidue {
+  return {
+    cwd,
+    before: placeholderSnapshot(cwd),
+    home,
+    homeBefore: placeholderSnapshot(home, HOME_PLACEHOLDERS),
+  };
+}
+
+/**
+ * Remove what the session's sandbox left (#263): the placeholders in the checkout and in `home`
+ * that were not there before and are still empty (`removeSandboxPlaceholders`). A placeholder
+ * another session running at the same time made looks new to this one and is removed too, and
+ * that session's sandbox may make it again; it is still only ever an empty entry.
+ */
+export function removeSandboxResidue(r: SandboxResidue): string[] {
+  return [
+    ...removeSandboxPlaceholders(r.cwd, r.before),
+    ...removeSandboxPlaceholders(r.home, r.homeBefore, HOME_PLACEHOLDERS).map((p) => join('~', p)),
+  ];
+}
+
 /** Whether every parent of `rel` under `cwd` is a directory and not a symlink. */
 function parentsAreDirs(cwd: string, rel: string): boolean {
   const segs = rel.split('/').slice(0, -1);
@@ -47,10 +118,13 @@ function parentsAreDirs(cwd: string, rel: string): boolean {
   return true;
 }
 
-/** Which of the sandbox's placeholder paths exist in `cwd` now (before a session starts). */
-export function placeholderSnapshot(cwd: string): Set<string> {
+/** Which of the sandbox's placeholder paths (`list`) exist in `cwd` now (before a session starts). */
+export function placeholderSnapshot(
+  cwd: string,
+  list: readonly string[] = SANDBOX_PLACEHOLDERS,
+): Set<string> {
   return new Set(
-    SANDBOX_PLACEHOLDERS.filter((p) => {
+    list.filter((p) => {
       try {
         lstatSync(join(cwd, p));
         return true;
@@ -71,9 +145,13 @@ export function placeholderSnapshot(cwd: string): Set<string> {
  * checkout's base commit or HEAD has as `before` (#263). Returns what was removed, relative to `cwd`;
  * errors leave the path in place.
  */
-export function removeSandboxPlaceholders(cwd: string, before: ReadonlySet<string>): string[] {
+export function removeSandboxPlaceholders(
+  cwd: string,
+  before: ReadonlySet<string>,
+  list: readonly string[] = SANDBOX_PLACEHOLDERS,
+): string[] {
   const removed: string[] = [];
-  for (const p of SANDBOX_PLACEHOLDERS) {
+  for (const p of list) {
     if (before.has(p)) continue;
     const full = join(cwd, p);
     // Only inside the checkout: every parent of a nested entry must be a real directory, never a
