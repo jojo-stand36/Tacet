@@ -547,6 +547,48 @@ describe('buildWorkerAdapters', () => {
   });
 });
 
+describe('where adapters keep per-repo state (#23)', () => {
+  it('puts an ACP agent home under the top-level stateDir, unless the adapter is given its own', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'tacet-build-statedir-'));
+    try {
+      const repo = join(root, 'repo');
+      const home = join(root, 'home');
+      mkdirSync(repo);
+      mkdirSync(home);
+      const homeOf = async (o: Parameters<typeof buildWorkerAdapters>[1]) => {
+        const built = buildWorkerAdapters(
+          { tiers: { worker: { adapter: 'acp:gemini' } } },
+          {
+            repoRoot: repo,
+            baseEnv: {
+              PATH: process.env.PATH,
+              HOME: home,
+              GEMINI_API_KEY: 'placeholder-not-a-real-key',
+            },
+            ...o,
+          },
+        );
+        const adapter = built['acp:gemini']?.adapter;
+        if (!adapter) throw new Error('no acp adapter');
+        const h = await adapter.start({ cwd: repo });
+        await adapter.close(h);
+      };
+      const executable = [process.execPath, FAKE_AGENT];
+      await homeOf({ stateDir: join(root, 'state'), acp: { executable, killTimeoutMs: 1000 } });
+      expect(existsSync(join(repoStateDir(repo, join(root, 'state')), 'acp-gemini'))).toBe(true);
+      // A per-adapter stateDir wins over the top-level one.
+      await homeOf({
+        stateDir: join(root, 'state'),
+        acp: { executable, killTimeoutMs: 1000, stateDir: join(root, 'own') },
+      });
+      expect(existsSync(join(repoStateDir(repo, join(root, 'own')), 'acp-gemini'))).toBe(true);
+      expect(existsSync(defaultStateDir(home))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('a Codex Worker built from config (#186)', () => {
   it('starts in a linked worktree of the repo, with a CODEX_HOME keyed by the repo root, under the state dir (#23)', {
     timeout: 120_000,

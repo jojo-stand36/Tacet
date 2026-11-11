@@ -58,7 +58,7 @@ export interface BuildWorkerAdaptersOptions {
   >;
   codex?: Pick<CodexAdapterOptions, 'apiBaseUrl' | 'codexPath' | 'killTimeoutMs' | 'stateDir'>;
   acp?: Pick<AcpAdapterOptions, 'executable' | 'killTimeoutMs' | 'stderr' | 'stateDir'>;
-  /** For the built-in `pty:claude` (Claude Code in a terminal), e.g. the resolved `events.state_dir`. */
+  /** For the built-in `pty:claude` (Claude Code in a terminal); its `stateDir` overrides the top-level one. */
   claudePty?: Pick<PtyAdapterOptions, 'command' | 'repoRoot' | 'stateDir' | 'spawn'>;
   /** For `pty:<slug>` presets. */
   ptyCli?: Pick<PtyCliAdapterOptions, 'spawn' | 'quietMs' | 'startTimeoutMs' | 'killTimeoutMs'>;
