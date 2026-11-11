@@ -7,6 +7,7 @@ export * from './config/index.js';
 export * from './event-log/index.js';
 export * from './git/index.js';
 export * from './process-group.js';
+export * from './process-lock.js';
 export * from './rpc/index.js';
 export * from './session-files.js';
 export * from './state-dir.js';

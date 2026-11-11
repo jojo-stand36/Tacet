@@ -7,6 +7,7 @@ import { detach } from './commands/detach.js';
 import { init, uninstall } from './commands/init.js';
 import { attach, logs, status } from './commands/read.js';
 import { run } from './commands/run.js';
+import { conductorStatus, up } from './commands/up.js';
 import type { Io } from './io.js';
 
 export type { Io };
@@ -43,8 +44,14 @@ const USAGE = `usage:
                                  its clipboard writes, OSC 52 and the like, and tmux
                                  passthrough are left out)
   tacet config explain [--json]  the effective configuration and where each value comes from
+  tacet up [--json]              run the Conductor until interrupted (Ctrl-C)
+  tacet up --add PATH | --remove PATH [--json]
+                                 register a repo with the Conductor, or unregister it
+  tacet conductor status [--json]
+                                 registered repos and connected Mini-conductors
 
-Every command takes --repo DIR (default: the repo of the current directory) and --user-dir DIR.
+Every command takes --user-dir DIR, and those about one repo --repo DIR (default: the repo of the
+current directory).
 run exits 0 when the task completed, 1 when it failed, 3 when it waits for an answer.`;
 
 const COMMON = {
@@ -82,6 +89,13 @@ const OPTIONS = {
   logs: { ...COMMON, transcript: { type: 'boolean' }, follow: { type: 'boolean', short: 'f' } },
   attach: COMMON,
   config: COMMON,
+  up: {
+    'user-dir': { type: 'string' },
+    json: { type: 'boolean' },
+    add: { type: 'string' },
+    remove: { type: 'string' },
+  },
+  conductor: { 'user-dir': { type: 'string' }, json: { type: 'boolean' } },
 } as const;
 
 /** Entry point for the `tacet` command. Resolves to the process exit code. */
@@ -152,6 +166,12 @@ export async function main(argv: string[], io: Io): Promise<number> {
       case 'attach':
         if (positionals.length !== 1) return usage(io);
         return await attach(io, positionals[0] as string, v);
+      case 'up':
+        if (positionals.length > 0) return usage(io);
+        return await up(io, v);
+      case 'conductor':
+        if (positionals.length !== 1 || positionals[0] !== 'status') return usage(io);
+        return conductorStatus(io, v);
       default:
         if (positionals.length !== 1 || positionals[0] !== 'explain') return usage(io);
         return explain(io, v);

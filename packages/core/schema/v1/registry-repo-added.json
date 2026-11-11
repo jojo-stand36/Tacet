@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:registry-repo-added:v1",
+  "title": "Tacet registry.repo_added payload",
+  "type": "object",
+  "properties": {
+    "repoId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "repoId",
+    "repoPath"
+  ]
+}

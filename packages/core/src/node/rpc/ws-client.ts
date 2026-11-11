@@ -20,6 +20,16 @@ export interface RpcClient {
   hello: HelloResult;
   call(method: string, params?: unknown, opts?: { timeoutMs?: number }): Promise<unknown>;
   close(): Promise<void>;
+  /** Settles when the connection is gone, whoever ended it, with the WebSocket close code. */
+  closed: Promise<{ code: number; reason: string }>;
+}
+
+/** What a Mini-conductor says about itself in its hello (ADR-003 §3.6): a lightweight Agent Card. */
+export interface MiniCard {
+  repoId: string;
+  repoPath: string;
+  adapters: string[];
+  miniVersion: string;
 }
 
 export interface ConnectRpcOptions {
@@ -27,6 +37,13 @@ export interface ConnectRpcOptions {
   token: Secret;
   clientInfo: { name: string; version: string };
   role?: 'cli' | 'mini';
+  /** Required with `role: 'mini'`. */
+  card?: MiniCard;
+  /**
+   * Close the connection when the server has sent nothing, not even a ping, for this long (ms):
+   * a server that hangs or a peer that vanished without a FIN (#23). Off by default.
+   */
+  silenceTimeoutMs?: number;
   /** Milliseconds for the connection and hello together, and the default per call. Default 10000. */
   timeoutMs?: number;
   maxPayload?: number;
@@ -37,6 +54,9 @@ export interface ConnectRpcOptions {
  * in the upgrade's `Authorization` header only, never in a URL, argument or error.
  */
 export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
+  if ((o.role ?? 'cli') === 'mini' && !o.card) {
+    throw new RpcClientError('a mini hello needs its card');
+  }
   const timeoutMs = o.timeoutMs ?? 10_000;
   const ws = new WebSocket(`ws://127.0.0.1:${o.port}/`, {
     headers: { authorization: `Bearer ${o.token.reveal()}` },
@@ -67,9 +87,26 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
       p.reject(new RpcClientError(message, code));
     } else p.resolve(msg.result);
   });
-  ws.on('close', (code, reason) => {
-    failAll(new RpcClientError(`connection closed (${code}${reason.length ? ` ${reason}` : ''})`));
+  const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+    ws.on('close', (code, reason) => {
+      failAll(
+        new RpcClientError(`connection closed (${code}${reason.length ? ` ${reason}` : ''})`),
+      );
+      resolve({ code, reason: reason.toString('utf8') });
+    });
   });
+  // Any frame from the server, pings included, shows it is there.
+  let silence: NodeJS.Timeout | undefined;
+  const heard = () => {
+    if (o.silenceTimeoutMs === undefined) return;
+    if (silence) clearTimeout(silence);
+    silence = setTimeout(() => ws.terminate(), o.silenceTimeoutMs);
+    silence.unref();
+  };
+  ws.on('ping', heard);
+  ws.on('message', heard);
+  ws.once('open', heard);
+  void closed.then(() => silence && clearTimeout(silence));
 
   const call = (method: string, params?: unknown, opts: { timeoutMs?: number } = {}) =>
     new Promise<unknown>((resolve, reject) => {
@@ -107,12 +144,14 @@ export async function connectRpc(o: ConnectRpcOptions): Promise<RpcClient> {
         role: o.role ?? 'cli',
         clientInfo: o.clientInfo,
         capabilities: {},
+        ...(o.role === 'mini' ? o.card : {}),
       }),
     );
     ws.on('error', () => {});
     return {
       hello,
       call,
+      closed,
       close: () =>
         new Promise<void>((resolve) => {
           if (ws.readyState === ws.CLOSED) return resolve();

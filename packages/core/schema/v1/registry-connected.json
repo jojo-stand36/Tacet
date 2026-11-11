@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:registry-connected:v1",
+  "title": "Tacet registry.connected payload",
+  "type": "object",
+  "properties": {
+    "repoId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}$"
+    },
+    "repoPath": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "miniVersion": {
+      "type": "string",
+      "minLength": 1
+    },
+    "adapters": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  },
+  "required": [
+    "repoId",
+    "repoPath",
+    "sessionId",
+    "miniVersion",
+    "adapters"
+  ]
+}
