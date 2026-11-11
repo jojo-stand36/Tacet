@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -79,6 +79,22 @@ describe('tacet up: the Conductor', () => {
       expect(r.code).toBe(0);
       expect(r.out).toContain(`(the repo containing ${plain})`);
     }
+  });
+
+  it('does not take a sandbox placeholder skeleton above a directory for a repo (#326)', async (ctx) => {
+    // What the Claude Code sandbox plants at `.git`: config, hooks and info, but no HEAD.
+    const skel = join(root, 'skel');
+    mkdirSync(join(skel, '.git', 'info', '.claude-sandbox-noreplace'), { recursive: true });
+    mkdirSync(join(skel, '.git', 'hooks'));
+    writeFileSync(join(skel, '.git', 'config'), '');
+    const plain = join(skel, 'plain');
+    mkdirSync(plain);
+    const found = repoRootFrom(plain);
+    if (found !== plain) ctx.skip(`a parent directory of the temp dir is a git repo (${found})`);
+    const r = await tacet(['up', '--add', plain]);
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('not a git repository');
+    expect((await status()).repos).toEqual([]);
   });
 
   it('refuses a mistyped path rather than register the repo around it, and both flags at once', async () => {

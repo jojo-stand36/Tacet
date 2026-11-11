@@ -55,6 +55,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Claude SDK sessions load the checkout's .claude settings and hooks: set settingSources: []** — `feature` `P0` `claude`
 - [ ] **Claude Workers can find a host OAuth token at Claude Code's fixed well-known path** — `feature` `P1` `claude + human`
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
+- [ ] **Claude's sandbox leaves a .git placeholder skeleton in /tmp (an ancestor or write-allowed dir), and Tacet then takes /tmp for a repo** — `feature` `P2` `claude`
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
 - [ ] **Codex Worker isolation does not hold for a repo under /tmp or $TMPDIR** — `P2` `claude`
 - [ ] **Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off** — `feature` `P1` `claude`
