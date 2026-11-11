@@ -38,7 +38,12 @@ import type {
   VerifyContext,
   WorkerMcp,
 } from './ports.js';
-import { type Script, ScriptedAdapter, TempWorkspaces } from './testing.js';
+import {
+  type Script,
+  ScriptedAdapter,
+  ScriptedTerminalAdapter,
+  TempWorkspaces,
+} from './testing.js';
 
 const CONFIG: TacetConfig = {
   tiers: { worker: { adapter: 'fake', model: 'cheap' }, review: { adapter: 'other', model: 'x' } },
@@ -2159,6 +2164,95 @@ describe('MiniConductor review fixes', () => {
       await new Promise((r) => setTimeout(r, 150));
       expect(ofType('worker.nudged', sub)).toHaveLength(0);
     });
+  });
+});
+
+describe('terminalStream (#201)', () => {
+  const text = (b: Uint8Array) => new TextDecoder().decode(b);
+
+  it('is there only for a running session whose adapter has a terminal', async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'hold' }));
+    const d = make();
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('worker.vendor_session', `${id}/1`).length).toBe(1);
+    expect(d.terminalStream(minted[0] ?? '')).toBeUndefined();
+    expect(d.terminalStream('no-such-session')).toBeUndefined();
+  });
+
+  /** A running session on a terminal adapter, and its terminal. */
+  async function running(endOnClose = true) {
+    const term = new ScriptedTerminalAdapter('fake', () => ({ do: 'hold' }));
+    term.endOnClose = endOnClose;
+    fake = term;
+    const d = make();
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('worker.vendor_session', `${id}/1`).length).toBe(1);
+    const handle = fake.sessions[0]?.handle;
+    if (!handle) throw new Error('no session');
+    return { d, id, t: term.terminal(handle), session: minted[0] ?? '' };
+  }
+  const open = (d: MiniConductor, session: string, signal?: AbortSignal) => {
+    const stream = d.terminalStream(session, signal);
+    if (!stream) throw new Error('no terminal stream');
+    return stream[Symbol.asyncIterator]();
+  };
+
+  it('draws the screen, follows the output, and redraws a viewer that fell behind', async () => {
+    const { d, t, session } = await running();
+    t.push('$ before\r\n');
+    const it = open(d, session);
+    expect(text((await it.next()).value)).toBe('$ before\r\n');
+    t.push('live 1');
+    expect(text((await it.next()).value)).toBe('live 1');
+    // Dropped for falling behind: a reset, then the whole screen again.
+    t.lag();
+    t.push('live 2');
+    expect(text((await it.next()).value)).toBe('\x1bc$ before\r\nlive 1live 2');
+    await it.return?.();
+    expect(t.viewers).toBe(0);
+  });
+
+  it('does not take a viewer dropped before it read anything for the end of the session', async () => {
+    const { d, t, session } = await running();
+    t.push('screen');
+    const it = open(d, session);
+    expect(text((await it.next()).value)).toBe('screen');
+    // Dropped while its first frame was still being sent: its stream ends with nothing read.
+    t.lag();
+    t.push(' more');
+    const next = await it.next();
+    expect(next.done).toBe(false);
+    expect(text(next.value)).toBe('\x1bcscreen more');
+    await it.return?.();
+  });
+
+  it('lets the terminal go as soon as the viewer leaves, while the Worker prints nothing', async () => {
+    const { d, t, session } = await running();
+    const left = new AbortController();
+    const it = open(d, session, left.signal);
+    t.push('x');
+    expect(text((await it.next()).value)).toBe('x');
+    // Waiting for output that may not come for hours.
+    const pending = it.next();
+    await expect.poll(() => t.viewers).toBe(1);
+    left.abort();
+    expect((await pending).done).toBe(true);
+    expect(t.viewers).toBe(0);
+  });
+
+  it('ends when the session stops running here, even if its terminal does not end', async () => {
+    const { d, id, t, session } = await running(false);
+    const it = open(d, session);
+    t.push('x');
+    expect(text((await it.next()).value)).toBe('x');
+    const pending = it.next();
+    await d.cancel(id);
+    expect((await pending).done).toBe(true);
+    expect(t.viewers).toBe(0);
+    // A session that is no longer running has no terminal to open.
+    expect(d.terminalStream(session)).toBeUndefined();
   });
 });
 

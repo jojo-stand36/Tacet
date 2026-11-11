@@ -13,6 +13,7 @@ import { basename, dirname, join } from 'node:path';
 import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-claude-sdk/launch';
 import {
   type AgentEvent,
+  type AgentTerminal,
   type Decision,
   Escalation,
   type EventEnvelope,
@@ -198,6 +199,8 @@ interface Run {
   settling: boolean;
   /** Aborts a verification in progress when the session ends (#19). */
   verifyAbort?: AbortController | undefined;
+  /** Aborted when the session stops running here: its terminal's viewers stop with it (#201). */
+  gone: AbortController;
 }
 
 /**
@@ -353,6 +356,8 @@ function verifyNote(status: VerificationStatus, notes?: string): string {
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
 const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
+/** Session states after which a Worker's terminal shows nothing new (#201). */
+const ENDED_STATES: ReadonlySet<string> = new Set(['done', 'error', 'cancelled']);
 /** Handoffs one sub-task may request when `workers.max_handoffs` is not set (#129). */
 const DEFAULT_MAX_HANDOFFS = 3;
 
@@ -496,6 +501,67 @@ export class MiniConductor {
     const view = this.#state().tasks[id];
     if (view) this.#plan(view.task);
     return id;
+  }
+
+  /**
+   * The live terminal of Worker session `sessionId` as bytes, for the control port's `/pty` path
+   * (#201, ADR-003 §5); undefined when that session is not running here or its adapter has no
+   * terminal. It starts with the scrollback, so a viewer can draw the screen, then follows the
+   * output. A viewer that fell behind (its terminal stream ended while the session runs on) gets a
+   * reset (`ESC c`) and the scrollback again. It ends when the session stops running here, as this
+   * Mini-conductor decides, whatever the terminal does, or when `signal` aborts (the viewer left):
+   * either way the terminal stream is let go at once, even while it waits for output. Never logged:
+   * it is the Worker's own terminal and may show what the Worker printed.
+   */
+  terminalStream(sessionId: string, signal?: AbortSignal): AsyncIterable<Uint8Array> | undefined {
+    const run = [...this.#runs.values()].find((r) => r.sessionId === sessionId);
+    const adapter = run && this.#o.adapters[run.adapterId]?.adapter;
+    let term: AgentTerminal | undefined;
+    try {
+      term = run && adapter?.terminal?.(run.handle);
+    } catch {
+      // Closed meanwhile: no terminal to show.
+    }
+    if (!run || !adapter || !term || run.gone.signal.aborted) return undefined;
+    const stop = AbortSignal.any([
+      run.gone.signal,
+      this.#abort.signal,
+      ...(signal ? [signal] : []),
+    ]);
+    const live = () =>
+      !stop.aborted &&
+      this.#started &&
+      this.#runs.get(run.subtaskId) === run &&
+      !ENDED_STATES.has(adapter.status(run.handle));
+    const encoder = new TextEncoder();
+    return (async function* () {
+      let reset = '';
+      while (live()) {
+        const output = term.output()[Symbol.asyncIterator]();
+        // Stopped while waiting for output: ending the terminal stream wakes that wait.
+        const letGo = () => void output.return?.();
+        stop.addEventListener('abort', letGo, { once: true });
+        let chunks = 0;
+        try {
+          const screen = reset + term.scrollback();
+          if (screen) yield encoder.encode(screen);
+          for (;;) {
+            const next = await output.next();
+            if (next.done || stop.aborted) break;
+            chunks++;
+            yield encoder.encode(next.value);
+          }
+        } finally {
+          stop.removeEventListener('abort', letGo);
+          await output.return?.();
+        }
+        // Still running: this viewer fell behind and was dropped (possibly before it read
+        // anything). Wait a moment before drawing again, so a terminal that ended before its
+        // session is seen to end is not polled hot.
+        if (chunks === 0 && live()) await new Promise((r) => setTimeout(r, 100));
+        reset = '\x1bc';
+      }
+    })();
   }
 
   /**
@@ -1648,6 +1714,7 @@ export class MiniConductor {
       text: '',
       turnActive: true,
       settling: false,
+      gone: new AbortController(),
       ...(baseCommit !== undefined ? { baseCommit } : {}),
       // Seeded now, also after a restart: the log's last event says nothing about this process.
       lastActivity: this.#now().getTime(),
@@ -2443,6 +2510,7 @@ export class MiniConductor {
     extra: { workspaceRefused?: boolean },
   ): Promise<void> {
     this.#runs.delete(run.subtaskId);
+    run.gone.abort();
     run.revoke();
     this.#o.store.append(
       this.#env(

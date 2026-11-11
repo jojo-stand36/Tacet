@@ -5,6 +5,7 @@ import type {
   AdapterCapabilities,
   AgentAdapter,
   AgentEvent,
+  AgentTerminal,
   ApprovalDecision,
   SessionHandle,
   SessionOptions,
@@ -246,5 +247,97 @@ export class TempWorkspaces implements Workspaces {
 
   dispose(): void {
     rmSync(this.root, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A Worker terminal a test writes to (#201), with the PTY adapter's viewer rules: `push` is the
+ * Worker printing; `lag()` drops every viewer as one that fell too far behind is dropped, losing
+ * what it had not read yet; `end()` is the session ending; a viewer's `return()` drops it.
+ */
+export class ScriptedTerminal implements AgentTerminal {
+  readonly cols = 80;
+  readonly rows = 24;
+  #screen = '';
+  #ended = false;
+  readonly #viewers = new Set<{ chunks: string[]; ended: boolean; wake?: () => void }>();
+
+  push(data: string): void {
+    if (this.#ended) return;
+    this.#screen += data;
+    for (const v of this.#viewers) {
+      v.chunks.push(data);
+      v.wake?.();
+    }
+  }
+
+  lag(): void {
+    for (const v of [...this.#viewers]) this.#drop(v);
+  }
+
+  end(): void {
+    this.#ended = true;
+    this.lag();
+  }
+
+  /** Streams open now. */
+  get viewers(): number {
+    return this.#viewers.size;
+  }
+
+  scrollback(): string {
+    return this.#screen;
+  }
+
+  output(): AsyncIterable<string> {
+    const v: { chunks: string[]; ended: boolean; wake?: () => void } = {
+      chunks: [],
+      ended: this.#ended,
+    };
+    if (!this.#ended) this.#viewers.add(v);
+    return {
+      [Symbol.asyncIterator]: () => ({
+        next: async (): Promise<IteratorResult<string>> => {
+          while (v.chunks.length === 0 && !v.ended) {
+            await new Promise<void>((r) => {
+              v.wake = r;
+            });
+          }
+          const chunk = v.chunks.shift();
+          return chunk === undefined
+            ? { value: undefined, done: true }
+            : { value: chunk, done: false };
+        },
+        return: async (): Promise<IteratorResult<string>> => {
+          this.#drop(v);
+          return { value: undefined, done: true };
+        },
+      }),
+    };
+  }
+
+  #drop(v: { chunks: string[]; ended: boolean; wake?: () => void }): void {
+    v.ended = true;
+    v.chunks.length = 0;
+    this.#viewers.delete(v);
+    v.wake?.();
+  }
+}
+
+/** A `ScriptedAdapter` whose sessions have a terminal, as PTY Workers do (#201). */
+export class ScriptedTerminalAdapter extends ScriptedAdapter {
+  readonly #terms = new Map<string, ScriptedTerminal>();
+  /** Whether closing a session ends its terminal. Off: a terminal that outlives its session. */
+  endOnClose = true;
+
+  terminal(h: SessionHandle): ScriptedTerminal {
+    const t = this.#terms.get(h.id) ?? new ScriptedTerminal();
+    this.#terms.set(h.id, t);
+    return t;
+  }
+
+  override async close(h: SessionHandle): Promise<void> {
+    await super.close(h);
+    if (this.endOnClose) this.#terms.get(h.id)?.end();
   }
 }
