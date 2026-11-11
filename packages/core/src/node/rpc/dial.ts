@@ -1,7 +1,8 @@
 import { CLOSE_CONFLICT } from '../auth/hello.js';
 import { conductorRuntimePath, readRuntimeFile } from '../auth/runtime-file.js';
 import { isProcessAlive } from '../process-lock.js';
-import { connectRpc, type MiniCard, type RpcClient } from './ws-client.js';
+import type { PeerHandler } from './peer.js';
+import { type ClientContext, connectRpc, type MiniCard, type RpcClient } from './ws-client.js';
 
 /** What a Mini-conductor's link to the Conductor is doing, for logs and tests. */
 export type ConductorLinkState =
@@ -16,6 +17,15 @@ export type ConductorLinkState =
 export interface DialConductorOptions {
   card: MiniCard;
   clientInfo: { name: string; version: string };
+  /**
+   * Methods the Conductor may call on the link (#24, ADR-003 §4: the Conductor is the A2A client
+   * and the Mini-conductor the A2A server). Anything else is answered `-32601`.
+   */
+  handlers?: Readonly<Record<string, PeerHandler<ClientContext>>>;
+  /** Capability flags the hello advertises (ADR-003 §2): what `handlers` serves. */
+  capabilities?: Record<string, unknown>;
+  /** Told about handler failures, by message only. */
+  onError?: (message: string) => void;
   /** Where `conductor.json` is. Default `~/.tacet/run`. */
   runDir?: string;
   /** First wait between attempts (ms), doubled up to `maxDelayMs`. Default 1000. */
@@ -116,6 +126,9 @@ export function dialConductor(o: DialConductorOptions): ConductorLink {
           clientInfo: o.clientInfo,
           role: 'mini',
           card: o.card,
+          ...(o.handlers ? { handlers: o.handlers } : {}),
+          ...(o.capabilities ? { capabilities: o.capabilities } : {}),
+          ...(o.onError ? { onError: o.onError } : {}),
           silenceTimeoutMs: o.silenceTimeoutMs ?? 30_000,
           // Bounds how long a close waits on a Conductor that accepts and never answers.
           timeoutMs: o.connectTimeoutMs ?? 5000,

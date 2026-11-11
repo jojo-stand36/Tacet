@@ -132,6 +132,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 Global conductor, multi-repo registry, decision inbox, summary packets.
 
 - [ ] **Epic: Conductor and escalation inbox** — `epic` `P0` `human`
+- [ ] **Authenticate the Conductor link** — `feature` `P1` `claude + human`
 - [ ] **Conductor daemon + mini-conductor registry** — `feature` `P0` `either`
 - [ ] **Conductor↔mini protocol implementation** — `feature` `P0` `claude`
 - [ ] **Cross-project goals: split one goal into tasks across repos** — `feature` `P1` `either`
@@ -139,6 +140,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Escalation gate in mini-conductor** — `feature` `P0` `claude`
 - [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
 - [ ] **Summary packets (no transcripts upward)** — `feature` `P1` `either`
+- [ ] **Tasks down the Conductor link: create tasks and answer escalations** — `feature` `P1` `claude + human`
 - [ ] **UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)** — `feature` `P2` `either`
 
 ## M3 · Context handoff & cost tiering

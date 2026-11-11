@@ -16,6 +16,7 @@ import {
   type Decision,
   Escalation,
   type EventEnvelope,
+  HandoffPacket,
   type MaintenanceOp,
   type MaintenanceProblem,
   newUlid,
@@ -68,9 +69,11 @@ import {
 import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
 import {
   HANDOFF_NOTE,
+  inlineHandoffNote,
   RESUME_PROMPT,
   safePrompt,
   WORKER_SYSTEM_PROMPT,
+  WORKER_SYSTEM_PROMPT_NO_TOOLS,
   workerPrompt,
 } from './prompts.js';
 import { blockedByFailure, pickReady, type SchedulableSubtask } from './scheduler.js';
@@ -167,7 +170,8 @@ interface View {
    * Per sub-task, the latest handoff not yet taken up by a successor (#129): requested by
    * `sessionId`, with no `handoff.accepted` after it.
    */
-  pendingHandoffs: Map<string, { handoffId: string; sessionId: string }>;
+  /** `packet` is the HandoffPacket as requested, when it parses (inlined for #184). */
+  pendingHandoffs: Map<string, { handoffId: string; sessionId: string; packet?: HandoffPacket }>;
   /** Handoffs requested per sub-task, for `workers.max_handoffs`. */
   handoffCount: Map<string, number>;
 }
@@ -181,8 +185,16 @@ interface Run {
   handle: SessionHandle;
   workspace: Workspace;
   revoke: () => void;
-  /** Name of the Mini-conductor's MCP server in this Worker's config. */
+  /** Name of the Mini-conductor's MCP server in this Worker's config; '' without one. */
   mcpServerName: string;
+  /** The Worker has the Mini-conductor's MCP tools (`capabilities().mcp`, #184). */
+  mcp: boolean;
+  /** Tool requests refused in the current turn ("tool: reason"), for a blocked turn (#184). */
+  refused: string[];
+  /** `commit` when the current turn started, so a turn's own commit can be told apart (#184). */
+  turnBase?: string | undefined;
+  /** Blocked turns in a row in this session, each escalated for it (#184); capped. */
+  blockedInRow: number;
   text: string;
   /** The last complete assistant message, for the summary. */
   lastMessage?: string;
@@ -359,6 +371,8 @@ function verifyNote(status: VerificationStatus, notes?: string): string {
 /** Sub-task states the parent mirrors while no sub-task failed for good (ADR-003 §4). */
 const WAITING: ReadonlySet<TaskState> = new Set(['input_required', 'auth_required']);
 const COUNTED: ReadonlySet<string> = new Set(['failed', 'stuck']);
+/** Blocked turns in a row after which a Worker without Tacet's tools is stopped (#184, #324). */
+const MAX_BLOCKED_IN_ROW = 2;
 /** Session states after which a Worker's terminal shows nothing new (#201). */
 const ENDED_STATES: ReadonlySet<string> = new Set(['done', 'error', 'cancelled']);
 /** Handoffs one sub-task may request when `workers.max_handoffs` is not set (#129). */
@@ -418,6 +432,14 @@ export class MiniConductor {
       if (tier && !opts.adapters[tier.adapter]) {
         throw new Error(`no Worker adapter ${tier.adapter} for its tier`);
       }
+    }
+    // A Worker with neither Tacet's MCP tools nor approval requests could never reach the
+    // Mini-conductor (#184): refused here, once, not on every attempt.
+    const caps = opts.adapters[worker.adapter]?.adapter.capabilities();
+    if (caps && !caps.mcp && caps.approvals !== 'roundtrip') {
+      throw new Error(
+        `${worker.adapter} has neither Tacet's MCP tools nor approval requests: it cannot run a Worker (#184)`,
+      );
     }
     const problem = reviewConfigProblem(opts.config);
     if (problem) throw new Error(problem);
@@ -1614,15 +1636,29 @@ export class MiniConductor {
     const marker = newWorkerMarker();
     this.#markers.set(sessionId, marker);
     this.#saveMarkers();
+    // A Worker whose adapter connects no MCP server gets no token and no MCP tools (#184). It can
+    // still reach the Mini-conductor through its approval requests; one that has neither (a
+    // generic PTY CLI) is refused, as it was when its adapter refused the MCP server.
+    const caps = worker.adapter.capabilities();
+    const mcp = caps.mcp;
     try {
-      const minted = this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId });
-      revoke = minted.revoke;
-      mcpServerName = minted.config.name;
+      if (!mcp && caps.approvals !== 'roundtrip') {
+        throw new Error(
+          `${tier.adapter} has neither Tacet's MCP tools nor approval requests: it cannot run a Worker (#184)`,
+        );
+      }
+      const minted = mcp
+        ? this.#o.mcp.workerConfig({ workerSessionId: sessionId, taskId: subtaskId })
+        : undefined;
+      if (minted) {
+        revoke = minted.revoke;
+        mcpServerName = minted.config.name;
+      }
       const launch = (p: ChosenProfile) =>
         worker.adapter.start({
           cwd: workspace.path,
-          systemPrompt: WORKER_SYSTEM_PROMPT,
-          mcpServers: [minted.config],
+          systemPrompt: mcp ? WORKER_SYSTEM_PROMPT : WORKER_SYSTEM_PROMPT_NO_TOOLS,
+          ...(minted ? { mcpServers: [minted.config] } : {}),
           ...(p.model !== undefined ? { model: p.model } : {}),
           ...(p.effort !== undefined ? { effort: p.effort } : {}),
           ...(p.contextWindow !== undefined ? { contextWindow: p.contextWindow } : {}),
@@ -1714,6 +1750,9 @@ export class MiniConductor {
       workspace,
       revoke,
       mcpServerName,
+      mcp,
+      refused: [],
+      blockedInRow: 0,
       text: '',
       turnActive: true,
       settling: false,
@@ -1731,14 +1770,14 @@ export class MiniConductor {
     try {
       // Composed inside the try: a prompt refused as unsafe ends the run like a failed send.
       const text = resume
-        ? safePrompt([RESUME_PROMPT, ...answers.map(answerText)], '\n\n')
+        ? safePrompt([RESUME_PROMPT, ...answers.map((x) => answerText(x, mcp))], '\n\n')
         : workerPrompt(view.task, this.#lastFeedback(subtaskId), [
-            ...(seed ? [HANDOFF_NOTE] : []),
+            ...(seed ? [mcp ? HANDOFF_NOTE : inlineHandoffNote(inlinePacket(seed.packet))] : []),
             ...(history.length > 0 && v.progress.has(subtaskId)
               ? [`Progress reported before: ${v.progress.get(subtaskId)}`]
               : []),
             ...notes,
-            ...answers.map(answerText),
+            ...answers.map((x) => answerText(x, mcp)),
           ]);
       await worker.adapter.send(handle, { text });
       if (this.#live(gen)) {
@@ -1804,6 +1843,8 @@ export class MiniConductor {
                 },
                 run.workspace.path,
               );
+          if (d && !d.allow)
+            run.refused.push(`${e.toolName ?? 'a tool'}: ${d.reason}`.slice(0, 500));
           if (d) {
             // Owner decision on #200: refusals are summary-grade (kept and forwarded), allows are
             // transcript-grade (`agent.approval.decision`, dropped by retention).
@@ -1830,11 +1871,17 @@ export class MiniConductor {
               : {
                   kind: 'reject',
                   persist: false,
-                  message: `Not approved: ${d?.reason ?? 'unattended Worker'}. Unattended Workers may only use file tools inside their own checkout; use the escalate tool if you need more.`,
+                  message: run.mcp
+                    ? `Not approved: ${d?.reason ?? 'unattended Worker'}. Unattended Workers may only use file tools inside their own checkout; use the escalate tool if you need more.`
+                    : `Not approved: ${d?.reason ?? 'unattended Worker'}. If you cannot continue without it, end your turn saying what you need.`,
                 },
           );
         } else if (e.t === 'status') {
           if (e.state === 'running') {
+            if (!started) {
+              run.refused = [];
+              run.turnBase = run.commit;
+            }
             started = true;
             run.turnActive = true;
           } else if (e.state === 'idle') {
@@ -1979,6 +2026,35 @@ export class MiniConductor {
         return;
       }
       if (this.#runs.get(run.subtaskId) !== run || !this.#started) return;
+      // A Worker without Tacet's tools that was refused something and stopped with no work done
+      // is blocked, not finished (#184): the Mini-conductor asks the user for it and keeps the
+      // session for the answer, as the escalate tool would.
+      if (
+        !run.mcp &&
+        run.refused.length > 0 &&
+        run.commit === run.turnBase &&
+        !('changes' in left && left.changes.length > 0) &&
+        (this.#state().kinds.get(run.subtaskId) ?? 'implement') === 'implement'
+      ) {
+        run.blockedInRow += 1;
+        // Owner decision on #324: after 2 in a row the Worker is stopped and the sub-task waits
+        // for the user. Their answer starts a fresh session, with the answer in its first message.
+        const stop = run.blockedInRow >= MAX_BLOCKED_IN_ROW;
+        this.#raise(run.subtaskId, blockedQuestion(run, stop), {
+          urgency: 'high',
+          category: 'blocked',
+        });
+        run.refused = [];
+        if (stop) {
+          await this.#end(
+            run,
+            'finished',
+            `stopped after ${run.blockedInRow} blocked turns in a row; waiting for the user`,
+          );
+        }
+        return;
+      }
+      run.blockedInRow = 0;
       if (run.commit === undefined && 'changes' in left && left.changes.length > 0) {
         const notes = notIntegrated(run, left.changes);
         this.#o.store.append([
@@ -2620,7 +2696,9 @@ export class MiniConductor {
     run.lastActivity = this.#now().getTime();
     run.nudgedAt = undefined;
     try {
-      await worker.adapter.send(run.handle, { text: safePrompt(answers.map(answerText)) });
+      await worker.adapter.send(run.handle, {
+        text: safePrompt(answers.map((x) => answerText(x, run.mcp))),
+      });
     } catch (err) {
       run.turnActive = false;
       this.#errors.push(err);
@@ -2947,7 +3025,10 @@ function readView(store: EventStore, prev?: View): View {
   const decisions = new Map<string, string>();
   const progress = new Map<string, string>();
   const progressAt = new Map<string, number>();
-  const pendingHandoffs = new Map<string, { handoffId: string; sessionId: string }>();
+  const pendingHandoffs = new Map<
+    string,
+    { handoffId: string; sessionId: string; packet?: HandoffPacket }
+  >();
   const handoffCount = new Map<string, number>();
   for (const { envelope: e } of store.query({})) {
     const d = (e.data ?? {}) as Record<string, unknown>;
@@ -3027,7 +3108,12 @@ function readView(store: EventStore, prev?: View): View {
       // Written by the MCP backend: the session is on the envelope (#129).
       const handoffId = str('handoffId');
       if (handoffId && e.taskId && e.sessionId) {
-        pendingHandoffs.set(e.taskId, { handoffId, sessionId: e.sessionId });
+        const packet = HandoffPacket.safeParse((d as { packet?: unknown }).packet);
+        pendingHandoffs.set(e.taskId, {
+          handoffId,
+          sessionId: e.sessionId,
+          ...(packet.success ? { packet: packet.data } : {}),
+        });
         handoffCount.set(e.taskId, (handoffCount.get(e.taskId) ?? 0) + 1);
       }
     } else if (e.type === 'handoff.accepted') {
@@ -3128,10 +3214,48 @@ function refusedField(err: unknown): ProfileField | undefined {
   return field === 'model' || field === 'effort' || field === 'contextWindow' ? field : undefined;
 }
 
-function answerText(x: EscalationRecord): string {
+function answerText(x: EscalationRecord, mcp = true): string {
   return x.answer !== undefined
-    ? `Answer to your escalation ${x.id}: ${x.answer}`
-    : `Your escalation ${x.id} was resolved without an answer text; continue with your best judgement or escalate again.`;
+    ? mcp
+      ? `Answer to your escalation ${x.id}: ${x.answer}`
+      : `The user's answer to what you said you needed: ${x.answer}`
+    : `Your escalation ${x.id} was resolved without an answer text; continue with your best judgement or ${mcp ? 'escalate again' : 'end your turn saying what you still need'}.`;
+}
+
+/**
+ * What the Mini-conductor asks the user for a Worker without Tacet's tools whose turn ended
+ * blocked (#184): the requests refused in it and the end of its last message, redacted.
+ */
+function blockedQuestion(run: Run, stopped = false): string {
+  // Text the Worker chose, which the Mini-conductor writes as its own: redacted, no controls.
+  const refused = run.refused
+    .slice(0, 10)
+    .map((r) => `- ${redactSecrets(r).replace(CONTROL, ' ')}`);
+  const last = redactSecrets(run.lastMessage ?? '')
+    .replace(CONTROL, (c) => (c === '\n' ? c : ' '))
+    .trim();
+  return [
+    `A Worker (${run.adapterId}) that cannot escalate by itself stopped with no work done after these requests were refused:`,
+    ...refused,
+    ...(last
+      ? ['', `Its last message: ${last.length > 2000 ? `…${last.slice(-2000)}` : last}`]
+      : []),
+    '',
+    ...(stopped
+      ? [
+          `It was blocked ${run.blockedInRow} turns in a row, so it has been stopped and this sub-task waits for you. Your answer starts a new Worker session on the same checkout, with your answer in its first message.`,
+        ]
+      : ['What should it do? Your answer is sent to it as its next message.']),
+  ].join('\n');
+}
+
+/** A HandoffPacket as text for a Worker's first message (#184): secrets redacted, capped. */
+function inlinePacket(packet: HandoffPacket | undefined): string {
+  if (packet === undefined)
+    return '(not readable: work out what is left from the checkout and the sub-task)';
+  // Redacted field by field, so one secret does not blank the whole packet.
+  const text = JSON.stringify(redactSecrets(packet));
+  return text.length > 16_000 ? `${text.slice(0, 16_000)}…` : text;
 }
 
 /**
@@ -3142,6 +3266,8 @@ function answerText(x: EscalationRecord): string {
  * #17), so its MCP elicitations are refused like everything else.
  */
 export function isOwnMcpTool(e: { toolName?: string | undefined }, serverName: string): boolean {
+  // A Worker without the Mini-conductor's server (#184) has none of its tools.
+  if (serverName === '') return false;
   return TOOL_NAMES.some((t) => e.toolName === `mcp__${serverName}__${t}`);
 }
 

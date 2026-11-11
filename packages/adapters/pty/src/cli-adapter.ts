@@ -39,6 +39,8 @@ export const PTY_CLI_CAPABILITIES: AdapterCapabilities = {
   approvals: 'none',
   interrupt: 'turn',
   resume: false,
+  // A generic CLI is given no MCP config: `start()` refuses `mcpServers`.
+  mcp: false,
   fork: 'none',
   usage: { live: false, context: false, cost: 'none' },
   modelSwitch: 'launch-only',

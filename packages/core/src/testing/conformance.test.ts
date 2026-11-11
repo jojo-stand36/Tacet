@@ -33,10 +33,11 @@ const verdict = (results: ProbeResult[], id: string) => results.find((r) => r.id
 describe('conformance bench with the mock adapter', () => {
   it('the full-featured mock passes every probe', async () => {
     const results = await run();
+    // Every probe but `mcp`, which needs an MCP server to check a declared client against.
     expect(
       results.map((r) => r.verdict),
       formatResults(results),
-    ).toEqual(results.map(() => 'pass'));
+    ).toEqual(results.map((r) => (r.id === 'mcp' ? 'skip' : 'pass')));
     expect(() => assertConformance(results)).not.toThrow();
   });
 
@@ -47,6 +48,7 @@ describe('conformance bench with the mock adapter', () => {
       approvals: 'predecided',
       interrupt: 'kill',
       resume: false,
+      mcp: true,
       fork: 'emulated',
       usage: { live: true, context: false, cost: 'none' },
       modelSwitch: 'launch-only',
@@ -134,6 +136,16 @@ describe('drift detection (declared vs observed)', () => {
     const results = await run({ lie: { [lie]: true } });
     expect(verdict(results, probe), formatResults(results)).toBe('drift');
     expect(() => assertConformance(results)).not.toThrow(); // P1 probes report, never gate
+  });
+
+  it('checks that an adapter declaring no MCP client refuses mcpServers (#184)', async () => {
+    const honest = await run({ capabilities: { mcp: false } });
+    expect(verdict(honest, 'mcp'), formatResults(honest)).toBe('pass');
+    const liar = await run({ capabilities: { mcp: false }, lie: { mcp: true } });
+    expect(verdict(liar, 'mcp'), formatResults(liar)).toBe('drift');
+    expect(() => assertConformance(liar)).toThrow(/mcp: drift/);
+    // Declaring it needs an MCP server to check against.
+    expect(verdict(await run({}), 'mcp')).toBe('skip');
   });
 
   it('reports drift when an adapter streams but declares that it does not', async () => {

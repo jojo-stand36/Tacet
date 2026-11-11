@@ -1441,6 +1441,20 @@
       "body": "One global place where the user sees only what needs them, across every repo.\n\n### Tasks\n- [ ] All M2 issues\n\n### Acceptance criteria\n- Demo: 3 repos running, user handles all decisions from one inbox\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Authenticate the Conductor link",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "area:mini",
+        "area:security",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "The Conductor↔Mini-conductor link (#23, #24) trusts its token, which sits in `~/.tacet/run/conductor.json` where Workers running as the same user can read it. So a reader can stand up a Conductor of its own that Mini-conductors dial, or dial the real Conductor as a registered repo's Mini-conductor and forward made-up events (accepted for #24 only: read and cancel down, events up; see the ADR-003 addendum on forwarding events). Anything that acts on what crosses the link in the user's name needs the two ends to authenticate each other first: the decision inbox (#26) and handing tasks down the link. How (a secret only the real processes hold, a socket with peer credentials, an OS keychain item, the worker sandbox keeping Workers out of the run directory) is an owner decision and likely an ADR-003 addendum.\n\n### Tasks\n- [ ] Choose the mechanism (owner decision; ADR-003 addendum)\n- [ ] Mini-conductors authenticate the Conductor before serving it, and the Conductor its Mini-conductors before taking their events\n- [ ] Tests: a reader of `~/.tacet/run` can neither pose as the Conductor nor forward events as a Mini-conductor\n\n### Acceptance criteria\n- A process that can read every file under `~/.tacet` but is not the real Conductor or Mini-conductor cannot complete either end's handshake (tested)\n- The ADR-003 known risk on the link is closed and ARCHITECTURE §6 updated\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
       "title": "Conductor daemon + mini-conductor registry",
       "milestone": "M2 · Conductor & escalation",
       "labels": [
@@ -1483,7 +1497,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n- [ ] Borrow (ADR-001): Per-severity notification routes and stale re-escalation (`stale_after`, max 2) for unanswered Decisions (Gas Town `docs/design/escalation.md`); coordinate with #45\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\nBlocked until the Conductor link is authenticated (#330; owner decision on #24): a forwarded escalation must not reach the user as something to decide while a reader of `~/.tacet/run` could have made it up.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n- [ ] Borrow (ADR-001): Per-severity notification routes and stale re-escalation (`stale_after`, max 2) for unanswered Decisions (Gas Town `docs/design/escalation.md`); coordinate with #45\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Escalation gate in mini-conductor",
@@ -1518,6 +1532,19 @@
         "agent:either"
       ],
       "body": "Mini-conductors report compact typed summaries to keep the Conductor's context small.\n\n### Tasks\n- [ ] Summary schema (shares fields with HandoffPacket)\n- [ ] Periodic + on-completion summaries\n- [ ] Drill-down links to full logs\n\n### Acceptance criteria\n- Conductor context stays bounded over a 3-hour multi-repo run\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Tasks down the Conductor link: create tasks and answer escalations",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:conductor",
+        "area:mini",
+        "priority:p1",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "#24 sends only `ListTasks`, `GetTask` and `CancelTask` down the Conductor link (owner decision on #24). Creating a task in a live Mini-conductor (A2A `SendMessage` without `taskId`) and answering its escalations (`SendMessage` with the decision extension) over the link would let whoever holds the link's token start Workers or decide in the user's name, so they wait for an authenticated link (#330). This also lets `tacet run` hand a task to a live Mini-conductor (an auto-started `tacet mini`) instead of being refused by its lock, and lets an auto-started Mini-conductor resume unfinished tasks. Depends on #24 and #330.\n\n### Tasks\n- [ ] `SendMessage` over the link: new tasks (with the Conductor's `contextId`, stored on `task.created`) and answers (how the #269 one-time answer code applies there is an owner decision)\n- [ ] `tacet run` hands its task to a live Mini-conductor; the control port's `-32004` rule changes accordingly (ADR-003 addendum)\n- [ ] `tacet mini` and auto-start may resume unfinished tasks\n\n### Acceptance criteria\n- With an authenticated link, a task created over it runs to completion and an escalation answered over it resumes its Worker (tested both ways)\n- Without one, both are refused as today (tested)\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)",

@@ -524,3 +524,177 @@ describe('connections a daemon keeps (#23)', () => {
     expect(closed.code).toBe(1006);
   });
 });
+
+describe('both directions on one socket (#24, ADR-003 §4)', () => {
+  type Conn = import('./ws-server.js').RpcConnection;
+  /** A server that hands over each connection, and a client of it with `handlers`. */
+  const pair = async (
+    handlers: Parameters<typeof connectRpc>[0]['handlers'],
+    extra: Partial<Parameters<typeof startRpcServer>[0]> = {},
+    onConn?: (c: Conn) => void,
+  ) => {
+    const conns: Conn[] = [];
+    const clientErrors: string[] = [];
+    const { server, token, errors } = await serve(randomToken(), {
+      onConnection: (c) => {
+        conns.push(c);
+        onConn?.(c);
+      },
+      ...extra,
+    });
+    const c = await connectRpc({
+      port: server.port,
+      token,
+      clientInfo: { name: 'test', version: '0' },
+      timeoutMs: 5000,
+      ...(handlers ? { handlers } : {}),
+      capabilities: { methods: Object.keys(handlers ?? {}) },
+      onError: (m) => clientErrors.push(m),
+    });
+    await vi.waitFor(() => expect(conns).toHaveLength(1));
+    return { c, conn: conns[0] as Conn, server, token, errors, clientErrors };
+  };
+
+  it('lets the server call the client while the client calls the server', async () => {
+    const { c, conn } = await pair({
+      ListTasks: async (p, ctx) => {
+        await new Promise((r) => setTimeout(r, 20));
+        return { got: p, session: ctx.sessionId };
+      },
+    });
+    const [down, up] = await Promise.all([
+      conn.call('ListTasks', { pageSize: 3 }),
+      c.call('echo', { x: 1 }),
+    ]);
+    expect(down).toEqual({ got: { pageSize: 3 }, session: c.hello.sessionId });
+    expect(up).toEqual({ x: 1 });
+    await c.close();
+  });
+
+  it("answers the server with the client's errors, never its internals", async () => {
+    const { conn, c, clientErrors } = await pair({
+      refuse: () => {
+        throw new RpcError(-32001, 'task not found');
+      },
+      boom: () => {
+        throw new Error('/private/path in a message');
+      },
+    });
+    await expect(conn.call('refuse')).rejects.toMatchObject({
+      code: -32001,
+      message: 'task not found',
+    });
+    const boom = await conn.call('boom').catch((e: unknown) => e);
+    expect(boom).toMatchObject({ code: -32603, message: 'internal error' });
+    // Reported where it happened, by message; the server never sees the path.
+    expect(clientErrors).toEqual(['/private/path in a message']);
+    expect(String((boom as Error).message)).not.toContain('/private');
+    await expect(conn.call('SendMessage')).rejects.toMatchObject({ code: -32601 });
+    await expect(conn.call('tacet/hello')).rejects.toMatchObject({ code: -32600 });
+    await c.close();
+  });
+
+  it('serves a request sent at once after the hello', async () => {
+    const answers: unknown[] = [];
+    const { c } = await pair({ GetTask: () => 'here' }, {}, (conn) => {
+      // In the same breath as the hello's answer.
+      void conn.call('GetTask').then((a) => answers.push(a));
+    });
+    await vi.waitFor(() => expect(answers).toEqual(['here']));
+    await c.close();
+  });
+
+  it('rejects calls in flight when the socket goes', async () => {
+    const { c, conn } = await pair({ slow: () => new Promise(() => {}) });
+    const pending = expect(conn.call('slow', undefined, { timeoutMs: 10_000 })).rejects.toThrow(
+      /connection closed/,
+    );
+    await c.close();
+    await pending;
+    await expect(conn.call('slow')).rejects.toThrow(/not connected/);
+  });
+
+  it('times out a call the client never answers', async () => {
+    const { c, conn } = await pair({ slow: () => new Promise(() => {}) });
+    await expect(conn.call('slow', undefined, { timeoutMs: 50 })).rejects.toThrow(/timed out/);
+    await c.close();
+  });
+
+  it('drops a response that answers nothing it asked, without replying', async () => {
+    const { server, token } = await serve();
+    const ws = await rawSocket(server.port, token);
+    const got: unknown[] = [];
+    ws.on('message', (d) => got.push(JSON.parse(d.toString())));
+    ws.send(hello());
+    await vi.waitFor(() => expect(got).toHaveLength(1));
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 999, result: 'forged' }));
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'echo', params: 'after' }));
+    await vi.waitFor(() => expect(got).toHaveLength(2));
+    expect(got[1]).toEqual({ jsonrpc: '2.0', id: 2, result: 'after' });
+    ws.close();
+  });
+
+  /** A raw socket past its hello, collecting every frame the server sends. */
+  const helloed = async (extra: Partial<Parameters<typeof startRpcServer>[0]>) => {
+    const { server, token } = await serve(randomToken(), extra);
+    const ws = await rawSocket(server.port, token);
+    const got: unknown[] = [];
+    const done = new Promise<number>((r) => ws.once('close', (code) => r(code)));
+    ws.on('message', (d) => got.push(JSON.parse(d.toString())));
+    ws.send(hello());
+    await vi.waitFor(() => expect(got).toHaveLength(1));
+    got.length = 0;
+    return { ws, got, done };
+  };
+
+  it('runs notifications in order, and never answers one', async () => {
+    const seen: number[] = [];
+    const { ws, got } = await helloed({
+      maxQueued: 50,
+      handlers: {
+        echo: (p) => p,
+        'tacet/event': async (p) => {
+          await new Promise((r) => setTimeout(r, 1));
+          seen.push((p as { n: number }).n);
+        },
+      },
+    });
+    // One burst, then a request: the request's answer is the only frame that comes back.
+    for (let n = 0; n < 40; n++) {
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'tacet/event', params: { n } }));
+    }
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'echo', params: 'done' }));
+    await vi.waitFor(() => expect(seen).toHaveLength(40), { timeout: 5000 });
+    expect(seen).toEqual([...Array(40).keys()]);
+    expect(got).toEqual([{ jsonrpc: '2.0', id: 7, result: 'done' }]);
+    ws.close();
+  });
+
+  it('closes a peer that queues more notifications than it may, rather than drop one', async () => {
+    const { ws, done } = await helloed({
+      maxQueued: 2,
+      handlers: { 'tacet/event': () => new Promise(() => {}) },
+    });
+    for (let n = 0; n < 5; n++) {
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'tacet/event', params: { n } }));
+    }
+    expect(await done).toBe(1008);
+  });
+
+  it('answers JSON that is not a request -32600, and what is not JSON -32700', async () => {
+    const { ws, got } = await helloed({});
+    ws.send('[]');
+    ws.send('5');
+    ws.send('{not json');
+    await vi.waitFor(() => expect(got).toHaveLength(3));
+    expect(got.map((m) => (m as { error: { code: number } }).error.code)).toEqual([
+      -32600, -32600, -32700,
+    ]);
+    // An error answer the peer could not tie to a request is a response: never answered.
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'x' } }));
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'echo', params: 'still here' }));
+    await vi.waitFor(() => expect(got).toHaveLength(4));
+    expect(got[3]).toEqual({ jsonrpc: '2.0', id: 8, result: 'still here' });
+    ws.close();
+  });
+});

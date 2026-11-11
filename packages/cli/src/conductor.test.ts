@@ -69,8 +69,16 @@ describe('tacet up: the Conductor', () => {
     const plain = join(root, 'plain');
     mkdirSync(plain);
     const r = await tacet(['up', '--add', plain]);
-    expect(r.code).toBe(1);
-    expect(r.err).toContain('not a git repository');
+    // The repo is found by walking up to a `.git`, so a stray one above the temp dir (a `/tmp/.git`)
+    // makes `plain` part of it: then it is registered as that repo, which the output says.
+    const around = repoRootFrom(plain);
+    if (around === plain) {
+      expect(r.code).toBe(1);
+      expect(r.err).toContain('not a git repository');
+    } else {
+      expect(r.code).toBe(0);
+      expect(r.out).toContain(`(the repo containing ${plain})`);
+    }
   });
 
   it('does not take a sandbox placeholder skeleton above a directory for a repo (#326)', async (ctx) => {

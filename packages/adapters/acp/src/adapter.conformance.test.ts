@@ -152,7 +152,10 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
     await adapter.close(h);
   });
 
-  it('keeps the Worker MCP token off the command line and off disk', {
+  // A canary (#184): `GEMINI_AGENT` declares `mcp: false` because Gemini CLI in an untrusted
+  // checkout never starts the MCP servers it is passed. Here the declaration is bypassed and the
+  // server is the mock API itself: if Gemini ever contacts it, the declaration needs revisiting.
+  it('never contacts the MCP server it is passed in an untrusted checkout, and keeps its token off the command line and off disk', {
     timeout: 120_000,
   }, async () => {
     const token = 'acp-conformance-token-5f1d0c7e9a2b4c6d';
@@ -160,7 +163,7 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
     mkdirSync(cwd);
     const stderr: string[] = [];
     const withLog = new AcpAdapter({
-      agent: GEMINI_AGENT,
+      agent: { ...GEMINI_AGENT, capabilities: { ...GEMINI_AGENT.capabilities, mcp: true } },
       executable: [process.execPath, GEMINI],
       killTimeoutMs: 2000,
       stderr: (t) => stderr.push(t),
@@ -173,11 +176,10 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
     });
     const h = await withLog.start({
       cwd,
-      // Nothing listens there: the token only has to reach the agent, not a server.
       mcpServers: [
         {
           name: 'tacet',
-          url: 'http://127.0.0.1:9/mcp',
+          url: `${api.url}/mcp`,
           headers: mcpAuthHeaders(new Secret(token)),
         },
       ],
@@ -195,5 +197,41 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
     for (const f of files(root)) expect(readFileSync(f, 'utf8'), f).not.toContain(token);
     expect(JSON.stringify(tap.events)).not.toContain(token);
     expect(stderr.join('')).not.toContain(token);
+    expect(api.otherPaths.filter((p) => p.startsWith('/mcp'))).toEqual([]);
+
+    // Control: the same turn in a checkout listed in the Worker home's `trustedFolders.json`
+    // does contact the server, so the empty list above is the trust gate, not a slow start.
+    const trusted = join(root, 'wt-mcp-trusted');
+    mkdirSync(trusted);
+    const control = new AcpAdapter({
+      agent: {
+        ...GEMINI_AGENT,
+        capabilities: { ...GEMINI_AGENT.capabilities, mcp: true },
+        home: {
+          env: GEMINI_AGENT.home?.env ?? 'GEMINI_CLI_HOME',
+          files: {
+            ...GEMINI_AGENT.home?.files,
+            '.gemini/trustedFolders.json': JSON.stringify({ [trusted]: 'TRUST_FOLDER' }),
+          },
+        },
+      },
+      executable: [process.execPath, GEMINI],
+      killTimeoutMs: 2000,
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: join(root, 'home'),
+        GEMINI_API_KEY: 'placeholder-not-a-real-key',
+        GOOGLE_GEMINI_BASE_URL: api.url,
+      },
+    });
+    const c = await control.start({
+      cwd: trusted,
+      mcpServers: [{ name: 'tacet', url: `${api.url}/mcp`, headers: {} }],
+    });
+    const ctap = new EventTap(control.events(c));
+    await control.send(c, { text: 'SAY mcp' });
+    await ctap.waitFor((e) => e.t === 'status' && e.state !== 'running', 60_000, 1);
+    await control.close(c);
+    expect(api.otherPaths.filter((p) => p.startsWith('/mcp')).length).toBeGreaterThan(0);
   });
 });

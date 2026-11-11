@@ -26,6 +26,12 @@ export interface AdapterCapabilities {
   /** `SessionOptions.resume` continues an earlier vendor session. */
   resume: boolean;
   /**
+   * Connects to every server in `SessionOptions.mcpServers` and offers its tools to the model
+   * (ADR-003 §6). `false`: the Worker has no MCP client Tacet can use (Gemini CLI in an untrusted
+   * checkout, #184; a generic PTY CLI), and `start()` throws when `mcpServers` is not empty.
+   */
+  mcp: boolean;
+  /**
    * `native`: the vendor forks. `emulated`: Tacet seeds a new session from a HandoffPacket.
    * `native` may still be refused for one session (an ACP agent that does not advertise
    * `session/fork` for it): `start()` then throws `ForkRefusedError`, as it does for `none` (#228).
