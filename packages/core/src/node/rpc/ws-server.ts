@@ -57,6 +57,25 @@ export interface RpcServerOptions {
   pty?: (id: string, left: AbortSignal) => AsyncIterable<Uint8Array> | undefined;
   /** `/pty` sockets open at once; more are refused (503). Default 8. */
   maxPtySockets?: number;
+  /** Told about each connection once its hello is answered (#23). */
+  onConnection?: (conn: RpcConnection) => void;
+}
+
+/**
+ * One client connection after its `tacet/hello` (#23): what a daemon needs to keep a registry of
+ * its peers, such as the Conductor's Mini-conductors.
+ */
+export interface RpcConnection {
+  readonly sessionId: string;
+  readonly hello: HelloInfo;
+  /** Close it with a WebSocket close code (e.g. 4409) and a short reason. */
+  close(code: number, reason: string): void;
+  /** Drop it at once, without the closing handshake: for a peer that no longer answers. */
+  terminate(): void;
+  /** Send a WebSocket ping; true when the pong comes back within `timeoutMs`. */
+  ping(timeoutMs: number): Promise<boolean>;
+  /** Settles when the socket is gone, with its close code. */
+  readonly closed: Promise<{ code: number; reason: string }>;
 }
 
 export interface RpcServer {
@@ -198,6 +217,13 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
       if (action.kind === 'reply') {
         if (ctx) ctx.sessionId = action.message.result.sessionId;
         send(action.message);
+        if (ctx && o.onConnection) {
+          try {
+            o.onConnection(connection(ws, ctx));
+          } catch (err) {
+            report(err);
+          }
+        }
         return;
       }
       if (isBinary || !ctx) {
@@ -220,6 +246,38 @@ export async function startRpcServer(o: RpcServerOptions): Promise<RpcServer> {
           inFlight--;
         });
     });
+  };
+
+  const connection = (ws: WebSocket, ctx: RpcContext): RpcConnection => {
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      if (ws.readyState === ws.CLOSED) resolve({ code: 1006, reason: '' });
+      ws.once('close', (code: number, reason: Buffer) =>
+        resolve({ code, reason: reason.toString('utf8') }),
+      );
+    });
+    return {
+      sessionId: ctx.sessionId,
+      hello: ctx.hello,
+      closed,
+      close: (code, reason) => {
+        if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close(code, reason);
+      },
+      terminate: () => ws.terminate(),
+      ping: (timeoutMs) =>
+        new Promise<boolean>((resolve) => {
+          if (ws.readyState !== ws.OPEN) return resolve(false);
+          const done = (ok: boolean) => {
+            clearTimeout(timer);
+            ws.off('pong', onPong);
+            resolve(ok);
+          };
+          const onPong = () => done(true);
+          const timer = setTimeout(() => done(false), timeoutMs);
+          timer.unref();
+          ws.once('pong', onPong);
+          ws.ping();
+        }),
+    };
   };
 
   const dispatch = async (frame: string, ctx: RpcContext) => {

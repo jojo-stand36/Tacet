@@ -12,6 +12,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SessionHandle } from '@tacet/core';
 import { repoStateDir } from '@tacet/core/node';
@@ -24,12 +25,14 @@ import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-res
 /**
  * A private TMPDIR per unattended Worker, with /tmp out of the sandbox's writable roots (#294),
  * against the real `codex app-server`: a repo, HOME and state dir all under /tmp are protected,
- * where without it the adapter has to refuse them (#293, #295). Off on macOS (the Xcode `git`
- * shim and the per-user temp dir are unchecked there), so this runs elsewhere only.
+ * where without it the adapter has to refuse them (#293, #295). On Linux and macOS: on macOS the
+ * first `git` inside the sandbox (the Xcode shim) works with it, the per-user temp dir there
+ * (`getconf DARWIN_USER_TEMP_DIR`) is the private TMPDIR, and the host's own per-user temp dir
+ * is not writable (#294).
  */
 const DENIED = /Read-only file system|Permission denied|Operation not permitted/;
 
-describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294)', () => {
+describe('Codex Worker private TMPDIR (#294)', () => {
   let api: MockResponsesApi;
   let root: string;
   let repo: string;
@@ -131,6 +134,21 @@ describe.runIf(process.platform !== 'darwin')('Codex Worker private TMPDIR (#294
     expect(owner.host).toBe(process.pid);
     expect(owner.group).toEqual(expect.any(Number));
 
+    // The first git inside the sandbox works: on macOS the Xcode shim writes its cache under
+    // the per-user temp dir, which inside the sandbox is the private TMPDIR (#294).
+    const first = await run(a, h, tap, 'git --version && git status --short && echo GIT-OK');
+    expect(first, first).toContain('GIT-OK');
+    if (process.platform === 'darwin') {
+      // There the per-user temp dir follows TMPDIR: the shim's cache lands in the private one.
+      const utd = await run(a, h, tap, 'echo "UTD=$(getconf DARWIN_USER_TEMP_DIR)"');
+      expect(utd, utd).toContain(`UTD=${workerTmp}`);
+      // The host's real per-user temp dir (/var/folders/…/T) is not writable either.
+      const hostTmp = join(tmpdir(), `tacet-294-host-${process.pid}`);
+      const host = await run(a, h, tap, `touch ${hostTmp} && echo HOSTTMP-OK`);
+      expect(host).not.toContain('HOSTTMP-OK');
+      expect(host).toMatch(DENIED);
+      expect(existsSync(hostTmp)).toBe(false);
+    }
     const mine = await run(
       a,
       h,

@@ -111,9 +111,10 @@ export interface CodexAdapterOptions {
    * Give each unattended Worker its own `TMPDIR` (a fresh 0700 dir in the repo's state dir,
    * removed when the session ends) and take `/tmp` out of the sandbox's writable roots, so no
    * shared temp dir is writable and a repo or state dir under `/tmp` is protected (#294). Default
-   * on, except on macOS: there the Xcode `git` shim writes under the per-user temp dir, which has
-   * not been checked against a private `TMPDIR`, so macOS keeps the shared temp dirs and refuses
-   * a repo or CODEX_HOME under them instead (#293, #295). Turning it on there is unverified.
+   * on, on Linux and macOS (verified live on both; on macOS the Xcode `git` shim works with it:
+   * inside the sandbox the per-user temp dir is the private `TMPDIR`, #294). Off, the shared temp
+   * dirs stay writable and a repo or CODEX_HOME under them is refused instead (#293, #295): an
+   * escape hatch for a tool that needs the shared temp dir.
    */
   privateTmpdir?: boolean;
   /** Path to the `codex` entry point. Default: the pinned `@openai/codex` package. */
@@ -347,7 +348,7 @@ export class CodexAppServerAdapter implements AgentAdapter {
     );
     const home = launch.env.HOME ?? homedir();
     // A private TMPDIR, and /tmp read-only: no shared temp dir is left writable (#294).
-    const privateTmp = unattended && (this.#opts.privateTmpdir ?? process.platform !== 'darwin');
+    const privateTmp = unattended && (this.#opts.privateTmpdir ?? true);
     // Without it, before anything is created for the Worker: the sandbox could not protect its
     // repo (#293), or the repo enclosing its cwd when no repoRoot is given (#295).
     if (unattended && !privateTmp) {
@@ -1453,8 +1454,8 @@ function errorMessage(err: unknown): string {
 /**
  * The temp dirs Codex's `workspace-write` sandbox leaves writable besides the cwd: `/tmp` and the
  * Worker's `$TMPDIR` (capability matrix, "Sandbox writable roots (#116)"). They stay writable
- * only without `privateTmpdir` (macOS by default: the Xcode `git` shim needs the per-user temp
- * dir, #294). Resolved, so a symlinked `/tmp` (`/private/tmp` on macOS) is caught too.
+ * only without `privateTmpdir` (#294). Resolved, so a symlinked `/tmp` (`/private/tmp` on
+ * macOS) is caught too.
  */
 export function sandboxTempRoots(tmpdir: string | undefined): string[] {
   const roots = ['/tmp', ...(tmpdir && isAbsolute(tmpdir) ? [tmpdir] : [])];

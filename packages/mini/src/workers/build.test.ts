@@ -345,7 +345,7 @@ describe('buildWorkerAdapters', () => {
     ).not.toThrow(/claude-agent-acp/);
   });
 
-  it('refuses acp:codex-acp for Workers until #183 is decided (interim default)', () => {
+  it('refuses acp:codex-acp for Workers (settled, #183)', () => {
     for (const tiers of [
       { worker: { adapter: 'acp:codex-acp' } },
       { worker: { adapter: 'claude-sdk', model: 'm' }, review: { adapter: 'acp:codex-acp' } },

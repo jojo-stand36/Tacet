@@ -7,6 +7,7 @@ import {
   AgentEvent,
   ApprovalDecision,
   allJsonSchemas,
+  CONDUCTOR_LOCAL_EVENT_NAMESPACES,
   Decision,
   DecisionExt,
   Escalation,
@@ -232,7 +233,7 @@ describe('forwarding upward: the ADR-003 §4 allowlist (#256)', () => {
       'worker',
     ]);
     expect([...UPWARD_EVENT_TYPES]).toEqual(['agent.usage']);
-    for (const ns of LOCAL_EVENT_NAMESPACES) {
+    for (const ns of [...LOCAL_EVENT_NAMESPACES, ...CONDUCTOR_LOCAL_EVENT_NAMESPACES]) {
       expect(UPWARD_EVENT_NAMESPACES as readonly string[]).not.toContain(ns);
     }
   });
@@ -259,6 +260,9 @@ describe('forwarding upward: the ADR-003 §4 allowlist (#256)', () => {
       'workspace.created',
       'workspace.removed',
       'maintenance.problem',
+      // The Conductor's own (#23).
+      'registry.connected',
+      'registry.repo_added',
       // Transcripts.
       'agent.message.delta',
       'agent.tool.call',

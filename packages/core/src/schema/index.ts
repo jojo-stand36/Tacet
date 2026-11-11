@@ -8,6 +8,12 @@ import { HelloParams, HelloResult } from './hello.js';
 import { MaintenanceProblem } from './maintenance.js';
 import { TaskPlan } from './plan.js';
 import { SessionProfile } from './profile.js';
+import {
+  RegistryConnected,
+  RegistryDisconnected,
+  RegistryRepoAdded,
+  RegistryRepoRemoved,
+} from './registry.js';
 import { StatusExt } from './status-ext.js';
 import { SummaryPacket } from './summary.js';
 import { Task, TaskExt, TaskLanded, TaskTarget } from './task.js';
@@ -36,6 +42,7 @@ export * from './hello.js';
 export * from './maintenance.js';
 export * from './plan.js';
 export * from './profile.js';
+export * from './registry.js';
 export * from './status-ext.js';
 export * from './summary.js';
 export * from './task.js';
@@ -95,6 +102,16 @@ export const jsonSchemas = {
   'worker-review': { schema: WorkerReview, title: 'Tacet worker.review payload' },
   'workspace-created': { schema: WorkspaceCreated, title: 'Tacet workspace.created payload' },
   'workspace-removed': { schema: WorkspaceRemoved, title: 'Tacet workspace.removed payload' },
+  'registry-repo-added': { schema: RegistryRepoAdded, title: 'Tacet registry.repo_added payload' },
+  'registry-repo-removed': {
+    schema: RegistryRepoRemoved,
+    title: 'Tacet registry.repo_removed payload',
+  },
+  'registry-connected': { schema: RegistryConnected, title: 'Tacet registry.connected payload' },
+  'registry-disconnected': {
+    schema: RegistryDisconnected,
+    title: 'Tacet registry.disconnected payload',
+  },
   'maintenance-problem': {
     schema: MaintenanceProblem,
     title: 'Tacet maintenance.problem payload',

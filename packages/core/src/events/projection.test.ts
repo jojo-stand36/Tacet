@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { EventEnvelope } from '../schema/envelope.js';
-import { project, tasksProjection, workspacesProjection } from './projection.js';
+import {
+  project,
+  registryProjection,
+  tasksProjection,
+  workspacesProjection,
+} from './projection.js';
 
 const st = (id: string, dependsOn: string[] = []) => ({
   id,
@@ -153,5 +158,50 @@ describe('workspaces projection (#126)', () => {
       createdAt: '2026-11-10T12:00:01.000Z',
     });
     expect(state.live['w-2']?.migrated).toBe(true);
+  });
+});
+
+describe('registry projection (#23)', () => {
+  const at = (n: number, type: string, data: unknown): EventEnvelope => ({
+    v: 1,
+    id: `01J00000000000000000000${String(n).padStart(3, '0')}`,
+    ts: `2026-11-11T12:00:0${n}.000Z`,
+    source: { kind: 'conductor', id: 'conductor' },
+    type,
+    data,
+  });
+  const a = '0123456789abcdef';
+  const b = 'fedcba9876543210';
+  const conn = (id: string, sessionId: string) => ({
+    repoId: id,
+    repoPath: `/r/${id}`,
+    sessionId,
+    miniVersion: '0',
+    adapters: [],
+  });
+
+  it('keeps registered repos and live connections, a stale disconnect leaving the new one', () => {
+    const state = project(registryProjection, [
+      at(1, 'registry.repo_added', { repoId: a, repoPath: '/r/a' }),
+      at(2, 'registry.repo_added', { repoId: b, repoPath: '/r/b' }),
+      at(3, 'registry.repo_removed', { repoId: b }),
+      at(4, 'registry.connected', conn(a, 's-1')),
+      // Not registered: connected all the same.
+      at(5, 'registry.connected', conn(b, 's-2')),
+      // A new session for a, then the old one's late end: the new one stays.
+      at(6, 'registry.connected', conn(a, 's-3')),
+      at(7, 'registry.disconnected', { repoId: a, sessionId: 's-1', reason: 'replaced' }),
+      at(8, 'registry.disconnected', { repoId: b, sessionId: 's-2', reason: 'a new reason' }),
+      // Malformed: skipped.
+      at(9, 'registry.repo_added', { repoId: 'not-an-id', repoPath: '/x' }),
+    ]);
+    expect(state.repos).toEqual({
+      [a]: { repoId: a, repoPath: '/r/a', addedAt: '2026-11-11T12:00:01.000Z' },
+    });
+    expect(Object.keys(state.connected)).toEqual([a]);
+    expect(state.connected[a]).toMatchObject({
+      sessionId: 's-3',
+      since: '2026-11-11T12:00:06.000Z',
+    });
   });
 });
