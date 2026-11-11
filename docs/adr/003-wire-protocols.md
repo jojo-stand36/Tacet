@@ -352,3 +352,13 @@ Status of this addendum: **accepted** on 2026-11-11, approved by the owner on PR
    - The decision inbox (#26) stays blocked until the link is authenticated (#330), so a forwarded escalation never reaches the user as something to decide.
 
 Additive under §2: a new Tacet-only method, the params of an existing notification, capability flags. The upward allowlist of §4 is not widened.
+
+### Addendum (2026-11-11): the escalation gate on the MCP surface (#25)
+
+Status of this addendum: **proposed**, pending the owner's approval in their own comment on the PR that adds it, together with [ADR-004](004-escalation-gate.md). Not accepted until that comment.
+
+1. **The gate's time.** §2.2 and the `escalate` row say the call returns `pending` "if the gate does not resolve it within a few seconds". That stays the default (3 s). With the Mini-conductor's own reasoning on (ADR-004 B, C) the limit is configurable as `escalation.gate_timeout_s` (default about 30 s), still far inside an MCP client's idle timeout. A Worker never waits on a person.
+2. **One write for an escalation and its outcome.** The Mini-conductor writes `escalation.raised` and, when the gate answers in time, the gate's Decision (`decision.recorded`, its `source`, a `rationale`, scope `task`), `escalation.resolved` and `escalation.delivered` (inline) in one append. So the user never sees a question the gate is still working on, and a crash leaves nothing half-written. When the gate does not answer in time the escalation is written as pending and the gate's late answer is dropped: the user answers it.
+3. **`escalation.resolved` carries `source`, `decisionId` and `rationale`.** `source` is `user`, `policy`, `precedent` or `mini` (an open enum; already written by every writer, and in core's schema since #25 PR1), `decisionId` names the Decision that records the answer, and `rationale` is the gate's, when it answered. Additive under §2.
+4. **`record_decision` with scope `repo` needs the user's approval, always.** The row's "become precedent only if repo policy and the autonomy setting allow it" is replaced: a repo-scope decision a Worker records is always an approval request, which only the user answers (ADR-004 A, E). Approving records it as the user's, under the `decisionId` the Worker was given (#25 PR1).
+5. **Where repo precedent comes from (security note, with #269 and #330).** A repo-scope Decision multiplies the effect of a forged answer, so one is made only by the user: an answer kept for the repo through a path that needs the escalation's one-time answer code (`tacet answer --repo-wide` over the control port), or a Worker's proposal the user approves at the run's own terminal or with that code. Over the Conductor link, only once the link is authenticated (#330).

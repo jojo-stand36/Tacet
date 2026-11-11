@@ -61,7 +61,7 @@ A mini-conductor can run **without** a Conductor (standalone mode) — useful on
 
 ### 2.2 Escalation flow
 - Workers call MCP `escalate({question, options?, urgency, contextRef?})`. The call does not block on a human: if the gate does not resolve it within a few seconds, it returns `pending`, and the answer arrives as the worker's next message ([ADR-003 §6](adr/003-wire-protocols.md#6-workers--mini-conductor-mcp-tool-surface)). Adapters can also surface a permission or approval request.
-- Mini-conductor's **escalation gate** first tries to resolve it: repo policy, past decisions log, its own reasoning. Only unresolved items go up.
+- Mini-conductor's **escalation gate** first tries to resolve it: repo policy, past decisions log, its own reasoning. Only unresolved items go up. How (proposed, [ADR-004](adr/004-escalation-gate.md), #25): only the user's own Decisions are precedent, matched exactly; the Mini-conductor's own reasoning runs from `autonomy: medium`, grounded in candidate precedents or constraints; `always_ask`, tool `ask`s and the Mini-conductor's own escalations always reach the user; and a gate answer is advice to the Worker, never a permission.
 - Conductor dedupes/batches across repos and puts them in the **decision inbox**, ranked by urgency × blocked-workers.
 - User answers once; the answer is recorded as a **decision** (reusable precedent) and flows back down.
 - Escalation strictness is a per-user/per-repo dial (`autonomy: low | medium | high`).
