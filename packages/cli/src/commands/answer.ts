@@ -9,6 +9,8 @@ export interface AnswerOptions {
   repo?: string;
   'user-dir'?: string;
   json?: boolean;
+  /** Keep the answer as precedent for the whole repo, not only this task (#25). */
+  'repo-wide'?: boolean;
 }
 
 /**
@@ -65,7 +67,14 @@ export async function answer(
         role: 'ROLE_USER',
         parts: [{ text }],
         extensions: [DECISION_EXT_URI],
-        metadata: { [DECISION_EXT_URI]: { escalationId, choice: text, scope: 'task', code } },
+        metadata: {
+          [DECISION_EXT_URI]: {
+            escalationId,
+            choice: text,
+            scope: o['repo-wide'] ? 'repo' : 'task',
+            code,
+          },
+        },
       },
     });
     if (o.json) io.out(safeJson({ answered: escalationId, taskId: task.id }));

@@ -280,6 +280,13 @@ export class EventLogBackend implements MiniBackend {
     return { ack: true as const };
   }
 
+  /** Whether the log already has an answer to this escalation. */
+  #resolved(taskId: string, escalationId: string): boolean {
+    return this.#o.store
+      .query({ taskId, typePrefix: 'escalation.resolved' })
+      .some((e) => (e.envelope.data as { escalationId?: unknown }).escalationId === escalationId);
+  }
+
   /** Record a new pending escalation, without consulting the gate. */
   #raise(
     b: WorkerBinding,
@@ -311,13 +318,21 @@ export class EventLogBackend implements MiniBackend {
     const escalation = this.#raise(b, i);
     const gate = this.#o.gate;
     if (!gate) return { escalationId: escalation.id, status: 'pending' };
-    const resolve = (result: { answer: string; source: 'policy' | 'precedent' | 'mini' }) =>
+    /** Record the gate's answer; false when the user had already answered (#25). */
+    const resolve = (result: {
+      answer: string;
+      source: 'policy' | 'precedent' | 'mini';
+    }): boolean => {
+      // Never twice: the user may have answered while the gate was still at work.
+      if (this.#resolved(b.taskId, escalation.id)) return false;
       this.#append(
         b,
         'escalation.resolved',
         { escalationId: escalation.id, answer: result.answer, source: result.source },
         'mini',
       );
+      return true;
+    };
     let timedOut = false;
     const answered = gate(escalation, b).then(
       (result) => {
@@ -349,8 +364,8 @@ export class EventLogBackend implements MiniBackend {
       }),
     ]);
     clearTimeout(timer);
-    if (result && !timedOut) {
-      resolve(result);
+    // The user's answer wins: left pending, so the daemon delivers theirs as the next message.
+    if (result && !timedOut && resolve(result)) {
       // The Worker gets this answer in the tool result itself: the daemon must not send it again.
       this.#append(
         b,
@@ -456,6 +471,8 @@ export class EventLogBackend implements MiniBackend {
         b,
         {
           question: `Approve a repo-wide decision on "${i.topic}": ${i.decision}`,
+          // "approve" records the proposal as the user's (#25); anything else leaves it out.
+          options: ['approve', 'reject'],
           urgency: 'normal',
           ...(i.rationale !== undefined ? { context: i.rationale } : {}),
         },

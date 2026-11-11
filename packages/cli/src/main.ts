@@ -31,11 +31,12 @@ const USAGE = `usage:
                                  with tacet run --resume --answer ID=TEXT; it logs to
                                  ~/.tacet/run/minis/<repo>.log
   tacet cancel <task> [--json]   cancel a task and its sub-tasks (in the live run, if any)
-  tacet answer <escalation> <text> [--json]
+  tacet answer <escalation> <text> [--repo-wide] [--json]
                                  answer an open escalation in the live run, with the
                                  one-time code its tacet run terminal shows (asked for here;
                                  under tmux or screen, or with session logging, any process
-                                 of yours can read that terminal)
+                                 of yours can read that terminal); --repo-wide keeps the
+                                 answer as precedent for the whole repo, not only the task
   tacet status [--json]          tasks, sub-tasks, open escalations; whether a run is live
   tacet logs <task> [--transcript] [--json] [--follow]
                                  a task's events (--transcript adds the Workers' own)
@@ -90,7 +91,7 @@ const OPTIONS = {
     'detached-child': { type: 'boolean' },
   },
   cancel: COMMON,
-  answer: COMMON,
+  answer: { ...COMMON, 'repo-wide': { type: 'boolean' } },
   status: COMMON,
   logs: { ...COMMON, transcript: { type: 'boolean' }, follow: { type: 'boolean', short: 'f' } },
   attach: COMMON,
