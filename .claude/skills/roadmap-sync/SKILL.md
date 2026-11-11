@@ -21,7 +21,7 @@ Read `.github/instructions/roadmap.instructions.md` first.
 2. Labels: exactly one `type:*`, one `priority:*`, one `agent:*` routing label (see `docs/HYBRID_WORKFLOW.md`), at least one `area:*`. Add `needs-human` if a decision is required.
 3. Acceptance criteria must be testable. If you can't write them, the issue isn't ready: label it `agent:claude` + `needs-human`.
 4. Regenerate: `node scripts/gen-roadmap.mjs`. It sorts `issues.json` into its canonical order (milestone, epics first, then title) and writes `ROADMAP.md`; `--check` fails if either is off.
-5. Push to GitHub (Claude Code with gh access): `scripts/create-issues.sh OWNER/REPO --dry-run`, then without `--dry-run`. Existing titles are skipped, so it is safe to re-run.
+5. Push to GitHub (Claude Code with gh access): `scripts/create-issues.sh OWNER/REPO --dry-run`, then without `--dry-run`. Existing titles are skipped, so it is safe to re-run. The dry-run reads the repo's labels, milestones and issues (never writes), so it lists exactly what a real run would create; if it says everything would be created, stop and check (#309).
 6. Commit `roadmap/issues.json` and `ROADMAP.md` together.
 
 ## Change an issue
