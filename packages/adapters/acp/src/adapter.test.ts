@@ -277,6 +277,36 @@ describe('AcpAdapter (fake ACP agent)', () => {
     });
   }
 
+  it("never passes the user's CODEX_CONFIG or CODEX_PATH to codex-acp, unless its spec sets them (#183)", async () => {
+    const user = {
+      OPENAI_API_KEY: 'placeholder',
+      CODEX_CONFIG: '/home/u/.codex/extra.toml',
+      CODEX_PATH: '/home/u/bin/codex',
+      CODEX_OTHER: 'kept',
+    };
+    // Even when the user passes them through on purpose.
+    const adapter = make(CODEX_ACP_AGENT, user, {
+      envPolicy: { pass: ['FAKE_*', 'CODEX_CONFIG', 'CODEX_PATH'] },
+    });
+    const h = await adapter.start({ cwd: join(root, 'wt') });
+    await adapter.close(h);
+    const names = (received()[0] as { envNames?: string[] }).envNames ?? [];
+    expect(names).toContain('CODEX_OTHER');
+    expect(names).not.toContain('CODEX_CONFIG');
+    expect(names).not.toContain('CODEX_PATH');
+    // Set by the spec itself: passed.
+    rmSync(logFile, { force: true });
+    const set = make(
+      { ...CODEX_ACP_AGENT, env: { ...CODEX_ACP_AGENT.env, CODEX_PATH: '/spec/codex' } },
+      user,
+    );
+    const h2 = await set.start({ cwd: join(root, 'wt') });
+    await set.close(h2);
+    const names2 = (received()[0] as { envNames?: string[] }).envNames ?? [];
+    expect(names2).toContain('CODEX_PATH');
+    expect(names2).not.toContain('CODEX_CONFIG');
+  });
+
   it('refuses to start without an API key, and when the agent wants a login', async () => {
     await expect(make(GEMINI_AGENT).start({ cwd: join(root, 'wt') })).rejects.toThrow(
       AuthRoutingError,
@@ -1122,5 +1152,7 @@ describe('ACP agent registry', () => {
     // No subscription or second key route, whatever the user passes through.
     expect(BUILTIN_ACP_AGENTS['claude-acp']?.envDeny).toContain('CLAUDE_CODE_OAUTH_TOKEN');
     expect(BUILTIN_ACP_AGENTS['codex-acp']?.envDeny).toEqual(['CODEX_API_KEY']);
+    // The user's own Codex config and binary only if the spec sets them (#183).
+    expect(BUILTIN_ACP_AGENTS['codex-acp']?.userEnvDeny).toEqual(['CODEX_CONFIG', 'CODEX_PATH']);
   });
 });
