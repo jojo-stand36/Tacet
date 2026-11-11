@@ -13,7 +13,12 @@ import {
 } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { type Conductor, startConductor } from './conductor.js';
+import {
+  type Conductor,
+  MINI_EXIT_UNFINISHED,
+  type SpawnedMini,
+  startConductor,
+} from './conductor.js';
 
 describe('the Conductor daemon (#23)', () => {
   let root: string;
@@ -248,5 +253,101 @@ describe('the Conductor daemon (#23)', () => {
     expect(c.registry().connected).toEqual({});
     expect(c.registry().repos[repoId]).toMatchObject({ repoPath: path });
     expect(ended()).toEqual([{ repoId, sessionId: 'old-session', reason: 'conductor_restart' }]);
+  });
+
+  describe('auto-start (conductor.autostart)', () => {
+    const register = (path: string) => {
+      const { repoId } = card(path);
+      mkdirSync(conductorStatePaths(stateDir).dir, { recursive: true });
+      const s = openEventStore(conductorStatePaths(stateDir).events);
+      s.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'conductor', id: 'cli' },
+        repo: repoId,
+        type: 'registry.repo_added',
+        data: { repoId, repoPath: path },
+      });
+      s.close();
+    };
+    /** Fake `tacet mini` processes: each start, and a way to end it with an exit code. */
+    const fakeMinis = () => {
+      const started: { path: string; exit: (code: number | string) => void }[] = [];
+      let live = new Set<string>();
+      return {
+        started,
+        live: (path: string, on: boolean) => {
+          live = new Set(live);
+          if (on) live.add(path);
+          else live.delete(path);
+        },
+        options: (more = {}) => ({
+          spawnMini: (path: string): SpawnedMini => {
+            let exit: (code: number | string) => void = () => {};
+            const exited = new Promise<number | string>((r) => {
+              exit = r;
+            });
+            started.push({ path, exit });
+            return { pid: 1000 + started.length, exited };
+          },
+          isMiniLive: (path: string) => live.has(path),
+          intervalMs: 20,
+          backoffMs: 50,
+          maxBackoffMs: 200,
+          ...more,
+        }),
+      };
+    };
+
+    it('starts a Mini-conductor for each registered repo, only once while it runs', async () => {
+      const api = repo('api');
+      repo('unregistered');
+      register(api);
+      const minis = fakeMinis();
+      await start({ autostart: minis.options() });
+      await vi.waitFor(() => expect(minis.started.map((m) => m.path)).toEqual([api]));
+      await new Promise((r) => setTimeout(r, 100));
+      expect(minis.started).toHaveLength(1);
+    });
+
+    it('starts none beside a live one, or a connected one', async () => {
+      const api = repo('api');
+      register(api);
+      const minis = fakeMinis();
+      minis.live(api, true);
+      const c = await start({ autostart: minis.options() });
+      await new Promise((r) => setTimeout(r, 100));
+      expect(minis.started).toEqual([]);
+      // It dials in; then it stops counting as live by its runtime file, and is still connected.
+      const m = await dial(c, api);
+      await vi.waitFor(() => expect(Object.keys(c.registry().connected)).toHaveLength(1));
+      minis.live(api, false);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(minis.started).toEqual([]);
+      await m.close();
+      await vi.waitFor(() => expect(minis.started).toHaveLength(1));
+    });
+
+    it('starts one that ended again after a growing backoff, and never one with unfinished tasks', async () => {
+      const api = repo('api');
+      register(api);
+      const minis = fakeMinis();
+      const notices: string[] = [];
+      await start({ autostart: minis.options({ onNotice: (m: string) => notices.push(m) }) });
+      await vi.waitFor(() => expect(minis.started).toHaveLength(1));
+      const t0 = Date.now();
+      minis.started[0]?.exit(1);
+      await vi.waitFor(() => expect(minis.started).toHaveLength(2));
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(40);
+      const t1 = Date.now();
+      minis.started[1]?.exit('signal SIGKILL');
+      await vi.waitFor(() => expect(minis.started).toHaveLength(3));
+      expect(Date.now() - t1).toBeGreaterThanOrEqual(90);
+      minis.started[2]?.exit(MINI_EXIT_UNFINISHED);
+      await new Promise((r) => setTimeout(r, 400));
+      expect(minis.started).toHaveLength(3);
+      expect(notices.at(-1)).toMatch(/unfinished tasks: not started again/);
+    });
   });
 });
