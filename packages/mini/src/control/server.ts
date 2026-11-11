@@ -197,7 +197,14 @@ export async function startMiniControl(o: MiniControlOptions): Promise<RpcServer
           );
         }
         try {
-          o.mini.answer(escalationId, answer);
+          // The user's scope and rationale come with the answer (#25): a `repo` answer becomes
+          // repo-wide precedent. Only this path, which needs the one-time code, can make one.
+          o.mini.answer(escalationId, answer, {
+            scope: decision.data.scope,
+            ...(decision.data.rationale !== undefined
+              ? { rationale: decision.data.rationale }
+              : {}),
+          });
         } catch (err) {
           // Resolved meanwhile: the message names the escalation only.
           throw new RpcError(-32602, (err as Error).message);

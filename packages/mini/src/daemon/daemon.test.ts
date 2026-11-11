@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  type Decision,
   type EventEnvelope,
   newUlid,
   ProfileRefusedError,
@@ -21,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
   cancelStopped,
+  isApproval,
   isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,
@@ -1014,13 +1016,177 @@ describe('MiniConductor', () => {
     expect(() => d.answer(escId, '  ')).toThrow(/empty/);
     d.answer(escId, 'Postgres');
     expect(() => d.answer(escId, 'MySQL')).toThrow(/already resolved/);
+    // Recorded as the user's decision (#25, ARCHITECTURE §2.2), and the answer names it.
+    const [decision] = ofType('decision.recorded', sub).map((e) => e.data) as Decision[];
+    expect(decision).toMatchObject({
+      escalationId: escId,
+      taskId: sub,
+      topic: 'Which database?',
+      decision: 'Postgres',
+      scope: 'task',
+      source: 'user',
+    });
     expect(ofType('escalation.resolved', sub).map((e) => e.data)).toEqual([
-      { escalationId: escId, answer: 'Postgres', source: 'user' },
+      { escalationId: escId, answer: 'Postgres', source: 'user', decisionId: decision?.id },
     ]);
     await d.settled();
     expect(tasks()[sub]?.state).toBe('completed');
     expect(fake.sessions[0]?.inputs.at(-1)).toBe(`Answer to your escalation ${escId}: Postgres`);
     expect(ofType('escalation.delivered', sub)).toHaveLength(1);
+  });
+
+  describe("the user's answers as decisions (#25)", () => {
+    /** A Worker that escalates once with `fields`, then finishes when answered. */
+    const asking = (escId: string, fields: Record<string, unknown>) =>
+      new ScriptedAdapter('fake', (input, s) => {
+        if (input.includes('[ask]') && !s.inputs.some((x) => x.startsWith('Answer'))) {
+          const started = store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope;
+          if (!started) throw new Error('no Worker started');
+          const sessionId = (started.data as { sessionId: string }).sessionId;
+          store.append({
+            v: 1,
+            id: newUlid(),
+            ts: new Date().toISOString(),
+            source: { kind: 'worker', id: sessionId },
+            taskId: started.taskId,
+            sessionId,
+            type: 'escalation.raised',
+            data: {
+              id: escId,
+              taskId: started.taskId,
+              question: 'Approve a repo-wide decision on "db": Postgres',
+              urgency: 'normal',
+              createdAt: new Date().toISOString(),
+              status: 'pending',
+              ...fields,
+            },
+          });
+          return { do: 'reply', text: 'Escalated; waiting.' };
+        }
+        return script(input);
+      });
+    const run = async (escId: string, fields: Record<string, unknown>) => {
+      fake = asking(escId, fields);
+      const d = make({
+        planner: new FixedPlanner([{ key: 'q', goal: 'decide [ask]', acceptanceCriteria: ['ok'] }]),
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+      return { d, sub };
+    };
+    const proposal = (decisionId: string) => ({
+      category: 'decision',
+      options: ['approve', 'reject'],
+      proposedDecision: {
+        decisionId,
+        topic: 'db',
+        decision: 'Postgres',
+        rationale: 'one store',
+        scope: 'repo',
+      },
+    });
+
+    it("records an approved proposal as the user's, under the id the Worker was given", async () => {
+      const escId = newUlid();
+      const decisionId = newUlid();
+      const { d, sub } = await run(escId, proposal(decisionId));
+      d.answer(escId, 'Approve');
+      const [decision] = ofType('decision.recorded', sub).map((e) => e.data) as Decision[];
+      expect(decision).toMatchObject({
+        id: decisionId,
+        escalationId: escId,
+        topic: 'db',
+        decision: 'Postgres',
+        scope: 'repo',
+        source: 'user',
+      });
+      // The Worker's rationale is not made the user's.
+      expect(decision?.rationale).toBeUndefined();
+      await d.settled();
+    });
+
+    it('takes only a plain approval as one', () => {
+      for (const yes of ['approve', 'Approve.', ' APPROVED ', 'yes', 'Y', 'y.']) {
+        expect(isApproval(yes), yes).toBe(true);
+      }
+      for (const no of ['yes, but use SQLite', 'approve it', 'ok', 'reject', 'no', '', 'yess']) {
+        expect(isApproval(no), no).toBe(false);
+      }
+    });
+
+    it("turns a Worker's approved proposal into the user's repo precedent, end to end", async () => {
+      let proposed: { decisionId?: string | undefined; escalationId?: string | undefined } = {};
+      fake = new ScriptedAdapter('fake', (input, s) => {
+        if (input.includes('[ask]') && !s.inputs.some((x) => x.startsWith('Answer'))) {
+          const started = store.query({ typePrefix: 'worker.started' }).at(-1)?.envelope;
+          if (!started?.taskId) throw new Error('no Worker started');
+          const sessionId = (started.data as { sessionId: string }).sessionId;
+          // What the Worker's MCP record_decision does, through the real backend.
+          void new EventLogBackend({ store })
+            .recordDecision(
+              { workerSessionId: sessionId, taskId: started.taskId },
+              { topic: 'db', decision: 'Postgres', rationale: 'one store', scope: 'repo' },
+            )
+            .then((r) => {
+              proposed = r;
+            });
+          return { do: 'reply', text: 'Proposed; waiting.' };
+        }
+        return script(input);
+      });
+      const d = make({
+        planner: new FixedPlanner([{ key: 'q', goal: 'decide [ask]', acceptanceCriteria: ['ok'] }]),
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
+      d.answer(proposed.escalationId as string, 'yes');
+      await d.settled();
+      // Another task's Worker finds it as repo precedent.
+      const found = await new EventLogBackend({ store }).searchDecisions(
+        { workerSessionId: 'other', taskId: 'other-task' },
+        { query: 'db' },
+      );
+      expect(found.decisions).toEqual([
+        expect.objectContaining({
+          id: proposed.decisionId,
+          decision: 'Postgres',
+          scope: 'repo',
+          source: 'user',
+        }),
+      ]);
+    });
+
+    it('records anything but an approval as a task answer, never the proposal', async () => {
+      const escId = newUlid();
+      const decisionId = newUlid();
+      const { d, sub } = await run(escId, proposal(decisionId));
+      // Even asked for repo-wide: the reply to an approval request is for this task only.
+      d.answer(escId, 'reject: use SQLite', { scope: 'repo' });
+      const decisions = ofType('decision.recorded', sub).map((e) => e.data) as Decision[];
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({ decision: 'reject: use SQLite', scope: 'task' });
+      expect(decisions[0]?.id).not.toBe(decisionId);
+      await d.settled();
+    });
+
+    it('keeps a plain answer as repo precedent when the user says so', async () => {
+      const escId = newUlid();
+      const { d, sub } = await run(escId, { question: 'Which database?' });
+      d.answer(escId, 'Postgres', { scope: 'repo', rationale: 'we run it already' });
+      expect(ofType('decision.recorded', sub).map((e) => e.data)).toEqual([
+        expect.objectContaining({
+          decision: 'Postgres',
+          scope: 'repo',
+          rationale: 'we run it already',
+          source: 'user',
+        }),
+      ]);
+      await d.settled();
+    });
   });
 
   describe('cancel (#202)', () => {
