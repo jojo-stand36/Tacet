@@ -324,6 +324,61 @@ describe.skipIf(!gate.ok)(
       await adapter.close(again);
     });
 
+    it('[1m] at launch and a subagent: what the transcript holds (#289)', {
+      timeout: 180_000,
+    }, async () => {
+      const h = await adapter.start({ cwd: worktree, model: 'claude-opus-4-6[1m]' });
+      const tap = new EventTap(adapter.events(h));
+      const usage = () => tap.events.filter((e) => e.t === 'usage');
+      await turn(h, tap, 'SAY onem');
+      // Claude Code strips [1m] before the request (so the API, and the transcript, name the
+      // plain id); the 1M window comes from the launch model.
+      const call = {
+        t: 'usage',
+        inputTokens: 100,
+        outputTokens: 10,
+        contextUsed: 110,
+        contextMax: 1_000_000,
+        model: 'claude-opus-4-6',
+        source: 'reported',
+      };
+      expect(api.requests.at(-1)?.model).toBe('claude-opus-4-6');
+      await expect.poll(() => usage(), { timeout: 5000 }).toEqual([call]);
+
+      // A subagent: its calls go to a file of their own, not the session's transcript.
+      const from = tap.events.length;
+      await adapter.send(h, { text: 'SUBAGENT' });
+      const ask = await tap.waitFor((e) => e.t === 'approval.request', 60_000, from);
+      if (ask.event.t !== 'approval.request') throw new Error('no approval request');
+      expect(ask.event.toolName).toBe('Agent');
+      await adapter.respond(h, ask.event.id, { kind: 'allow_once', persist: false });
+      await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, ask.index + 1);
+      expect(api.requests.some((r) => r.text === 'SAY subagent')).toBe(true);
+      // The parent's two calls (the tool call, then its answer); none for the subagent.
+      await expect.poll(() => usage(), { timeout: 5000 }).toEqual([call, call, call]);
+      await adapter.close(h);
+
+      const state = join(root, 'state');
+      const sessionDir = readdirSync(state)
+        .map((repo) => join(state, repo, 'claude-pty', h.vendorSessionId as string))
+        .find((d) => existsSync(d)) as string;
+      const files = readdirSync(sessionDir, { recursive: true, encoding: 'utf8' }).filter((f) =>
+        f.endsWith('.jsonl'),
+      );
+      const sub = files.filter((f) => /\/subagents\/agent-[^/]+\.jsonl$/.test(f));
+      expect(sub).toHaveLength(1);
+      const lines = (f: string) =>
+        readFileSync(join(sessionDir, f), 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as { type?: string; isSidechain?: boolean });
+      const subCalls = lines(sub[0] as string).filter((l) => l.type === 'assistant');
+      expect(subCalls.length).toBeGreaterThan(0);
+      expect(subCalls.every((l) => l.isSidechain === true)).toBe(true);
+      const main = files.find((f) => f.endsWith(`/${h.vendorSessionId}.jsonl`)) as string;
+      expect(lines(main).some((l) => l.type === 'assistant' && l.isSidechain)).toBe(false);
+    });
+
     it('reports each model call’s usage from its transcript, once, across a resume (#255)', {
       timeout: 180_000,
     }, async () => {
