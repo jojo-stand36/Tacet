@@ -1256,7 +1256,8 @@ export function refuseGitInSandboxTemp(
   }
   const dirs = [common, wt?.gitDir].filter((d): d is string => d !== undefined);
   for (const root of sandboxTempRoots(tmpdir)) {
-    const inside = dirs.find((d) => d === root || d.startsWith(root + sep));
+    const prefix = root.endsWith(sep) ? root : root + sep;
+    const inside = dirs.find((d) => d === root || d.startsWith(prefix));
     if (inside !== undefined) {
       throw new Error(
         `refusing to start an unattended Codex Worker: its git dir ${inside} is under ${root}, ` +

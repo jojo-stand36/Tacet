@@ -37,13 +37,16 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     const parent = realpathSync(mkdtempSync('/tmp/tacet-293-'));
     dirs.push(parent);
     const { repo, wt } = repoIn(parent);
+    // Resolved: /private/tmp on macOS.
+    const tmp = realpathSync.native('/tmp');
     expect(() => refuseGitInSandboxTemp(wt, repo, undefined)).toThrow(
-      new RegExp(
-        `its git dir ${join(repo, '.git')}.* is under /tmp.*Move the repository outside /tmp and \\$TMPDIR`,
-      ),
+      `its git dir ${join(repo, '.git')} is under ${tmp}`,
+    );
+    expect(() => refuseGitInSandboxTemp(wt, repo, undefined)).toThrow(
+      'Move the repository outside /tmp and $TMPDIR.',
     );
     // The main checkout itself, with no linked worktree, too.
-    expect(() => refuseGitInSandboxTemp(repo, repo, undefined)).toThrow(/is under \/tmp/);
+    expect(() => refuseGitInSandboxTemp(repo, repo, undefined)).toThrow(`is under ${tmp}`);
   });
 
   it("refuses a repo under the Worker's $TMPDIR, and runs one outside it", () => {
@@ -51,8 +54,16 @@ describe('repos under the sandbox temp dirs (#293)', () => {
     dirs.push(tmp);
     const { repo, wt } = repoIn(tmp);
     expect(() => refuseGitInSandboxTemp(wt, repo, tmp)).toThrow(`is under ${tmp}`);
-    // The same repo, with $TMPDIR elsewhere: nothing to refuse.
+    // The same repo, with $TMPDIR elsewhere: nothing to refuse. (A real Worker start on a repo
+    // outside the temp dirs is `isolation.test.ts`, whose fixture is placed the same way.)
     expect(() => refuseGitInSandboxTemp(wt, repo, undefined)).not.toThrow();
+  });
+
+  it('a $TMPDIR of / makes every repo refused', () => {
+    const tmp = codexFixtureDir('tacet-293-root-');
+    dirs.push(tmp);
+    const { repo, wt } = repoIn(tmp);
+    expect(() => refuseGitInSandboxTemp(wt, repo, '/')).toThrow('is under /,');
   });
 
   it('resolves the temp roots, and ignores a relative $TMPDIR', () => {
