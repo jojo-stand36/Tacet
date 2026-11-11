@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import {
   existsSync,
   lstatSync,
-  mkdirSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -42,6 +41,10 @@ import {
   endMarkedProcesses,
   isWorkerMarker,
   newWorkerMarker,
+  type ProcessLockText,
+  processLockHolder,
+  releaseProcessLock,
+  takeProcessLock,
   WORKER_MARKER_VAR,
 } from '@tacet/core/node';
 import { TOOL_NAMES } from '../mcp/tools.js';
@@ -2996,47 +2999,21 @@ function readView(store: EventStore, prev?: View): View {
   };
 }
 
+/** The Mini-conductor lock's refusals: the CLI and tests match on these words. */
+const MINI_LOCK_TEXT: ProcessLockText = {
+  heldHere: 'a Mini-conductor in this process is already running for this repo',
+  heldBy: (pid) => `another Mini-conductor (pid ${pid}) is running for this repo`,
+  failed: 'could not take the Mini-conductor lock',
+};
+
 /** Take the repo's single-instance Mini-conductor lock, or throw when a live one holds it. */
 function takeMiniLock(path: string): void {
-  if (HELD_LOCKS.has(path)) {
-    throw new Error('a Mini-conductor in this process is already running for this repo');
-  }
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      writeFileSync(path, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-      HELD_LOCKS.add(path);
-      return;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-    }
-    // Take a stale lock over by renaming it away first: of two processes doing this at once,
-    // only one rename succeeds, and the loser retries against the winner's new lock.
-    const aside = `${path}.${process.pid}.${randomUUID()}.stale`;
-    try {
-      renameSync(path, aside);
-    } catch {
-      continue;
-    }
-    const pid = Number.parseInt(readFileSync(aside, 'utf8'), 10);
-    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && alive(pid)) {
-      // Not stale after all: put it back and refuse.
-      try {
-        renameSync(aside, path);
-      } catch {
-        rmSync(aside, { force: true });
-      }
-      throw new Error(`another Mini-conductor (pid ${pid}) is running for this repo`);
-    }
-    rmSync(aside, { force: true });
-  }
-  throw new Error('could not take the Mini-conductor lock');
+  takeProcessLock(path, MINI_LOCK_TEXT);
 }
 
 /** Release a lock this process took with `takeMiniLock`. */
 function releaseMiniLock(path: string): void {
-  if (!HELD_LOCKS.delete(path)) return;
-  rmSync(path, { force: true });
+  releaseProcessLock(path);
 }
 
 /**
@@ -3101,25 +3078,7 @@ export function isOwnMcpTool(e: { toolName?: string | undefined }, serverName: s
  * or undefined when none is running. For `tacet status` (#21); never takes the lock.
  */
 export function miniLockHolder(lockPath: string): number | undefined {
-  let pid: number;
-  try {
-    pid = Number.parseInt(readFileSync(lockPath, 'utf8'), 10);
-  } catch {
-    return undefined;
-  }
-  return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
-}
-
-/** Lock files held by Mini-conductors in this process. */
-const HELD_LOCKS = new Set<string>();
-
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
+  return processLockHolder(lockPath);
 }
 
 /** Conflicting files for a question: repo-relative, at most 20. */

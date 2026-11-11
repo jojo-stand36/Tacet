@@ -299,3 +299,13 @@ Within that, it drops:
 - SOS and PM.
 
 iTerm2's other keys, inline images among them, and kitty's APC graphics pass. The facts are in capability matrix §5b. It assumes the user's terminal decodes UTF-8, and it keeps a Worker from switching it away (`ESC % @`). Attach sends `ESC \` when it ends, to close a string a Worker left open. ASCII-only text is what makes it safe under GNU screen, which keeps only the low byte of each title character and re-sends the title to the outer terminal. Known risks: GNU screen's behaviour was modelled from its source, never run. The filter has been tested against xterm.js and against models of kitty, tmux, iTerm2 and screen, never against those terminals themselves. Real-terminal testing, and restoring non-ASCII titles safely, are #311.
+
+### Addendum (2026-11-11): the Conductor's registry connections (#23)
+
+Status of this addendum: **proposed**, pending the owner's approval in a comment on the PR that adds it. The owner decided the substance on #23 (relayed); this text is not accepted until that comment.
+
+1. **One connection per repo, close code 4409.** When a `tacet/hello` with role `mini` names a `repoId` that already has a live connection, the Conductor pings the existing socket. If it answers within about 2 s, the newcomer is closed with **4409** ("repo already connected"); a refused Mini-conductor backs off and retries. If it does not answer, the old socket is ended and the newcomer is accepted. So a Mini-conductor that restarted is never shut out by its own stale socket, and two live ones never serve one repo. 4409 joins 4401 and 4406 (§3).
+2. **Liveness is WebSocket ping/pong.** Heartbeats are transport ping and pong frames, not a JSON-RPC method: the Conductor pings each connection every 10 s and ends one that misses 2 pongs. A client may also close a socket that has been silent too long. No method is added, so §4 is unchanged.
+3. **The local-namespace standing rule covers the Conductor.** The standing rule of 2026-11-11 (local event namespaces, §1) reads "local to the Mini-conductor or the Conductor, never forwarded". `registry.*` (`registry.repo_added`, `registry.repo_removed`, `registry.connected`, `registry.disconnected`) is the Conductor's first such namespace: its registry of Mini-conductors, kept in the Conductor's own event log. It carries repo paths, and it is never sent anywhere (`CONDUCTOR_LOCAL_EVENT_NAMESPACES`; not on the §4 allowlist, so `isForwardable` refuses it).
+
+Registration itself is not protocol: a hello records a connection, and only the user registers a repo (`tacet up --add`).

@@ -18,6 +18,8 @@ export const EVENT_NAMESPACES = [
   // failures of its own upkeep (#254).
   'workspace',
   'maintenance',
+  // Local to the Conductor (#23): its registry of Mini-conductors. The Conductor forwards nothing.
+  'registry',
 ] as const;
 
 /**
@@ -34,6 +36,9 @@ export const EventType = z
  * allowlist below, and these are not on it.
  */
 export const LOCAL_EVENT_NAMESPACES = ['workspace', 'maintenance'] as const;
+
+/** Namespaces local to the Conductor (#23): never sent anywhere, and not on the §4 allowlist. */
+export const CONDUCTOR_LOCAL_EVENT_NAMESPACES = ['registry'] as const;
 
 /**
  * The upward stream by default (ADR-003 §4, `tacet/event`): summary-grade namespaces sent to the

@@ -5,6 +5,12 @@ import { Decision } from '../schema/decision.js';
 import type { EventEnvelope } from '../schema/envelope.js';
 import { Escalation } from '../schema/escalation.js';
 import { TaskPlan } from '../schema/plan.js';
+import {
+  RegistryConnected,
+  RegistryDisconnected,
+  RegistryRepoAdded,
+  RegistryRepoRemoved,
+} from '../schema/registry.js';
 import { type SummaryOutcome, SummaryPacket } from '../schema/summary.js';
 import { Task } from '../schema/task.js';
 import { WorkerEnded, WorkerStarted } from '../schema/worker.js';
@@ -245,5 +251,73 @@ export const workspacesProjection: Projection<WorkspacesState> = {
       return { live, removed: { ...state.removed, [d.data.workspaceId]: true } };
     }
     return state;
+  },
+};
+
+/** A repo in the Conductor's registry (#23). */
+export interface RegisteredRepo {
+  repoId: string;
+  repoPath: string;
+  /** When `registry.repo_added` was recorded. */
+  addedAt: string;
+}
+
+/** A Mini-conductor connected to the Conductor (#23), registered or not. */
+export interface ConnectedMini {
+  repoId: string;
+  repoPath: string;
+  sessionId: string;
+  miniVersion: string;
+  adapters: string[];
+  /** When `registry.connected` was recorded. */
+  since: string;
+}
+
+export interface RegistryState {
+  /** Repos the user registered, by repo id. */
+  repos: Record<string, RegisteredRepo>;
+  /** Live connections as the log last recorded them, by repo id. */
+  connected: Record<string, ConnectedMini>;
+}
+
+/**
+ * The Conductor's registry from `registry.*` events (#23). A `disconnected` ends only the session
+ * it names, so a late one for a connection already replaced leaves the new one. Malformed payloads
+ * and unknown types are skipped. A repo removed and added again is registered again.
+ */
+export const registryProjection: Projection<RegistryState> = {
+  name: 'registry',
+  initial: () => ({ repos: {}, connected: {} }),
+  apply(state, e) {
+    switch (e.type) {
+      case 'registry.repo_added': {
+        const d = RegistryRepoAdded.safeParse(e.data);
+        if (!d.success) return state;
+        const repo = { repoId: d.data.repoId, repoPath: d.data.repoPath, addedAt: e.ts };
+        return { ...state, repos: { ...state.repos, [d.data.repoId]: repo } };
+      }
+      case 'registry.repo_removed': {
+        const d = RegistryRepoRemoved.safeParse(e.data);
+        if (!d.success) return state;
+        const { [d.data.repoId]: _gone, ...repos } = state.repos;
+        return { ...state, repos };
+      }
+      case 'registry.connected': {
+        const d = RegistryConnected.safeParse(e.data);
+        if (!d.success) return state;
+        const mini = { ...d.data, since: e.ts };
+        return { ...state, connected: { ...state.connected, [d.data.repoId]: mini } };
+      }
+      case 'registry.disconnected': {
+        const d = RegistryDisconnected.safeParse(e.data);
+        if (!d.success || state.connected[d.data.repoId]?.sessionId !== d.data.sessionId) {
+          return state;
+        }
+        const { [d.data.repoId]: _gone, ...connected } = state.connected;
+        return { ...state, connected };
+      }
+      default:
+        return state;
+    }
   },
 };
