@@ -220,7 +220,9 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
             ? {
                 reasoner,
                 aside: (taskId, label, fn) => {
-                  if (!started) throw new Error('the Mini-conductor is not running yet');
+                  if (!started) {
+                    return Promise.reject(new Error('the Mini-conductor is not running yet'));
+                  }
                   return started.aside(taskId, label, fn);
                 },
               }

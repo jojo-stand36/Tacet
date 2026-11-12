@@ -28,7 +28,10 @@ export interface EscalationGateOptions {
   aside?: Aside;
   /** The time the reasoning session may take, for a task. */
   timeoutMs: (taskId: string) => number;
-  /** Reasoning sessions running at once, at most; past it the question goes to the user. Default 2. */
+  /**
+   * Reasoning sessions running at once, at most; past it the question goes to the user. Default
+   * 2; 0 turns the reasoning step off.
+   */
   maxReasoning?: number;
 }
 
@@ -94,8 +97,10 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     const reasoner = o.reasoner;
     if (reasoning >= cap) return undefined;
     reasoning++;
-    const verdict = await o
-      .aside(b.taskId, 'gate', async ({ marker, signal, charge }) => {
+    let verdict: Awaited<ReturnType<typeof reasoner.reason>>['verdict'];
+    try {
+      // `await` inside `try`: a slot is freed whether `aside` rejects or throws at once.
+      verdict = await o.aside(b.taskId, 'gate', async ({ marker, signal, charge }) => {
         const r = await reasoner.reason({
           goal: rootView.task.goal,
           ...(b.taskId !== root ? { subtaskGoal: view.task.goal } : {}),
@@ -109,10 +114,10 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
         });
         charge(r.usage);
         return r.verdict;
-      })
-      .finally(() => {
-        reasoning--;
       });
+    } finally {
+      reasoning--;
+    }
     if (verdict.verdict !== 'answer') return undefined;
     const cited = verdict.cites.length > 0 ? ` (cites ${verdict.cites.join(', ')})` : '';
     return {

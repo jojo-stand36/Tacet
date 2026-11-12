@@ -4,7 +4,7 @@ import { type EventStore, openEventStore, WORKER_MARKER_VAR } from '@tacet/core/
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ScriptedAdapter } from '../daemon/testing.js';
 import { EventLogBackend } from '../mcp/backend.js';
-import { escalationGate } from './escalation-gate.js';
+import { type Aside, escalationGate } from './escalation-gate.js';
 import {
   AdapterReasoner,
   type Candidate,
@@ -343,6 +343,36 @@ describe('escalationGate (ADR-004 B)', () => {
     expect(started).toBe(3);
     releases.at(-1)?.();
     await fourth;
+  });
+
+  it('frees a slot when the session throws at once or fails', async () => {
+    let mode: 'throw' | 'reject' | 'ok' = 'throw';
+    const g = escalationGate({
+      store,
+      config: config('high'),
+      reasoner,
+      maxReasoning: 1,
+      aside: ((_t: string, _l: string, fn: Parameters<Aside>[2]) => {
+        if (mode === 'throw') throw new Error('not running');
+        if (mode === 'reject') return Promise.reject(new Error('failed'));
+        return fn({ marker: 'm', signal: new AbortController().signal, charge: () => {} });
+      }) as Aside,
+      timeoutMs: () => 30_000,
+    });
+    await expect(g(escalation('root-1'), b('root-1'))).rejects.toThrow('not running');
+    mode = 'reject';
+    await expect(g(escalation('root-1'), b('root-1'))).rejects.toThrow('failed');
+    mode = 'ok';
+    expect(await g(escalation('root-1'), b('root-1'))).toMatchObject({ source: 'mini' });
+  });
+
+  it('treats an empty options list as free text below high', async () => {
+    const id = answered('root-1', { question: 'Which database driver for the cache?' });
+    reply = { verdict: 'answer', answer: 'pg', rationale: 'r', cites: [id] };
+    expect(
+      await gate(config('medium'))(escalation('root-1', { options: [] }), b('root-1')),
+    ).toBeUndefined();
+    expect(calls).toHaveLength(0);
   });
 
   it('reasons without a candidate at high, for urgency low and normal only', async () => {
