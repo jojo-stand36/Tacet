@@ -9,6 +9,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { evaluatePolicies } from '@tacet/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { decideToolRequest } from './tool-policy.js';
 
@@ -512,6 +513,59 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
     for (const id of ['codex-app-server', 'acp:gemini', 'pty:aider', 'acp:custom']) {
       expect(ask('Read', { file_path: 'src/a.ts' }, id).allow).toBe(false);
     }
+  });
+
+  describe('what policies see (#25, ADR-004 D)', () => {
+    const verdict = (match: string, toolName: string, input: unknown) => {
+      const d = ask(toolName, input);
+      if (!d.allow) throw new Error(`refused: ${d.reason}`);
+      return evaluatePolicies([{ match, decision: 'deny' }], {
+        tool: toolName,
+        paths: d.paths,
+        ...(d.roots ? { roots: d.roots } : {}),
+      })?.decision;
+    };
+    beforeEach(() => {
+      mkdirSync(join(wt, 'secrets'));
+      writeFileSync(join(wt, 'secrets', 'k'), 'key');
+      // A link with an innocent name to a secret, and one with a secret name to a plain file.
+      symlinkSync(join(wt, 'secrets', 'k'), join(wt, 'notes.txt'));
+      symlinkSync(join(wt, 'src', 'a.ts'), join(wt, '.env'));
+    });
+
+    it('sees a target both as written and after symlinks', () => {
+      expect(verdict('secrets/**', 'Read', { file_path: 'notes.txt' })).toBe('deny');
+      expect(verdict('.env', 'Read', { file_path: '.env' })).toBe('deny');
+      expect(verdict('secrets/**', 'Read', { file_path: join(wt, 'secrets', 'k') })).toBe('deny');
+      expect(verdict('secrets/**', 'Read', { file_path: 'src/a.ts' })).toBeUndefined();
+      // Spelled differently: `./` and another letter case.
+      expect(verdict('secrets/**', 'Read', { file_path: './Secrets/k' })).toBe('deny');
+    });
+
+    it('covers searches that could read below a match', () => {
+      expect(verdict('secrets/**', 'Grep', { pattern: 'key' })).toBe('deny');
+      expect(verdict('secrets/**', 'Grep', { pattern: 'key', path: 'src' })).toBeUndefined();
+      expect(verdict('secrets/**', 'Grep', { pattern: 'key', path: 'secrets/k' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: 'secrets/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: 'src/*.ts' })).toBeUndefined();
+      expect(verdict('secrets/**', 'Glob', { pattern: '**/*.ts' })).toBe('deny');
+      // Through a symlink in the pattern's literal directories, or in its path.
+      symlinkSync(join(wt, 'secrets'), join(wt, 'link'));
+      mkdirSync(join(wt, 'dir'));
+      symlinkSync('../secrets', join(wt, 'dir', 'l2'));
+      expect(verdict('secrets/**', 'Glob', { pattern: 'link/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: 'dir/l2/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: 'l2/*', path: 'dir' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: '*', path: 'link' })).toBe('deny');
+      // A symlink in the middle of the pattern's directories, and a leading `./`.
+      mkdirSync(join(wt, 'a', 'b'), { recursive: true });
+      symlinkSync('../../secrets', join(wt, 'a', 'b', 'l3'));
+      expect(verdict('secrets/**', 'Glob', { pattern: 'a/b/l3/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: './src/*.ts' })).toBeUndefined();
+      // A pattern through a dangling link is refused before policies.
+      symlinkSync(join(wt, 'gone'), join(wt, 'dangling'));
+      expect(ask('Glob', { pattern: 'dangling/*' }).allow).toBe(false);
+    });
   });
 
   it('refuses everything once the checkout is gone', () => {

@@ -1,4 +1,9 @@
-import { assertSafePrompt, type SessionHandle } from '@tacet/core';
+import {
+  assertSafePrompt,
+  evaluatePolicies,
+  type PolicyRule,
+  type SessionHandle,
+} from '@tacet/core';
 import type { WorkerAdapter } from './ports.js';
 import { MAX_REPLY_CHARS } from './reply.js';
 import { decideToolRequest } from './tool-policy.js';
@@ -25,7 +30,11 @@ export function sessionTurns(
     label: string;
     refusal: string;
     timeoutMs: number;
-    reads?: { adapterId: string; cwd: string };
+    /**
+     * Reads the Worker policy allows inside `cwd`, less what `policies` deny or ask about (a
+     * Mini-conductor session never escalates for one; it is refused).
+     */
+    reads?: { adapterId: string; cwd: string; policies?: readonly PolicyRule[] };
   },
 ): (text: string) => Promise<string> {
   const { adapter } = worker;
@@ -56,17 +65,25 @@ export function sessionTurns(
         usage.outputTokens += e.outputTokens;
         usage.costUsd += e.costUsd ?? 0;
       } else if (e.t === 'approval.request') {
-        const read =
-          o.reads !== undefined &&
-          READ_TOOLS.has(e.toolName ?? '') &&
-          decideToolRequest(
-            {
-              adapterId: o.reads.adapterId,
-              toolName: e.toolName,
-              input: (e.requestedGrant as { input?: unknown } | undefined)?.input,
-            },
-            o.reads.cwd,
-          ).allow;
+        const d =
+          o.reads !== undefined && READ_TOOLS.has(e.toolName ?? '')
+            ? decideToolRequest(
+                {
+                  adapterId: o.reads.adapterId,
+                  toolName: e.toolName,
+                  input: (e.requestedGrant as { input?: unknown } | undefined)?.input,
+                },
+                o.reads.cwd,
+              )
+            : undefined;
+        const verdict = d?.allow
+          ? evaluatePolicies(o.reads?.policies ?? [], {
+              tool: e.toolName ?? '',
+              paths: d.paths,
+              ...(d.roots ? { roots: d.roots } : {}),
+            })
+          : undefined;
+        const read = d?.allow === true && (!verdict || verdict.decision === 'allow');
         await adapter.respond(
           h,
           e.id,

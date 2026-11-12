@@ -1,4 +1,4 @@
-import { planIssues, type Task } from '@tacet/core';
+import { type PolicyRule, planIssues, type Task } from '@tacet/core';
 import { z } from 'zod';
 import {
   type Planner,
@@ -73,6 +73,8 @@ export interface AdapterPlannerOptions {
   cwd: string;
   /** Milliseconds to wait for one planner reply. Default 10 minutes. */
   timeoutMs?: number;
+  /** The repo's `policies`: a read they deny or ask about is refused (ADR-004 D). */
+  policies?: readonly PolicyRule[];
 }
 
 /**
@@ -110,7 +112,11 @@ export class AdapterPlanner implements Planner {
         label: 'planner',
         refusal: 'The planner is read-only.',
         timeoutMs: this.#o.timeoutMs ?? 600_000,
-        reads: { adapterId: this.#o.adapterId, cwd: this.#o.cwd },
+        reads: {
+          adapterId: this.#o.adapterId,
+          cwd: this.#o.cwd,
+          ...(this.#o.policies ? { policies: this.#o.policies } : {}),
+        },
       });
       let reply = await turns(plannerPrompt(task));
       let lastError: unknown;
