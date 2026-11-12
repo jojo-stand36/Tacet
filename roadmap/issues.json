@@ -1569,6 +1569,18 @@
       "body": "#24 sends only `ListTasks`, `GetTask` and `CancelTask` down the Conductor link (owner decision on #24). Creating a task in a live Mini-conductor (A2A `SendMessage` without `taskId`) and answering its escalations (`SendMessage` with the decision extension) over the link would let whoever holds the link's token start Workers or decide in the user's name, so they wait for an authenticated link (#330). This also lets `tacet run` hand a task to a live Mini-conductor (an auto-started `tacet mini`) instead of being refused by its lock, and lets an auto-started Mini-conductor resume unfinished tasks. Depends on #24 and #330.\n\n### Tasks\n- [ ] `SendMessage` over the link: new tasks (with the Conductor's `contextId`, stored on `task.created`) and answers (how the #269 one-time answer code applies there is an owner decision)\n- [ ] `tacet run` hands its task to a live Mini-conductor; the control port's `-32004` rule changes accordingly (ADR-003 addendum)\n- [ ] `tacet mini` and auto-start may resume unfinished tasks\n\n### Acceptance criteria\n- With an authenticated link, a task created over it runs to completion and an escalation answered over it resumes its Worker (tested both ways)\n- Without one, both are refused as today (tested)\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Tool policies: searches that walk through symlinks below their start",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:security",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Tool policies (#25 PR4, ADR-004 D) match a Grep or Glob on where it starts, as written and after symlinks, including a Glob pattern's literal directories. A symlink further below that start (`dir/l2 -> ../secrets`, searched from `dir`) is not followed, so if Claude Code's search tools follow symlinks while they walk, a search from `dir` could list or read what `secrets/**` denies. Whether they do is not verified.\n\n### Tasks\n- [ ] Verify against primary sources whether Claude Code's Grep and Glob follow symlinked directories while walking (`verify-vendor-facts`), and record it in `docs/adapters/capability-matrix.md`\n- [ ] If they do: match a search on the real targets of the links below its start (bounded walk, failing closed like `linkedConfig`), or refuse a search under a `match` rule when its start holds a link that leads to a match\n- [ ] Note the result in the `decideToolRequest` doc comment and ARCHITECTURE §4\n\n### Acceptance criteria\n- With `dir/l2 -> ../secrets` and `{match: \"secrets/**\", decision: deny}`, a Grep or Glob from `dir` is refused if the tools follow the link, and the verified behaviour is recorded with its source\n\n_See docs/ARCHITECTURE.md and docs/adr/004-escalation-gate.md for context._"
+    },
+    {
       "title": "UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)",
       "milestone": "M2 · Conductor & escalation",
       "labels": [
