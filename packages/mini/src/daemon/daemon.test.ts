@@ -1055,6 +1055,8 @@ describe('MiniConductor', () => {
             data: {
               id: escId,
               taskId: started.taskId,
+              // As the MCP backend raises it: the Worker's session is on the escalation.
+              sessionId,
               question: 'Approve a repo-wide decision on "db": Postgres',
               urgency: 'normal',
               createdAt: new Date().toISOString(),
@@ -1189,11 +1191,36 @@ describe('MiniConductor', () => {
       await d.settled();
     });
 
+    /** A new root task with one sub-task, as the daemon records them. */
+    const otherRoot = (root: string) => {
+      const sub = `${root}/1`;
+      for (const [id, parentId] of [
+        [root, undefined],
+        [sub, root],
+      ] as const) {
+        store.append({
+          v: 1,
+          id: newUlid(),
+          ts: new Date().toISOString(),
+          source: { kind: 'mini', id: 'test' },
+          taskId: id,
+          type: 'task.created',
+          data: {
+            id,
+            goal: 'g',
+            acceptanceCriteria: ['ok'],
+            ...(parentId ? { parentId } : {}),
+            createdAt: new Date().toISOString(),
+          },
+        });
+      }
+      return sub;
+    };
+
     it("answers the next Worker that asks the same question from the user's answer (#25)", async () => {
       const escId = newUlid();
       const { d, sub } = await run(escId, { question: 'Which database?' });
       d.answer(escId, 'Postgres');
-      // Another sub-task of the same root task asks again, through the MCP backend and the gate.
       const root = tasks()[sub]?.task.parentId as string;
       const sibling = `${root}/9`;
       store.append({
@@ -1211,6 +1238,7 @@ describe('MiniConductor', () => {
           createdAt: new Date().toISOString(),
         },
       });
+      // Another sub-task of the same root task asks again, through the MCP backend and the gate.
       const backend = new EventLogBackend({ store, gate: deterministicGate({ store }) });
       const r = await backend.escalate(
         { workerSessionId: 'w-later', taskId: sibling },
@@ -1219,10 +1247,44 @@ describe('MiniConductor', () => {
       expect(r).toMatchObject({ status: 'resolved', answer: 'Postgres', source: 'precedent' });
       // Another root task gets no task-scope precedent: it asks the user.
       const other = await backend.escalate(
-        { workerSessionId: 'w-other', taskId: 'another-root' },
+        { workerSessionId: 'w-other', taskId: otherRoot('another-root') },
         { question: 'which database', urgency: 'normal' },
       );
       expect(other.status).toBe('pending');
+      await d.settled();
+    });
+
+    it('answers any root task from a repo-wide answer (#25)', async () => {
+      const escId = newUlid();
+      const { d } = await run(escId, { question: 'Which database?' });
+      d.answer(escId, 'Postgres', { scope: 'repo' });
+      const backend = new EventLogBackend({ store, gate: deterministicGate({ store }) });
+      const r = await backend.escalate(
+        { workerSessionId: 'w-other', taskId: otherRoot('another-root') },
+        { question: 'Which database?', urgency: 'low' },
+      );
+      expect(r).toMatchObject({ status: 'resolved', answer: 'Postgres', source: 'precedent' });
+      await d.settled();
+    });
+
+    it('never answers from an approved proposal or the verdict on one (#25)', async () => {
+      const escId = newUlid();
+      const { d, sub } = await run(escId, proposal(newUlid()));
+      d.answer(escId, 'yes');
+      // The proposal is now the user's repo-wide Decision, but it answered an approval request.
+      expect(ofType('decision.recorded', sub).map((e) => e.data)).toEqual([
+        expect.objectContaining({ source: 'user', scope: 'repo' }),
+      ]);
+      const backend = new EventLogBackend({ store, gate: deterministicGate({ store }) });
+      const r = await backend.escalate(
+        { workerSessionId: 'w-other', taskId: otherRoot('another-root') },
+        {
+          question: 'Approve a repo-wide decision on "db": Postgres',
+          options: ['approve', 'reject'],
+          urgency: 'low',
+        },
+      );
+      expect(r.status).toBe('pending');
       await d.settled();
     });
   });

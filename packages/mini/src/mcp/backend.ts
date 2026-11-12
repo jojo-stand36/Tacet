@@ -32,7 +32,8 @@ export interface GateAnswer {
 /**
  * Resolves an escalation without a human when it can (ARCHITECTURE.md §2.2, ADR-004): a precedent
  * of the user's own, or the Mini-conductor's own judgement. Returns `undefined` to leave it to the
- * user. The server waits at most `gateTimeoutMs` for it, so it must never block on a person. Its
+ * user. The server waits at most `gateTimeoutMs` for its promise, so it must never block on a
+ * person; synchronous work it does before its first `await` is not bounded by that time. Its
  * answer is advice to the sub-task, never a permission (ADR-004 E).
  */
 export type EscalationGate = (
@@ -103,7 +104,11 @@ export interface EventLogBackendOptions {
 }
 
 const ANSWER_SOURCES = new Set(['policy', 'precedent', 'mini', 'user']);
-const GATE_SOURCES: ReadonlySet<string> = new Set(['policy', 'precedent', 'mini']);
+/**
+ * Sources a gate may answer with. `policy` is reserved until a rule kind that can answer exists
+ * (ADR-004 D), and a gate never answers as the user.
+ */
+const GATE_SOURCES: ReadonlySet<string> = new Set(['precedent', 'mini']);
 
 export type LimitedTool = 'escalate' | 'record_decision';
 export interface ToolLimit {
@@ -363,29 +368,48 @@ export class EventLogBackend implements MiniBackend {
         { escalationId: escalation.id, message: err instanceof Error ? err.message : String(err) },
         'mini',
       );
-    const answered = gate(escalation, b).then(
-      (result) => ({ result }),
-      (err: unknown) => {
-        // Failing after the time is up still leaves a trace; the user answers either way.
-        if (settled) this.#o.store.append(failed(err));
-        return { result: undefined, error: err };
-      },
-    );
+    // A gate that throws at once fails like one that rejects: the escalation is still written.
+    const answered = Promise.resolve()
+      .then(() => gate(escalation, b))
+      .then(
+        (result) => ({ result }),
+        (err: unknown) => {
+          if (settled) {
+            // Failing after the time is up still leaves a trace; the user answers either way. The
+            // store may be closed by then (the Mini-conductor stopping): nothing is left to tell.
+            try {
+              this.#o.store.append(failed(err));
+            } catch {}
+          }
+          return { result: undefined, error: err };
+        },
+      );
     let timer: NodeJS.Timeout | undefined;
+    let writeError: unknown;
     const outcome = await Promise.race([
       answered,
       new Promise<undefined>((r) => {
-        timer = setTimeout(() => r(undefined), this.#o.gateTimeoutMs ?? 3000);
+        timer = setTimeout(() => {
+          // Time is up: written as pending at once, so a gate failure after it comes after it.
+          settled = true;
+          try {
+            this.#o.store.append(raised);
+          } catch (err) {
+            writeError = err;
+          }
+          r(undefined);
+        }, this.#o.gateTimeoutMs ?? 3000);
       }),
     ]);
     clearTimeout(timer);
+    if (outcome === undefined) {
+      if (writeError !== undefined) throw writeError;
+      return { escalationId: escalation.id, status: 'pending' };
+    }
     settled = true;
-    const result = outcome?.result;
-    // Only the gate's own sources: a gate never answers as the user.
+    const result = outcome.result;
     if (!result || !GATE_SOURCES.has(result.source)) {
-      this.#o.store.append(
-        outcome && 'error' in outcome ? [raised, failed(outcome.error)] : [raised],
-      );
+      this.#o.store.append('error' in outcome ? [raised, failed(outcome.error)] : [raised]);
       return { escalationId: escalation.id, status: 'pending' };
     }
     const decision = Decision.parse({

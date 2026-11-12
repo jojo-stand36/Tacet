@@ -23,6 +23,9 @@ describe('normalizeQuestion and precedentKey', () => {
     );
     expect(precedentKey('Which DB?', ['a'])).not.toBe(precedentKey('Which DB?', ['a', 'b']));
     expect(precedentKey('Which DB?')).not.toBe(precedentKey('Which cache?'));
+    // Symbols change what a question asks.
+    expect(precedentKey('Pin x >= 2?')).not.toBe(precedentKey('Pin x <= 2?'));
+    expect(precedentKey('Use a+b?')).not.toBe(precedentKey('Use a b?'));
   });
 });
 
@@ -47,6 +50,19 @@ describe('alwaysAskMatch', () => {
     // Paths and dotted names stay one word.
     expect(alwaysAskMatch(['src/auth.ts'], q('Edit src/auth.ts?'))).toBe('src/auth.ts');
     expect(alwaysAskMatch(['src/auth.ts'], q('Edit src/auth?'))).toBeUndefined();
+  });
+  it('matches a word that ends a sentence, and paths under a path entry', () => {
+    expect(alwaysAskMatch(['deploy to prod'], q('Can I deploy to prod.'))).toBe('deploy to prod');
+    expect(alwaysAskMatch(['schema migrations'], q('Run the schema migrations.'))).toBe(
+      'schema migrations',
+    );
+    expect(alwaysAskMatch(['auth'], q('Should I refactor the auth...'))).toBe('auth');
+    // ARCHITECTURE §4's example: a path entry covers what is under it, and only that.
+    expect(alwaysAskMatch(['anything touching /infra'], q('Edit /infra/main.tf?'))).toBe(
+      'anything touching /infra',
+    );
+    expect(alwaysAskMatch(['/infra'], q('Edit /infrastructure/main.tf?'))).toBeUndefined();
+    expect(alwaysAskMatch(['/infra/'], q('Edit /infra/x?'))).toBe('/infra/');
   });
   it('never matches with an entry of filler words alone', () => {
     expect(alwaysAskMatch(['anything', 'the and or'], q('the question'))).toBeUndefined();
@@ -89,6 +105,7 @@ describe('the deterministic gate', () => {
     return {
       id: newUlid(),
       taskId,
+      sessionId: 'w',
       question: 'Which database?',
       urgency: 'normal',
       blockedWorkers: 0,
@@ -212,6 +229,46 @@ describe('the deterministic gate', () => {
     ).toBeUndefined();
     // High urgency is answered by an exact precedent (ADR-004 B).
     expect(await gate()(escalation('root-1', { urgency: 'high' }), binding('x'))).toMatchObject({
+      answer: 'Postgres',
+    });
+  });
+
+  it("never takes the user's answer to the Mini-conductor's own escalation as precedent", async () => {
+    // A blocked Worker or a merge conflict: raised by the Mini-conductor, with a category.
+    answered('root-1', 'go on', { category: 'blocked' }, { scope: 'repo' });
+    const { sessionId: _none, ...mine } = escalation('root-1', { question: 'Unblock?' });
+    append('root-1', 'escalation.raised', mine);
+    const decisionId = newUlid();
+    append('root-1', 'decision.recorded', {
+      id: decisionId,
+      escalationId: mine.id,
+      taskId: 'root-1',
+      topic: mine.question,
+      decision: 'go on',
+      scope: 'repo',
+      source: 'user',
+      decidedAt: NOW,
+    });
+    expect(findPrecedent(store, escalation('root-1'))).toBeUndefined();
+    expect(findPrecedent(store, escalation('root-1', { question: 'Unblock?' }))).toBeUndefined();
+  });
+
+  it("never takes another repo's Decision as precedent", async () => {
+    const x = escalation('root-1');
+    append('root-1', 'escalation.raised', x, 'worker');
+    append('root-1', 'decision.recorded', {
+      id: newUlid(),
+      escalationId: x.id,
+      taskId: 'root-1',
+      repo: 'other-repo',
+      topic: x.question,
+      decision: 'Postgres',
+      scope: 'repo',
+      source: 'user',
+      decidedAt: NOW,
+    });
+    expect(findPrecedent(store, escalation('root-2'), 'this-repo')).toBeUndefined();
+    expect(findPrecedent(store, escalation('root-2'), 'other-repo')).toMatchObject({
       answer: 'Postgres',
     });
   });

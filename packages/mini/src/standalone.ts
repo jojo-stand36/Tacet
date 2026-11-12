@@ -180,7 +180,11 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
         repo: paths.repoId,
         miniId: 'standalone',
         // The escalation gate (#25, ADR-004): the user's own exact precedent only, so far.
-        gate: deterministicGate({ store, alwaysAsk: config.escalation?.always_ask ?? [] }),
+        gate: deterministicGate({
+          store,
+          repo: paths.repoId,
+          alwaysAsk: config.escalation?.always_ask ?? [],
+        }),
         // A Worker's handoff (#129): the Mini-conductor, made below, decides and reseeds.
         canHandoff: (b) =>
           started ? started.handoffRefusal(b.workerSessionId) : 'not running yet',

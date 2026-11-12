@@ -359,6 +359,33 @@ describe('EventLogBackend', () => {
     ).toContainEqual({ escalationId: third.escalationId, message: 'too late' });
   });
 
+  it('writes the escalation when the gate throws at once, or the store closes meanwhile (#25)', async () => {
+    const throwing = make({
+      gate: () => {
+        throw new Error('sync boom');
+      },
+    });
+    const r = await throwing.escalate(W1, { question: 'q', urgency: 'low' });
+    expect(r.status).toBe('pending');
+    expect(types().slice(-2)).toEqual(['escalation.raised', 'escalation.gate_failed']);
+
+    let fail: (err: Error) => void = () => {};
+    const closing = make({
+      gate: () =>
+        new Promise((_, reject) => {
+          fail = reject;
+        }),
+      gateTimeoutMs: 10,
+    });
+    const pending = await closing.escalate(W1, { question: 'q2', urgency: 'low' });
+    expect(pending.status).toBe('pending');
+    // The Mini-conductor stops while the gate still works: its late failure has nowhere to go.
+    store.close();
+    fail(new Error('after close'));
+    await new Promise((res) => setImmediate(res));
+    store = openEventStore(':memory:');
+  });
+
   it("writes the escalation and the gate's answer in one append (#25, ADR-003 addendum item 2)", async () => {
     let seen: string[] = [];
     const b = make({
