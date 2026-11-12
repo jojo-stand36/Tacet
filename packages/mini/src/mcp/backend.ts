@@ -7,6 +7,7 @@ import {
   tasksProjection,
 } from '@tacet/core';
 import type { EventStore, WorkerBinding } from '@tacet/core/node';
+import { rootTasks } from '../gate/gate.js';
 import type { DecisionSummary, ToolInput, ToolOutput } from './tools.js';
 
 /** A tool failure the worker should see (`isError`), with optional structured detail. */
@@ -20,15 +21,25 @@ export class ToolError extends Error {
   }
 }
 
+/** What the escalation gate answered, and why (ADR-004). */
+export interface GateAnswer {
+  answer: string;
+  source: 'policy' | 'precedent' | 'mini';
+  /** Why, for the user reading the log later; recorded on the Decision and `escalation.resolved`. */
+  rationale?: string;
+}
+
 /**
- * Resolves an escalation without a human when it can (ARCHITECTURE.md §2.2): policy, precedent or
- * the Mini-conductor's own judgement. Returns `undefined` to leave it pending. The server waits
- * at most `gateTimeoutMs` for it, so it must never block on a person.
+ * Resolves an escalation without a human when it can (ARCHITECTURE.md §2.2, ADR-004): a precedent
+ * of the user's own, or the Mini-conductor's own judgement. Returns `undefined` to leave it to the
+ * user. The server waits at most `gateTimeoutMs` for its promise, so it must never block on a
+ * person; synchronous work is not bounded by that time. Its
+ * answer is advice to the sub-task, never a permission (ADR-004 E).
  */
 export type EscalationGate = (
   escalation: Escalation,
   binding: WorkerBinding,
-) => Promise<{ answer: string; source: 'policy' | 'precedent' | 'mini' } | undefined>;
+) => Promise<GateAnswer | undefined>;
 
 /**
  * What the MCP tools do. The server derives `binding` from the caller's token; a backend must
@@ -93,6 +104,11 @@ export interface EventLogBackendOptions {
 }
 
 const ANSWER_SOURCES = new Set(['policy', 'precedent', 'mini', 'user']);
+/**
+ * Sources a gate may answer with. `policy` is reserved until a rule kind that can answer exists
+ * (ADR-004 D), and a gate never answers as the user.
+ */
+const GATE_SOURCES: ReadonlySet<string> = new Set(['precedent', 'mini']);
 
 export type LimitedTool = 'escalate' | 'record_decision';
 export interface ToolLimit {
@@ -148,9 +164,20 @@ export class EventLogBackend implements MiniBackend {
     data: unknown,
     kind: 'worker' | 'mini',
   ): string {
+    const env = this.#envelope(b, type, data, kind);
+    this.#o.store.append(env);
+    return env.id;
+  }
+
+  #envelope(
+    b: WorkerBinding | undefined,
+    type: string,
+    data: unknown,
+    kind: 'worker' | 'mini',
+  ): EventEnvelope {
     const now = this.#now();
     const id = newUlid(now.getTime());
-    const env: EventEnvelope = {
+    return {
       v: 1,
       id,
       ts: now.toISOString(),
@@ -163,8 +190,6 @@ export class EventLogBackend implements MiniBackend {
       type,
       data,
     };
-    this.#o.store.append(env);
-    return id;
   }
 
   #events(b: WorkerBinding, typePrefix: string) {
@@ -172,14 +197,17 @@ export class EventLogBackend implements MiniBackend {
   }
 
   #decisions(b: WorkerBinding): Decision[] {
-    // Task decisions for this task, plus repo-scope precedent from any task.
+    // Task decisions of any task with the same root task (a task's sub-tasks share them, ADR-004
+    // A), plus repo-scope precedent from any task.
+    const rootOf = rootTasks(this.#o.store);
+    const root = rootOf(b.taskId);
     return this.#o.store
       .query({ typePrefix: 'decision.recorded' })
       .flatMap((e) => {
         const d = Decision.safeParse(e.envelope.data);
         return d.success ? [d.data] : [];
       })
-      .filter((d) => d.scope === 'repo' || d.taskId === b.taskId);
+      .filter((d) => d.scope === 'repo' || (d.taskId !== undefined && rootOf(d.taskId) === root));
   }
 
   async readTask(b: WorkerBinding): Promise<ToolOutput<'read_task'>> {
@@ -280,21 +308,25 @@ export class EventLogBackend implements MiniBackend {
     return { ack: true as const };
   }
 
-  /** Whether the log already has an answer to this escalation. */
-  #resolved(taskId: string, escalationId: string): boolean {
-    return this.#o.store
-      .query({ taskId, typePrefix: 'escalation.resolved' })
-      .some((e) => (e.envelope.data as { escalationId?: unknown }).escalationId === escalationId);
-  }
-
   /** Record a new pending escalation, without consulting the gate. */
   #raise(
     b: WorkerBinding,
     i: ToolInput<'escalate'>,
     extra: Pick<Escalation, 'category' | 'proposedDecision'> = {},
   ): Escalation {
+    const escalation = this.#escalation(b, i, extra);
+    this.#append(b, 'escalation.raised', escalation, 'worker');
+    return escalation;
+  }
+
+  /** A new pending escalation, not yet written. */
+  #escalation(
+    b: WorkerBinding,
+    i: ToolInput<'escalate'>,
+    extra: Pick<Escalation, 'category' | 'proposedDecision'> = {},
+  ): Escalation {
     const now = this.#now();
-    const escalation = Escalation.parse({
+    return Escalation.parse({
       id: newUlid(now.getTime()),
       taskId: b.taskId,
       sessionId: b.workerSessionId,
@@ -309,78 +341,125 @@ export class EventLogBackend implements MiniBackend {
       createdAt: now.toISOString(),
       ...extra,
     });
-    this.#append(b, 'escalation.raised', escalation, 'worker');
-    return escalation;
   }
 
+  /**
+   * Raise an escalation and give the gate up to `gateTimeoutMs` to answer it (ADR-003 addendum on
+   * the escalation gate, item 2). The escalation and its outcome are one write: answered in time,
+   * `escalation.raised` goes with the gate's Decision (scope `task`, never precedent),
+   * `escalation.resolved` and `escalation.delivered` (inline), so the user never sees a question
+   * the gate answered, and a crash leaves nothing half-written; not answered in time, the
+   * escalation is written as pending and a late answer is dropped, since the user may already
+   * be reading it. `blocking` questions never reach the gate (ADR-004 B).
+   */
   async escalate(b: WorkerBinding, i: ToolInput<'escalate'>): Promise<ToolOutput<'escalate'>> {
     this.#limit(b, 'escalate');
-    const escalation = this.#raise(b, i);
     const gate = this.#o.gate;
-    if (!gate) return { escalationId: escalation.id, status: 'pending' };
-    /** Record the gate's answer; false when the user had already answered (#25). */
-    const resolve = (result: {
-      answer: string;
-      source: 'policy' | 'precedent' | 'mini';
-    }): boolean => {
-      // Never twice: the user may have answered while the gate was still at work.
-      if (this.#resolved(b.taskId, escalation.id)) return false;
-      this.#append(
+    if (!gate || i.urgency === 'blocking') {
+      return { escalationId: this.#raise(b, i).id, status: 'pending' };
+    }
+    const escalation = this.#escalation(b, i);
+    const raised = this.#envelope(b, 'escalation.raised', escalation, 'worker');
+    let settled = false;
+    let writeError: unknown;
+    const failed = (err: unknown) =>
+      this.#envelope(
         b,
-        'escalation.resolved',
-        { escalationId: escalation.id, answer: result.answer, source: result.source },
+        'escalation.gate_failed',
+        { escalationId: escalation.id, message: err instanceof Error ? err.message : String(err) },
         'mini',
       );
-      return true;
-    };
-    let timedOut = false;
-    const answered = gate(escalation, b).then(
-      (result) => {
-        // A late answer is still recorded; the daemon delivers it as the worker's next message.
-        if (result && timedOut) resolve(result);
-        return result;
-      },
-      (err: unknown) => {
-        this.#append(
-          b,
-          'escalation.gate_failed',
-          {
-            escalationId: escalation.id,
-            message: err instanceof Error ? err.message : String(err),
-          },
-          'mini',
-        );
-        return undefined;
-      },
-    );
+    // A gate that throws at once fails like one that rejects: the escalation is still written.
+    const answered = Promise.resolve()
+      .then(() => gate(escalation, b))
+      .then(
+        (result) => ({ result }),
+        (err: unknown) => {
+          // Not when the pending write itself failed: there is no escalation to name.
+          if (settled && writeError === undefined) {
+            // Failing after the time is up still leaves a trace; the user answers either way. The
+            // store may be closed by then (the Mini-conductor stopping): nothing is left to tell.
+            try {
+              this.#o.store.append(failed(err));
+            } catch {}
+          }
+          return { result: undefined, error: err };
+        },
+      );
     let timer: NodeJS.Timeout | undefined;
-    const result = await Promise.race([
+    const outcome = await Promise.race([
       answered,
       new Promise<undefined>((r) => {
         timer = setTimeout(() => {
-          timedOut = true;
+          // Time is up: written as pending at once, so a gate failure after it comes after it.
+          settled = true;
+          try {
+            this.#o.store.append(raised);
+          } catch (err) {
+            writeError = err;
+          }
           r(undefined);
         }, this.#o.gateTimeoutMs ?? 3000);
       }),
     ]);
     clearTimeout(timer);
-    // The user's answer wins: left pending, so the daemon delivers theirs as the next message.
-    if (result && !timedOut && resolve(result)) {
+    if (outcome === undefined) {
+      if (writeError !== undefined) throw writeError;
+      return { escalationId: escalation.id, status: 'pending' };
+    }
+    settled = true;
+    const result = outcome.result;
+    if (!result || !GATE_SOURCES.has(result.source)) {
+      this.#o.store.append('error' in outcome ? [raised, failed(outcome.error)] : [raised]);
+      return { escalationId: escalation.id, status: 'pending' };
+    }
+    // A gate's answer that is not a valid Decision (an empty answer) leaves the question pending.
+    const parsed = Decision.safeParse({
+      id: newUlid(this.#now().getTime()),
+      escalationId: escalation.id,
+      taskId: b.taskId,
+      ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+      topic: escalation.question,
+      decision: result.answer,
+      ...(result.rationale !== undefined ? { rationale: result.rationale } : {}),
+      scope: 'task',
+      source: result.source,
+      decidedAt: this.#now().toISOString(),
+    });
+    if (!parsed.success) {
+      this.#o.store.append([raised, failed(new Error('the gate gave an invalid answer'))]);
+      return { escalationId: escalation.id, status: 'pending' };
+    }
+    const decision = parsed.data;
+    this.#o.store.append([
+      raised,
+      this.#envelope(b, 'decision.recorded', decision, 'mini'),
+      this.#envelope(
+        b,
+        'escalation.resolved',
+        {
+          escalationId: escalation.id,
+          answer: result.answer,
+          source: result.source,
+          decisionId: decision.id,
+          ...(result.rationale !== undefined ? { rationale: result.rationale } : {}),
+        },
+        'mini',
+      ),
       // The Worker gets this answer in the tool result itself: the daemon must not send it again.
-      this.#append(
+      this.#envelope(
         b,
         'escalation.delivered',
         { escalationId: escalation.id, sessionId: b.workerSessionId, inline: true },
         'mini',
-      );
-      return {
-        escalationId: escalation.id,
-        status: 'resolved',
-        answer: result.answer,
-        source: result.source,
-      };
-    }
-    return { escalationId: escalation.id, status: 'pending' };
+      ),
+    ]);
+    return {
+      escalationId: escalation.id,
+      status: 'resolved',
+      answer: result.answer,
+      source: result.source,
+    };
   }
 
   async getDecision(
