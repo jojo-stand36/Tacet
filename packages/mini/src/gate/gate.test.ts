@@ -285,6 +285,9 @@ describe('the deterministic gate', () => {
   it("never takes the user's answer to the Mini-conductor's own escalation as precedent", async () => {
     // A blocked Worker or a merge conflict: raised by the Mini-conductor, with a category.
     answered('root-1', 'go on', { category: 'blocked' }, { scope: 'repo' });
+    // Nor the answer to a policy `ask` about a Worker's tool request (#25 PR4).
+    answered('root-1', 'use lib/', { category: 'help', question: 'Edit src?' }, { scope: 'repo' });
+    expect(findPrecedent(store, escalation('root-1', { question: 'Edit src?' }))).toBeUndefined();
     const { sessionId: _none, ...mine } = escalation('root-1', { question: 'Unblock?' });
     append('root-1', 'escalation.raised', mine);
     const decisionId = newUlid();

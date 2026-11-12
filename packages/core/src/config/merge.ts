@@ -173,6 +173,12 @@ export function mergeConfig(
         `worktrees: the task layer (${layer.origin}) may not change worktree cleanup`,
       );
     }
+    if (layer.name === 'repo' && layer.data.policies?.some((r) => r.decision === 'allow')) {
+      // A cloned repo must not grant tools (ADR-004 D).
+      layerErrors.push(
+        `policies: the repo layer (${layer.origin}) may not allow; put allow rules in your user or local config`,
+      );
+    }
     if (layer.name === 'task' && layer.data.review?.enabled === false) {
       // A task may ask for review, never skip one the repo or the user asked for (#19).
       layerErrors.push(`review.enabled: the task layer (${layer.origin}) may not turn review off`);

@@ -163,7 +163,29 @@ export interface ToolRequest {
   input?: unknown;
 }
 
-export type ToolDecision = { allow: true; reason: string } | { allow: false; reason: string };
+export type ToolDecision =
+  | {
+      allow: true;
+      reason: string;
+      /**
+       * The targets a reading or writing tool names, relative to the checkout and `/`-separated,
+       * each both as written and after symlinks: the input policies match on (ADR-004 D).
+       */
+      paths: string[];
+      /**
+       * For the search tools (Glob, Grep): the directories they read below, in both forms, with
+       * a Glob pattern's literal leading directories added (`''` for the whole checkout).
+       */
+      roots?: string[];
+    }
+  | {
+      allow: false;
+      reason: string;
+      /** A repo policy refused it, not the interim policy (ADR-004 D). */
+      policy?: 'deny' | 'ask';
+      /** For the Worker only: where the user's answer stands, for a policy `ask`. */
+      note?: string;
+    };
 
 /**
  * The interim policy for unattended Workers until #25 (owner decision on #200, 2026-11-10): allow
@@ -216,6 +238,8 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     );
   }
   const targets: string[] = [];
+  /** Each target as written, before symlinks: a policy on a link's own name applies too. */
+  const written: string[] = [];
   /** Where each path key landed: a glob is resolved from its tool's `path` (#213 review). */
   const landed: Record<string, string> = {};
   for (const f of spec.paths) {
@@ -233,6 +257,7 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
       );
     }
     targets.push(at);
+    written.push(lexical(root, worktree, v));
     landed[f] = at;
   }
   if (spec.needsPath && targets.length === 0) return refuse(`${name}: no path given`);
@@ -245,7 +270,30 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   }
   const where = targets.length ? targets.map((t) => t || '.').join(', ') : 'the worktree';
   // Names reached through a symlink were never scrubbed: the reason goes into a summary event.
-  return { allow: true, reason: redactSecrets(`${name} inside the worktree (${where})`) };
+  const slash = (p: string) => p.split(sep).join('/');
+  const both = [...new Set([...targets, ...written].map(slash))];
+  const reason = redactSecrets(`${name} inside the worktree (${where})`);
+  if (spec.writes || spec.needsPath) return { allow: true, reason, paths: both };
+  // A search reads everything below where it starts: a Glob pattern's literal directories
+  // narrow that (`secrets/*` starts at `secrets`). Known limit: a symlink further below a start
+  // is not followed here, so a search that walks through one is matched on its start only (#344).
+  const from = both.length ? both : [''];
+  const pattern =
+    typeof fields.pattern === 'string' && spec.globs.includes('pattern') ? fields.pattern : '';
+  const lead: string[] = [];
+  for (const seg of pattern.split('/')) {
+    if (seg === '.') continue;
+    if (seg === '' || /[*?[\]]/.test(seg)) break;
+    lead.push(seg);
+  }
+  if (lead.length === 0) return { allow: true, reason, paths: [], roots: from };
+  // The narrowed start, as written and after symlinks (a `link/*` pattern searches the link's
+  // target). `badGlob` resolved the same path already: failing now means it changed meanwhile.
+  const base = landed.path ?? '';
+  const real = inside(root, worktree, [...(base ? base.split(sep) : []), ...lead].join('/'), false);
+  if (typeof real !== 'string') return refuse(`${name}: pattern directory cannot be checked`);
+  const roots = [slash(real), ...from.map((r) => [r, ...lead].filter((x) => x !== '').join('/'))];
+  return { allow: true, reason, paths: [], roots: [...new Set(roots)] };
 }
 
 /**

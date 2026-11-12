@@ -150,6 +150,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
             ...(mini.model !== undefined ? { model: mini.model } : {}),
             ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
             cwd,
+            policies: config.policies ?? [],
           }),
       );
     }

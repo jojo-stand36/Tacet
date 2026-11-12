@@ -40,7 +40,7 @@ escalation:
   always_ask: ["schema migrations"]
 verify: [pnpm test, pnpm lint]
 policies:
-  - { tool: Bash, match: "pnpm *", decision: allow }
+  - { tool: Bash, match: "pnpm *", decision: ask }
 `;
 const LOCAL = `
 verify: [pnpm test]
@@ -71,7 +71,7 @@ describe('loadConfig', () => {
     write(join(repoRoot, '.tacet', 'tacet.yaml'), REPO);
     const { config } = loadConfig({ userDir, repoRoot });
     expect(config.escalation?.always_ask).toEqual(['dependency upgrades', 'schema migrations']);
-    expect(config.policies?.map((p) => p.decision)).toEqual(['deny', 'allow']);
+    expect(config.policies?.map((p) => p.decision)).toEqual(['deny', 'ask']);
   });
 
   it('explains every value with the layer and file that set it', () => {
@@ -100,7 +100,7 @@ describe('loadConfig', () => {
     // Same content as REPO, with top-level and nested keys in a different order.
     const reordered = [
       'policies:',
-      '  - { decision: allow, match: "pnpm *", tool: Bash }',
+      '  - { decision: ask, match: "pnpm *", tool: Bash }',
       'verify: [pnpm test, pnpm lint]',
       'escalation:',
       '  always_ask: ["schema migrations"]',
