@@ -1540,7 +1540,9 @@ describe('MiniConductor', () => {
         'allow_once',
         'reject',
       ]);
-      expect(claude.approvalsAnswered[0]?.message).toMatch(/a policy denies it: keys stay local/);
+      expect(claude.approvalsAnswered[0]?.message).toMatch(
+        /a policy denies it: keys stay local\. A repo policy refuses this; use the escalate tool/,
+      );
       const refused = ofType('worker.approval').map((e) => e.data as { reason: string });
       expect(refused[0]?.reason).toBe('a policy denies it: keys stay local');
       // Nothing to ask the user about.
@@ -1566,7 +1568,7 @@ describe('MiniConductor', () => {
       const sub = `${id}/1`;
       await expect.poll(() => tasks()[sub]?.state, { timeout: 5000 }).toBe('input_required');
       expect(claude.approvalsAnswered[0]).toMatchObject({ kind: 'reject' });
-      expect(claude.approvalsAnswered[0]?.message).toMatch(/The user has been asked/);
+      expect(claude.approvalsAnswered[0]?.message).toMatch(/The user has been asked \(escalation /);
       const raised = ofType('escalation.raised', sub);
       expect(raised).toHaveLength(1);
       const x = raised[0]?.data as { id: string; question: string; category: string };
@@ -1578,7 +1580,38 @@ describe('MiniConductor', () => {
       d.answer(x.id, 'Leave src alone; put it in lib/.');
       await d.settled();
       expect(claude.approvalsAnswered.map((a) => a.kind)).toEqual(['reject', 'reject']);
+      expect(claude.approvalsAnswered[0]?.message).toContain(x.id);
+      // Asked again after the answer: refused, pointed at the answer, not escalated again.
+      expect(claude.approvalsAnswered[1]?.message).toMatch(
+        new RegExp(`already answered about this \\(escalation ${x.id}\\)`),
+      );
       expect(ofType('escalation.raised', sub)).toHaveLength(1);
+    });
+
+    it('leaves what the interim policy refuses to it, with no escalation', async () => {
+      const claude = new ScriptedAdapter('claude-sdk', (input, s) =>
+        s.inputs.length > 1 ? { do: 'reply', text: 'done' } : { do: 'approval', toolName: 'Bash' },
+      );
+      const d = withPolicies(claude, [{ tool: 'Bash', decision: 'ask' }], ['Bash x']);
+      await d.start();
+      d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      expect(claude.approvalsAnswered[0]?.message).toMatch(/not a file tool/);
+      expect(ofType('escalation.raised')).toEqual([]);
+    });
+
+    it('refuses a search of the whole checkout under a deny rule', async () => {
+      const claude = new ScriptedAdapter('claude-sdk', (input, s) =>
+        s.inputs.length > 1
+          ? { do: 'reply', text: 'done' }
+          : { do: 'approval', toolName: 'Grep', grant: { input: { pattern: 'key' } } },
+      );
+      const d = withPolicies(claude, [{ match: 'secrets/**', decision: 'deny' }], ['Grep x']);
+      await d.start();
+      d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      expect(claude.approvalsAnswered[0]).toMatchObject({ kind: 'reject' });
+      expect(claude.approvalsAnswered[0]?.message).toMatch(/a policy denies it/);
     });
 
     it('raises no second escalation for a Worker without MCP tools (#184)', async () => {

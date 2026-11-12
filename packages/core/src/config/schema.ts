@@ -109,7 +109,7 @@ export const PolicyRule = z.strictObject({
     'Tool name, e.g. Read; a trailing * matches a prefix (mcp__github__*). Absent: any tool',
   ),
   match: NonEmpty.optional().describe(
-    'Glob on the target paths, relative to the checkout (* within a segment, ** across segments, ? one character), e.g. "secrets/**"',
+    'Glob on the target paths, relative to the checkout (* within a segment, ** across segments, ? one character), e.g. "secrets/**" (a bare "secrets" is that name only); a search (Grep, Glob) that could reach a match is covered too',
   ),
   decision: z.enum(['allow', 'deny', 'ask']),
   reason: z.string().optional(),

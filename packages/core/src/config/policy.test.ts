@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { mergeConfig } from './merge.js';
-import { evaluatePolicies, globRegExp } from './policy.js';
+import { evaluatePolicies, globRegExp, mayContain } from './policy.js';
 import type { PolicyRule } from './schema.js';
 
 describe('globRegExp', () => {
@@ -24,9 +24,32 @@ describe('globRegExp', () => {
     expect(m('a/**/b', 'a/xb')).toBe(false);
     expect(m('**', 'anything/at/all')).toBe(true);
   });
+  it('collapses runs of **', () => {
+    expect(m('**/**', 'a')).toBe(true);
+    expect(m('**/**', 'a/b')).toBe(true);
+    expect(m('**/**/*.pem', 'a.pem')).toBe(true);
+    expect(m('**/**/*.pem', 'x/a.pem')).toBe(true);
+    expect(m('a/**/**/b', 'a/b')).toBe(true);
+  });
   it('takes regular-expression characters literally', () => {
     expect(m('a.b', 'axb')).toBe(false);
     expect(m('(x)+', '(x)+')).toBe(true);
+  });
+});
+
+describe('mayContain', () => {
+  it('tells whether a search from a directory could reach a match', () => {
+    expect(mayContain('', 'secrets/**')).toBe(true);
+    expect(mayContain('secrets', 'secrets/**')).toBe(true);
+    expect(mayContain('secrets/sub', 'secrets/**')).toBe(true);
+    expect(mayContain('src', 'src/*/key.pem')).toBe(true);
+    expect(mayContain('src/a', 'src/*/key.pem')).toBe(true);
+    expect(mayContain('src/a/key.pem', 'src/*/key.pem')).toBe(true);
+    expect(mayContain('lib', 'src/**')).toBe(false);
+    expect(mayContain('src/a/b', 'src/*/key.pem')).toBe(false);
+    expect(mayContain('docs', '**/*.pem')).toBe(true);
+    // Below a literal file path nothing more can match.
+    expect(mayContain('secrets/k/x', 'secrets/k')).toBe(false);
   });
 });
 
@@ -67,6 +90,13 @@ describe('evaluatePolicies', () => {
     expect(evaluatePolicies(rules, { tool: 'Bash' })).toBeUndefined();
     // Compared as a case-insensitive file system would, and without `./`.
     expect(evaluatePolicies(rules, { tool: 'Read', paths: ['./Secrets/K'] })).toBeDefined();
+  });
+
+  it('covers a search whose roots could reach a match', () => {
+    const rules = [r({ match: 'secrets/**' })];
+    expect(evaluatePolicies(rules, { tool: 'Grep', paths: [], roots: [''] })).toBeDefined();
+    expect(evaluatePolicies(rules, { tool: 'Grep', paths: [], roots: ['src'] })).toBeUndefined();
+    expect(evaluatePolicies(rules, { tool: 'Glob', paths: [], roots: ['secrets'] })).toBeDefined();
   });
 
   it("never applies to Tacet's own MCP tools", () => {

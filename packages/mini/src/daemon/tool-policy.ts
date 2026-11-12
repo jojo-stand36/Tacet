@@ -168,16 +168,23 @@ export type ToolDecision =
       allow: true;
       reason: string;
       /**
-       * The targets, relative to the checkout and `/`-separated (`''` for the checkout itself,
-       * as a search without a path has): the input policies match on (ADR-004 D).
+       * The targets a reading or writing tool names, relative to the checkout and `/`-separated,
+       * each both as written and after symlinks: the input policies match on (ADR-004 D).
        */
       paths: string[];
+      /**
+       * For the search tools (Glob, Grep): the directories they read below, in both forms, with
+       * a Glob pattern's literal leading directories added (`''` for the whole checkout).
+       */
+      roots?: string[];
     }
   | {
       allow: false;
       reason: string;
       /** A repo policy refused it, not the interim policy (ADR-004 D). */
       policy?: 'deny' | 'ask';
+      /** For the Worker only: where the user's answer stands, for a policy `ask`. */
+      note?: string;
     };
 
 /**
@@ -231,6 +238,8 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     );
   }
   const targets: string[] = [];
+  /** Each target as written, before symlinks: a policy on a link's own name applies too. */
+  const written: string[] = [];
   /** Where each path key landed: a glob is resolved from its tool's `path` (#213 review). */
   const landed: Record<string, string> = {};
   for (const f of spec.paths) {
@@ -248,6 +257,7 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
       );
     }
     targets.push(at);
+    written.push(lexical(root, worktree, v));
     landed[f] = at;
   }
   if (spec.needsPath && targets.length === 0) return refuse(`${name}: no path given`);
@@ -260,11 +270,22 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   }
   const where = targets.length ? targets.map((t) => t || '.').join(', ') : 'the worktree';
   // Names reached through a symlink were never scrubbed: the reason goes into a summary event.
-  return {
-    allow: true,
-    reason: redactSecrets(`${name} inside the worktree (${where})`),
-    paths: targets.length ? targets.map((t) => t.split(sep).join('/')) : [''],
-  };
+  const slash = (p: string) => p.split(sep).join('/');
+  const both = [...new Set([...targets, ...written].map(slash))];
+  const reason = redactSecrets(`${name} inside the worktree (${where})`);
+  if (spec.writes || spec.needsPath) return { allow: true, reason, paths: both };
+  // A search reads everything below where it starts: a Glob pattern's literal directories
+  // narrow that (`secrets/*` starts at `secrets`).
+  const from = both.length ? both : [''];
+  const pattern =
+    typeof fields.pattern === 'string' && spec.globs.includes('pattern') ? fields.pattern : '';
+  const lead: string[] = [];
+  for (const seg of pattern.split('/')) {
+    if (seg === '' || seg === '.' || /[*?[\]]/.test(seg)) break;
+    lead.push(seg);
+  }
+  const roots = from.map((r) => [r, ...lead].filter((x) => x !== '').join('/'));
+  return { allow: true, reason, paths: [], roots: [...new Set(roots)] };
 }
 
 /**

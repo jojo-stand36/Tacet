@@ -77,7 +77,11 @@ export function sessionTurns(
               )
             : undefined;
         const verdict = d?.allow
-          ? evaluatePolicies(o.reads?.policies ?? [], { tool: e.toolName ?? '', paths: d.paths })
+          ? evaluatePolicies(o.reads?.policies ?? [], {
+              tool: e.toolName ?? '',
+              paths: d.paths,
+              ...(d.roots ? { roots: d.roots } : {}),
+            })
           : undefined;
         const read = d?.allow === true && (!verdict || verdict.decision === 'allow');
         await adapter.respond(
