@@ -1580,6 +1580,18 @@
       "body": "ADR-003 §5 carries Tacet-specific UI items as AG-UI `CUSTOM` events with `name` ∈ `tacet.usage`, `tacet.escalation`, `tacet.decision`, `tacet.budget`, and §7 lists a `ui-custom-events` JSON Schema. #5 left it out because it needs `@ag-ui/core`. This issue adds those payload schemas to `@tacet/core`.\n\n### Tasks\n- [ ] Add `@ag-ui/core` (1.x, ADR-003 §2) to `@tacet/core`, justified in the PR, through the pnpm catalog\n- [ ] zod schemas for the four `CUSTOM` payloads, reusing `Usage`, `Escalation`, `Decision` and budget types; enums via `openEnum`\n- [ ] Export `ui-custom-events` to `packages/core/schema/v1/` with an example\n- [ ] Contract test: every `tacet/ui.event` payload validates against `@ag-ui/core` (ADR-003 §7)\n\n### Acceptance criteria\n- `pnpm check:generated` covers the new schema\n- The contract test passes for one example of each custom event\n\n_See docs/adr/003-wire-protocols.md §5 and §7._"
     },
     {
+      "title": "read_task: report the root task's remaining budget to a Worker on a sub-task",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:cost",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "MCP `read_task` gives a Worker `budgetRemaining` from its own task's view. Workers always run on planner-made sub-tasks, which have no budget, and the tasks projection does not roll sub-task usage up into the root, so a Worker always sees `null`. The escalation gate's budget floor (#25 PR5) already reads the root task's budget against what all its sub-tasks spent; `read_task` should do the same.\n\n### Tasks\n- [ ] `budgetRemaining` from the root task's `budget.usd` minus the usage of the root and all its sub-tasks\n- [ ] Share the computation with the escalation gate's budget floor\n\n### Acceptance criteria\n- A Worker on sub-task `root/2` of a root with a $1 budget, where `root/1` spent $0.40, reads `budgetRemaining: 0.6`\n- A root without a budget still reads `null`\n\n_See docs/ARCHITECTURE.md and docs/adr/004-escalation-gate.md for context._"
+    },
+    {
       "title": "Epic: Context handoff and cost tiering",
       "milestone": "M3 · Context handoff & cost tiering",
       "labels": [
