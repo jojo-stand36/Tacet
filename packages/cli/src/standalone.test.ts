@@ -671,6 +671,17 @@ ws.close();
           source: 'user',
         }),
       ]);
+      // Counted as one escalation that reached the user (#25).
+      const counted = JSON.parse((await tacet(['status', ...user(), '--json'])).out);
+      expect(counted.escalations.total).toMatchObject({
+        raised: 1,
+        answeredByUser: 1,
+        open: 0,
+        rate: 1,
+      });
+      expect((await tacet(['status', ...user()])).out).toContain(
+        'escalations, in all: 1 from Workers, 0 answered without you, 1 to you (100%)',
+      );
       expect(git(repo, ['show', `${branch}:work.txt`])).not.toBe('MySQL');
       // The code is in no file: not the event log, the runtime file or the state dir.
       const inFiles = (dir: string): boolean =>
