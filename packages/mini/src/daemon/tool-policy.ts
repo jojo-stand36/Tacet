@@ -275,7 +275,8 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   const reason = redactSecrets(`${name} inside the worktree (${where})`);
   if (spec.writes || spec.needsPath) return { allow: true, reason, paths: both };
   // A search reads everything below where it starts: a Glob pattern's literal directories
-  // narrow that (`secrets/*` starts at `secrets`).
+  // narrow that (`secrets/*` starts at `secrets`). Known limit: a symlink further below a start
+  // is not followed here, so a search that walks through one is matched on its start only.
   const from = both.length ? both : [''];
   const pattern =
     typeof fields.pattern === 'string' && spec.globs.includes('pattern') ? fields.pattern : '';
@@ -284,7 +285,13 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     if (seg === '' || seg === '.' || /[*?[\]]/.test(seg)) break;
     lead.push(seg);
   }
-  const roots = from.map((r) => [r, ...lead].filter((x) => x !== '').join('/'));
+  if (lead.length === 0) return { allow: true, reason, paths: [], roots: from };
+  // The narrowed start, as written and after symlinks (a `link/*` pattern searches the link's
+  // target); when it cannot be resolved, the search is matched on where it starts unnarrowed.
+  const base = landed.path ?? '';
+  const real = inside(root, worktree, [...(base ? base.split(sep) : []), ...lead].join('/'), false);
+  if (typeof real !== 'string') return { allow: true, reason, paths: [], roots: from };
+  const roots = [slash(real), ...from.map((r) => [r, ...lead].filter((x) => x !== '').join('/'))];
   return { allow: true, reason, paths: [], roots: [...new Set(roots)] };
 }
 

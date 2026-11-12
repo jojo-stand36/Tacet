@@ -1589,7 +1589,7 @@ describe('MiniConductor', () => {
     });
 
     it('leaves what the interim policy refuses to it, with no escalation', async () => {
-      const claude = new ScriptedAdapter('claude-sdk', (input, s) =>
+      const claude = new ScriptedAdapter('claude-sdk', (_input, s) =>
         s.inputs.length > 1 ? { do: 'reply', text: 'done' } : { do: 'approval', toolName: 'Bash' },
       );
       const d = withPolicies(claude, [{ tool: 'Bash', decision: 'ask' }], ['Bash x']);
@@ -1601,7 +1601,7 @@ describe('MiniConductor', () => {
     });
 
     it('refuses a search of the whole checkout under a deny rule', async () => {
-      const claude = new ScriptedAdapter('claude-sdk', (input, s) =>
+      const claude = new ScriptedAdapter('claude-sdk', (_input, s) =>
         s.inputs.length > 1
           ? { do: 'reply', text: 'done' }
           : { do: 'approval', toolName: 'Grep', grant: { input: { pattern: 'key' } } },

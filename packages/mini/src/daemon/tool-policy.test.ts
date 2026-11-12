@@ -549,6 +549,14 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
       expect(verdict('secrets/**', 'Glob', { pattern: 'secrets/*' })).toBe('deny');
       expect(verdict('secrets/**', 'Glob', { pattern: 'src/*.ts' })).toBeUndefined();
       expect(verdict('secrets/**', 'Glob', { pattern: '**/*.ts' })).toBe('deny');
+      // Through a symlink in the pattern's literal directories, or in its path.
+      symlinkSync(join(wt, 'secrets'), join(wt, 'link'));
+      mkdirSync(join(wt, 'dir'));
+      symlinkSync('../secrets', join(wt, 'dir', 'l2'));
+      expect(verdict('secrets/**', 'Glob', { pattern: 'link/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: 'dir/l2/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: 'l2/*', path: 'dir' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: '*', path: 'link' })).toBe('deny');
     });
   });
 
