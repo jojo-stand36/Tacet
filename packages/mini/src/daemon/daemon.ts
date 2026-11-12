@@ -177,6 +177,14 @@ interface View {
   handoffCount: Map<string, number>;
 }
 
+/** What a Mini-conductor session of its own used (`aside`). */
+export interface AsideUsage {
+  inputTokens: number;
+  outputTokens: number;
+  costUsd?: number;
+  model?: string;
+}
+
 interface Run {
   sessionId: string;
   /** The commit its checkout started at (#134). */
@@ -596,6 +604,44 @@ export class MiniConductor {
    * a session that is not running here, one whose turn is being verified or integrated, a task
    * that has ended, or a sub-task past `workers.max_handoffs`.
    */
+  /**
+   * Run a session of the Mini-conductor's own for `taskId` (the escalation gate's reasoning,
+   * #25): its process marker recorded first, so a crash leaves nothing running unaccounted for;
+   * whatever it left running ended afterwards; aborted when the Mini-conductor stops; and its
+   * usage charged to the task (`agent.usage`). Throws when not running.
+   */
+  async aside<T>(
+    taskId: string,
+    label: string,
+    fn: (ctx: {
+      marker: string;
+      signal: AbortSignal;
+    }) => Promise<{ result: T; usage?: AsideUsage }>,
+  ): Promise<T> {
+    if (!this.#started) throw new Error('the Mini-conductor is not running');
+    const marker = newWorkerMarker();
+    const key = `${label}:${newUlid(this.#now().getTime())}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    let usage: AsideUsage | undefined;
+    try {
+      const out = await fn({ marker, signal: this.#abort.signal });
+      usage = out.usage;
+      return out.result;
+    } finally {
+      await endMarkedProcesses([marker]).catch(() => undefined);
+      if (this.#markers.get(key) === marker) {
+        this.#markers.delete(key);
+        this.#saveMarkers();
+      }
+      if (usage && (usage.inputTokens > 0 || usage.outputTokens > 0 || (usage.costUsd ?? 0) > 0)) {
+        this.#o.store.append(
+          this.#env(taskId, 'agent.usage', { t: 'usage', source: 'reported', ...usage }),
+        );
+      }
+    }
+  }
+
   handoffRefusal(sessionId: string): string | undefined {
     const run = [...this.#runs.values()].find((r) => r.sessionId === sessionId);
     if (!this.#started || !run) return 'this session is not running';
