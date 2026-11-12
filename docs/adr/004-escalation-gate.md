@@ -107,3 +107,12 @@ Until the worker sandbox (#53) denies the state directory, code a Worker wrote r
 - **Replace the interim tool policy with policies now**: rejected until #53. `allow` rules widening it would rest on the interim policy's time-of-check assumptions.
 - **Autonomy by §4's plain scalar rule** (any layer replaces the one below): rejected. A committed repo config could then raise autonomy above the user's own setting.
 - **Autonomy as the lowest of all layers**: rejected. The user's own local file could not raise it for one repo.
+
+## Addendum (2026-11-12): the reasoning step's answers and how many run at once (#25)
+
+Status of this addendum: **proposed**, pending the owner's approval in their own comment on the PR that adds it. The owner made both decisions on 2026-11-12, relayed by the coordinator; this addendum records them. It narrows B and does not change A, C, D, E or H. The code is in #25 PR5b (#348).
+
+1. **Free text is advice only at `high`.** At `low` and `medium` the Mini-conductor's own reasoning answers only a question that has options, and its answer must be one of them. A question without options, or with an empty list, goes to the user. At `high` it may also answer a free-text question; that answer is redacted and capped at 1000 characters. This is the reasoning step only: an exact user precedent (A) answers a free-text question at every level, because it is the user's own answer to the same question, not the gate's advice. B's "the answer must be one of the options when there are options" stands. This item adds that, below `high`, a question without options is not reasoned about at all.
+2. **At most two reasoning sessions at once per Mini-conductor.** A question that would start a third goes to the user at once. It is not queued, so the user is never kept waiting behind the gate. This bound is in addition to the `escalate` rate limit (6 per Worker session per 10 minutes) that B names, which stays.
+
+Consequence: at the default `medium`, a Worker's free-text question reaches the user unless the user already answered the same question. Concurrent reasoning cost per repo is bounded by two sessions, whatever the number of Workers.
