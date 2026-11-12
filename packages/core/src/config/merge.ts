@@ -48,6 +48,27 @@ export interface EffectiveConfig {
   config: TacetConfig;
   explain: ExplainEntry[];
   errors: string[];
+  /** Problems that were worked around, for the user to see (e.g. an ignored repo autonomy). */
+  warnings: string[];
+}
+
+/** Autonomy levels, lowest first. */
+export const AUTONOMY_LEVELS = ['low', 'medium', 'high'] as const;
+export type AutonomyLevel = (typeof AUTONOMY_LEVELS)[number];
+
+/** The lower of two autonomy levels. */
+export function lowerAutonomy(a: AutonomyLevel, b: AutonomyLevel): AutonomyLevel {
+  return AUTONOMY_LEVELS.indexOf(a) <= AUTONOMY_LEVELS.indexOf(b) ? a : b;
+}
+
+/**
+ * The escalation gate's time limit (ADR-003 addendum item 1): 3 s at `low`, always; at `medium`
+ * and `high`, where the Mini-conductor's own reasoning may run, `escalation.gate_timeout_s` or 30 s.
+ */
+export function gateTimeoutMs(config: TacetConfig, autonomy?: AutonomyLevel): number {
+  if ((autonomy ?? config.escalation?.autonomy ?? 'medium') === 'low') return 3000;
+  const set = config.escalation?.gate_timeout_s;
+  return set !== undefined ? Math.round(set * 1000) : 30_000;
 }
 
 type Plain = Record<string, unknown>;
@@ -107,7 +128,13 @@ export function mergeConfig(
     }
   };
   const layerErrors: string[] = [];
+  const warnings: string[] = [];
   for (const layer of all) {
+    if (layer.name === 'task' && layer.data.escalation?.gate_timeout_s !== undefined) {
+      layerErrors.push(
+        `escalation.gate_timeout_s: the task layer (${layer.origin}) may not set it`,
+      );
+    }
     if (layer.name === 'task') {
       layerErrors.push(...taskRaisesWorkers(merged, layer), ...taskSetsTierBounds(layer));
     }
@@ -159,6 +186,14 @@ export function mergeConfig(
     apply(merged, layer.data as Plain, layer, '', []);
   }
 
+  const autonomy = mergeAutonomy(all, layerErrors, warnings);
+  if (autonomy) {
+    const esc = (isPlain(merged.escalation) ? merged.escalation : {}) as Plain;
+    esc.autonomy = autonomy.level;
+    merged.escalation = esc;
+    sources.set('escalation.autonomy', [autonomy.source]);
+  }
+
   const explain: ExplainEntry[] = [];
   const walk = (value: unknown, path: string, segments: readonly string[]) => {
     if (isPlain(value) && !UNION_PATHS.has(path) && !isAtomicPath(segments)) {
@@ -183,7 +218,45 @@ export function mergeConfig(
     config,
     explain,
     errors: [...layerErrors, ...shapeErrors, ...validateEffective(config)],
+    warnings,
   };
+}
+
+/**
+ * `escalation.autonomy` across layers (ADR-004 B): only the user raises it. The user layer sets
+ * it (the default when it says nothing); the committed repo layer may only lower it (a higher
+ * level is ignored, with a warning: a file a Worker can edit must not widen what is answered
+ * without the user); the local layer, the user's own and gitignored, replaces it either way; the
+ * task layer may only lower it (raising it is an error, as for `workers.*`).
+ */
+function mergeAutonomy(
+  layers: readonly ConfigLayer[],
+  errors: string[],
+  warnings: string[],
+): { level: AutonomyLevel; source: { layer: LayerName; origin: string } } | undefined {
+  let at: { level: AutonomyLevel; source: { layer: LayerName; origin: string } } | undefined;
+  for (const layer of layers) {
+    const level = layer.data.escalation?.autonomy;
+    if (level === undefined) continue;
+    const source = { layer: layer.name, origin: layer.origin };
+    const higher = at !== undefined && lowerAutonomy(level, at.level) !== level;
+    if (layer.name === 'repo' && higher && at) {
+      const yours =
+        at.source.layer === 'default' ? `the default ${at.level}` : `your own ${at.level}`;
+      warnings.push(
+        `escalation.autonomy: ${level} in the repo layer (${layer.origin}) is above ${yours} and is ignored; only you can raise it, in your user or local config`,
+      );
+      continue;
+    }
+    if (layer.name === 'task' && higher && at) {
+      errors.push(
+        `escalation.autonomy: the task layer (${layer.origin}) may only lower it, not raise it to ${level} (currently ${at.level})`,
+      );
+      continue;
+    }
+    at = { level, source };
+  }
+  return at;
 }
 
 /** Tier bounds (#110) are the user's and the repo's to set: a task may not set them, to widen or to narrow. */

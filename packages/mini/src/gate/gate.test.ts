@@ -5,6 +5,7 @@ import { EventLogBackend } from '../mcp/backend.js';
 import {
   alwaysAskMatch,
   deterministicGate,
+  effectiveAutonomy,
   findPrecedent,
   normalizeQuestion,
   precedentKey,
@@ -146,6 +147,54 @@ describe('the deterministic gate', () => {
   }
   const gate = (alwaysAsk: string[] = []) => deterministicGate({ store, alwaysAsk });
   const binding = (taskId: string): WorkerBinding => ({ workerSessionId: 'w', taskId });
+
+  it("works at the config's autonomy, lowered by the root task's own (ADR-004 B)", () => {
+    const config = { escalation: { autonomy: 'high' as const } };
+    expect(effectiveAutonomy(store, config, 'root-1.a.x')).toBe('high');
+    append('root-3', 'task.created', {
+      id: 'root-3',
+      goal: 'G',
+      acceptanceCriteria: ['A'],
+      createdAt: NOW,
+      autonomy: 'low',
+    });
+    // A sub-task follows its root task, whatever its own record says.
+    append('root-3.a', 'task.created', {
+      id: 'root-3.a',
+      goal: 'G',
+      acceptanceCriteria: ['A'],
+      createdAt: NOW,
+      parentId: 'root-3',
+      autonomy: 'high',
+    });
+    expect(effectiveAutonomy(store, config, 'root-3.a')).toBe('low');
+    // A task never raises it.
+    append('root-4', 'task.created', {
+      id: 'root-4',
+      goal: 'G',
+      acceptanceCriteria: ['A'],
+      createdAt: NOW,
+      autonomy: 'high',
+    });
+    expect(effectiveAutonomy(store, { escalation: { autonomy: 'low' } }, 'root-4')).toBe('low');
+  });
+
+  it("gives the gate the time a Worker's task allows", async () => {
+    let called = 0;
+    const backend = new EventLogBackend({
+      store,
+      gateTimeoutMs: (b) => {
+        called++;
+        return b.taskId === 'root-1' ? 10 : 5000;
+      },
+      gate: () => new Promise(() => {}),
+    });
+    const started = Date.now();
+    const r = await backend.escalate(binding('root-1'), { question: 'slow?', urgency: 'low' });
+    expect(r.status).toBe('pending');
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(called).toBe(1);
+  });
 
   it('walks parentId to the root task', () => {
     const rootOf = rootTasks(store);

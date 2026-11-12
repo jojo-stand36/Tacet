@@ -80,8 +80,11 @@ export interface EventLogBackendOptions {
   /** Mini-conductor id for the event `source`. */
   miniId?: string;
   gate?: EscalationGate;
-  /** Longest the escalation gate may take before the result is `pending`. Default 3000 ms. */
-  gateTimeoutMs?: number;
+  /**
+   * Longest the escalation gate may take before the result is `pending`, or how to tell it for a
+   * Worker (by its task's autonomy). Default 3000 ms.
+   */
+  gateTimeoutMs?: number | ((b: WorkerBinding) => number);
   /** Whether a worker's repo-scope decision becomes precedent without approval. Default: never. */
   allowRepoDecision?: (b: WorkerBinding, d: ToolInput<'record_decision'>) => boolean;
   /** Called when a handoff packet is accepted; the daemon closes the session and seeds a new one. */
@@ -152,6 +155,11 @@ export class EventLogBackend implements MiniBackend {
       }
     }
     this.#o = opts;
+  }
+
+  #gateTimeout(b: WorkerBinding): number {
+    const t = this.#o.gateTimeoutMs;
+    return typeof t === 'function' ? t(b) : (t ?? 3000);
   }
 
   #now(): Date {
@@ -399,7 +407,7 @@ export class EventLogBackend implements MiniBackend {
             writeError = err;
           }
           r(undefined);
-        }, this.#o.gateTimeoutMs ?? 3000);
+        }, this.#gateTimeout(b));
       }),
     ]);
     clearTimeout(timer);
