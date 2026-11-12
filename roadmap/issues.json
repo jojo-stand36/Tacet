@@ -1508,7 +1508,7 @@
         "priority:p0",
         "agent:either"
       ],
-      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\nBlocked until the Conductor link is authenticated (#330; owner decision on #24): a forwarded escalation must not reach the user as something to decide while a reader of `~/.tacet/run` could have made it up.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n- [ ] Borrow (ADR-001): Per-severity notification routes and stale re-escalation (`stale_after`, max 2) for unanswered Decisions (Gas Town `docs/design/escalation.md`); coordinate with #45\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "The core UX. Ranks by urgency × number of blocked workers; dedupes similar questions across repos.\n\nBlocked until the Conductor link is authenticated (#330; owner decision on #24): a forwarded escalation must not reach the user as something to decide while a reader of `~/.tacet/run` could have made it up.\n\n### Tasks\n- [ ] Inbox model + API\n- [ ] Answer → Decision stored as precedent, flows back down\n- [ ] Snooze / delegate-to-conductor ('you decide')\n- [ ] Borrow (ADR-001): Per-severity notification routes and stale re-escalation (`stale_after`, max 2) for unanswered Decisions (Gas Town `docs/design/escalation.md`); coordinate with #45. Moved here from #25 (ADR-004 H): the escalation gate does not re-escalate\n\n### Acceptance criteria\n- Answering one item unblocks all dependent workers\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Escalation gate in mini-conductor",
@@ -1519,7 +1519,7 @@
         "priority:p0",
         "agent:claude"
       ],
-      "body": "Resolve what can be resolved locally (policy, precedent decisions, own reasoning); escalate the rest.\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n- [ ] Borrow (ADR-001): Three-level policy model with ALLOW/DENY/ASK where DENY short-circuits, mapped to task > repo `.tacet/` > user config; ASK becomes an Escalation (Omnigent `docs/POLICIES.md`)\n- [ ] Borrow (ADR-001): Severity-routed escalation where each tier resolves or forwards, plus stale re-escalation (Gas Town `docs/design/escalation.md`)\n- [ ] Borrow (ADR-001): Later (M2+): CEL for side-effect-free inline policy rules (Omnigent `policies/builtins/cel.py`); a TS CEL dependency must be justified\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Resolve what can be resolved locally (precedent decisions, own reasoning); escalate the rest. Decided in ADR-004 (`docs/adr/004-escalation-gate.md`): policies decide tool approvals only and never answer an escalation; CEL rules that can answer one (#339), and a tool `ask` that grants (#340), are their own issues (ADR-004 H).\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n- [ ] Borrow (ADR-001): Three-level policy model with ALLOW/DENY/ASK where DENY short-circuits, mapped to task > repo `.tacet/` > user config; ASK becomes an Escalation (Omnigent `docs/POLICIES.md`)\n- [ ] Borrow (ADR-001): Severity-routed escalation where each tier resolves or forwards (Gas Town `docs/design/escalation.md`). Stale re-escalation of unanswered items moved to the inbox (#26, #45) by ADR-004 H\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Escalation gate: an incremental precedent index instead of scanning the log",
@@ -1813,7 +1813,7 @@
         "priority:p1",
         "agent:copilot"
       ],
-      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n- [ ] Borrow (ADR-001): Per-severity notification routes, with stale re-escalation feeding the channels (Gas Town `docs/design/escalation.md`); coordinate with #26\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Pluggable notifier for escalations, completions, budget alerts.\n\n### Tasks\n- [ ] Channel interface\n- [ ] Per-urgency routing rules\n- [ ] Borrow (ADR-001): Per-severity notification routes, with stale re-escalation feeding the channels (Gas Town `docs/design/escalation.md`); coordinate with #26. Stale re-escalation moved here and to #26 from #25 (ADR-004 H)\n\n### Acceptance criteria\n- Rules configurable per user\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Remote/phone access (opt-in, Tailscale/tunnel guidance)",
@@ -1926,7 +1926,20 @@
         "priority:p2",
         "agent:either"
       ],
-      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n- [ ] Borrow (ADR-001): Adapter package contract shaped like Omnigent's `HarnessContribution` (ids, aliases, install/login hints, labels) (`designs/harness-plugin-interface.md`)\n- [ ] Borrow (ADR-001): Later: CEL policy rules as a plugin (see #25)\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+      "body": "Third parties can add adapters/channels/workflows without forking.\n\n### Tasks\n- [ ] Plugin manifest + loader\n- [ ] Versioned plugin API\n- [ ] Borrow (ADR-001): Adapter package contract shaped like Omnigent's `HarnessContribution` (ids, aliases, install/login hints, labels) (`designs/harness-plugin-interface.md`)\n- [ ] Borrow (ADR-001): Later: CEL policy rules as a plugin (see #339)\n\n### Acceptance criteria\n- One external adapter built as a plugin\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Policies: CEL rules that can answer an escalation",
+      "milestone": "M6 · Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:config",
+        "priority:p3",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "ADR-004 (#25) keeps policies to tool approvals: they never answer an escalation, and the `source: policy` of ADR-003 §6 is reserved until a rule kind that can answer exists. This is that rule kind: side-effect-free inline CEL expressions (ADR-001's borrow from Omnigent `policies/builtins/cel.py`) that the escalation gate may evaluate to answer an Escalation, recorded as a Decision with `source: policy`. A TypeScript CEL implementation is a new runtime dependency and must be justified on its own; it may come as a plugin (#50). Needs an ADR change to ADR-004 D and E, approved by the owner, before code.\n\n### Tasks\n- [ ] ADR-004 amendment: which layers may hold answering rules (not the committed repo layer unless the owner decides otherwise), what they may read, and how they rank against precedent and `always_ask`\n- [ ] Choose and justify a CEL implementation, or a plugin (#50)\n- [ ] Evaluate rules in the gate where the amendment puts them (proposed default: after `always_ask`, before reasoning); write `decision.recorded` and `escalation.resolved` with `source: policy` and the rule as rationale\n\n### Acceptance criteria\n- A CEL rule in a layer the amendment allows answers a matching Escalation, recorded with `source: policy`, and that Decision is never used as precedent\n- `always_ask`, `blocking`, approval requests, tool `ask`s and the Mini-conductor's own escalations are never answered by a rule\n- A rule that errors or does not match forwards the Escalation unchanged\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "Re-check Bun when oven-sh/bun#25822 closes",
@@ -1950,6 +1963,19 @@
         "needs-human"
       ],
       "body": "Prompt injection via repo content, MCP tool abuse, local server exposure, secrets.\n\n### Tasks\n- [ ] STRIDE pass\n- [ ] Mitigations as issues\n\n### Acceptance criteria\n- SECURITY.md updated\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
+    },
+    {
+      "title": "Tool `ask` that grants the refused call once answered, after the worker sandbox (#53)",
+      "milestone": "M6 · Ecosystem & hardening",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:security",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Until the worker sandbox (#53), ADR-004 D has a policy `ask` refuse the tool call and raise at most one Escalation per session and rule, which the user answers as a message to the Worker: nothing is granted. Once #53 confines Workers, a user's \"yes\" to a tool `ask` may grant the refused call (once, or for the session), so the Worker need not retry by hand. Granting changes ADR-004 D (and E's \"never gated: tool `ask`\" line) and ADR-003's #184 addendum (approvals are never held open), so it needs an owner-approved ADR change before code.\n\n### Tasks\n- [ ] ADR change: what a grant covers (the exact call, or the rule for the session), how long it lasts, and how it reaches a Worker whose approval was already refused\n- [ ] Record grants in the event log, scoped to the session, never as precedent\n- [ ] Only the user's own answer grants; a gate answer, precedent or policy never does\n\n### Acceptance criteria\n- With #53 in place, answering a tool-`ask` Escalation with approval lets the Worker make that call without another Escalation\n- A gate, precedent or policy answer never grants a tool call\n- Grants end with the session and are not reused by other sessions\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
       "title": "v0.1 release: packaging (npm, Homebrew), installers, changelog",
