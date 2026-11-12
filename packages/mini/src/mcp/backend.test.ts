@@ -312,7 +312,7 @@ describe('EventLogBackend', () => {
     ).resolves.toMatchObject({ accepted: true });
   });
 
-  it('records gate failures and late gate answers', async () => {
+  it('records a gate failure with the escalation, and drops a late gate answer (#25)', async () => {
     const failing = make({ gate: async () => Promise.reject(new Error('gate down')) });
     await failing.escalate(W1, { question: 'q', urgency: 'low' });
     expect(store.query({ typePrefix: 'escalation.gate_failed' })[0]?.raw.data).toMatchObject({
@@ -328,13 +328,129 @@ describe('EventLogBackend', () => {
     });
     const esc = await late.escalate(W1, { question: 'q2', urgency: 'low' });
     expect(esc.status).toBe('pending');
+    // Written as pending once the time is up: the user can see it and answer it.
+    expect(
+      store
+        .query({ typePrefix: 'escalation.raised' })
+        .some((e) => (e.envelope.data as { id: string }).id === esc.escalationId),
+    ).toBe(true);
     release({ answer: 'later', source: 'mini' });
     await new Promise((r) => setImmediate(r));
     expect(await late.getDecision(W1, { escalationId: esc.escalationId })).toEqual({
-      status: 'resolved',
-      answer: 'later',
-      source: 'mini',
+      status: 'pending',
     });
+    expect(store.query({ typePrefix: 'decision.recorded' })).toEqual([]);
+
+    let fail: (err: Error) => void = () => {};
+    const lateFailure = make({
+      gate: () =>
+        new Promise((_, reject) => {
+          fail = reject;
+        }),
+      gateTimeoutMs: 10,
+    });
+    const third = await lateFailure.escalate(W1, { question: 'q3', urgency: 'low' });
+    fail(new Error('too late'));
+    await new Promise((r) => setImmediate(r));
+    expect(
+      store
+        .query({ typePrefix: 'escalation.gate_failed' })
+        .map((e) => e.envelope.data as { escalationId: string; message: string }),
+    ).toContainEqual({ escalationId: third.escalationId, message: 'too late' });
+  });
+
+  it("writes the escalation and the gate's answer in one append (#25, ADR-003 addendum item 2)", async () => {
+    let seen: string[] = [];
+    const b = make({
+      gate: async () => {
+        // The user never sees a question the gate is still working on.
+        seen = types();
+        return { answer: 'use sqlite', source: 'precedent' as const, rationale: 'asked before' };
+      },
+    });
+    const r = await b.escalate(W1, { question: 'db?', urgency: 'normal' });
+    expect(seen).not.toContain('escalation.raised');
+    const written = store.query({}).slice(1);
+    expect(written.map((e) => e.envelope.type)).toEqual([
+      'escalation.raised',
+      'decision.recorded',
+      'escalation.resolved',
+      'escalation.delivered',
+    ]);
+    const [, decision, resolved, delivered] = written.map((e) => e.envelope.data);
+    expect(decision).toMatchObject({
+      escalationId: r.escalationId,
+      taskId: 'task-1',
+      topic: 'db?',
+      decision: 'use sqlite',
+      rationale: 'asked before',
+      scope: 'task',
+      source: 'precedent',
+    });
+    expect(resolved).toEqual({
+      escalationId: r.escalationId,
+      answer: 'use sqlite',
+      source: 'precedent',
+      decisionId: (decision as { id: string }).id,
+      rationale: 'asked before',
+    });
+    expect(delivered).toMatchObject({ escalationId: r.escalationId, inline: true });
+  });
+
+  it('never gates a blocking question, and never takes a gate answer as the user (#25)', async () => {
+    let calls = 0;
+    const blocking = await make({
+      gate: async () => {
+        calls++;
+        return { answer: 'x', source: 'precedent' as const };
+      },
+    }).escalate(W1, { question: 'stop?', urgency: 'blocking' });
+    expect(blocking.status).toBe('pending');
+    expect(calls).toBe(0);
+
+    const asUser = await make({
+      // biome-ignore lint/suspicious/noExplicitAny: a misbehaving gate, which the types forbid.
+      gate: async () => ({ answer: 'x', source: 'user' }) as any,
+    }).escalate(W1, { question: 'who?', urgency: 'low' });
+    expect(asUser.status).toBe('pending');
+    expect(store.query({ typePrefix: 'escalation.resolved' })).toEqual([]);
+  });
+
+  it("shares task decisions across a root task's sub-tasks, not across root tasks (#25)", async () => {
+    const created = (id: string, parentId?: string) =>
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: NOW,
+        source: { kind: 'mini', id: 'mini' },
+        taskId: id,
+        type: 'task.created',
+        data: {
+          id,
+          goal: 'G',
+          acceptanceCriteria: ['A'],
+          createdAt: NOW,
+          ...(parentId ? { parentId } : {}),
+        },
+      });
+    created('task-1.a', 'task-1');
+    created('task-1.b', 'task-1');
+    created('task-2');
+    const b = make();
+    await b.recordDecision(
+      { workerSessionId: 'w-a', taskId: 'task-1.a' },
+      { topic: 'logging library', decision: 'pino', scope: 'task' },
+    );
+    const sibling = await b.searchDecisions(
+      { workerSessionId: 'w-b', taskId: 'task-1.b' },
+      { query: 'logging' },
+    );
+    expect(sibling.decisions.map((d) => d.decision)).toEqual(['pino']);
+    const other = await b.searchDecisions(
+      { workerSessionId: 'w-2', taskId: 'task-2' },
+      { query: 'logging' },
+    );
+    expect(other.decisions).toEqual([]);
   });
 
   it('never lets a late gate answer resolve what the user has answered (#25)', async () => {
@@ -374,33 +490,6 @@ describe('EventLogBackend', () => {
       options: ['approve', 'reject'],
       proposedDecision: { decisionId: r.decisionId, scope: 'repo' },
     });
-  });
-
-  it("leaves the user's answer standing when the gate answers in time after it (#25)", async () => {
-    const b = make({
-      gate: async (esc: { id: string }) => {
-        // The user answers while the gate works, and the gate still answers within its time.
-        store.append({
-          v: 1,
-          id: newUlid(),
-          ts: NOW,
-          source: { kind: 'mini', id: 'mini' },
-          taskId: 'task-1',
-          type: 'escalation.resolved',
-          data: { escalationId: esc.id, answer: 'mine', source: 'user' },
-        });
-        return { answer: 'the gate', source: 'mini' as const };
-      },
-    });
-    const r = await b.escalate(W1, { question: 'q4', urgency: 'low' });
-    // Pending, so the daemon delivers the user's answer; nothing marks the gate's as delivered.
-    expect(r.status).toBe('pending');
-    expect(
-      store
-        .query({ typePrefix: 'escalation.resolved' })
-        .map((e) => (e.envelope.data as { answer: string }).answer),
-    ).toEqual(['mine']);
-    expect(store.query({ typePrefix: 'escalation.delivered' })).toEqual([]);
   });
 
   it('writes escalations as escalationStats counts them (#25)', async () => {

@@ -19,6 +19,7 @@ import {
   WORKER_MARKER_VAR,
 } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { deterministicGate } from '../gate/gate.js';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
   cancelStopped,
@@ -1185,6 +1186,43 @@ describe('MiniConductor', () => {
           source: 'user',
         }),
       ]);
+      await d.settled();
+    });
+
+    it("answers the next Worker that asks the same question from the user's answer (#25)", async () => {
+      const escId = newUlid();
+      const { d, sub } = await run(escId, { question: 'Which database?' });
+      d.answer(escId, 'Postgres');
+      // Another sub-task of the same root task asks again, through the MCP backend and the gate.
+      const root = tasks()[sub]?.task.parentId as string;
+      const sibling = `${root}/9`;
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'test' },
+        taskId: sibling,
+        type: 'task.created',
+        data: {
+          id: sibling,
+          goal: 'g',
+          acceptanceCriteria: ['ok'],
+          parentId: root,
+          createdAt: new Date().toISOString(),
+        },
+      });
+      const backend = new EventLogBackend({ store, gate: deterministicGate({ store }) });
+      const r = await backend.escalate(
+        { workerSessionId: 'w-later', taskId: sibling },
+        { question: 'which database', urgency: 'normal' },
+      );
+      expect(r).toMatchObject({ status: 'resolved', answer: 'Postgres', source: 'precedent' });
+      // Another root task gets no task-scope precedent: it asks the user.
+      const other = await backend.escalate(
+        { workerSessionId: 'w-other', taskId: 'another-root' },
+        { question: 'which database', urgency: 'normal' },
+      );
+      expect(other.status).toBe('pending');
       await d.settled();
     });
   });
