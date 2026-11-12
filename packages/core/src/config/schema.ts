@@ -114,8 +114,21 @@ export const TacetConfig = z.strictObject({
   tiers: z.record(NonEmpty, TierConfig).optional(),
   escalation: z
     .strictObject({
-      autonomy: z.enum(['low', 'medium', 'high']).optional(),
+      autonomy: z
+        .enum(['low', 'medium', 'high'])
+        .optional()
+        .describe(
+          'What the escalation gate may answer (ADR-004 B). Only the user raises it: the repo and task layers may only lower it',
+        ),
       always_ask: z.array(NonEmpty).optional(),
+      gate_timeout_s: z
+        .number()
+        .min(1)
+        .max(240)
+        .optional()
+        .describe(
+          'Longest the gate may take before `escalate` returns pending, at autonomy medium and high (default 30; low is always 3). From 1 to 240, inside every MCP client limit measured (spike #68)',
+        ),
     })
     .optional(),
   handoff: z
