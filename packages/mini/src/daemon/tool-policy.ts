@@ -163,7 +163,22 @@ export interface ToolRequest {
   input?: unknown;
 }
 
-export type ToolDecision = { allow: true; reason: string } | { allow: false; reason: string };
+export type ToolDecision =
+  | {
+      allow: true;
+      reason: string;
+      /**
+       * The targets, relative to the checkout and `/`-separated (`''` for the checkout itself,
+       * as a search without a path has): the input policies match on (ADR-004 D).
+       */
+      paths: string[];
+    }
+  | {
+      allow: false;
+      reason: string;
+      /** A repo policy refused it, not the interim policy (ADR-004 D). */
+      policy?: 'deny' | 'ask';
+    };
 
 /**
  * The interim policy for unattended Workers until #25 (owner decision on #200, 2026-11-10): allow
@@ -245,7 +260,11 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   }
   const where = targets.length ? targets.map((t) => t || '.').join(', ') : 'the worktree';
   // Names reached through a symlink were never scrubbed: the reason goes into a summary event.
-  return { allow: true, reason: redactSecrets(`${name} inside the worktree (${where})`) };
+  return {
+    allow: true,
+    reason: redactSecrets(`${name} inside the worktree (${where})`),
+    paths: targets.length ? targets.map((t) => t.split(sep).join('/')) : [''],
+  };
 }
 
 /**

@@ -17,6 +17,7 @@ import {
   type DecisionScope,
   Escalation,
   type EventEnvelope,
+  evaluatePolicies,
   HandoffPacket,
   type MaintenanceOp,
   type MaintenanceProblem,
@@ -192,6 +193,8 @@ interface Run {
   mcp: boolean;
   /** Tool requests refused in the current turn ("tool: reason"), for a blocked turn (#184). */
   refused: string[];
+  /** Policy `ask` rules (by index) already escalated in this session: once each (ADR-004 D). */
+  askedRules: Set<number>;
   /** `commit` when the current turn started, so a turn's own commit can be told apart (#184). */
   turnBase?: string | undefined;
   /** Blocked turns in a row in this session, each escalated for it (#184); capped. */
@@ -1550,6 +1553,67 @@ export class MiniConductor {
     }
   }
 
+  /**
+   * The repo's `policies` on a request the interim policy allows (ADR-004 D): until the worker
+   * sandbox (#53) they only narrow it. `deny` refuses with the rule's reason. `ask` refuses too,
+   * and raises one escalation per session and rule, which the user answers as a message to the
+   * Worker; a Worker without the Mini-conductor's MCP tools (#184) gets no second escalation, as
+   * its blocked turn already reports what was refused. `allow` grants nothing more.
+   */
+  #withPolicies(
+    run: Run,
+    toolName: string | undefined,
+    d: ReturnType<typeof decideToolRequest>,
+  ): ReturnType<typeof decideToolRequest> {
+    if (!d.allow) return d;
+    const tool = toolName ?? '';
+    const verdict = evaluatePolicies(this.#o.config.policies ?? [], { tool, paths: d.paths });
+    if (!verdict || verdict.decision === 'allow') return d;
+    const why = verdict.rule.reason?.trim();
+    if (verdict.decision === 'deny') {
+      return {
+        allow: false,
+        reason: redactSecrets(`a policy denies it${why ? `: ${why}` : ''}`),
+        policy: 'deny',
+      };
+    }
+    if (run.mcp && !run.askedRules.has(verdict.index)) {
+      run.askedRules.add(verdict.index);
+      const where = d.paths.map((p) => p || '.').join(', ');
+      this.#ask(
+        run,
+        redactSecrets(
+          `A Worker on ${run.subtaskId} asked to use ${tool} on ${where}, and a policy says to ask you first${why ? ` (${why})` : ''}. It was refused; the Worker is told your answer, and policies grant nothing until the worker sandbox (#53), so say what it should do instead.`,
+        ).slice(0, 2000),
+      );
+    }
+    return {
+      allow: false,
+      reason: redactSecrets(`a policy asks the user first${why ? `: ${why}` : ''}`),
+      policy: 'ask',
+    };
+  }
+
+  /**
+   * An escalation about a Worker's tool request, for its session to be told the answer. The
+   * sub-task waits for it at the end of the Worker's turn, as for any open escalation. Never
+   * gated (ADR-004 E): the Mini-conductor raises it, not the Worker's `escalate`.
+   */
+  #ask(run: Run, question: string): void {
+    const escalation = Escalation.parse({
+      id: newUlid(this.#now().getTime()),
+      taskId: run.subtaskId,
+      sessionId: run.sessionId,
+      ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
+      question,
+      urgency: 'normal',
+      category: 'help',
+      createdAt: this.#now().toISOString(),
+      status: 'pending',
+    });
+    this.#o.store.append(this.#env(run.subtaskId, 'escalation.raised', escalation));
+  }
+
   /** The Mini-conductor's own escalation on `taskId`, which waits for it (`input_required`). */
   #raise(
     taskId: string,
@@ -1809,6 +1873,7 @@ export class MiniConductor {
       mcpServerName,
       mcp,
       refused: [],
+      askedRules: new Set(),
       blockedInRow: 0,
       text: '',
       turnActive: true,
@@ -1892,13 +1957,17 @@ export class MiniConductor {
           const own = isOwnMcpTool(e, run.mcpServerName);
           const d = own
             ? undefined
-            : decideToolRequest(
-                {
-                  adapterId: run.adapterId,
-                  toolName: e.toolName,
-                  input: (e.requestedGrant as { input?: unknown } | undefined)?.input,
-                },
-                run.workspace.path,
+            : this.#withPolicies(
+                run,
+                e.toolName,
+                decideToolRequest(
+                  {
+                    adapterId: run.adapterId,
+                    toolName: e.toolName,
+                    input: (e.requestedGrant as { input?: unknown } | undefined)?.input,
+                  },
+                  run.workspace.path,
+                ),
               );
           if (d && !d.allow)
             run.refused.push(`${e.toolName ?? 'a tool'}: ${d.reason}`.slice(0, 500));
@@ -1929,7 +1998,9 @@ export class MiniConductor {
                   kind: 'reject',
                   persist: false,
                   message: run.mcp
-                    ? `Not approved: ${d?.reason ?? 'unattended Worker'}. Unattended Workers may only use file tools inside their own checkout; use the escalate tool if you need more.`
+                    ? d && !d.allow && d.policy === 'ask'
+                      ? `Not approved: ${d.reason}. The user has been asked and their answer will come as a message; meanwhile continue with work that does not need it, or end your turn.`
+                      : `Not approved: ${d?.reason ?? 'unattended Worker'}. Unattended Workers may only use file tools inside their own checkout; use the escalate tool if you need more.`
                     : `Not approved: ${d?.reason ?? 'unattended Worker'}. If you cannot continue without it, end your turn saying what you need.`,
                 },
           );

@@ -99,12 +99,18 @@ export const AgentPreset = z.strictObject({
 export type AgentPreset = z.infer<typeof AgentPreset>;
 
 /**
- * Policy rule (Omnigent's ALLOW/DENY/ASK model). Rules from every layer are kept; evaluation
- * (#25) checks task, then local, then repo, then user rules, and a `deny` anywhere wins.
+ * Policy rule (Omnigent's ALLOW/DENY/ASK model; ADR-004 D). Rules from every layer are kept and
+ * evaluated order-free by `evaluatePolicies`: DENY beats ASK beats ALLOW. Until the worker
+ * sandbox (#53) they only narrow the interim tool policy, and the committed repo layer may not
+ * `allow`.
  */
 export const PolicyRule = z.strictObject({
-  tool: NonEmpty.optional().describe('Tool name, e.g. Bash'),
-  match: NonEmpty.optional().describe('Glob on the tool input summary, e.g. "rm -rf *"'),
+  tool: NonEmpty.optional().describe(
+    'Tool name, e.g. Read; a trailing * matches a prefix (mcp__github__*). Absent: any tool',
+  ),
+  match: NonEmpty.optional().describe(
+    'Glob on the target paths, relative to the checkout (* within a segment, ** across segments, ? one character), e.g. "secrets/**"',
+  ),
   decision: z.enum(['allow', 'deny', 'ask']),
   reason: z.string().optional(),
 });
