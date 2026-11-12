@@ -319,6 +319,16 @@ describe('tacet standalone (#21)', () => {
     expect(inDistro.err).not.toMatch(/warning: the/);
   });
 
+  it("warns that a repo autonomy above the user's is ignored (#25, ADR-004 B)", async () => {
+    const cfg = join(repo, '.tacet', 'tacet.yaml');
+    writeFileSync(cfg, `${readFileSync(cfg, 'utf8')}escalation: { autonomy: high }\n`);
+    const r = await tacet(['run', ...user(), 'add work.txt']);
+    expect(r.code).toBe(0);
+    expect(r.err).toMatch(
+      /warning: config: escalation\.autonomy: high in the repo layer .* is above the default medium and is ignored/,
+    );
+  });
+
   it('refuses to run beside another live Mini-conductor for the repo', async () => {
     const paths = repoStatePaths(repo, state);
     const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {

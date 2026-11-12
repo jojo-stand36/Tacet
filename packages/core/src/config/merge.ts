@@ -61,11 +61,14 @@ export function lowerAutonomy(a: AutonomyLevel, b: AutonomyLevel): AutonomyLevel
   return AUTONOMY_LEVELS.indexOf(a) <= AUTONOMY_LEVELS.indexOf(b) ? a : b;
 }
 
-/** The escalation gate's time limit (ADR-003 addendum item 1): set, or by autonomy. */
+/**
+ * The escalation gate's time limit (ADR-003 addendum item 1): 3 s at `low`, always; at `medium`
+ * and `high`, where the Mini-conductor's own reasoning may run, `escalation.gate_timeout_s` or 30 s.
+ */
 export function gateTimeoutMs(config: TacetConfig, autonomy?: AutonomyLevel): number {
+  if ((autonomy ?? config.escalation?.autonomy ?? 'medium') === 'low') return 3000;
   const set = config.escalation?.gate_timeout_s;
-  if (set !== undefined) return Math.round(set * 1000);
-  return (autonomy ?? config.escalation?.autonomy ?? 'medium') === 'low' ? 3000 : 30_000;
+  return set !== undefined ? Math.round(set * 1000) : 30_000;
 }
 
 type Plain = Record<string, unknown>;
@@ -232,8 +235,10 @@ function mergeAutonomy(
     const source = { layer: layer.name, origin: layer.origin };
     const higher = at !== undefined && lowerAutonomy(level, at.level) !== level;
     if (layer.name === 'repo' && higher && at) {
+      const yours =
+        at.source.layer === 'default' ? `the default ${at.level}` : `your own ${at.level}`;
       warnings.push(
-        `escalation.autonomy: ${level} in the repo layer (${layer.origin}) is above your own ${at.level} and is ignored; only you can raise it, in your user or local config`,
+        `escalation.autonomy: ${level} in the repo layer (${layer.origin}) is above ${yours} and is ignored; only you can raise it, in your user or local config`,
       );
       continue;
     }

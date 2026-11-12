@@ -123,11 +123,11 @@ export const TacetConfig = z.strictObject({
       always_ask: z.array(NonEmpty).optional(),
       gate_timeout_s: z
         .number()
-        .positive()
+        .min(1)
         .max(240)
         .optional()
         .describe(
-          'Longest the gate may take before `escalate` returns pending. Default 3 at autonomy low, 30 at medium and high; at most 240, inside every MCP client limit measured (spike #68)',
+          'Longest the gate may take before `escalate` returns pending, at autonomy medium and high (default 30; low is always 3). From 1 to 240, inside every MCP client limit measured (spike #68)',
         ),
     })
     .optional(),

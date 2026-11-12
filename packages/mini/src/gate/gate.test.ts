@@ -158,7 +158,15 @@ describe('the deterministic gate', () => {
       createdAt: NOW,
       autonomy: 'low',
     });
-    created('root-3.a', 'root-3');
+    // A sub-task follows its root task, whatever its own record says.
+    append('root-3.a', 'task.created', {
+      id: 'root-3.a',
+      goal: 'G',
+      acceptanceCriteria: ['A'],
+      createdAt: NOW,
+      parentId: 'root-3',
+      autonomy: 'high',
+    });
     expect(effectiveAutonomy(store, config, 'root-3.a')).toBe('low');
     // A task never raises it.
     append('root-4', 'task.created', {
