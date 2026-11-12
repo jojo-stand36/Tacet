@@ -28,10 +28,18 @@ export interface EscalationGateOptions {
   aside?: Aside;
   /** The time the reasoning session may take, for a task. */
   timeoutMs: (taskId: string) => number;
+  /** Reasoning sessions running at once, at most; past it the question goes to the user. Default 2. */
+  maxReasoning?: number;
 }
 
 /** Below this share of its budget left, a task gets no reasoning step (ADR-004 B). */
 const BUDGET_FLOOR = 0.1;
+
+/**
+ * Reasoning sessions one Mini-conductor runs at once (owner decision, 2026-11-12, relayed by the
+ * coordinator): one more goes straight to the user, never into a queue that would delay it.
+ */
+export const MAX_REASONING_SESSIONS = 2;
 
 /**
  * The escalation gate (#25, ADR-004): the user's own exact precedent at every autonomy level;
@@ -43,6 +51,8 @@ const BUDGET_FLOOR = 0.1;
  */
 export function escalationGate(o: EscalationGateOptions): EscalationGate {
   const alwaysAsk = o.config.escalation?.always_ask ?? [];
+  const cap = o.maxReasoning ?? MAX_REASONING_SESSIONS;
+  let reasoning = 0;
   return async (escalation, b, gateSignal) => {
     // The gate's time runs from here: the reasoning session gets what is left of it.
     const deadline = Date.now() + o.timeoutMs(b.taskId);
@@ -62,6 +72,10 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     if (autonomy === 'low') return undefined;
     const candidates = reasoningCandidates(o.store, escalation, o.repo);
     if (autonomy === 'medium' && candidates.length === 0) return undefined;
+    // Free text is advice the gate may give only at `high`; below, it picks from the options
+    // (owner decision, 2026-11-12, relayed by the coordinator).
+    const hasOptions = (escalation.options?.length ?? 0) > 0;
+    if (autonomy !== 'high' && !hasOptions) return undefined;
     // Budgets are the root task's (the user's), and its sub-tasks spend them.
     const rootOf = rootTasks(o.store);
     const root = rootOf(b.taskId);
@@ -78,21 +92,27 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
       if (budget - spent < budget * BUDGET_FLOOR) return undefined;
     }
     const reasoner = o.reasoner;
-    const verdict = await o.aside(b.taskId, 'gate', async ({ marker, signal, charge }) => {
-      const r = await reasoner.reason({
-        goal: rootView.task.goal,
-        ...(b.taskId !== root ? { subtaskGoal: view.task.goal } : {}),
-        escalation,
-        candidates,
-        alwaysAsk,
-        mayAnswerWithoutPrecedent: autonomy === 'high',
-        marker,
-        signal: gateSignal ? AbortSignal.any([signal, gateSignal]) : signal,
-        timeoutMs: Math.max(1, deadline - Date.now()),
+    if (reasoning >= cap) return undefined;
+    reasoning++;
+    const verdict = await o
+      .aside(b.taskId, 'gate', async ({ marker, signal, charge }) => {
+        const r = await reasoner.reason({
+          goal: rootView.task.goal,
+          ...(b.taskId !== root ? { subtaskGoal: view.task.goal } : {}),
+          escalation,
+          candidates,
+          alwaysAsk,
+          mayAnswerWithoutPrecedent: autonomy === 'high',
+          marker,
+          signal: gateSignal ? AbortSignal.any([signal, gateSignal]) : signal,
+          timeoutMs: Math.max(1, deadline - Date.now()),
+        });
+        charge(r.usage);
+        return r.verdict;
+      })
+      .finally(() => {
+        reasoning--;
       });
-      charge(r.usage);
-      return r.verdict;
-    });
     if (verdict.verdict !== 'answer') return undefined;
     const cited = verdict.cites.length > 0 ? ` (cites ${verdict.cites.join(', ')})` : '';
     return {

@@ -294,12 +294,55 @@ describe('escalationGate (ADR-004 B)', () => {
     expect(calls).toHaveLength(0);
     const id = answered('root-1', { question: 'Which database driver for the cache?' });
     reply = { verdict: 'answer', answer: 'pg', rationale: 'as before', cites: [id] };
-    const r = await gate(config('medium'))(escalation('root-1'), b('root-1'));
+    // Below `high` it picks from the options: a free-text question goes to the user.
+    expect(await gate(config('medium'))(escalation('root-1'), b('root-1'))).toBeUndefined();
+    expect(calls).toHaveLength(0);
+    const r = await gate(config('medium'))(
+      escalation('root-1', { options: ['pg', 'sqlite'] }),
+      b('root-1'),
+    );
     expect(r).toEqual({ answer: 'pg', source: 'mini', rationale: `as before (cites ${id})` });
     expect(calls[0]).toMatchObject({ mayAnswerWithoutPrecedent: false, goal: 'goal of root-1' });
     expect(calls[0]?.candidates.map((c) => c.id)).toEqual([id]);
     // Its usage is charged to the Worker's task.
     expect(charged).toEqual([{ taskId: 'root-1', usage: { inputTokens: 10, outputTokens: 2 } }]);
+  });
+
+  it('runs at most two reasoning sessions at once; one more goes to the user at once', async () => {
+    const releases: (() => void)[] = [];
+    let started = 0;
+    const slow = escalationGate({
+      store,
+      config: config('high'),
+      reasoner: {
+        reason: () =>
+          new Promise<ReasonResult>((resolve) => {
+            started++;
+            releases.push(() =>
+              resolve({ verdict: reply, usage: { inputTokens: 0, outputTokens: 0 } }),
+            );
+          }),
+      },
+      aside: async (_t, _l, fn) =>
+        fn({ marker: 'm', signal: new AbortController().signal, charge: () => {} }),
+      timeoutMs: () => 30_000,
+    });
+    const first = slow(escalation('root-1'), b('root-1'));
+    const second = slow(escalation('root-1'), b('root-1'));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(started).toBe(2);
+    // Not queued: answered (by the user) straight away.
+    expect(await slow(escalation('root-1'), b('root-1'))).toBeUndefined();
+    expect(started).toBe(2);
+    for (const r of releases) r();
+    expect(await first).toMatchObject({ source: 'mini' });
+    expect(await second).toMatchObject({ source: 'mini' });
+    // A slot is free again.
+    const fourth = slow(escalation('root-1'), b('root-1'));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(started).toBe(3);
+    releases.at(-1)?.();
+    await fourth;
   });
 
   it('reasons without a candidate at high, for urgency low and normal only', async () => {
