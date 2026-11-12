@@ -435,6 +435,18 @@ describe('EventLogBackend', () => {
     expect(blocking.status).toBe('pending');
     expect(calls).toBe(0);
 
+    // `policy` is reserved until rules that can answer exist (ADR-004 D), and an empty answer is
+    // no answer: both leave the question to the user.
+    const asPolicy = await make({
+      gate: async () => ({ answer: 'x', source: 'policy' as const }),
+    }).escalate(W1, { question: 'rule?', urgency: 'low' });
+    expect(asPolicy.status).toBe('pending');
+    const empty = await make({
+      gate: async () => ({ answer: '', source: 'precedent' as const }),
+    }).escalate(W1, { question: 'empty?', urgency: 'low' });
+    expect(empty.status).toBe('pending');
+    expect(types().slice(-2)).toEqual(['escalation.raised', 'escalation.gate_failed']);
+
     const asUser = await make({
       // biome-ignore lint/suspicious/noExplicitAny: a misbehaving gate, which the types forbid.
       gate: async () => ({ answer: 'x', source: 'user' }) as any,

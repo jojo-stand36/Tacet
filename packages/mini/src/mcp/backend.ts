@@ -33,7 +33,7 @@ export interface GateAnswer {
  * Resolves an escalation without a human when it can (ARCHITECTURE.md §2.2, ADR-004): a precedent
  * of the user's own, or the Mini-conductor's own judgement. Returns `undefined` to leave it to the
  * user. The server waits at most `gateTimeoutMs` for its promise, so it must never block on a
- * person; synchronous work it does before its first `await` is not bounded by that time. Its
+ * person; synchronous work is not bounded by that time. Its
  * answer is advice to the sub-task, never a permission (ADR-004 E).
  */
 export type EscalationGate = (
@@ -361,6 +361,7 @@ export class EventLogBackend implements MiniBackend {
     const escalation = this.#escalation(b, i);
     const raised = this.#envelope(b, 'escalation.raised', escalation, 'worker');
     let settled = false;
+    let writeError: unknown;
     const failed = (err: unknown) =>
       this.#envelope(
         b,
@@ -374,7 +375,8 @@ export class EventLogBackend implements MiniBackend {
       .then(
         (result) => ({ result }),
         (err: unknown) => {
-          if (settled) {
+          // Not when the pending write itself failed: there is no escalation to name.
+          if (settled && writeError === undefined) {
             // Failing after the time is up still leaves a trace; the user answers either way. The
             // store may be closed by then (the Mini-conductor stopping): nothing is left to tell.
             try {
@@ -385,7 +387,6 @@ export class EventLogBackend implements MiniBackend {
         },
       );
     let timer: NodeJS.Timeout | undefined;
-    let writeError: unknown;
     const outcome = await Promise.race([
       answered,
       new Promise<undefined>((r) => {
@@ -412,7 +413,8 @@ export class EventLogBackend implements MiniBackend {
       this.#o.store.append('error' in outcome ? [raised, failed(outcome.error)] : [raised]);
       return { escalationId: escalation.id, status: 'pending' };
     }
-    const decision = Decision.parse({
+    // A gate's answer that is not a valid Decision (an empty answer) leaves the question pending.
+    const parsed = Decision.safeParse({
       id: newUlid(this.#now().getTime()),
       escalationId: escalation.id,
       taskId: b.taskId,
@@ -424,6 +426,11 @@ export class EventLogBackend implements MiniBackend {
       source: result.source,
       decidedAt: this.#now().toISOString(),
     });
+    if (!parsed.success) {
+      this.#o.store.append([raised, failed(new Error('the gate gave an invalid answer'))]);
+      return { escalationId: escalation.id, status: 'pending' };
+    }
+    const decision = parsed.data;
     this.#o.store.append([
       raised,
       this.#envelope(b, 'decision.recorded', decision, 'mini'),
