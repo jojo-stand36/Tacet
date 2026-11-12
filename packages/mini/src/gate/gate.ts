@@ -1,4 +1,11 @@
-import { Decision, Escalation, Task } from '@tacet/core';
+import {
+  type AutonomyLevel,
+  Decision,
+  Escalation,
+  lowerAutonomy,
+  type TacetConfig,
+  Task,
+} from '@tacet/core';
 import type { EventStore } from '@tacet/core/node';
 import type { EscalationGate } from '../mcp/backend.js';
 
@@ -78,6 +85,26 @@ export function alwaysAskMatch(
     const need = words(entry).filter((w) => !FILLER.has(w));
     return need.length > 0 && need.every((n) => have.some((h) => covers(n, h)));
   });
+}
+
+/**
+ * The autonomy the gate works at for `taskId` (ADR-004 B): the config's (merged so that only the
+ * user raises it), lowered by its root task's own `autonomy` when that is lower.
+ */
+export function effectiveAutonomy(
+  store: EventStore,
+  config: TacetConfig,
+  taskId: string,
+): AutonomyLevel {
+  const configured: AutonomyLevel = config.escalation?.autonomy ?? 'medium';
+  const root = rootTasks(store)(taskId);
+  for (const e of store.query({ taskId: root, typePrefix: 'task.created' })) {
+    const t = Task.safeParse(e.envelope.data);
+    if (t.success && t.data.id === root && t.data.autonomy !== undefined) {
+      return lowerAutonomy(configured, t.data.autonomy);
+    }
+  }
+  return configured;
 }
 
 /** Each task's root: itself, or the top of its `parentId` chain, as `task.created` has it. */

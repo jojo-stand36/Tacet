@@ -54,6 +54,16 @@
       "minLength": 1,
       "maxLength": 256
     },
+    "autonomy": {
+      "description": "The task's own escalation autonomy (TaskExt). It may only lower the config's (ADR-004 B); its sub-tasks follow their root task",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "x-tacet-fallback": "low",
+      "type": "string"
+    },
     "contextId": {
       "description": "A2A contextId: the cross-repo goal or workflow",
       "type": "string",

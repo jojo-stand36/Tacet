@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { TacetConfig, Task } from '@tacet/core';
+import { gateTimeoutMs, type TacetConfig, type Task } from '@tacet/core';
 import {
   type ConductorLink,
   type ConductorLinkState,
@@ -26,7 +26,7 @@ import { LINK_METHODS, startMiniControl, taskMethods } from './control/server.js
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
-import { deterministicGate } from './gate/gate.js';
+import { deterministicGate, effectiveAutonomy } from './gate/gate.js';
 import { GitIntegrator } from './git/integrate.js';
 import { eventForwarding } from './link/forward.js';
 import { EventLogBackend } from './mcp/backend.js';
@@ -107,6 +107,8 @@ export interface Standalone {
 export async function startStandalone(o: StandaloneOptions): Promise<Standalone> {
   const loaded = loadConfig({ repoRoot: o.repoRoot, ...(o.userDir ? { userDir: o.userDir } : {}) });
   const config = loaded.config;
+  // Worked around, not fatal: an ignored repo autonomy above the user's own (ADR-004 B).
+  for (const w of loaded.warnings) o.onWarning?.('config', w);
   const stateDir = resolveStateDir(config.events?.state_dir, o.repoRoot, o.home);
   const paths = repoStatePaths(o.repoRoot, stateDir);
   const baseEnv = o.baseEnv ?? process.env;
@@ -180,6 +182,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
         repo: paths.repoId,
         miniId: 'standalone',
         // The escalation gate (#25, ADR-004): the user's own exact precedent only, so far.
+        gateTimeoutMs: (b) => gateTimeoutMs(config, effectiveAutonomy(store, config, b.taskId)),
         gate: deterministicGate({
           store,
           repo: paths.repoId,

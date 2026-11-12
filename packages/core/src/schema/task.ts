@@ -33,6 +33,9 @@ export const Task = z.object({
   budget: Budget.optional(),
   priority: Priority.default('p2'),
   parentId: Id.optional().describe('Parent task, carried as A2A referenceTaskIds'),
+  autonomy: Autonomy.optional().describe(
+    "The task's own escalation autonomy (TaskExt). It may only lower the config's (ADR-004 B); its sub-tasks follow their root task",
+  ),
   contextId: Id.optional().describe('A2A contextId: the cross-repo goal or workflow'),
   createdAt: Timestamp,
 });
