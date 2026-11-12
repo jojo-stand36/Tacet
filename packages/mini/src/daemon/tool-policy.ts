@@ -276,7 +276,7 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
   if (spec.writes || spec.needsPath) return { allow: true, reason, paths: both };
   // A search reads everything below where it starts: a Glob pattern's literal directories
   // narrow that (`secrets/*` starts at `secrets`). Known limit: a symlink further below a start
-  // is not followed here, so a search that walks through one is matched on its start only.
+  // is not followed here, so a search that walks through one is matched on its start only (#344).
   const from = both.length ? both : [''];
   const pattern =
     typeof fields.pattern === 'string' && spec.globs.includes('pattern') ? fields.pattern : '';
