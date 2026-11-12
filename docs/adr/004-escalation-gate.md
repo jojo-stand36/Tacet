@@ -4,7 +4,7 @@
 - Date: 2026-11-11
 - Accepted by the owner on 2026-11-12, on PR #338 ([comment 6834514985](https://github.com/jojo-stand36/Tacet/pull/338#issuecomment-6834514985): "Approved A–H").
 
-Issue: #25. The plan, reviewed by the architect agent, is on #25. The owner approved all the items listed under "Owner items" (A to H) in their own comment on PR #338. A proposed addendum (2026-11-12), at the end, narrows B.
+Issue: #25. The plan, reviewed by the architect agent, is on #25. The owner approved all the items listed under "Owner items" (A to H) in their own comment on PR #338. An addendum (2026-11-12, accepted on PR #349), at the end, narrows B.
 
 ## Context
 
@@ -110,7 +110,7 @@ Until the worker sandbox (#53) denies the state directory, code a Worker wrote r
 
 ## Addendum (2026-11-12): the reasoning step's answers and how many run at once (#25)
 
-Status of this addendum: **proposed**, pending the owner's approval in their own comment on the PR that adds it. The owner made both decisions on 2026-11-12, relayed by the coordinator; this addendum records them. It narrows B and changes nothing else. The code is in #25 PR5b (#348).
+Status of this addendum: **accepted** on 2026-11-12, approved by the owner on PR #349 ([comment 6837500666](https://github.com/jojo-stand36/Tacet/pull/349#issuecomment-6837500666): "approved"). The owner made both decisions on 2026-11-12; this addendum records them. It narrows B and changes nothing else. The code is in #25 PR5b (#348).
 
 1. **The reasoning step answers free-text questions only at `high`.** At `medium` (at `low` there is no reasoning step) the Mini-conductor's own reasoning answers only a question that has options, and its answer must be one of them. A question without options, or with an empty list, goes to the user. At `high` it may also answer a free-text question; that answer is redacted and capped at 1000 characters. This is the reasoning step only: an exact user precedent (A) answers a free-text question at every level, because it is the user's own answer to the same question, not the gate's advice. B's "the answer must be one of the options when there are options" stands.
 2. **At most two reasoning sessions at once per Mini-conductor.** A question that would start a third goes to the user at once. It is not queued, so the user is never kept waiting behind the gate. This bound is in addition to the `escalate` rate limit (6 per Worker session per 10 minutes) that B names, which stays.
