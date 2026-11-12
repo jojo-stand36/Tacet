@@ -26,7 +26,9 @@ import { LINK_METHODS, startMiniControl, taskMethods } from './control/server.js
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
-import { deterministicGate, effectiveAutonomy } from './gate/gate.js';
+import { escalationGate } from './gate/escalation-gate.js';
+import { effectiveAutonomy } from './gate/gate.js';
+import { AdapterReasoner } from './gate/reasoning.js';
 import { GitIntegrator } from './git/integrate.js';
 import { eventForwarding } from './link/forward.js';
 import { EventLogBackend } from './mcp/backend.js';
@@ -131,6 +133,7 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
   let workspaces: WorktreeManager;
   let planner: Planner = new SingleStepPlanner();
   let reviewer: Reviewer | undefined;
+  let reasoner: AdapterReasoner | undefined;
   try {
     workspaces = new WorktreeManager(o.repoRoot, paths.worktrees, {
       env: baseEnv,
@@ -153,6 +156,31 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
             policies: config.policies ?? [],
           }),
       );
+    }
+    // The escalation gate's own reasoning (#25, ADR-004 B), on the `mini` tier like the planner.
+    // An agent that cannot have its tools refused cannot reason: the gate keeps to precedent.
+    if (mini && (config.escalation?.autonomy ?? 'medium') !== 'low') {
+      const worker = adapters[mini.adapter];
+      if (!worker) {
+        o.onWarning?.(
+          mini.adapter,
+          'the escalation gate answers by exact precedent only: the mini tier adapter was not built',
+        );
+      } else {
+        try {
+          reasoner = new AdapterReasoner({
+            worker,
+            adapterId: mini.adapter,
+            ...(mini.model !== undefined ? { model: mini.model } : {}),
+            ...(mini.effort !== undefined ? { effort: mini.effort } : {}),
+          });
+        } catch (err) {
+          o.onWarning?.(
+            mini.adapter,
+            `the escalation gate answers by exact precedent only: ${(err as Error).message}`,
+          );
+        }
+      }
     }
     if (config.review?.enabled && tiers.review) {
       const worker = adapters[tiers.review.adapter];
@@ -182,12 +210,25 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
         store,
         repo: paths.repoId,
         miniId: 'standalone',
-        // The escalation gate (#25, ADR-004): the user's own exact precedent only, so far.
+        // The escalation gate (#25, ADR-004): the user's own exact precedent, then the
+        // Mini-conductor's own reasoning at autonomy medium and high.
         gateTimeoutMs: (b) => gateTimeoutMs(config, effectiveAutonomy(store, config, b.taskId)),
-        gate: deterministicGate({
+        gate: escalationGate({
           store,
+          config,
           repo: paths.repoId,
-          alwaysAsk: config.escalation?.always_ask ?? [],
+          ...(reasoner
+            ? {
+                reasoner,
+                aside: (taskId, label, fn) => {
+                  if (!started) {
+                    return Promise.reject(new Error('the Mini-conductor is not running yet'));
+                  }
+                  return started.aside(taskId, label, fn);
+                },
+              }
+            : {}),
+          timeoutMs: (taskId) => gateTimeoutMs(config, effectiveAutonomy(store, config, taskId)),
         }),
         // A Worker's handoff (#129): the Mini-conductor, made below, decides and reseeds.
         canHandoff: (b) =>

@@ -178,6 +178,14 @@ interface View {
   handoffCount: Map<string, number>;
 }
 
+/** What a Mini-conductor session of its own used (`aside`). */
+export interface AsideUsage {
+  inputTokens: number;
+  outputTokens: number;
+  costUsd?: number;
+  model?: string;
+}
+
 interface Run {
   sessionId: string;
   /** The commit its checkout started at (#134). */
@@ -594,6 +602,63 @@ export class MiniConductor {
         reset = '\x1bc';
       }
     })();
+  }
+
+  /**
+   * Run a session of the Mini-conductor's own for `taskId` (the escalation gate's reasoning,
+   * #25): its process marker recorded first, so a crash leaves nothing running unaccounted for;
+   * whatever it left running ended afterwards; aborted when the Mini-conductor stops, and waited
+   * for by `stop()`; and what it used, as `fn` reports it through `charge` (even when `fn`
+   * throws), charged to the task (`agent.usage`). Throws when not running.
+   */
+  aside<T>(
+    taskId: string,
+    label: string,
+    fn: (ctx: {
+      marker: string;
+      signal: AbortSignal;
+      charge: (usage: AsideUsage) => void;
+    }) => Promise<T>,
+  ): Promise<T> {
+    if (!this.#started) return Promise.reject(new Error('the Mini-conductor is not running'));
+    const marker = newWorkerMarker();
+    const key = `${label}:${newUlid(this.#now().getTime())}`;
+    this.#markers.set(key, marker);
+    this.#saveMarkers();
+    const used: AsideUsage = { inputTokens: 0, outputTokens: 0 };
+    const charge = (u: AsideUsage) => {
+      used.inputTokens += u.inputTokens;
+      used.outputTokens += u.outputTokens;
+      if (u.costUsd !== undefined) used.costUsd = (used.costUsd ?? 0) + u.costUsd;
+      if (u.model !== undefined) used.model = u.model;
+    };
+    const run = (async () => {
+      try {
+        return await fn({ marker, signal: this.#abort.signal, charge });
+      } finally {
+        await endMarkedProcesses([marker]).catch(() => undefined);
+        if (this.#markers.get(key) === marker) {
+          this.#markers.delete(key);
+          this.#saveMarkers();
+        }
+        if (used.inputTokens > 0 || used.outputTokens > 0 || (used.costUsd ?? 0) > 0) {
+          const costUsd =
+            used.costUsd !== undefined ? Math.round(used.costUsd * 1e6) / 1e6 : undefined;
+          this.#o.store.append(
+            this.#env(taskId, 'agent.usage', {
+              t: 'usage',
+              source: 'reported',
+              ...used,
+              ...(costUsd !== undefined ? { costUsd } : {}),
+            }),
+          );
+        }
+      }
+    })();
+    // `stop()` waits for it before it lets go of the lock and the store. Its failure is the
+    // caller's to handle (the gate records it), not the Mini-conductor's.
+    this.#track(run.catch(() => undefined));
+    return run;
   }
 
   /**

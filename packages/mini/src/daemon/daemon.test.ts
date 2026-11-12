@@ -1507,6 +1507,67 @@ describe('MiniConductor', () => {
     });
   });
 
+  it('runs a session of its own under a recorded marker, and charges its usage (#25)', async () => {
+    const d = make();
+    await expect(d.aside('t', 'gate', async () => 1)).rejects.toThrow(/not running/);
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    let seen: string[] = [];
+    const out = await d.aside(id, 'gate', async ({ marker, charge }) => {
+      seen = JSON.parse(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')) as string[];
+      expect(seen).toContain(marker);
+      charge({ inputTokens: 5, outputTokens: 1, costUsd: 0.01 });
+      return 'ok';
+    });
+    expect(out).toBe('ok');
+    // What it used is charged even when it fails.
+    await expect(
+      d.aside(id, 'gate', async ({ charge }) => {
+        charge({ inputTokens: 7, outputTokens: 0 });
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+    expect(ofType('agent.usage', id).map((e) => e.data)).toContainEqual({
+      t: 'usage',
+      source: 'reported',
+      inputTokens: 7,
+      outputTokens: 0,
+    });
+    // stop() waits for a session of its own and aborts it.
+    let aborted = false;
+    let marker = '';
+    const pending = d.aside(id, 'gate', ({ signal, marker: m, charge }) => {
+      marker = m;
+      return new Promise<string>((resolve) =>
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          // Finishing takes a while after the abort: stop() must wait for it.
+          setTimeout(() => {
+            charge({ inputTokens: 3, outputTokens: 0 });
+            resolve('stopped');
+          }, 30);
+        }),
+      );
+    });
+    await d.stop();
+    expect(aborted).toBe(true);
+    // By the time stop() returns, its marker is gone and its usage charged.
+    expect(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')).not.toContain(marker);
+    expect(ofType('agent.usage', id).map((e) => e.data)).toContainEqual(
+      expect.objectContaining({ inputTokens: 3 }),
+    );
+    await expect(pending).resolves.toBe('stopped');
+    const left = JSON.parse(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')) as string[];
+    expect(left).not.toContain(seen.at(-1));
+    expect(ofType('agent.usage', id).map((e) => e.data)).toContainEqual({
+      t: 'usage',
+      source: 'reported',
+      inputTokens: 5,
+      outputTokens: 1,
+      costUsd: 0.01,
+    });
+  });
+
   it('miniLockHolder names the running holder only (#21)', async () => {
     const lock = join(dir, 'mini.lock');
     expect(miniLockHolder(lock)).toBeUndefined();

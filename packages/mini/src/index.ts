@@ -58,15 +58,34 @@ export {
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
 export {
+  type Aside,
+  type EscalationGateOptions,
+  escalationGate,
+} from './gate/escalation-gate.js';
+export {
   alwaysAskMatch,
   type DeterministicGateOptions,
   deterministicGate,
+  effectiveAutonomy,
   findPrecedent,
+  forUser,
   normalizeQuestion,
   type Precedent,
   precedentKey,
   rootTasks,
 } from './gate/gate.js';
+export {
+  AdapterReasoner,
+  type AdapterReasonerOptions,
+  type Candidate,
+  checkReply,
+  REASONER_SYSTEM_PROMPT,
+  type ReasonedVerdict,
+  type ReasonRequest,
+  type ReasonResult,
+  reasonerPrompt,
+  reasoningCandidates,
+} from './gate/reasoning.js';
 export { type ReviewDiff, type ReviewDiffOptions, reviewDiff } from './git/diff.js';
 export {
   GitIntegrator,

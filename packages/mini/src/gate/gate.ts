@@ -195,6 +195,16 @@ export function findPrecedent(
   return undefined;
 }
 
+/**
+ * Whether the escalation always goes to the user, whatever precedent or reasoning would say
+ * (ADR-004 B, C, E): `blocking` urgency, an approval request, or an `always_ask` match.
+ */
+export function forUser(escalation: Escalation, alwaysAsk: readonly string[]): boolean {
+  if (escalation.urgency === 'blocking') return true;
+  if (escalation.category === 'decision' || escalation.proposedDecision !== undefined) return true;
+  return alwaysAskMatch(alwaysAsk, escalation) !== undefined;
+}
+
 export interface DeterministicGateOptions {
   store: EventStore;
   /** `escalation.always_ask` from the merged config. */
@@ -212,11 +222,7 @@ export interface DeterministicGateOptions {
 export function deterministicGate(o: DeterministicGateOptions): EscalationGate {
   return async (escalation) => {
     await Promise.resolve();
-    if (escalation.urgency === 'blocking') return undefined;
-    if (escalation.category === 'decision' || escalation.proposedDecision !== undefined) {
-      return undefined;
-    }
-    if (alwaysAskMatch(o.alwaysAsk ?? [], escalation) !== undefined) return undefined;
+    if (forUser(escalation, o.alwaysAsk ?? [])) return undefined;
     const p = findPrecedent(o.store, escalation, o.repo);
     if (!p) return undefined;
     return {

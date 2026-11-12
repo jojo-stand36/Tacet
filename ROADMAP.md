@@ -145,6 +145,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Tasks down the Conductor link: create tasks and answer escalations** — `feature` `P1` `claude + human`
 - [ ] **Tool policies: searches that walk through symlinks below their start** — `feature` `P2` `claude`
 - [ ] **UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)** — `feature` `P2` `either`
+- [ ] **read_task: report the root task's remaining budget to a Worker on a sub-task** — `feature` `P2` `either`
 
 ## M3 · Context handoff & cost tiering
 
