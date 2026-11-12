@@ -557,6 +557,14 @@ describe('decideToolRequest: unattended Worker tool policy (#200)', () => {
       expect(verdict('secrets/**', 'Glob', { pattern: 'dir/l2/*' })).toBe('deny');
       expect(verdict('secrets/**', 'Glob', { pattern: 'l2/*', path: 'dir' })).toBe('deny');
       expect(verdict('secrets/**', 'Glob', { pattern: '*', path: 'link' })).toBe('deny');
+      // A symlink in the middle of the pattern's directories, and a leading `./`.
+      mkdirSync(join(wt, 'a', 'b'), { recursive: true });
+      symlinkSync('../../secrets', join(wt, 'a', 'b', 'l3'));
+      expect(verdict('secrets/**', 'Glob', { pattern: 'a/b/l3/*' })).toBe('deny');
+      expect(verdict('secrets/**', 'Glob', { pattern: './src/*.ts' })).toBeUndefined();
+      // A pattern through a dangling link is refused before policies.
+      symlinkSync(join(wt, 'gone'), join(wt, 'dangling'));
+      expect(ask('Glob', { pattern: 'dangling/*' }).allow).toBe(false);
     });
   });
 

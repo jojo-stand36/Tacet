@@ -282,15 +282,16 @@ export function decideToolRequest(req: ToolRequest, worktree: string): ToolDecis
     typeof fields.pattern === 'string' && spec.globs.includes('pattern') ? fields.pattern : '';
   const lead: string[] = [];
   for (const seg of pattern.split('/')) {
-    if (seg === '' || seg === '.' || /[*?[\]]/.test(seg)) break;
+    if (seg === '.') continue;
+    if (seg === '' || /[*?[\]]/.test(seg)) break;
     lead.push(seg);
   }
   if (lead.length === 0) return { allow: true, reason, paths: [], roots: from };
   // The narrowed start, as written and after symlinks (a `link/*` pattern searches the link's
-  // target); when it cannot be resolved, the search is matched on where it starts unnarrowed.
+  // target). `badGlob` resolved the same path already: failing now means it changed meanwhile.
   const base = landed.path ?? '';
   const real = inside(root, worktree, [...(base ? base.split(sep) : []), ...lead].join('/'), false);
-  if (typeof real !== 'string') return { allow: true, reason, paths: [], roots: from };
+  if (typeof real !== 'string') return refuse(`${name}: pattern directory cannot be checked`);
   const roots = [slash(real), ...from.map((r) => [r, ...lead].filter((x) => x !== '').join('/'))];
   return { allow: true, reason, paths: [], roots: [...new Set(roots)] };
 }
