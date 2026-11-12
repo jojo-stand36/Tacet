@@ -72,6 +72,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Delete a task's pinned-target ref once its result lands** — `feature` `P2` `claude`
 - [ ] **Forward events by the ADR-003 §4 allowlist, not a local-namespace denylist** — `feature` `P1` `claude`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
+- [ ] **Gemini Workers read outside their checkout without asking, through a symlink and Gemini's no-ask shell commands** — `P1` `claude + human`
 - [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
 - [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude + human`
 - [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
