@@ -1675,6 +1675,8 @@ describe('MiniConductor', () => {
       expect(x.category).toBe('help');
       expect(x.question).toContain('Edit on src/a.ts');
       expect(x.question).toContain('src is reviewed');
+      // The Worker's turn ended without the call: the sub-task waits for the answer, not done.
+      expect(ofType('task.result', sub)).toHaveLength(0);
       // Raised by the Mini-conductor, so the escalation gate never sees it.
       expect(raised[0]?.source.kind).toBe('mini');
       d.answer(x.id, 'Leave src alone; put it in lib/.');
@@ -1712,6 +1714,18 @@ describe('MiniConductor', () => {
       await d.settled();
       expect(claude.approvalsAnswered[0]).toMatchObject({ kind: 'reject' });
       expect(claude.approvalsAnswered[0]?.message).toMatch(/a policy denies it/);
+      // A search of a directory the rule cannot reach is allowed.
+      const scoped = new ScriptedAdapter('claude-sdk', (_input, s) =>
+        s.inputs.length > 1
+          ? { do: 'reply', text: 'done' }
+          : { do: 'approval', toolName: 'Grep', grant: { input: { pattern: 'key', path: 'src' } } },
+      );
+      await d.stop();
+      const d2 = withPolicies(scoped, [{ match: 'secrets/**', decision: 'deny' }], ['Grep y']);
+      await d2.start();
+      d2.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await d2.settled();
+      expect(scoped.approvalsAnswered[0]).toMatchObject({ kind: 'allow_once' });
     });
 
     it('raises no second escalation for a Worker without MCP tools (#184)', async () => {
