@@ -1534,19 +1534,27 @@ describe('MiniConductor', () => {
     });
     // stop() waits for a session of its own and aborts it.
     let aborted = false;
-    const pending = d.aside(
-      id,
-      'gate',
-      ({ signal }) =>
-        new Promise<string>((resolve) =>
-          signal.addEventListener('abort', () => {
-            aborted = true;
+    let marker = '';
+    const pending = d.aside(id, 'gate', ({ signal, marker: m, charge }) => {
+      marker = m;
+      return new Promise<string>((resolve) =>
+        signal.addEventListener('abort', () => {
+          aborted = true;
+          // Finishing takes a while after the abort: stop() must wait for it.
+          setTimeout(() => {
+            charge({ inputTokens: 3, outputTokens: 0 });
             resolve('stopped');
-          }),
-        ),
-    );
+          }, 30);
+        }),
+      );
+    });
     await d.stop();
     expect(aborted).toBe(true);
+    // By the time stop() returns, its marker is gone and its usage charged.
+    expect(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')).not.toContain(marker);
+    expect(ofType('agent.usage', id).map((e) => e.data)).toContainEqual(
+      expect.objectContaining({ inputTokens: 3 }),
+    );
     await expect(pending).resolves.toBe('stopped');
     const left = JSON.parse(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')) as string[];
     expect(left).not.toContain(seen.at(-1));

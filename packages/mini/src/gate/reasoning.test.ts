@@ -389,6 +389,7 @@ describe('escalationGate (ADR-004 B)', () => {
 
   it('stops the reasoning when the gate is out of time', async () => {
     let seen: AbortSignal | undefined;
+    let given = 0;
     const slow = escalationGate({
       store,
       config: config('high'),
@@ -396,6 +397,7 @@ describe('escalationGate (ADR-004 B)', () => {
         reason: (req) =>
           new Promise((resolve) => {
             seen = req.signal;
+            given = req.timeoutMs;
             req.signal.addEventListener('abort', () =>
               resolve({
                 verdict: { verdict: 'forward', why: 'stopped' },
@@ -413,6 +415,9 @@ describe('escalationGate (ADR-004 B)', () => {
     expect(r.status).toBe('pending');
     await new Promise((res) => setTimeout(res, 10));
     expect(seen?.aborted).toBe(true);
+    // What was left of the gate's 50 ms, not the whole of it again.
+    expect(given).toBeGreaterThan(0);
+    expect(given).toBeLessThanOrEqual(50);
   });
 
   it("is recorded as the Mini-conductor's, never as precedent", async () => {
