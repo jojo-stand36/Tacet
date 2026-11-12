@@ -39,6 +39,8 @@ export interface GateAnswer {
 export type EscalationGate = (
   escalation: Escalation,
   binding: WorkerBinding,
+  /** Aborted when the gate's time is up: its answer would be dropped, so work for it can stop. */
+  signal?: AbortSignal,
 ) => Promise<GateAnswer | undefined>;
 
 /**
@@ -378,8 +380,9 @@ export class EventLogBackend implements MiniBackend {
         'mini',
       );
     // A gate that throws at once fails like one that rejects: the escalation is still written.
+    const late = new AbortController();
     const answered = Promise.resolve()
-      .then(() => gate(escalation, b))
+      .then(() => gate(escalation, b, late.signal))
       .then(
         (result) => ({ result }),
         (err: unknown) => {
@@ -401,6 +404,7 @@ export class EventLogBackend implements MiniBackend {
         timer = setTimeout(() => {
           // Time is up: written as pending at once, so a gate failure after it comes after it.
           settled = true;
+          late.abort();
           try {
             this.#o.store.append(raised);
           } catch (err) {

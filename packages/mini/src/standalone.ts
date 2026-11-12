@@ -160,7 +160,12 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
     // An agent that cannot have its tools refused cannot reason: the gate keeps to precedent.
     if (mini && (config.escalation?.autonomy ?? 'medium') !== 'low') {
       const worker = adapters[mini.adapter];
-      if (worker) {
+      if (!worker) {
+        o.onWarning?.(
+          mini.adapter,
+          'the escalation gate answers by exact precedent only: the mini tier adapter was not built',
+        );
+      } else {
         try {
           reasoner = new AdapterReasoner({
             worker,

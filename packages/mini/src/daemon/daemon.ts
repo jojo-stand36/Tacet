@@ -599,49 +599,68 @@ export class MiniConductor {
   }
 
   /**
-   * Why the Worker session `sessionId` may not hand off now, or undefined if it may (#129). Asked
-   * by the MCP backend before it records a `request_handoff`, so a refused one leaves no packet:
-   * a session that is not running here, one whose turn is being verified or integrated, a task
-   * that has ended, or a sub-task past `workers.max_handoffs`.
-   */
-  /**
    * Run a session of the Mini-conductor's own for `taskId` (the escalation gate's reasoning,
    * #25): its process marker recorded first, so a crash leaves nothing running unaccounted for;
-   * whatever it left running ended afterwards; aborted when the Mini-conductor stops; and its
-   * usage charged to the task (`agent.usage`). Throws when not running.
+   * whatever it left running ended afterwards; aborted when the Mini-conductor stops, and waited
+   * for by `stop()`; and what it used, as `fn` reports it through `charge` (even when `fn`
+   * throws), charged to the task (`agent.usage`). Throws when not running.
    */
-  async aside<T>(
+  aside<T>(
     taskId: string,
     label: string,
     fn: (ctx: {
       marker: string;
       signal: AbortSignal;
-    }) => Promise<{ result: T; usage?: AsideUsage }>,
+      charge: (usage: AsideUsage) => void;
+    }) => Promise<T>,
   ): Promise<T> {
-    if (!this.#started) throw new Error('the Mini-conductor is not running');
+    if (!this.#started) return Promise.reject(new Error('the Mini-conductor is not running'));
     const marker = newWorkerMarker();
     const key = `${label}:${newUlid(this.#now().getTime())}`;
     this.#markers.set(key, marker);
     this.#saveMarkers();
-    let usage: AsideUsage | undefined;
-    try {
-      const out = await fn({ marker, signal: this.#abort.signal });
-      usage = out.usage;
-      return out.result;
-    } finally {
-      await endMarkedProcesses([marker]).catch(() => undefined);
-      if (this.#markers.get(key) === marker) {
-        this.#markers.delete(key);
-        this.#saveMarkers();
+    const used: AsideUsage = { inputTokens: 0, outputTokens: 0 };
+    const charge = (u: AsideUsage) => {
+      used.inputTokens += u.inputTokens;
+      used.outputTokens += u.outputTokens;
+      if (u.costUsd !== undefined) used.costUsd = (used.costUsd ?? 0) + u.costUsd;
+      if (u.model !== undefined) used.model = u.model;
+    };
+    const run = (async () => {
+      try {
+        return await fn({ marker, signal: this.#abort.signal, charge });
+      } finally {
+        await endMarkedProcesses([marker]).catch(() => undefined);
+        if (this.#markers.get(key) === marker) {
+          this.#markers.delete(key);
+          this.#saveMarkers();
+        }
+        if (used.inputTokens > 0 || used.outputTokens > 0 || (used.costUsd ?? 0) > 0) {
+          const costUsd =
+            used.costUsd !== undefined ? Math.round(used.costUsd * 1e6) / 1e6 : undefined;
+          this.#o.store.append(
+            this.#env(taskId, 'agent.usage', {
+              t: 'usage',
+              source: 'reported',
+              ...used,
+              ...(costUsd !== undefined ? { costUsd } : {}),
+            }),
+          );
+        }
       }
-      if (usage && (usage.inputTokens > 0 || usage.outputTokens > 0 || (usage.costUsd ?? 0) > 0)) {
-        this.#o.store.append(
-          this.#env(taskId, 'agent.usage', { t: 'usage', source: 'reported', ...usage }),
-        );
-      }
-    }
+    })();
+    // `stop()` waits for it before it lets go of the lock and the store. Its failure is the
+    // caller's to handle (the gate records it), not the Mini-conductor's.
+    this.#track(run.catch(() => undefined));
+    return run;
   }
 
+  /**
+   * Why the Worker session `sessionId` may not hand off now, or undefined if it may (#129). Asked
+   * by the MCP backend before it records a `request_handoff`, so a refused one leaves no packet:
+   * a session that is not running here, one whose turn is being verified or integrated, a task
+   * that has ended, or a sub-task past `workers.max_handoffs`.
+   */
   handoffRefusal(sessionId: string): string | undefined {
     const run = [...this.#runs.values()].find((r) => r.sessionId === sessionId);
     if (!this.#started || !run) return 'this session is not running';

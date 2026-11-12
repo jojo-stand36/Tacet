@@ -219,6 +219,22 @@ describe('checkReply', () => {
     });
   });
 
+  it('redacts and caps a free-text answer; empty options are none; an ambiguous option forwards', () => {
+    const r = check(
+      {
+        verdict: 'answer',
+        answer: `use sk-ant-api03-${'a'.repeat(40)} ${'z'.repeat(2000)}`,
+        cites: ['D1'],
+      },
+      { options: [] },
+    );
+    expect(r.verdict === 'answer' && r.answer.length).toBe(1000);
+    expect(JSON.stringify(r)).not.toContain('sk-ant-api03-a');
+    expect(
+      check({ verdict: 'answer', answer: 'yes', cites: ['D1'] }, { options: ['Yes!', 'yes'] }),
+    ).toMatchObject({ why: 'the answer is ambiguous' });
+  });
+
   it('caps and redacts the rationale, and refuses anything but the JSON shape', () => {
     const r = check({
       verdict: 'answer',
@@ -254,9 +270,14 @@ describe('escalationGate (ADR-004 B)', () => {
       config: c,
       reasoner,
       aside: async (taskId, _label, fn) => {
-        const out = await fn({ marker: 'm', signal: new AbortController().signal });
-        charged.push({ taskId, usage: out.usage });
-        return out.result;
+        const used: unknown[] = [];
+        const out = await fn({
+          marker: 'm',
+          signal: new AbortController().signal,
+          charge: (u) => used.push(u),
+        });
+        charged.push({ taskId, usage: used[0] });
+        return out;
       },
       timeoutMs: () => 30_000,
     });
@@ -343,6 +364,57 @@ describe('escalationGate (ADR-004 B)', () => {
     });
   });
 
+  it("weighs the root task's budget, spent by all its sub-tasks, for a Worker on a sub-task", async () => {
+    created('root-6', undefined, { budget: { usd: 1 } });
+    created('root-6/1', 'root-6');
+    created('root-6/2', 'root-6');
+    const spend = (id: string, costUsd: number) =>
+      append(id, 'agent.usage', {
+        t: 'usage',
+        source: 'reported',
+        inputTokens: 1,
+        outputTokens: 1,
+        costUsd,
+      });
+    spend('root-6/1', 0.5);
+    expect(await gate(config('high'))(escalation('root-6/2'), b('root-6/2'))).toMatchObject({
+      source: 'mini',
+    });
+    // The root's own goal is shown as the user's; the sub-task's is fenced.
+    expect(calls.at(-1)).toMatchObject({ goal: 'goal of root-6', subtaskGoal: 'goal of root-6/2' });
+    spend('root-6/2', 0.45);
+    expect(await gate(config('high'))(escalation('root-6/1'), b('root-6/1'))).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('stops the reasoning when the gate is out of time', async () => {
+    let seen: AbortSignal | undefined;
+    const slow = escalationGate({
+      store,
+      config: config('high'),
+      reasoner: {
+        reason: (req) =>
+          new Promise((resolve) => {
+            seen = req.signal;
+            req.signal.addEventListener('abort', () =>
+              resolve({
+                verdict: { verdict: 'forward', why: 'stopped' },
+                usage: { inputTokens: 0, outputTokens: 0 },
+              }),
+            );
+          }),
+      },
+      aside: async (_t, _l, fn) =>
+        fn({ marker: 'm', signal: new AbortController().signal, charge: () => {} }),
+      timeoutMs: () => 50,
+    });
+    const backend = new EventLogBackend({ store, gate: slow, gateTimeoutMs: 20 });
+    const r = await backend.escalate(b('root-1'), { question: 'Slow?', urgency: 'low' });
+    expect(r.status).toBe('pending');
+    await new Promise((res) => setTimeout(res, 10));
+    expect(seen?.aborted).toBe(true);
+  });
+
   it("is recorded as the Mini-conductor's, never as precedent", async () => {
     const backend = new EventLogBackend({ store, gate: gate(config('high')) });
     const r = await backend.escalate(b('root-1'), { question: 'Name the module?', urgency: 'low' });
@@ -387,6 +459,55 @@ describe('AdapterReasoner', () => {
     expect(cwd).toMatch(/tacet-gate-/);
     expect(existsSync(cwd)).toBe(false);
     expect(adapter.discarded).toHaveLength(1);
+  });
+
+  it('forwards when the session cannot start, or the gate stopped waiting meanwhile', async () => {
+    const failing = new ScriptedAdapter('fake', () => ({ do: 'reply', text: '' }));
+    failing.startDelayMs = 0;
+    const broken = Object.assign(Object.create(failing), {
+      start: async () => {
+        throw new Error('no binary');
+      },
+    }) as ScriptedAdapter;
+    expect(
+      (
+        await new AdapterReasoner({
+          worker: { adapter: broken, authRoute: 'api_key' },
+          adapterId: 'fake',
+        }).reason(req())
+      ).verdict,
+    ).toEqual({ verdict: 'forward', why: 'the reasoning session could not start' });
+    const stop = new AbortController();
+    const adapter = new ScriptedAdapter('fake', () => ({ do: 'reply', text: '{}' }));
+    let release = () => {};
+    adapter.startGate = new Promise<void>((r) => {
+      release = r;
+    });
+    const pending = new AdapterReasoner({
+      worker: { adapter, authRoute: 'api_key' },
+      adapterId: 'fake',
+    }).reason(req({ signal: stop.signal }));
+    await new Promise((r) => setTimeout(r, 10));
+    stop.abort();
+    release();
+    expect((await pending).verdict).toEqual({
+      verdict: 'forward',
+      why: 'the gate stopped waiting',
+    });
+    expect(adapter.sessions[0]?.inputs ?? []).toEqual([]);
+  });
+
+  it('fences the sub-task goal', () => {
+    const p = reasonerPrompt({
+      goal: 'User goal',
+      subtaskGoal: 'Planner goal',
+      escalation: escalation('root-1'),
+      candidates: [],
+      alwaysAsk: [],
+      mayAnswerWithoutPrecedent: true,
+    });
+    expect(p).toContain("The task's goal: User goal");
+    expect(p).toMatch(/<<<UNTRUSTED-[0-9a-f]{16} the sub-task the agent works on\nPlanner goal/);
   });
 
   it('answers when the reply checks out', async () => {

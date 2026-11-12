@@ -31,6 +31,7 @@ const MIN_SHARED_TERMS = 2;
 /** Each untrusted field in the prompt, in characters (ADR-004 B). */
 const FIELD_CAP = 4000;
 const RATIONALE_CAP = 1000;
+const ANSWER_CAP = 1000;
 
 function terms(text: string): Set<string> {
   return new Set(
@@ -109,9 +110,13 @@ function fence(tag: string, label: string, text: string): string[] {
   return [`<<<UNTRUSTED-${tag} ${label}`, capped, `UNTRUSTED-${tag}>>>`];
 }
 
-/** The request: the task's goal, then every untrusted field fenced by markers it cannot guess. */
+/**
+ * The request: the user's task goal, then every untrusted field fenced by markers it cannot
+ * guess, the sub-task's goal among them (the planner wrote it after reading the repo).
+ */
 export function reasonerPrompt(o: {
   goal: string;
+  subtaskGoal?: string;
   escalation: Escalation;
   candidates: readonly Candidate[];
   alwaysAsk: readonly string[];
@@ -123,13 +128,16 @@ export function reasonerPrompt(o: {
     'Decide whether to answer this question for the user.',
     '',
     `The task's goal: ${o.goal.slice(0, FIELD_CAP)}`,
+    ...(o.subtaskGoal !== undefined
+      ? fence(tag, 'the sub-task the agent works on', o.subtaskGoal)
+      : []),
     o.mayAnswerWithoutPrecedent
       ? 'You may answer without a past decision when the answer is clear and low-risk.'
       : 'You may answer only by citing at least one of the past decisions below; otherwise forward.',
     '',
     ...fence(tag, 'question', x.question),
     ...(x.context !== undefined ? fence(tag, 'context', x.context) : []),
-    ...(x.options && x.options.length > 0
+    ...(hasOptions(x.options)
       ? fence(tag, 'options', x.options.map((op) => `- ${op}`).join('\n'))
       : ['There are no options: the answer is free text.']),
     ...fence(
@@ -145,6 +153,11 @@ export function reasonerPrompt(o: {
       o.alwaysAsk.length > 0 ? o.alwaysAsk.map((r) => `- ${r}`).join('\n') : '(none)',
     ),
   ].join('\n');
+}
+
+/** Options to choose from; an empty list is none (free text). */
+function hasOptions(options: readonly string[] | undefined): options is readonly string[] {
+  return options !== undefined && options.length > 0;
 }
 
 const Reply = z.strictObject({
@@ -193,11 +206,16 @@ export function checkReply(
   }
   let answer = (r.answer ?? '').trim();
   if (answer === '') return { verdict: 'forward', why: 'the answer is empty' };
-  if (o.options && o.options.length > 0) {
+  if (hasOptions(o.options)) {
     const want = normalizeQuestion(answer);
-    const option = o.options.find((op) => normalizeQuestion(op) === want);
-    if (option === undefined) return { verdict: 'forward', why: 'the answer is not an option' };
-    answer = option;
+    const matching = o.options.filter((op) => normalizeQuestion(op) === want);
+    if (matching.length === 0) return { verdict: 'forward', why: 'the answer is not an option' };
+    // Options that only differ in case or punctuation: which one it meant cannot be told.
+    if (new Set(matching).size > 1) return { verdict: 'forward', why: 'the answer is ambiguous' };
+    answer = matching[0] as string;
+  } else {
+    // Free text goes into the log and up to the Conductor: no secret it echoed, and short.
+    answer = redactSecrets(answer).slice(0, ANSWER_CAP);
   }
   const rationale = redactSecrets(r.rationale.replace(/\s+/g, ' ').trim()).slice(0, RATIONALE_CAP);
   return { verdict: 'answer', answer, rationale, cites: [...new Set(r.cites)] };
@@ -215,7 +233,10 @@ export interface AdapterReasonerOptions {
 
 /** One reasoning request, as the gate asks it. */
 export interface ReasonRequest {
+  /** The root task's goal: the user's. */
   goal: string;
+  /** The sub-task's goal, when the Worker is on one: the planner's, fenced as untrusted. */
+  subtaskGoal?: string;
   escalation: Escalation;
   candidates: readonly Candidate[];
   alwaysAsk: readonly string[];
@@ -284,6 +305,8 @@ export class AdapterReasoner {
       const onAbort = () => void adapter.close(h).catch(() => {});
       req.signal.addEventListener('abort', onAbort, { once: true });
       try {
+        // Stopped while it started: nothing more to wait for.
+        if (req.signal.aborted) return forward('the gate stopped waiting');
         const turns = sessionTurns(this.#o.worker, h, usage, {
           label: 'escalation gate',
           refusal: 'The escalation gate is read-only: everything it needs is in the message.',
@@ -292,6 +315,7 @@ export class AdapterReasoner {
         const reply = await turns(
           reasonerPrompt({
             goal: req.goal,
+            ...(req.subtaskGoal !== undefined ? { subtaskGoal: req.subtaskGoal } : {}),
             escalation: req.escalation,
             candidates: req.candidates,
             alwaysAsk: req.alwaysAsk,
@@ -302,7 +326,7 @@ export class AdapterReasoner {
           return {
             verdict: checkReply(reply, {
               candidates: req.candidates,
-              ...(req.escalation.options ? { options: req.escalation.options } : {}),
+              ...(hasOptions(req.escalation.options) ? { options: req.escalation.options } : {}),
               needsCite: !req.mayAnswerWithoutPrecedent,
             }),
             usage: usageOut(),
