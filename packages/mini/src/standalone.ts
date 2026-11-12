@@ -26,6 +26,7 @@ import { LINK_METHODS, startMiniControl, taskMethods } from './control/server.js
 import { MiniConductor } from './daemon/daemon.js';
 import { AdapterPlanner, SingleStepPlanner } from './daemon/planner.js';
 import type { Planner, PlanResult, Reviewer, WorkerAdapter, Workspaces } from './daemon/ports.js';
+import { deterministicGate } from './gate/gate.js';
 import { GitIntegrator } from './git/integrate.js';
 import { eventForwarding } from './link/forward.js';
 import { EventLogBackend } from './mcp/backend.js';
@@ -178,6 +179,12 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
         store,
         repo: paths.repoId,
         miniId: 'standalone',
+        // The escalation gate (#25, ADR-004): the user's own exact precedent only, so far.
+        gate: deterministicGate({
+          store,
+          repo: paths.repoId,
+          alwaysAsk: config.escalation?.always_ask ?? [],
+        }),
         // A Worker's handoff (#129): the Mini-conductor, made below, decides and reseeds.
         canHandoff: (b) =>
           started ? started.handoffRefusal(b.workerSessionId) : 'not running yet',

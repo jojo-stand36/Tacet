@@ -139,6 +139,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Cross-project goals: split one goal into tasks across repos** — `feature` `P1` `either`
 - [ ] **Decision inbox: dedupe, batch, rank, answer, propagate** — `feature` `P0` `either`
 - [ ] **Escalation gate in mini-conductor** — `feature` `P0` `claude`
+- [ ] **Escalation gate: an incremental precedent index instead of scanning the log** — `feature` `P2` `either`
 - [ ] **Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)** — `feature` `P2` `claude`
 - [ ] **Summary packets (no transcripts upward)** — `feature` `P1` `either`
 - [ ] **Tasks down the Conductor link: create tasks and answer escalations** — `feature` `P1` `claude + human`

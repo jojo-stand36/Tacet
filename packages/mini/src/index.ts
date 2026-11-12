@@ -57,6 +57,16 @@ export {
   pickReady,
   type SchedulableSubtask,
 } from './daemon/scheduler.js';
+export {
+  alwaysAskMatch,
+  type DeterministicGateOptions,
+  deterministicGate,
+  findPrecedent,
+  normalizeQuestion,
+  type Precedent,
+  precedentKey,
+  rootTasks,
+} from './gate/gate.js';
 export { type ReviewDiff, type ReviewDiffOptions, reviewDiff } from './git/diff.js';
 export {
   GitIntegrator,
@@ -68,6 +78,7 @@ export {
   type EscalationGate,
   EventLogBackend,
   type EventLogBackendOptions,
+  type GateAnswer,
   type MiniBackend,
   ToolError,
 } from './mcp/backend.js';

@@ -1522,6 +1522,17 @@
       "body": "Resolve what can be resolved locally (precedent decisions, own reasoning); escalate the rest. Decided in ADR-004 (`docs/adr/004-escalation-gate.md`): policies decide tool approvals only and never answer an escalation; CEL rules that can answer one (#339), and a tool `ask` that grants (#340), are their own issues (ADR-004 H).\n\n### Tasks\n- [ ] Autonomy dial low/medium/high\n- [ ] `always_ask` rules from config\n- [ ] Precedent matching against decisions log\n- [ ] Log every auto-resolution with rationale (auditable)\n- [ ] Borrow (ADR-001): Three-level policy model with ALLOW/DENY/ASK where DENY short-circuits, mapped to task > repo `.tacet/` > user config; ASK becomes an Escalation (Omnigent `docs/POLICIES.md`)\n- [ ] Borrow (ADR-001): Severity-routed escalation where each tier resolves or forwards (Gas Town `docs/design/escalation.md`). Stale re-escalation of unanswered items moved to the inbox (#26, #45) by ADR-004 H\n\n### Acceptance criteria\n- Configurable; measured escalation rate shown per repo\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Escalation gate: an incremental precedent index instead of scanning the log",
+      "milestone": "M2 · Conductor & escalation",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "The deterministic escalation gate (#25 PR3) and the MCP `read_task` and `search_decisions` tools read every `task.created`, `escalation.raised` and `decision.recorded` event on each call, synchronously, to find root tasks and exact precedent. On a long-lived repo's log this blocks the Mini-conductor's event loop, and the gate's time limit cannot bound synchronous work. Keep an index that is updated incrementally from the log (`afterSeq`) instead.\n\n### Tasks\n- [ ] A parent map (task → root task) and a map from precedent key (ADR-004 A) to the newest user Decision in scope, built once and updated from `lastSeq`\n- [ ] Use it in `deterministicGate`, `read_task` and `search_decisions`\n- [ ] Superseding and new Decisions take effect on the next call\n\n### Acceptance criteria\n- Results are the same as the scan's on the existing gate tests\n- With a log of 100k events, an `escalate` call's gate step reads only the events appended since the previous call\n\n_See docs/ARCHITECTURE.md and docs/adr/004-escalation-gate.md for context._"
+    },
+    {
       "title": "Expose mini-conductor as an ACP agent (use from Zed/JetBrains/Neovim)",
       "milestone": "M2 · Conductor & escalation",
       "labels": [
