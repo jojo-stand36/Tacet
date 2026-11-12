@@ -1,9 +1,10 @@
 # ADR-004: The escalation gate and policy evaluation
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-11
+- Accepted by the owner on 2026-11-12, on PR #338 ([comment 6834514985](https://github.com/jojo-stand36/Tacet/pull/338#issuecomment-6834514985): "Approved A–H").
 
-Issue: #25. The plan, reviewed by the architect agent, is on #25. The owner decides the items listed under "Owner items" in their own comment on the PR that adds this ADR.
+Issue: #25. The plan, reviewed by the architect agent, is on #25. The owner approved all the items listed under "Owner items" (A to H) in their own comment on PR #338.
 
 ## Context
 
