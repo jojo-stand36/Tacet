@@ -194,6 +194,8 @@ Plugins, A2A/ACP exposure, sandboxing, evals, docs, release.
 - [ ] **Expose conductor via A2A** — `feature` `P2` `claude`
 - [ ] **OS sandboxing for workers (bubblewrap / seatbelt / containers)** — `feature` `P2` `either`
 - [ ] **Plugin system: adapters, channels, tools, workflows** — `feature` `P2` `either`
+- [ ] **Policies: CEL rules that can answer an escalation** — `feature` `P3` `claude + human`
 - [ ] **Re-check Bun when oven-sh/bun#25822 closes** — `spike` `P2` `claude`
 - [ ] **Threat model + security review** — `docs` `P1` `claude + human`
+- [ ] **Tool `ask` that grants the refused call once answered, after the worker sandbox (#53)** — `feature` `P2` `claude + human`
 - [ ] **v0.1 release: packaging (npm, Homebrew), installers, changelog** — `chore` `P1` `copilot`
