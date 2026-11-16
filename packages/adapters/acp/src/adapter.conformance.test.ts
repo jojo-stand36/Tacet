@@ -270,12 +270,12 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
         try {
           const tap = new EventTap(a.events(h));
           await a.send(h, { text: prompt });
-          // Gemini's "safe" commands run without asking; any request is refused here.
+          // Gemini's "safe" commands run without asking; any request is refused here. From 1: the
+          // session's start reports idle first.
           const end = await tap.waitFor(
-            (e) =>
-              e.t === 'approval.request' ||
-              (e.t === 'status' && e.state === 'idle' && tap.events.some((x) => x.t === 'usage')),
+            (e) => e.t === 'approval.request' || (e.t === 'status' && e.state === 'idle'),
             60_000,
+            1,
           );
           if (end.event.t === 'approval.request') {
             asked.push(prompt);
@@ -286,11 +286,25 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
           await a.close(h);
         }
       }
-      const sent = api.requests
-        .slice(from)
-        .map((r) => r.raw)
-        .join('\n');
-      return { asked, leaked: /OUTSIDE-MARKER-350/.test(sent) };
+      const reqs = api.requests.slice(from);
+      const sent = reqs.map((r) => r.raw).join('\n');
+      // Whether the model was offered shell at all, from the declarations each request carried.
+      const declared = reqs.some((r) => {
+        try {
+          const tools = (JSON.parse(r.raw) as { tools?: unknown }).tools;
+          return JSON.stringify(tools ?? []).includes('"name":"run_shell_command"');
+        } catch {
+          return false;
+        }
+      });
+      return {
+        asked,
+        // Both calls were made and answered: each run sent the model a tool result.
+        answered: reqs.filter((r) => r.toolResult).length,
+        declared,
+        leaked: /OUTSIDE-MARKER-350/.test(sent),
+        refused: /not found in registry/.test(sent),
+      };
     };
     // Control: Gemini's own defaults (no Tacet policy, shell in the registry) read outside, unasked.
     const { tools: _noShell, ...withShell } = GEMINI_WORKER_SETTINGS;
@@ -301,8 +315,19 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
         files: { '.gemini/settings.json': JSON.stringify(withShell) },
       },
     };
-    expect(await run(control, 'control')).toEqual({ asked: [], leaked: true });
-    // The Worker spec: no shell, so nothing outside the checkout reaches the model.
-    expect(await run(GEMINI_AGENT, 'worker')).toEqual({ asked: [], leaked: false });
+    expect(await run(control, 'control')).toMatchObject({
+      asked: [],
+      answered: 2,
+      declared: true,
+      leaked: true,
+    });
+    // The Worker spec: shell is not offered, both calls fail, nothing outside reaches the model.
+    expect(await run(GEMINI_AGENT, 'worker')).toEqual({
+      asked: [],
+      answered: 2,
+      declared: false,
+      leaked: false,
+      refused: true,
+    });
   });
 });
