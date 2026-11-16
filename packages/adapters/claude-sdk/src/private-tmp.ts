@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /**
  * Where Claude Code's Linux sandbox may write and leave placeholders, and how Tacet keeps that
@@ -34,18 +34,11 @@ export function refuseSharedCwd(
   /** The HOME the session itself runs with, when it differs from `env`'s. */
   sessionHome?: string,
 ): void {
-  const real = (p: string): string => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return resolve(p);
-    }
-  };
-  const at = real(cwd);
+  const at = realPath(cwd);
   const shared = new Set(
     ['/', '/tmp', tmpdir(), env.TMPDIR, env.HOME, sessionHome, homedir()]
       .filter((p): p is string => typeof p === 'string' && p !== '' && isAbsolute(p))
-      .map(real),
+      .map(realPath),
   );
   for (const dir of shared) {
     // The cwd is that directory, or one above it (whose write root would hold it).
@@ -54,6 +47,26 @@ export function refuseSharedCwd(
       throw new Error(
         `refusing a Claude session in ${at}: its sandbox writes placeholders into its working directory, which must not be (or contain) ${dir} (#326)`,
       );
+    }
+  }
+}
+
+/**
+ * `p` after symlinks, also when it does not exist (yet): the deepest ancestor that exists is
+ * resolved and the rest appended. A HOME or TMPDIR that is not there still compares in the same
+ * form as a cwd that is (on macOS `/home` is `/System/Volumes/Data/home`, `/tmp` `/private/tmp`).
+ */
+function realPath(p: string): string {
+  let at = resolve(p);
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync(at), ...rest);
+    } catch {
+      const up = dirname(at);
+      if (up === at) return resolve(p);
+      rest.unshift(basename(at));
+      at = up;
     }
   }
 }

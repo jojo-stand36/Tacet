@@ -73,13 +73,28 @@ describe('refuseSharedCwd', () => {
   it('compares after symlinks', () => {
     const link = join(root, 'to-tmp');
     symlinkSync('/tmp', link);
-    expect(() => refuseSharedCwd(link, env)).toThrow(/in \/tmp/);
+    // `/tmp` itself may be a link (macOS: `/private/tmp`): the message names the real dir.
+    expect(() => refuseSharedCwd(link, env)).toThrow(`in ${realpathSync('/tmp')}:`);
     const home = join(root, 'home');
     mkdirSync(home);
     const alias = join(root, 'home-link');
     symlinkSync(home, alias);
     expect(() => refuseSharedCwd(home, { HOME: alias })).toThrow(/refusing/);
     expect(() => refuseSharedCwd(join(home, 'repo'), { HOME: alias })).not.toThrow();
+  });
+
+  it('compares a HOME or TMPDIR that does not exist after the links above it', () => {
+    // As on macOS, where `/home` is `/System/Volumes/Data/home` and `/var` is `/private/var`.
+    const data = join(root, 'data', 'home');
+    mkdirSync(data, { recursive: true });
+    const link = join(root, 'home');
+    symlinkSync(data, link);
+    const env = { HOME: join(link, 'someone'), TMPDIR: join(link, 'tmp', 'x') };
+    for (const cwd of [link, data, root, join(data, 'someone')]) {
+      expect(() => refuseSharedCwd(cwd, env), cwd).toThrow(/refusing a Claude session/);
+    }
+    expect(() => refuseSharedCwd(join(data, 'someone', 'repo'), env)).not.toThrow();
+    expect(() => refuseSharedCwd(join(data, 'other'), env)).not.toThrow();
   });
 });
 
