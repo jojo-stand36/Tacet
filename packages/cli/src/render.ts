@@ -69,7 +69,10 @@ export function formatEvent(e: EventEnvelope): string {
       what = `escalation ${str(d, 'id') ?? '?'}: ${oneLine(str(d, 'question') ?? '', 400)}`;
       break;
     case 'escalation.resolved':
-      what = `escalation ${str(d, 'escalationId') ?? '?'} answered${str(d, 'answer') ? `: ${oneLine(str(d, 'answer') ?? '')}` : ''}`;
+      what =
+        str(d, 'source') === 'canceled'
+          ? `escalation ${str(d, 'escalationId') ?? '?'} withdrawn (task canceled)`
+          : `escalation ${str(d, 'escalationId') ?? '?'} answered${str(d, 'answer') ? `: ${oneLine(str(d, 'answer') ?? '')}` : ''}`;
       break;
     case 'agent.message.delta':
       what = `says:\n  ${(str(d, 'text') ?? '').trim().split('\n').join('\n  ')}`;

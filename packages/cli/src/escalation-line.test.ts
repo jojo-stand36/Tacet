@@ -35,6 +35,10 @@ describe('the escalation line of tacet status (#25)', () => {
     ).toBe(
       '3 from Workers, 1 answered without you (precedent 1), 1 to you (50%), 1 withdrawn (task canceled)',
     );
+    // Every one withdrawn: no rate, and nothing said to have gone to the user.
+    expect(formatEscalationStats(stats({ raised: 2, withdrawn: 2, rate: null }))).toBe(
+      '2 from Workers, 0 answered without you, 2 withdrawn (task canceled)',
+    );
     expect(formatEscalationStats(stats({ raisedByMini: 1 }))).toBe(
       '0 from Workers, 1 from the Mini-conductor',
     );

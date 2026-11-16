@@ -1544,6 +1544,31 @@ describe('MiniConductor', () => {
           source: 'canceled',
         },
       ]);
+      expect(
+        ofType('escalation.delivered', `${id}/2`).map(
+          (e) => (e.data as { escalationId: string }).escalationId,
+        ),
+      ).toEqual(['01JZZZZZZZZZZZZZZZZZZZZZB1']);
+      expect(
+        Object.values(tasks()[`${id}/2`]?.escalations ?? {}).filter((x) => x.status === 'pending'),
+      ).toEqual([]);
+    });
+
+    it('withdraws a question raised on a canceled task after the cancel, and says so on an answer (#362)', async () => {
+      const d = make({ planner: plan3() });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => fake.open, { timeout: 5000 }).toBe(2);
+      await d.cancel(id);
+      await d.settled();
+      // As a gated `escalate` that timed out after the cancel would write it.
+      ask(`${id}/1`, '01JZZZZZZZZZZZZZZZZZZZZZC1');
+      await expect
+        .poll(() => resolutions(`${id}/1`).map((r) => r.source), { timeout: 5000 })
+        .toEqual(['canceled']);
+      expect(() => d.answer('01JZZZZZZZZZZZZZZZZZZZZZC1', 'left')).toThrow(
+        'was withdrawn: its task was canceled',
+      );
     });
 
     it('refuses an unknown task, a sub-task and a task that has ended', async () => {
@@ -3524,10 +3549,16 @@ describe('budgets (#35)', () => {
       await expect.poll(() => ofType('budget.unpriced').length, { timeout: 5000 }).toBe(2);
       expect(ofType('budget.unpriced').map((e) => e.taskId)).toEqual([`${a}/1`, `${b}/1`]);
       // The first question is retired, so it is not left open on a canceled task.
-      // The cancel withdrew it (#362); it is asked again on b.
+      // The cancel withdrew it (#362), which neither allows nor refuses the model; it is asked
+      // again on b.
       expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({
         source: 'canceled',
       });
+      expect(
+        ofType('budget.unpriced').filter(
+          (e) => (e.data as { allowed?: boolean }).allowed !== undefined,
+        ),
+      ).toEqual([]);
       d.answer(lastEscalation(`${b}/1`)?.id ?? '', 'yes');
       await d.settled();
       expect(tasks()[`${b}/1`]?.state).toBe('completed');
@@ -3668,8 +3699,9 @@ describe('budgets (#35)', () => {
     await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(2);
     expect(ofType('budget.exceeded')[1]?.taskId).toBe(b);
     expect(ofType('task.planned', b)).toHaveLength(0);
-    // The cancel withdrew it (#362); it is asked again on b.
+    // The cancel withdrew it (#362), which raises nothing; it is asked again on b.
     expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({ source: 'canceled' });
+    expect(ofType('budget.raised')).toEqual([]);
     d.answer(lastEscalation(b)?.id ?? '', '10');
     await d.settled();
     expect(tasks()[`${b}/1`]?.state).toBe('completed');

@@ -745,7 +745,14 @@ export class MiniConductor {
     if (!this.#started) throw new Error('call start() first');
     const x = this.#state().escalations.get(escalationId);
     if (!x) throw new Error(`unknown escalation ${escalationId}`);
-    if (x.resolved) throw new Error(`escalation ${escalationId} is already resolved`);
+    if (x.resolved) {
+      const withdrawn = x.answer === WITHDRAWN_ANSWER;
+      throw new Error(
+        withdrawn
+          ? `escalation ${escalationId} was withdrawn: its task was canceled`
+          : `escalation ${escalationId} is already resolved`,
+      );
+    }
     if (answer.trim() === '') throw new Error('an answer must not be empty');
     const raised = this.#raised(x.taskId, escalationId);
     const at = this.#now();
@@ -1036,6 +1043,7 @@ export class MiniConductor {
   }
 
   async #tick(gen: number): Promise<void> {
+    this.#withdrawOnCanceled();
     await this.#enforceBudgets();
     // Tasks a spent cap kept from being planned, once it is raised (#35).
     for (const t of Object.values(this.#state().tasks)) {
@@ -1798,6 +1806,23 @@ export class MiniConductor {
       ...also,
     ]);
     return escalation.id;
+  }
+
+  /**
+   * A question still open on a canceled task is withdrawn (#362): one raised while the cancel ran
+   * (a gated `escalate` that timed out after it, a budget question on a task being planned), or
+   * left in a log written before #362.
+   */
+  #withdrawOnCanceled(): void {
+    if (!this.#started) return;
+    const v = this.#state();
+    const events: EventEnvelope[] = [];
+    for (const x of v.escalations.values()) {
+      if (!x.resolved && v.tasks[x.taskId]?.state === 'canceled') {
+        events.push(...withdrawEvents(x, (...a) => this.#env(...a)));
+      }
+    }
+    if (events.length > 0) this.#o.store.append(events);
   }
 
   // ---- Budgets (#35) -------------------------------------------------------------------------
@@ -3542,6 +3567,23 @@ type MakeEnvelope = (
 ) => EventEnvelope;
 
 /**
+ * An open escalation withdrawn because its task was canceled (#362): resolved with
+ * `source: canceled`, and delivered, so no Worker or budget check reads it as an answer.
+ */
+function withdrawEvents(x: EscalationRecord, env: MakeEnvelope): EventEnvelope[] {
+  return [
+    env(x.taskId, 'escalation.resolved', {
+      escalationId: x.id,
+      answer: WITHDRAWN_ANSWER,
+      source: 'canceled',
+    }),
+    env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
+  ];
+}
+
+const WITHDRAWN_ANSWER = 'no longer needed: the task was canceled';
+
+/**
  * The events that cancel `taskId`: `worker.ended` (`canceled`) for each of its sessions with no
  * end recorded, except `open` ones the caller ends itself; every escalation still open on the task
  * or a sub-task resolved as withdrawn (`source: canceled`, and delivered, so no Worker or budget
@@ -3569,15 +3611,7 @@ function cancelEvents(
     }
   }
   for (const x of v.escalations.values()) {
-    if (x.resolved || !ours(x.taskId)) continue;
-    events.push(
-      env(x.taskId, 'escalation.resolved', {
-        escalationId: x.id,
-        answer: 'no longer needed: the task was canceled',
-        source: 'canceled',
-      }),
-      env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
-    );
+    if (!x.resolved && ours(x.taskId)) events.push(...withdrawEvents(x, env));
   }
   const subs = Object.values(v.tasks)
     .filter((t) => t.task.id !== taskId && ours(t.task.id) && !TERMINAL.has(t.state))
