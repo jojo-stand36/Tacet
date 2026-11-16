@@ -110,7 +110,28 @@ export const GEMINI_WORKER_SETTINGS = {
     folderTrust: { enabled: true },
   },
   advanced: { ignoreLocalEnv: true },
+  // No shell for Gemini Workers (#350, owner decision 2026-11-16): Gemini 0.67.0 runs a list of
+  // "safe" shell commands without asking, and its path check sees only each literal argument, so
+  // `cat ln*` or `grep -R` through a symlink out of the checkout read outside it with no request
+  // reaching Tacet (verified live). Removed from Gemini's tool registry here, and denied again by
+  // the policy file in the same home (`GEMINI_WORKER_POLICY`).
+  tools: { exclude: ['run_shell_command'] },
 };
+
+/**
+ * A user-tier Gemini policy in the Worker's own home (`<GEMINI_CLI_HOME>/.gemini/policies`), the
+ * second layer of #350's shell removal: a `deny` rule is never loosened by Gemini's safe-command
+ * heuristic (verified in the 0.67.0 source and live, capability matrix "Turning off no-ask shell
+ * (#321 c3)"). The checkout's own policies never load (untrusted).
+ */
+export const GEMINI_WORKER_POLICY = [
+  '# Written by Tacet for every session: no shell for Gemini Workers (#350).',
+  '[[rule]]',
+  'toolName = "run_shell_command"',
+  'decision = "deny"',
+  'priority = 999',
+  '',
+].join('\n');
 
 /** Capabilities every ACP v1 agent can offer through this adapter. */
 const ACP_BASE: AdapterCapabilities = {
@@ -161,7 +182,10 @@ export const GEMINI_AGENT: AcpAgentSpec = {
   // Its own `.gemini` root with the Worker settings, never the user's `~/.gemini` (#150).
   home: {
     env: 'GEMINI_CLI_HOME',
-    files: { '.gemini/settings.json': `${JSON.stringify(GEMINI_WORKER_SETTINGS, null, 2)}\n` },
+    files: {
+      '.gemini/settings.json': `${JSON.stringify(GEMINI_WORKER_SETTINGS, null, 2)}\n`,
+      '.gemini/policies/tacet.toml': GEMINI_WORKER_POLICY,
+    },
   },
   // It would trust the checkout, and a trusted folder's `.gemini/.env` loads whatever
   // `ignoreLocalEnv` says (bundle `findEnvFile`).
