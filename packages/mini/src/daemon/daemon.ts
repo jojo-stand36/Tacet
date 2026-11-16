@@ -1876,10 +1876,12 @@ export class MiniConductor {
    * no cost and no price is known for the model today. The tier's model is the profile's
    * (`chooseProfile`); with none, the vendor's default, named `default@<adapter>`.
    */
-  #unpricedTier(tier: TierConfig): string | undefined {
+  #unpricedTier(tier: TierConfig, worker: boolean): string | undefined {
     const adapter = this.#o.adapters[tier.adapter]?.adapter;
     if (adapter?.capabilities().usage.cost !== 'none') return undefined;
-    const model = tier.model ?? tier.models?.[0];
+    // Workers run on the profile's model, `models[0]` when only a list is set; the planner, the
+    // gate's reasoning and the reviewer are given `model` only, else the vendor's default.
+    const model = worker ? (tier.model ?? tier.models?.[0]) : tier.model;
     const price = priceFor(model, this.#pricing);
     const today = this.#now().toISOString().slice(0, 10);
     if (price && (price.until === undefined || today <= price.until)) return undefined;
@@ -1894,18 +1896,18 @@ export class MiniConductor {
   #unpricedModels(taskId: string): string[] {
     if (!this.#anyCap(taskId)) return [];
     const v = this.#state();
-    const tiers: TierConfig[] = [];
+    const tiers: [TierConfig, boolean][] = [];
     if (!v.tasks[taskId]?.task.parentId) {
-      if (this.#o.plannerTier) tiers.push(this.#o.plannerTier);
+      if (this.#o.plannerTier) tiers.push([this.#o.plannerTier, false]);
     } else {
-      tiers.push(this.#tierFor(v.kinds.get(taskId)));
-      if (this.#o.reasonerTier) tiers.push(this.#o.reasonerTier);
+      tiers.push([this.#tierFor(v.kinds.get(taskId)), true]);
+      if (this.#o.reasonerTier) tiers.push([this.#o.reasonerTier, false]);
       const review = this.#o.config.tiers?.review;
-      if (this.#o.config.review?.enabled && this.#o.reviewer && review) tiers.push(review);
+      if (this.#o.config.review?.enabled && this.#o.reviewer && review) tiers.push([review, false]);
     }
     const out = new Set<string>();
-    for (const t of tiers) {
-      const m = this.#unpricedTier(t);
+    for (const [t, worker] of tiers) {
+      const m = this.#unpricedTier(t, worker);
       if (m !== undefined) out.add(m);
     }
     return [...out];
@@ -2072,9 +2074,10 @@ export class MiniConductor {
    * answer that no longer matters.
    */
   #retireStaleBudgetQuestions(): void {
-    const v = this.#state();
     const now = this.#now().toISOString();
-    for (const rec of Object.values(v.ledger.exceeded)) {
+    for (const rec of Object.values(this.#state().ledger.exceeded)) {
+      // Read again per record: retiring one question changes what is open on its task.
+      const v = this.#state();
       const current =
         rec.scope === 'day'
           ? now.slice(0, 10)
@@ -2386,15 +2389,22 @@ export class MiniConductor {
     }
     const spent = this.#overBudget(subtaskId);
     if (spent) {
-      // A cap was spent while the session started (#35): end it before its first message. Nothing
-      // ran in it, so its vendor state goes; the run after a raise starts afresh.
-      revoke();
-      await worker.adapter.close(handle).catch(() => {});
-      if (this.#markers.delete(sessionId)) this.#saveMarkers();
-      if (handle.vendorSessionId) {
-        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
-      }
-      this.#o.store.append(
+      // A cap was spent while the session started (#35): end it before its first message. The end
+      // is written first, so a cancel or a crash meanwhile cannot end it a second time. A resumed
+      // session keeps the conversation it resumed, for the run after a raise; a fresh one, in
+      // which nothing ran, gives its vendor state back.
+      const keep = resume !== undefined && handle.vendorSessionId !== undefined;
+      this.#o.store.append([
+        ...(keep
+          ? [
+              this.#env(
+                subtaskId,
+                'worker.vendor_session',
+                { sessionId, vendorSessionId: handle.vendorSessionId },
+                sessionId,
+              ),
+            ]
+          : []),
         this.#env(
           subtaskId,
           'worker.ended',
@@ -2405,7 +2415,13 @@ export class MiniConductor {
           },
           sessionId,
         ),
-      );
+      ]);
+      revoke();
+      await worker.adapter.close(handle).catch(() => {});
+      if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      if (!keep && handle.vendorSessionId) {
+        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
+      }
       this.#kick();
       return;
     }

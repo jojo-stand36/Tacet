@@ -3561,6 +3561,7 @@ describe('budgets (#35)', () => {
     await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(2);
     expect(ofType('budget.exceeded')[1]?.taskId).toBe(b);
     expect(ofType('task.planned', b)).toHaveLength(0);
+    expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({ source: 'mini' });
     d.answer(lastEscalation(b)?.id ?? '', '10');
     await d.settled();
     expect(tasks()[`${b}/1`]?.state).toBe('completed');
@@ -3666,6 +3667,111 @@ describe('budgets (#35)', () => {
     await expect
       .poll(() => ofType('agent.usage', dropped).map((e) => e.data), { timeout: 5000 })
       .toEqual([{ t: 'usage', source: 'reported', ...spent }]);
+  });
+
+  describe('a cap spent while a session starts', () => {
+    /** Spends the month cap (from elsewhere) while a session starts, when `armed`. */
+    class SpendsOnStart extends ScriptedAdapter {
+      armed = false;
+      onStart: () => void = () => {};
+      override async start(opts: SessionOptions) {
+        const h = await super.start(opts);
+        if (this.armed) this.onStart();
+        return h;
+      }
+    }
+
+    it('ends a fresh session before its first message and gives its vendor state back', async () => {
+      let elsewhere = 0;
+      const a = new SpendsOnStart('fake', script);
+      a.armed = true;
+      a.onStart = () => {
+        elsewhere = 1000;
+      };
+      fake = a;
+      const d = make({
+        config: { ...CONFIG, budget: { api_key_per_month_usd: 200 } },
+        monthSpendElsewhere: () => elsewhere,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => reasonsOf(`${id}/1`), { timeout: 5000 }).toEqual(['budget']);
+      await expect.poll(() => a.discarded.length, { timeout: 5000 }).toBe(1);
+      expect(a.sessions[0]?.inputs ?? []).toHaveLength(0);
+      expect(ofType('budget.exceeded', `${id}/1`)).toHaveLength(1);
+    });
+
+    it('keeps the conversation a resumed session carries, for the run after a raise', async () => {
+      let elsewhere = 0;
+      let turns = 0;
+      const a = new SpendsOnStart('fake', () =>
+        ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+      );
+      a.onStart = () => {
+        elsewhere = 1000;
+      };
+      fake = a;
+      const d = make({
+        config: { ...CONFIG, budget: { per_task_usd: 1, api_key_per_month_usd: 200 } },
+        monthSpendElsewhere: () => elsewhere,
+      });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      const sub = `${id}/1`;
+      await expect.poll(() => reasonsOf(sub), { timeout: 5000 }).toEqual(['budget']);
+      const vendor = a.sessions[0]?.handle.vendorSessionId;
+      // The task cap is raised, and the month cap is spent while the resumed session starts.
+      a.armed = true;
+      d.answer(lastEscalation(sub)?.id ?? '', '5');
+      await expect.poll(() => reasonsOf(sub), { timeout: 5000 }).toEqual(['budget', 'budget']);
+      expect(a.sessions[1]?.opts.resume?.vendorSessionId).toBe(vendor);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(a.discarded).toEqual([]);
+      // Raised again: the next run resumes the same conversation.
+      a.armed = false;
+      elsewhere = 0;
+      await expect
+        .poll(() => ofType('budget.exceeded', sub).length, { timeout: 5000 })
+        .toBeGreaterThan(1);
+      d.answer(lastEscalation(sub)?.id ?? '', '5000');
+      await d.settled();
+      expect(a.sessions.at(-1)?.opts.resume?.vendorSessionId).toBe(vendor);
+      expect(tasks()[sub]?.state).toBe('completed');
+    });
+  });
+
+  it('leaves a task waiting when a stale day question is retired but another question is open', async () => {
+    let clock = new Date('2026-11-16T23:59:00.000Z');
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } }, now: () => clock });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(1);
+    // Another question, open on the same sub-task.
+    store.append({
+      v: 1,
+      id: '01JZZZZZZZZZZZZZZZZZZZZZZY',
+      ts: clock.toISOString(),
+      source: { kind: 'mini', id: 'test' },
+      type: 'escalation.raised',
+      taskId: sub,
+      data: {
+        id: 'other-question',
+        taskId: sub,
+        question: 'which way?',
+        urgency: 'normal',
+        createdAt: clock.toISOString(),
+      },
+    });
+    clock = new Date('2026-11-17T00:00:30.000Z');
+    await expect.poll(() => ofType('escalation.resolved', sub).length, { timeout: 5000 }).toBe(1);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(tasks()[sub]?.state).toBe('input_required');
+    expect(fake.sessions).toHaveLength(1);
   });
 
   it('reads only a bare dollar amount, and only a plain yes', () => {

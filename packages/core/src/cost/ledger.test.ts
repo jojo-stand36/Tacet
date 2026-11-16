@@ -104,6 +104,17 @@ describe('costLedgerProjection (#35)', () => {
     ]);
     expect(l.tasks.T).toMatchObject({ usd: 1.7, estimatedUsd: 1 });
     expect(l.days['2026-11-16']?.usd).toBe(1.7);
+    // Estimates are kept as one running sum per bucket, however many calls a session makes.
+    const many = ledger(
+      Array.from({ length: 50 }, () =>
+        usage(
+          { inputTokens: 1000, outputTokens: 0, model: 'claude-opus-5-5' },
+          { taskId: 'T/1', sessionId: 's' },
+        ),
+      ),
+    );
+    expect(many.provisional.s).toHaveLength(1);
+    expect(many.provisional.s?.[0]?.usd).toBeCloseTo(many.tasks.T?.estimatedUsd ?? -1, 9);
     // A report also settles tokens that had no price.
     const settled = ledger([
       usage(
