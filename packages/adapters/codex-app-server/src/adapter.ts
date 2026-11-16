@@ -921,6 +921,12 @@ export class CodexAppServerAdapter implements AgentAdapter {
           t: 'usage',
           inputTokens: n(last.inputTokens),
           outputTokens: n(last.outputTokens),
+          // Both are within `inputTokens`: Codex's own `non_cached_input` is input minus cached
+          // (protocol.rs at rust-v0.167.0); a cache write is not subtracted there either (#355).
+          ...(n(last.cachedInputTokens) > 0 ? { cacheReadTokens: n(last.cachedInputTokens) } : {}),
+          ...(n(last.cacheWriteInputTokens) > 0
+            ? { cacheWriteTokens: n(last.cacheWriteInputTokens) }
+            : {}),
           ...(typeof window === 'number'
             ? { contextUsed: n(last.totalTokens), contextMax: n(window) }
             : {}),

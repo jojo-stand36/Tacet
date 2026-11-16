@@ -124,13 +124,25 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
-          "description": "Input tokens for this call (delta)"
+          "description": "Input tokens for this call (delta), cache reads and writes included"
         },
         "outputTokens": {
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
           "description": "Output tokens for this call (delta)"
+        },
+        "cacheReadTokens": {
+          "description": "Of inputTokens, those read from a prompt cache (delta, #355)",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "cacheWriteTokens": {
+          "description": "Of inputTokens, those written to a prompt cache (delta, #355)",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
         },
         "contextUsed": {
           "description": "Tokens currently in context (gauge)",

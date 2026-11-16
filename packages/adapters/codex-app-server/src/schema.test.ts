@@ -91,7 +91,15 @@ describe(`codex app-server schema (pinned ${CODEX_VERSION})`, () => {
       expect(JSON.parse(read(f)).properties).toHaveProperty('config');
     }
     const usage = read('v2/ThreadTokenUsageUpdatedNotification.json');
-    for (const f of ['"last"', '"modelContextWindow"', '"inputTokens"', '"outputTokens"']) {
+    for (const f of [
+      '"last"',
+      '"modelContextWindow"',
+      '"inputTokens"',
+      '"outputTokens"',
+      // The cache counts the usage mapping reads (#355).
+      '"cachedInputTokens"',
+      '"cacheWriteInputTokens"',
+    ]) {
       expect(usage).toContain(f);
     }
     expect(read('ServerNotification.json')).toContain('"interrupted"');

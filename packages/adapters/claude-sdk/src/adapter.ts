@@ -224,7 +224,9 @@ interface Session {
    */
   costSoFar: number | undefined;
   /** The top-level model call in progress: prompt tokens and model from `message_start`. */
-  call: { inputTokens: number; model: string | undefined } | undefined;
+  call:
+    | { inputTokens: number; cacheRead: number; cacheWrite: number; model: string | undefined }
+    | undefined;
   /** Context window of `contextMaxModel`, from `getContextUsage`. */
   contextMax: number | undefined;
   contextMaxModel: string | undefined;
@@ -871,11 +873,13 @@ export class ClaudeSdkAdapter implements AgentAdapter {
           this.#emit(s, { t: 'message.delta', text: ev.delta.text });
         } else if (ev.type === 'message_start') {
           const u = ev.message.usage;
+          // `input_tokens` excludes the cache: reads and writes are their own fields (#355).
+          const cacheRead = u.cache_read_input_tokens ?? 0;
+          const cacheWrite = u.cache_creation_input_tokens ?? 0;
           s.call = {
-            inputTokens:
-              u.input_tokens +
-              (u.cache_creation_input_tokens ?? 0) +
-              (u.cache_read_input_tokens ?? 0),
+            inputTokens: u.input_tokens + cacheWrite + cacheRead,
+            cacheRead,
+            cacheWrite,
             model: ev.message.model || s.model,
           };
         } else if (ev.type === 'message_delta' && s.call) {
@@ -933,6 +937,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       t: 'usage',
       inputTokens: call.inputTokens,
       outputTokens,
+      ...(call.cacheRead > 0 ? { cacheReadTokens: call.cacheRead } : {}),
+      ...(call.cacheWrite > 0 ? { cacheWriteTokens: call.cacheWrite } : {}),
       ...this.#contextFields(s),
       ...(call.model ? { model: call.model } : {}),
       source: 'reported',

@@ -89,16 +89,28 @@ function finished(
  */
 export function turnUsage(r: PromptResponse, st: TurnState): AgentEvent | undefined {
   const u = (r as { usage?: unknown }).usage as
-    | { inputTokens?: unknown; outputTokens?: unknown }
+    | {
+        inputTokens?: unknown;
+        outputTokens?: unknown;
+        cachedReadTokens?: unknown;
+        cachedWriteTokens?: unknown;
+      }
     | undefined;
   const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
   const input = n(u?.inputTokens);
   const output = n(u?.outputTokens);
   if (input === undefined || output === undefined) return undefined;
+  // The draft's cache counts (#355). claude-agent-acp 0.101.0 reports Anthropic's `input_tokens`,
+  // which leaves the cache out, as `inputTokens`, so they are added to it. An agent whose
+  // `inputTokens` already counts them is counted high, never low.
+  const read = n(u?.cachedReadTokens) ?? 0;
+  const write = n(u?.cachedWriteTokens) ?? 0;
   return {
     t: 'usage',
-    inputTokens: input,
+    inputTokens: input + read + write,
     outputTokens: output,
+    ...(read > 0 ? { cacheReadTokens: read } : {}),
+    ...(write > 0 ? { cacheWriteTokens: write } : {}),
     // The gauges as last reported: still the context's size at the end of the turn.
     ...(st.context ? { contextUsed: st.context.used, contextMax: st.context.size } : {}),
     source: 'reported',

@@ -731,7 +731,7 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
         type: 'message_start',
         message: {
           model,
-          usage: { input_tokens: 7, cache_read_input_tokens: 3, cache_creation_input_tokens: 0 },
+          usage: { input_tokens: 5, cache_read_input_tokens: 3, cache_creation_input_tokens: 2 },
         },
       });
     start('served-model-a');
@@ -752,6 +752,9 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
         t: 'usage',
         inputTokens: 10,
         outputTokens: 4,
+        // Of the input, read from and written to the cache (#355).
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
         contextUsed: 14,
         contextMax: 100,
         model: 'served-model-a',
@@ -761,6 +764,9 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
         t: 'usage',
         inputTokens: 10,
         outputTokens: 5,
+        // Of the input, read from and written to the cache (#355).
+        cacheReadTokens: 3,
+        cacheWriteTokens: 2,
         contextUsed: 15,
         contextMax: 100,
         model: 'served-model-b',

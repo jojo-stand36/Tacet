@@ -32,9 +32,16 @@ function project(name = '-work-tree'): string {
   return dir;
 }
 const reader = () => new TranscriptReader(() => findTranscript(root, ID));
-const call = (inputTokens: number, outputTokens: number, model = 'claude-sonnet-4-5') => ({
+const call = (
+  inputTokens: number,
+  outputTokens: number,
+  model = 'claude-sonnet-4-5',
+  cache: { read?: number; write?: number } = {},
+) => ({
   inputTokens,
   outputTokens,
+  cacheReadTokens: cache.read ?? 0,
+  cacheWriteTokens: cache.write ?? 0,
   contextUsed: inputTokens + outputTokens,
   model,
 });
@@ -99,7 +106,7 @@ describe('TranscriptReader', () => {
         // A second content block of the same call: its usage is final.
         assistantLine('m1', { input: 3, created: 100, read: 1000, output: 40 }),
     );
-    expect(r.read()).toEqual([call(1103, 40)]);
+    expect(r.read()).toEqual([call(1103, 40, undefined, { read: 1000, write: 100 })]);
     expect(r.read()).toEqual([]);
     // A line written in two parts is read once it ends.
     const next = assistantLine('m2', { input: 5, output: 6 });
@@ -113,9 +120,9 @@ describe('TranscriptReader', () => {
     const file = join(project(), `${ID}.jsonl`);
     const r = reader();
     writeFileSync(file, assistantLine('m1', { input: 10, read: 90, output: 1 }));
-    expect(r.read()).toEqual([call(100, 1)]);
+    expect(r.read()).toEqual([call(100, 1, undefined, { read: 90 })]);
     appendFileSync(file, assistantLine('m1', { input: 10, read: 90, output: 50 }));
-    // A delta, with the context gauge after the whole call.
+    // A delta, with the context gauge after the whole call; the cache was reported already.
     expect(r.read()).toEqual([{ ...call(0, 49), contextUsed: 150 }]);
     // An earlier line seen again (a rewrite) adds nothing.
     appendFileSync(file, assistantLine('m1', { input: 10, read: 90, output: 1 }));
@@ -140,7 +147,14 @@ describe('TranscriptReader', () => {
         `${JSON.stringify({ type: 'assistant', message: { id: 'n2' } })}\n`,
     );
     expect(reader().read()).toEqual([
-      { inputTokens: 3, outputTokens: 0, contextUsed: 3, model: undefined },
+      {
+        inputTokens: 3,
+        outputTokens: 0,
+        cacheReadTokens: 3,
+        cacheWriteTokens: 0,
+        contextUsed: 3,
+        model: undefined,
+      },
     ]);
   });
 
