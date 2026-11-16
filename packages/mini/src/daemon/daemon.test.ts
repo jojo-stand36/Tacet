@@ -26,6 +26,7 @@ import {
   cancelStopped,
   isApproval,
   isOwnMcpTool,
+  isYes,
   MiniConductor,
   type MiniConductorOptions,
   miniLockHolder,
@@ -3187,10 +3188,13 @@ describe('Workers without the Mini-conductor MCP tools (#184)', () => {
   });
 });
 
-describe('hard budget caps (#35)', () => {
-  const answerOf = (id: string) =>
-    (ofType('escalation.raised', `${id}/1`).at(-1)?.data as { id: string; question: string }) ??
-    undefined;
+describe('budgets (#35)', () => {
+  const lastEscalation = (taskId: string) =>
+    ofType('escalation.raised', taskId).at(-1)?.data as
+      | { id: string; question: string }
+      | undefined;
+  const reasonsOf = (sub: string) =>
+    ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason);
 
   it('stops the Worker at the task cap, starts none, and resumes once the user raises it', async () => {
     let turns = 0;
@@ -3202,33 +3206,41 @@ describe('hard budget caps (#35)', () => {
     const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
     const sub = `${id}/1`;
     await expect.poll(() => ofType('budget.exceeded', sub).length, { timeout: 5000 }).toBe(1);
-    await expect
-      .poll(() => ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason))
-      .toEqual(['budget']);
+    await expect.poll(() => reasonsOf(sub)).toEqual(['budget']);
     expect(ofType('budget.exceeded', sub)[0]?.data).toMatchObject({
       scope: 'task',
       key: id,
       capUsd: 1,
       spentUsd: 1.5,
     });
-    const x = answerOf(id);
-    expect(x?.question).toMatch(/has spent \$1\.50 of its \$1\.00 budget/);
+    expect(lastEscalation(sub)?.question).toMatch(/has spent \$1\.50 of its \$1\.00 budget/);
     expect(ofType('escalation.raised', sub)[0]?.data).toMatchObject({
       urgency: 'high',
       category: 'blocked',
     });
     expect(tasks()[sub]?.state).toBe('input_required');
-    // Nothing starts while the cap is spent.
     await new Promise((r) => setTimeout(r, 100));
     expect(fake.sessions).toHaveLength(1);
 
-    // An answer that is not a raise leaves the cap, and asks again.
-    d.answer(x?.id ?? '', 'no');
-    await expect.poll(() => ofType('escalation.raised', sub).length, { timeout: 5000 }).toBe(2);
+    // Not a bare amount: the cap stays, and it asks again.
+    for (const no of ["don't raise past 5", '1,000', 'raise it to $5']) {
+      const before = ofType('escalation.raised', sub).length;
+      d.answer(lastEscalation(sub)?.id ?? '', no);
+      await expect
+        .poll(() => ofType('escalation.raised', sub).length, { timeout: 5000 })
+        .toBe(before + 1);
+    }
+    // A cap at or below the spend is not a raise either.
+    const before = ofType('escalation.raised', sub).length;
+    d.answer(lastEscalation(sub)?.id ?? '', '1.25');
+    await expect
+      .poll(() => ofType('escalation.raised', sub).length, { timeout: 5000 })
+      .toBe(before + 1);
+    expect(ofType('budget.raised', sub)).toHaveLength(0);
     expect(fake.sessions).toHaveLength(1);
 
-    // A raise: the answer is consumed, never sent to a Worker, and the sub-task runs again.
-    d.answer(answerOf(id)?.id ?? '', 'Raise it to $5');
+    // A raise: consumed by the Mini-conductor, never sent to the Worker, which resumes.
+    d.answer(lastEscalation(sub)?.id ?? '', '$5');
     await d.settled();
     expect(ofType('budget.raised', sub)[0]?.data).toMatchObject({
       scope: 'task',
@@ -3236,7 +3248,8 @@ describe('hard budget caps (#35)', () => {
       capUsd: 5,
     });
     expect(fake.sessions).toHaveLength(2);
-    expect(fake.sessions[1]?.inputs.join('\n')).not.toMatch(/Raise it to/);
+    expect(fake.sessions[1]?.opts.resume).toBeDefined();
+    expect(fake.sessions[1]?.inputs.join('\n')).not.toMatch(/\$5/);
     expect(tasks()[sub]?.state).toBe('completed');
     // A budget stop is not a failed attempt.
     expect(
@@ -3254,29 +3267,200 @@ describe('hard budget caps (#35)', () => {
       .toMatchObject({ scope: 'task', capUsd: 0.5, spentUsd: 0.6 });
   });
 
-  it("holds every task's Workers once today's cap is spent", async () => {
+  it("holds every task's Workers and planners once today's cap is spent, and asks for each cap", async () => {
     let turns = 0;
     fake = new ScriptedAdapter('fake', () =>
       ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
     );
-    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } } });
+    let planned = 0;
+    const planner: Planner = {
+      async plan() {
+        planned += 1;
+        return {
+          subtasks: [{ key: 'a', goal: 'a', acceptanceCriteria: ['ok'] }],
+          rationale: 'r',
+          planner: { adapter: 'test' },
+        };
+      },
+    };
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } }, planner });
     await d.start();
     const first = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
     await expect
       .poll(() => ofType('budget.exceeded', `${first}/1`)[0]?.data, { timeout: 5000 })
       .toMatchObject({ scope: 'day', capUsd: 2, spentUsd: 2 });
-    // A second task submitted now does not start a Worker.
+    // A task submitted now is not even planned.
     const second = d.submit({ goal: 'h', acceptanceCriteria: ['ok'] });
     await new Promise((r) => setTimeout(r, 150));
+    expect(planned).toBe(1);
     expect(fake.sessions).toHaveLength(1);
-    expect(ofType('worker.started', `${second}/1`)).toHaveLength(0);
+    expect(ofType('task.planned', second)).toHaveLength(0);
+    // One question for the day's cap, not one per task.
+    expect(ofType('budget.exceeded')).toHaveLength(1);
+    // Raised: the waiting task is planned and runs.
+    d.answer(lastEscalation(`${first}/1`)?.id ?? '', '10');
+    await d.settled();
+    expect(planned).toBe(2);
+    expect(tasks()[`${second}/1`]?.state).toBe('completed');
   });
 
-  it('reads a dollar amount from an answer', () => {
+  it("stops a planner whose usage spends the task's cap, without failing the task", async () => {
+    const planner: Planner = {
+      async plan() {
+        return {
+          subtasks: [{ key: 'a', goal: 'a', acceptanceCriteria: ['ok'] }],
+          rationale: 'r',
+          planner: { adapter: 'test' },
+          usage: { inputTokens: 10, outputTokens: 10, costUsd: 3 },
+        };
+      },
+    };
+    const d = make({ config: { ...CONFIG, budget: { per_task_usd: 2 } }, planner });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('budget.exceeded')[0]?.data, { timeout: 5000 })
+      .toMatchObject({ scope: 'task', key: id, spentUsd: 3 });
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fake.sessions).toHaveLength(0);
+    expect(tasks()[id]?.state).not.toBe('failed');
+  });
+
+  it('enforces the month cap across the repos registered with the Conductor', async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'spend', costUsd: 1 }));
+    const months: string[] = [];
+    const d = make({
+      config: { ...CONFIG, budget: { api_key_per_month_usd: 200 } },
+      monthSpendElsewhere: (month) => {
+        months.push(month);
+        return 199.5;
+      },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('budget.exceeded', `${id}/1`)[0]?.data, { timeout: 5000 })
+      .toMatchObject({ scope: 'month', capUsd: 200, spentUsd: 200.5 });
+    expect(months[0]).toMatch(/^\d{4}-\d{2}$/);
+    expect(lastEscalation(`${id}/1`)?.question).toMatch(/monthly API-key budget/);
+  });
+
+  it('retires a question about a day that has passed, and the work goes on', async () => {
+    let clock = new Date('2026-11-16T23:59:00.000Z');
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } }, now: () => clock });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(1);
+    clock = new Date('2026-11-17T00:00:30.000Z');
+    await expect
+      .poll(() => ofType('escalation.resolved', `${id}/1`).length, { timeout: 5000 })
+      .toBe(1);
+    await d.settled();
+    expect(ofType('escalation.resolved', `${id}/1`)[0]?.data).toMatchObject({
+      source: 'mini',
+      answer: expect.stringMatching(/the day \(2026-11-16\) is over/),
+    });
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+  });
+
+  it('tells the user when a task passes a soft threshold, and stops nothing', async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'spend', costUsd: 1.5 }));
+    const d = make({ config: { ...CONFIG, budget: { ask_thresholds_usd: [2, 1] } } });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('budget.threshold', id).map((e) => e.data), { timeout: 5000 })
+      .toEqual([{ scope: 'task', key: id, thresholdUsd: 1, spentUsd: 1.5 }]);
+    expect(reasonsOf(`${id}/1`)).toEqual([]);
+    expect(ofType('escalation.raised')).toHaveLength(0);
+  });
+
+  describe('a model whose cost cannot be known', () => {
+    class NoCost extends ScriptedAdapter {
+      override capabilities() {
+        const c = super.capabilities();
+        return { ...c, usage: { ...c.usage, cost: 'none' as const } };
+      }
+    }
+    const nocost = (overrides: Partial<TacetConfig> = {}) => {
+      fake = new NoCost('fake', script);
+      return make({
+        adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+        config: { ...CONFIG, tiers: { worker: { adapter: 'fake', model: 'cheap' } }, ...overrides },
+      });
+    };
+
+    it('asks once per model before running it, and runs every sub-task on a yes', async () => {
+      const d = nocost({ budget: { per_day_usd: 10 } });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      const b = d.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('budget.unpriced').length, { timeout: 5000 }).toBe(1);
+      expect(ofType('budget.unpriced')[0]?.data).toMatchObject({ model: 'cheap' });
+      await new Promise((r) => setTimeout(r, 100));
+      expect(fake.sessions).toHaveLength(0);
+      const x = ofType('escalation.raised')[0]?.data as { id: string; question: string };
+      expect(x.question).toMatch(/run on cheap, whose cost Tacet cannot know/);
+      d.answer(x.id, 'yes');
+      await d.settled();
+      expect(tasks()[`${a}/1`]?.state).toBe('completed');
+      expect(tasks()[`${b}/1`]?.state).toBe('completed');
+      expect(ofType('escalation.raised')).toHaveLength(1);
+    });
+
+    it('fails its sub-tasks on anything but a yes, without asking again', async () => {
+      const d = nocost({ budget: { per_day_usd: 10 } });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('escalation.raised').length, { timeout: 5000 }).toBe(1);
+      const asked = ofType('escalation.raised')[0]?.data as { id: string } | undefined;
+      d.answer(asked?.id ?? '', 'yes, but only once');
+      await d.settled();
+      expect(tasks()[`${a}/1`]?.state).toBe('failed');
+      expect(fake.sessions).toHaveLength(0);
+      const b = d.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      expect(tasks()[`${b}/1`]?.state).toBe('failed');
+      expect(ofType('escalation.raised')).toHaveLength(1);
+    });
+
+    it('runs without asking when no cap applies, or a price is configured', async () => {
+      const d = nocost({
+        pricing: { cheap: { input_per_mtok: 1, output_per_mtok: 1 } },
+        budget: { per_day_usd: 10 },
+      });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      expect(tasks()[`${a}/1`]?.state).toBe('completed');
+      expect(ofType('budget.unpriced')).toHaveLength(0);
+    });
+  });
+
+  it('reads only a bare dollar amount, and only a plain yes', () => {
     expect(parseUsd('5')).toBe(5);
-    expect(parseUsd('$12.50 please')).toBe(12.5);
-    expect(parseUsd('raise it to 7.25 USD')).toBe(7.25);
-    expect(parseUsd('no')).toBeUndefined();
-    expect(parseUsd(undefined)).toBeUndefined();
+    expect(parseUsd(' $12.50 ')).toBe(12.5);
+    expect(parseUsd('7.25 USD')).toBe(7.25);
+    for (const no of [
+      "don't raise past 5",
+      '.5',
+      'no, keep it at 2 tasks',
+      '1,000',
+      '$1k',
+      'raise by 10',
+      'no',
+      undefined,
+    ]) {
+      expect(parseUsd(no), String(no)).toBeUndefined();
+    }
+    for (const yes of ['yes', 'Y', 'ok.', 'run it', 'go ahead!'])
+      expect(isYes(yes), yes).toBe(true);
+    for (const no of ['no', 'yes, but only once', 'not yes', '', undefined]) {
+      expect(isYes(no), String(no)).toBe(false);
+    }
   });
 });

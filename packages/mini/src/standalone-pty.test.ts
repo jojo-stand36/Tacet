@@ -15,6 +15,7 @@ import { gatedTitle, ptyGate } from '@tacet/adapter-pty/testing';
 import type { SessionOptions } from '@tacet/core';
 import { connectPty, readRuntimeFile } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { allowUnpriced } from './daemon/testing.js';
 import { type Standalone, startStandalone } from './standalone.js';
 
 // node-pty must load in CI; locally a machine that could not build it skips these (#189).
@@ -128,6 +129,7 @@ describe.skipIf(!gate.ok)(
       const { port, token } = readRuntimeFile(sa.control.runtimeFile);
       const secret = token.reveal();
       const id = sa.mini.submit({ goal: 'watch me', acceptanceCriteria: ['ok'] });
+      await allowUnpriced(sa.store, sa.mini);
       const session = await (async () => {
         for (let i = 0; i < 200; i++) {
           const started = sa?.store.query({ taskId: `${id}/1`, typePrefix: 'worker.started' });

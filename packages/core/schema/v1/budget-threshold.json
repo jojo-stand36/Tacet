@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:budget-threshold:v1",
+  "title": "Tacet budget.threshold payload",
+  "type": "object",
+  "properties": {
+    "scope": {
+      "enum": [
+        "task",
+        "day",
+        "month"
+      ],
+      "x-tacet-fallback": "task",
+      "type": "string"
+    },
+    "key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "thresholdUsd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "spentUsd": {
+      "type": "number",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "scope",
+    "key",
+    "thresholdUsd",
+    "spentUsd"
+  ]
+}

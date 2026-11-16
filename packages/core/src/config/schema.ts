@@ -156,8 +156,35 @@ export const TacetConfig = z.strictObject({
       per_task_usd: z.number().nonnegative(),
       per_day_usd: z.number().nonnegative(),
       api_key_per_month_usd: z.number().nonnegative(),
+      ask_thresholds_usd: z
+        .array(z.number().positive())
+        .max(20)
+        .describe(
+          "A task's spend at which the user is told, without stopping anything (#35, owner decision: notify only)",
+        ),
     })
     .partial()
+    .optional(),
+  /**
+   * List prices for models the built-in table does not price, or a correction to it (#35), in US
+   * dollars per million tokens. Owner decision (#35): only the user layer may set prices; a
+   * committed repo file could otherwise set them to 0 and so slip past every budget.
+   */
+  pricing: z
+    .record(
+      z.string().min(1),
+      z.strictObject({
+        input_per_mtok: z.number().nonnegative(),
+        output_per_mtok: z.number().nonnegative(),
+        long_context: z
+          .strictObject({
+            above_input_tokens: z.number().int().positive(),
+            input_per_mtok: z.number().nonnegative(),
+            output_per_mtok: z.number().nonnegative(),
+          })
+          .optional(),
+      }),
+    )
     .optional(),
   /**
    * Owner rule (2026-11-09): API key for parallel or unattended Workers, own login for interactive

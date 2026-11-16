@@ -39,3 +39,29 @@ export const BudgetRaised = z.object({
   escalationId: Ulid.optional(),
 });
 export type BudgetRaised = z.infer<typeof BudgetRaised>;
+
+/**
+ * Payload of `budget.threshold` (#35, owner decision: notify only): a root task's spend passed
+ * one of `budget.ask_thresholds_usd`. Nothing stops; the user is told. One event per threshold.
+ */
+export const BudgetThreshold = z.object({
+  scope: BudgetScope,
+  key: Id,
+  thresholdUsd: Usd,
+  spentUsd: Usd,
+});
+export type BudgetThreshold = z.infer<typeof BudgetThreshold>;
+
+/**
+ * Payload of `budget.unpriced` (#35, owner decision: ask once per model per repo, never run
+ * silently): a Worker was about to run on a model whose cost Tacet cannot know (its adapter reports
+ * none and no price is known), so the user is asked first. `allowed` is absent while the question
+ * is open and set by the answer; a refusal stands too, so the same model is not asked about again.
+ * `model` is the id, or `default@<adapter>` when the session runs on the vendor's default.
+ */
+export const BudgetUnpriced = z.object({
+  model: Id,
+  escalationId: Ulid.optional(),
+  allowed: z.boolean().optional(),
+});
+export type BudgetUnpriced = z.infer<typeof BudgetUnpriced>;

@@ -19,7 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MiniConductor } from '../daemon/daemon.js';
 import { SingleStepPlanner } from '../daemon/planner.js';
 import type { WorkerMcp } from '../daemon/ports.js';
-import { TempWorkspaces } from '../daemon/testing.js';
+import { allowUnpriced, TempWorkspaces } from '../daemon/testing.js';
 import {
   buildWorkerAdapters,
   commandWords,
@@ -755,6 +755,7 @@ describe('a Mini-conductor started from a config file (#149)', () => {
     });
     await d.start();
     d.submit({ goal: `say ${SECRET}`, acceptanceCriteria: ['ok'] });
+    await allowUnpriced(store, d);
     await d.settled();
 
     expect(existsSync(log)).toBe(true);

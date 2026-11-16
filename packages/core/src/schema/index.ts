@@ -1,6 +1,6 @@
 import type { z } from 'zod';
 import { AgentEvent, ApprovalDecision } from './agent-event.js';
-import { BudgetExceeded, BudgetRaised } from './budget.js';
+import { BudgetExceeded, BudgetRaised, BudgetThreshold, BudgetUnpriced } from './budget.js';
 import { Decision, DecisionExt } from './decision.js';
 import { EventEnvelope } from './envelope.js';
 import { Escalation, EscalationExt } from './escalation.js';
@@ -90,6 +90,8 @@ export const jsonSchemas = {
   'task-target': { schema: TaskTarget, title: 'Tacet task.target payload' },
   'budget-exceeded': { schema: BudgetExceeded, title: 'Tacet budget.exceeded payload' },
   'budget-raised': { schema: BudgetRaised, title: 'Tacet budget.raised payload' },
+  'budget-threshold': { schema: BudgetThreshold, title: 'Tacet budget.threshold payload' },
+  'budget-unpriced': { schema: BudgetUnpriced, title: 'Tacet budget.unpriced payload' },
   'worker-started': { schema: WorkerStarted, title: 'Tacet worker.started payload' },
   'worker-vendor-session': {
     schema: WorkerVendorSession,

@@ -179,6 +179,12 @@ export function mergeConfig(
         `policies: the repo layer (${layer.origin}) may not allow; put allow rules in your user or local config`,
       );
     }
+    if (layer.data.pricing !== undefined && layer.name !== 'user' && layer.name !== 'default') {
+      // Prices set what a budget counts: only the user's own config may set them (#35).
+      layerErrors.push(
+        `pricing: the ${layer.name} layer (${layer.origin}) may not set prices; put them in your user config (~/.tacet/config.yaml)`,
+      );
+    }
     if (layer.name === 'task' && layer.data.review?.enabled === false) {
       // A task may ask for review, never skip one the repo or the user asked for (#19).
       layerErrors.push(`review.enabled: the task layer (${layer.origin}) may not turn review off`);

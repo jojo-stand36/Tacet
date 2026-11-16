@@ -354,3 +354,28 @@ export class ScriptedTerminalAdapter extends ScriptedAdapter {
     if (this.endOnClose) this.#terms.get(h.id)?.end();
   }
 }
+
+/**
+ * Answer yes to the one question a Worker on a model with no known cost raises before it runs
+ * (#35): a CLI or ACP agent that reports no cost, under the default month cap. For tests about
+ * something else.
+ */
+export async function allowUnpriced(
+  store: { query(f: { typePrefix: string }): { envelope: { type: string; data: unknown } }[] },
+  mini: { answer(escalationId: string, text: string): unknown },
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const asked = store
+      .query({ typePrefix: 'budget' })
+      .find((e) => e.envelope.type === 'budget.unpriced');
+    const id = (asked?.envelope.data as { escalationId?: string } | undefined)?.escalationId;
+    if (id) {
+      mini.answer(id, 'yes');
+      return;
+    }
+    if (Date.now() > deadline) throw new Error('no question about an unpriced model was raised');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}

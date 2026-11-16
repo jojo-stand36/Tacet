@@ -1,6 +1,12 @@
 import type { Projection } from '../events/projection.js';
 import { Usage } from '../schema/agent-event.js';
-import { BudgetExceeded, BudgetRaised, type BudgetScope } from '../schema/budget.js';
+import {
+  BudgetExceeded,
+  BudgetRaised,
+  type BudgetScope,
+  BudgetThreshold,
+  BudgetUnpriced,
+} from '../schema/budget.js';
 import type { EventEnvelope } from '../schema/envelope.js';
 import { WorkerProfile, WorkerStarted } from '../schema/worker.js';
 import { costOf, type PricingTable, priceFor } from './pricing.js';
@@ -31,6 +37,26 @@ export interface CostLedger {
   exceeded: Record<string, BudgetExceeded>;
   /** Worker session id → the model it ran on, for usage events that name none. */
   sessionModels: Record<string, string>;
+  /** `scope:key` → the soft thresholds the user was already told about. */
+  thresholds: Record<string, number[]>;
+  /** Model → the latest question about running it with no known cost, and its answer. */
+  unpriced: Record<string, BudgetUnpriced>;
+  /**
+   * Worker session id → what its usage added since the session last reported a cost: priced
+   * estimates and unpriced tokens. A later reported cost replaces them (it covers the same calls),
+   * so an adapter that sends tokens per call and the cost per turn (claude-sdk, ACP) is not
+   * counted twice.
+   */
+  provisional: Record<string, Provisional[]>;
+}
+
+/** One usage event's provisional share in the buckets it was added to. */
+interface Provisional {
+  root: string;
+  day: string;
+  month: string;
+  usd: number;
+  tokens: number;
 }
 
 /** The ledger key for a cap: `task:<root>`, `day:<YYYY-MM-DD>` or `month:<YYYY-MM>`. */
@@ -45,6 +71,17 @@ export function rootTaskId(taskId: string): string {
 }
 
 const empty = (): Spend => ({ usd: 0, estimatedUsd: 0, unpricedTokens: 0, unpricedModels: [] });
+
+/** Take a provisional share back out of a bucket. */
+function remove(prev: Spend | undefined, usd: number, tokens: number): Spend {
+  const s = prev ?? empty();
+  return {
+    ...s,
+    usd: micro(Math.max(0, s.usd - usd)),
+    estimatedUsd: micro(Math.max(0, s.estimatedUsd - usd)),
+    unpricedTokens: Math.max(0, s.unpricedTokens - tokens),
+  };
+}
 /** Micro-dollars, so float addition order cannot change a total. */
 const micro = (n: number) => Math.round(n * 1e6) / 1e6;
 
@@ -72,7 +109,8 @@ function add(
  * table always give the same ledger). Each `agent.usage` event costs what the adapter reported;
  * when it reported nothing, its tokens are priced from the table by the event's model, else the
  * session's (`worker.profile`, `worker.started`); when that model has no price, the tokens are
- * counted as unpriced, never guessed. Days and months are UTC, by the event's timestamp.
+ * counted as unpriced, never guessed. Those estimates are provisional per session: a cost the
+ * session reports later replaces them. Days and months are UTC, by the event's timestamp.
  */
 export function costLedgerProjection(table: PricingTable): Projection<CostLedger> {
   return {
@@ -84,6 +122,9 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
       raised: {},
       exceeded: {},
       sessionModels: {},
+      thresholds: {},
+      unpriced: {},
+      provisional: {},
     }),
     apply(state, e: EventEnvelope) {
       switch (e.type) {
@@ -100,33 +141,62 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
           const u = Usage.safeParse(e.data);
           if (!u.success || !e.taskId) return state;
           const { inputTokens, outputTokens, costUsd } = u.data;
-          const model =
-            u.data.model ?? (e.sessionId ? state.sessionModels[e.sessionId] : undefined);
+          const sid = e.sessionId;
+          const model = u.data.model ?? (sid ? state.sessionModels[sid] : undefined);
+          let next = state;
           let usd = 0;
           let estimated = 0;
           let unpriced = 0;
-          if (costUsd !== undefined) usd = costUsd;
-          else {
+          if (costUsd !== undefined) {
+            usd = costUsd;
+            // The reported cost covers the session's calls since its last report: take their
+            // provisional estimates and unpriced tokens back out first.
+            const back = sid ? state.provisional[sid] : undefined;
+            if (sid && back) {
+              const tasks = { ...state.tasks };
+              const days = { ...state.days };
+              const months = { ...state.months };
+              for (const b of back) {
+                tasks[b.root] = remove(tasks[b.root], b.usd, b.tokens);
+                days[b.day] = remove(days[b.day], b.usd, b.tokens);
+                months[b.month] = remove(months[b.month], b.usd, b.tokens);
+              }
+              const { [sid]: _settled, ...provisional } = state.provisional;
+              next = { ...state, tasks, days, months, provisional };
+            }
+          } else {
             const price = priceFor(model, table);
-            if (price) {
+            // A promotional price holds only through its last day (UTC).
+            if (price && (price.until === undefined || e.ts.slice(0, 10) <= price.until)) {
               estimated = costOf(price, inputTokens, outputTokens);
               usd = estimated;
             } else unpriced = inputTokens + outputTokens;
           }
-          if (usd === 0 && unpriced === 0) return state;
+          if (usd === 0 && unpriced === 0) return next;
           const root = rootTaskId(e.taskId);
           const day = e.ts.slice(0, 10);
           const month = e.ts.slice(0, 7);
+          const provisional =
+            sid && costUsd === undefined
+              ? {
+                  ...next.provisional,
+                  [sid]: [
+                    ...(next.provisional[sid] ?? []),
+                    { root, day, month, usd: estimated, tokens: unpriced },
+                  ],
+                }
+              : next.provisional;
           return {
-            ...state,
+            ...next,
+            provisional,
             tasks: {
-              ...state.tasks,
-              [root]: add(state.tasks[root], usd, estimated, unpriced, model),
+              ...next.tasks,
+              [root]: add(next.tasks[root], usd, estimated, unpriced, model),
             },
-            days: { ...state.days, [day]: add(state.days[day], usd, estimated, unpriced, model) },
+            days: { ...next.days, [day]: add(next.days[day], usd, estimated, unpriced, model) },
             months: {
-              ...state.months,
-              [month]: add(state.months[month], usd, estimated, unpriced, model),
+              ...next.months,
+              [month]: add(next.months[month], usd, estimated, unpriced, model),
             },
           };
         }
@@ -137,6 +207,22 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
             ...state,
             exceeded: { ...state.exceeded, [budgetKey(d.data.scope, d.data.key)]: d.data },
           };
+        }
+        case 'budget.threshold': {
+          const d = BudgetThreshold.safeParse(e.data);
+          if (!d.success) return state;
+          const k = budgetKey(d.data.scope, d.data.key);
+          const told = state.thresholds[k] ?? [];
+          if (told.includes(d.data.thresholdUsd)) return state;
+          return {
+            ...state,
+            thresholds: { ...state.thresholds, [k]: [...told, d.data.thresholdUsd] },
+          };
+        }
+        case 'budget.unpriced': {
+          const d = BudgetUnpriced.safeParse(e.data);
+          if (!d.success) return state;
+          return { ...state, unpriced: { ...state.unpriced, [d.data.model]: d.data } };
         }
         case 'budget.raised': {
           const d = BudgetRaised.safeParse(e.data);

@@ -23,7 +23,7 @@ describe('priceFor (#35)', () => {
       'sonnet',
       'claude-sonnet',
       'claude-sonnet-5-5-fast',
-      'gpt-6-astra',
+      'gemini-3-pro-preview',
     ]) {
       expect(priceFor(m, BUILTIN_PRICES), String(m)).toBeUndefined();
     }
@@ -91,17 +91,70 @@ describe('costLedgerProjection (#35)', () => {
     expect(l.months['2026-11']?.usd).toBe(2.75);
   });
 
+  it('lets a cost the session reports later replace its estimates, as claude-sdk and ACP send them', () => {
+    const l = ledger([
+      env('worker.started', { sessionId: 's', model: 'claude-opus-5-5' }, { taskId: 'T/1' }),
+      // Per call: tokens and model, no cost (priced provisionally: $1 each).
+      usage({ inputTokens: 200_000, outputTokens: 10_000 }, { taskId: 'T/1', sessionId: 's' }),
+      usage({ inputTokens: 200_000, outputTokens: 10_000 }, { taskId: 'T/1', sessionId: 's' }),
+      // Turn end: the real cost of those calls, with no tokens.
+      usage({ inputTokens: 0, outputTokens: 0, costUsd: 0.7 }, { taskId: 'T/1', sessionId: 's' }),
+      // The next call is provisional again, on top of what was reported.
+      usage({ inputTokens: 200_000, outputTokens: 10_000 }, { taskId: 'T/1', sessionId: 's' }),
+    ]);
+    expect(l.tasks.T).toMatchObject({ usd: 1.7, estimatedUsd: 1 });
+    expect(l.days['2026-11-16']?.usd).toBe(1.7);
+    // A report also settles tokens that had no price.
+    const settled = ledger([
+      usage(
+        { inputTokens: 5, outputTokens: 5, model: 'gemini-x' },
+        { taskId: 'T', sessionId: 'g' },
+      ),
+      usage({ inputTokens: 0, outputTokens: 0, costUsd: 0.01 }, { taskId: 'T', sessionId: 'g' }),
+    ]);
+    expect(settled.tasks.T).toMatchObject({ usd: 0.01, unpricedTokens: 0 });
+  });
+
   it('counts tokens of a model with no price as unpriced, never guessed', () => {
     const l = ledger([
-      usage({ inputTokens: 700, outputTokens: 300, model: 'gpt-6-astra' }, { taskId: 'T/1' }),
+      usage(
+        { inputTokens: 700, outputTokens: 300, model: 'gemini-3-pro-preview' },
+        { taskId: 'T/1' },
+      ),
       usage({ inputTokens: 5, outputTokens: 5 }, { taskId: 'T/1', sessionId: 'unknown-session' }),
     ]);
     expect(l.tasks.T).toEqual({
       usd: 0,
       estimatedUsd: 0,
       unpricedTokens: 1010,
-      unpricedModels: ['gpt-6-astra', 'unknown'],
+      unpricedModels: ['gemini-3-pro-preview', 'unknown'],
     });
+  });
+
+  it('prices a promotional rate only through its last day', () => {
+    const l = ledger([
+      usage(
+        { inputTokens: 100_000, outputTokens: 0, model: 'gpt-5.6-sol' },
+        { taskId: 'A', ts: '2026-11-30T23:59:59.000Z' },
+      ),
+      usage(
+        { inputTokens: 100_000, outputTokens: 0, model: 'gpt-5.6-sol' },
+        { taskId: 'B', ts: '2026-12-01T00:00:00.000Z' },
+      ),
+    ]);
+    expect(l.tasks.A?.usd).toBe(0.4);
+    expect(l.tasks.B).toMatchObject({
+      usd: 0,
+      unpricedTokens: 100_000,
+      unpricedModels: ['gpt-5.6-sol'],
+    });
+  });
+
+  it('applies the OpenAI long-context rate above 272,000 input tokens', () => {
+    const sol = priceFor('gpt-6.1-sol', BUILTIN_PRICES);
+    if (!sol) throw new Error('no price');
+    expect(costOf(sol, 272_000, 0)).toBeCloseTo(0.544, 9);
+    expect(costOf(sol, 272_001, 0)).toBeCloseTo(1.088004, 9);
   });
 
   it('keeps the latest exceeded cap until the user raises it', () => {

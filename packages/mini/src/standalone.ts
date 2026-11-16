@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { gateTimeoutMs, type TacetConfig, type Task } from '@tacet/core';
+import { gateTimeoutMs, pricingTable, type TacetConfig, type Task } from '@tacet/core';
 import {
   type ConductorLink,
   type ConductorLinkState,
@@ -33,6 +33,7 @@ import { GitIntegrator } from './git/integrate.js';
 import { eventForwarding } from './link/forward.js';
 import { EventLogBackend } from './mcp/backend.js';
 import { MiniMcpServer } from './mcp/server.js';
+import { monthSpendElsewhere } from './month-spend.js';
 import { AdapterReviewer } from './review/adapter-reviewer.js';
 import { commandVerifierFromConfig } from './verify/command-verifier.js';
 import { type BuildWorkerAdaptersOptions, buildWorkerAdapters } from './workers/build.js';
@@ -238,9 +239,23 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       tokens: new WorkerTokens(),
       ...(o.onError ? { onError: o.onError } : {}),
     });
+    // The month cap counts every repo registered with the Conductor (#35, owner decision (a)).
+    const elsewhere = monthSpendElsewhere({
+      stateDir,
+      repoId: paths.repoId,
+      pricing: pricingTable(config.pricing),
+    });
+    const monthCap = config.budget?.api_key_per_month_usd;
+    if (!elsewhere && monthCap !== undefined) {
+      o.onWarning?.(
+        'budget',
+        `the monthly API-key budget (USD ${monthCap}) counts only this repo's spend: register it with tacet up --add so it counts every repo on this machine`,
+      );
+    }
     const mini = new MiniConductor({
       store,
       config,
+      ...(elsewhere ? { monthSpendElsewhere: elsewhere } : {}),
       adapters,
       workspaces,
       planner,
