@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { readRuntimeFile } from '@tacet/core/node';
 import { liveControl, liveStatus, runtimeFileFor } from '../control.js';
 import type { Io } from '../io.js';
+import { guardMemory } from '../memory-guard.js';
 import { safeJson, terminalSafe } from '../render.js';
 import {
   DONE_STATES,
@@ -133,6 +134,9 @@ export async function detach(io: Io, goal: string | undefined, o: RunOptions): P
     return 0;
   }
 
+  // The background run (the same Node) hardens itself and warns only into its log, so the warning
+  // is said here, on the user's terminal, too (#316).
+  guardMemory(io);
   const runtimeFile = runtimeFileFor(io, repoRoot);
   const log = detachedLogFor(io, repoRoot);
   mkdirSync(dirname(log), { recursive: true, mode: 0o700 });

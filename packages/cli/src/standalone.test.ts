@@ -30,7 +30,7 @@ import {
 import { type Script, ScriptedAdapter, ScriptedTerminalAdapter } from '@tacet/mini/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SpawnDetached } from './commands/detach.js';
-import type { Io } from './io.js';
+import type { Io, MemoryGuard } from './io.js';
 import { main } from './main.js';
 import { repoRootFrom } from './state.js';
 
@@ -317,6 +317,31 @@ describe('tacet standalone (#21)', () => {
     });
     expect(inDistro.code).toBe(0);
     expect(inDistro.err).not.toMatch(/warning: the/);
+  });
+
+  it('makes the run non-dumpable, and warns when it cannot and nothing else protects it (#316)', async () => {
+    let hardened = 0;
+    const unavailable = () => {
+      hardened += 1;
+      return { state: 'unavailable', reason: 'Node v24 has no node:ffi' } as const;
+    };
+    const exposed = await tacet(['run', ...user(), 'add work.txt'], {
+      memoryGuard: { harden: unavailable, scope: () => undefined, platform: 'linux' },
+    });
+    expect(exposed.code).toBe(0);
+    expect(hardened).toBe(1);
+    expect(exposed.err).toMatch(
+      /warning: this kernel has no Yama, and this process could not make itself non-dumpable \(Node v24 has no node:ffi\)\. Programs a Worker runs could read the answer codes/,
+    );
+    // Yama at 1 keeps a Worker (a descendant) out already; non-dumpable keeps everyone out.
+    for (const memoryGuard of [
+      { harden: unavailable, scope: () => 1, platform: 'linux' as const },
+      { harden: () => ({ state: 'set' }) as const, scope: () => 0, platform: 'linux' as const },
+    ]) {
+      const r = await tacet(['run', ...user(), 'again'], { memoryGuard });
+      expect(r.code).toBe(0);
+      expect(r.err).not.toMatch(/answer codes/);
+    }
   });
 
   it("warns that a repo autonomy above the user's is ignored (#25, ADR-004 B)", async () => {
@@ -968,6 +993,8 @@ ws.close();
     /** The background run, in this process: what it was started with, and how it ended. */
     const started: { argv: string[]; env: Record<string, string | undefined> }[] = [];
     let child: Promise<number> | undefined;
+    /** The background run's memory guard (#316), when a test gives one. */
+    let childGuard: MemoryGuard | undefined;
     const inProcess: SpawnDetached = (argv, childEnv) => {
       started.push({ argv, env: childEnv });
       // Its output to the log, as the real one's: its own descriptor, as a child inherits one.
@@ -983,12 +1010,36 @@ ws.close();
         pollMs: 20,
         signal: abort.signal,
         standalone: { adapters: { 'claude-sdk': { adapter: fake(), authRoute: 'api_key' } } },
+        ...(childGuard ? { memoryGuard: childGuard } : {}),
       }).finally(() => closeSync(fd));
       return { pid: process.pid, exited: child, stop: () => abort.abort() };
     };
     beforeEach(() => {
       started.length = 0;
       child = undefined;
+      childGuard = undefined;
+    });
+
+    it('guards the background run, and says so on the terminal that started it too (#316)', async () => {
+      const calls: string[] = [];
+      const guard = (who: string): MemoryGuard => ({
+        harden: () => {
+          calls.push(who);
+          return { state: 'unavailable', reason: 'Node v24 has no node:ffi' };
+        },
+        scope: () => undefined,
+        platform: 'linux',
+      });
+      childGuard = guard('child');
+      const r = await tacet(['run', ...user(), '--detach', 'add work.txt'], {
+        spawnDetached: inProcess,
+        memoryGuard: guard('parent'),
+      });
+      expect(r.code, r.err).toBe(0);
+      expect(r.err).toMatch(/warning: this kernel has no Yama, .*answer codes/);
+      expect(await child).toBe(0);
+      expect(calls).toEqual(['parent', 'child']);
+      expect(readFileSync(logFile(), 'utf8')).toMatch(/warning: this kernel has no Yama/);
     });
 
     it('runs in the background, stops for an answer as a run without a terminal does, and passes no secret', async () => {

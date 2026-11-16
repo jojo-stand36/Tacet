@@ -132,7 +132,17 @@ describe('tacet mini and conductor.autostart', () => {
       { timeout: 5000 },
     );
     const stopMini = new AbortController();
-    const mini = tacet(['mini'], { signal: stopMini.signal });
+    let hardened = 0;
+    const mini = tacet(['mini'], {
+      signal: stopMini.signal,
+      // It holds answer codes as a run does, so it is guarded too (#316).
+      memoryGuard: {
+        harden: () => {
+          hardened += 1;
+          return { state: 'set' };
+        },
+      },
+    });
     const status = async () => JSON.parse((await tacet(['conductor', 'status', '--json'])).out);
     await vi.waitFor(
       async () => expect((await status()).repos[0]).toMatchObject({ connected: true }),
@@ -147,6 +157,7 @@ describe('tacet mini and conductor.autostart', () => {
     expect(m.code).toBe(MINI_EXIT.stopped);
     expect(m.err).toContain('Mini-conductor running for');
     expect(m.err).toContain('connected to the Conductor');
+    expect(hardened).toBe(1);
     await vi.waitFor(async () =>
       expect((await status()).repos[0]).toMatchObject({ connected: false }),
     );
