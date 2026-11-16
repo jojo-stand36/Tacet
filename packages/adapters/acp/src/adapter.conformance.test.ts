@@ -7,6 +7,8 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -16,7 +18,7 @@ import { mcpAuthHeaders, Secret } from '@tacet/core/node';
 import { assertConformance, EventTap, formatResults, runConformance } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from './adapter.js';
-import { GEMINI_AGENT } from './agents.js';
+import { type AcpAgentSpec, GEMINI_AGENT, GEMINI_WORKER_SETTINGS } from './agents.js';
 import { type MockGeminiApi, startMockGeminiApi } from './testing/mock-gemini-api.js';
 
 const require = createRequire(import.meta.url);
@@ -233,5 +235,99 @@ describe('AcpAdapter conformance (real Gemini CLI over ACP, mock Gemini API)', (
     await ctap.waitFor((e) => e.t === 'status' && e.state !== 'running', 60_000, 1);
     await control.close(c);
     expect(api.otherPaths.filter((p) => p.startsWith('/mcp')).length).toBeGreaterThan(0);
+  });
+
+  it('gives a Gemini Worker no shell to read outside its checkout through a symlink (#350)', {
+    timeout: 300_000,
+  }, async () => {
+    // Outside the checkout: a file and a directory carrying a marker, reached by links in it.
+    const outside = join(root, 'outside-350');
+    mkdirSync(join(outside, 'dir'), { recursive: true });
+    writeFileSync(join(outside, 'secret.txt'), 'OUTSIDE-MARKER-350-FILE\n');
+    writeFileSync(join(outside, 'dir', 'inner.txt'), 'OUTSIDE-MARKER-350-DIR\n');
+    const run = async (agent: AcpAgentSpec, label: string) => {
+      const dir = join(root, `symlink-350-${label}`);
+      const cwd = join(dir, 'wt');
+      mkdirSync(cwd, { recursive: true });
+      symlinkSync(join(outside, 'secret.txt'), join(cwd, 'lnk'));
+      symlinkSync(join(outside, 'dir'), join(cwd, 'dlnk'));
+      const a = new AcpAdapter({
+        agent,
+        executable: [process.execPath, GEMINI],
+        killTimeoutMs: 2000,
+        stateDir: join(dir, 'state'),
+        baseEnv: {
+          PATH: process.env.PATH,
+          HOME: join(root, 'home'),
+          GEMINI_API_KEY: 'placeholder-not-a-real-key',
+          GOOGLE_GEMINI_BASE_URL: api.url,
+        },
+      });
+      const asked: string[] = [];
+      const from = api.requests.length;
+      for (const prompt of ['CAT_GLOB', 'GREP_R']) {
+        const h = await a.start({ cwd });
+        try {
+          const tap = new EventTap(a.events(h));
+          await a.send(h, { text: prompt });
+          // Gemini's "safe" commands run without asking; any request is refused here. From 1: the
+          // session's start reports idle first.
+          const end = await tap.waitFor(
+            (e) => e.t === 'approval.request' || (e.t === 'status' && e.state === 'idle'),
+            60_000,
+            1,
+          );
+          if (end.event.t === 'approval.request') {
+            asked.push(prompt);
+            await a.respond(h, end.event.id, { kind: 'reject', persist: false });
+            await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, end.index + 1);
+          }
+        } finally {
+          await a.close(h);
+        }
+      }
+      const reqs = api.requests.slice(from);
+      const sent = reqs.map((r) => r.raw).join('\n');
+      // Whether the model was offered shell at all, from the declarations each request carried.
+      const declared = reqs.some((r) => {
+        try {
+          const tools = (JSON.parse(r.raw) as { tools?: unknown }).tools;
+          return JSON.stringify(tools ?? []).includes('"name":"run_shell_command"');
+        } catch {
+          return false;
+        }
+      });
+      return {
+        asked,
+        // Both calls were made and answered: each run sent the model a tool result.
+        answered: reqs.filter((r) => r.toolResult).length,
+        declared,
+        leaked: /OUTSIDE-MARKER-350/.test(sent),
+        refused: /not found in registry/.test(sent),
+      };
+    };
+    // Control: Gemini's own defaults (no Tacet policy, shell in the registry) read outside, unasked.
+    const { tools: _noShell, ...withShell } = GEMINI_WORKER_SETTINGS;
+    const control: AcpAgentSpec = {
+      ...GEMINI_AGENT,
+      home: {
+        env: 'GEMINI_CLI_HOME',
+        files: { '.gemini/settings.json': JSON.stringify(withShell) },
+      },
+    };
+    expect(await run(control, 'control')).toMatchObject({
+      asked: [],
+      answered: 2,
+      declared: true,
+      leaked: true,
+    });
+    // The Worker spec: shell is not offered, both calls fail, nothing outside reaches the model.
+    expect(await run(GEMINI_AGENT, 'worker')).toEqual({
+      asked: [],
+      answered: 2,
+      declared: false,
+      leaked: false,
+      refused: true,
+    });
   });
 });
