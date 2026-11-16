@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { project } from '../events/projection.js';
 import type { EventEnvelope } from '../schema/envelope.js';
 import { budgetKey, costLedgerProjection, rootTaskId } from './ledger.js';
-import { BUILTIN_PRICES, costOf, priceFor } from './pricing.js';
+import { BUILTIN_PRICES, costOf, type PricingTable, priceFor, priceOn } from './pricing.js';
 
 describe('priceFor (#35)', () => {
   it('matches an id exactly, without a context suffix, and a dated snapshot with its alias', () => {
@@ -181,7 +181,12 @@ describe('costLedgerProjection (#35)', () => {
       outputPerMTok: output,
     });
     for (const [model, price] of Object.entries({
-      'gemini-3.8-flash': { inputPerMTok: 0.75, outputPerMTok: 3.75, until: '2026-12-31' },
+      'gemini-3.8-flash': {
+        inputPerMTok: 0.75,
+        outputPerMTok: 3.75,
+        until: '2026-12-31',
+        later: [{ from: '2027-01-01', price: { inputPerMTok: 1.5, outputPerMTok: 7.5 } }],
+      },
       'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
       'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
       'gemini-3.1-pro-preview': { inputPerMTok: 2, outputPerMTok: 12, longContext: tier(4, 18) },
@@ -196,6 +201,7 @@ describe('costLedgerProjection (#35)', () => {
         outputPerMTok: 10,
         longContext: tier(2.5, 15),
         until: '2026-11-30',
+        later: [{ from: '2026-12-01', billedAs: 'gemini-3.8-flash' }],
       },
     })) {
       expect(priceFor(model, BUILTIN_PRICES), model).toEqual(price);
@@ -210,8 +216,8 @@ describe('costLedgerProjection (#35)', () => {
       expect(priceFor(m, BUILTIN_PRICES), m).toBeUndefined();
     }
     const l = ledger([
-      // 3.8 Flash's introductory price holds through 2026-12-31; 2.5 Pro is billed as 3.8 Flash
-      // from 2026-12-01, so its own price holds through 2026-11-30.
+      // 3.8 Flash's introductory price holds through 2026-12-31, its later one from 2027-01-01;
+      // 2.5 Pro is billed as 3.8 Flash from 2026-12-01 (#363).
       usage(
         { inputTokens: 1_000_000, outputTokens: 0, model: 'gemini-3.8-flash' },
         { taskId: 'A', ts: '2026-12-31T23:59:59.000Z' },
@@ -230,9 +236,60 @@ describe('costLedgerProjection (#35)', () => {
       ),
     ]);
     expect(l.tasks.A?.usd).toBe(0.75);
-    expect(l.tasks.B).toMatchObject({ usd: 0, unpricedTokens: 1_000_000 });
+    expect(l.tasks.B).toMatchObject({ usd: 1.5, unpricedTokens: 0 });
     expect(l.tasks.C?.usd).toBe(0.125);
-    expect(l.tasks.D).toMatchObject({ usd: 0, unpricedTokens: 100_000 });
+    expect(l.tasks.D).toMatchObject({ usd: 0.075, unpricedTokens: 0 });
+  });
+
+  it('takes the price in force on the day: a later price, or the model it is billed as (#363)', () => {
+    // Acceptance: 3.8 Flash on 2027-01-01 at $1.50 / $7.50.
+    expect(priceOn('gemini-3.8-flash', '2026-12-31', BUILTIN_PRICES)).toEqual({
+      inputPerMTok: 0.75,
+      outputPerMTok: 3.75,
+    });
+    expect(priceOn('gemini-3.8-flash', '2027-01-01', BUILTIN_PRICES)).toEqual({
+      inputPerMTok: 1.5,
+      outputPerMTok: 7.5,
+    });
+    // Acceptance: 2.5 Pro from 2026-12-01 at 3.8 Flash's rate for that day, which itself changes.
+    expect(priceOn('gemini-2.5-pro', '2026-11-30', BUILTIN_PRICES)?.inputPerMTok).toBe(1.25);
+    expect(priceOn('gemini-2.5-pro', '2026-12-01', BUILTIN_PRICES)).toEqual({
+      inputPerMTok: 0.75,
+      outputPerMTok: 3.75,
+    });
+    expect(priceOn('gemini-2.5-pro', '2027-02-01', BUILTIN_PRICES)?.outputPerMTok).toBe(7.5);
+    // Acceptance: a price whose later rate is not known still ends on its last day.
+    expect(priceOn('gpt-5.6-sol', '2026-11-30', BUILTIN_PRICES)?.inputPerMTok).toBe(4);
+    expect(priceOn('gpt-5.6-sol', '2026-12-01', BUILTIN_PRICES)).toBeUndefined();
+    // A later step before its `from`, a model billed as one with no price, and a loop.
+    const table: PricingTable = {
+      a: { inputPerMTok: 1, outputPerMTok: 1, later: [{ from: '2027-01-01', billedAs: 'b' }] },
+      b: { inputPerMTok: 2, outputPerMTok: 2, later: [{ from: '2027-01-01', billedAs: 'a' }] },
+      c: { inputPerMTok: 3, outputPerMTok: 3, later: [{ from: '2027-01-01', billedAs: 'none' }] },
+    };
+    expect(priceOn('a', '2026-12-31', table)?.inputPerMTok).toBe(1);
+    expect(priceOn('a', '2027-01-01', table)).toBeUndefined();
+    expect(priceOn('c', '2027-01-01', table)).toBeUndefined();
+    // A user price for the model billed as replaces it there too.
+    expect(
+      priceOn('gemini-2.5-pro', '2026-12-01', {
+        ...BUILTIN_PRICES,
+        'gemini-3.8-flash': { inputPerMTok: 9, outputPerMTok: 9 },
+      })?.inputPerMTok,
+    ).toBe(9);
+  });
+
+  it('keeps every later price in date order, after the entry it follows', () => {
+    for (const [model, price] of Object.entries(BUILTIN_PRICES)) {
+      const froms = (price.later ?? []).map((l) => l.from);
+      expect(froms, model).toEqual([...froms].sort());
+      if (price.until !== undefined && froms[0] !== undefined) {
+        expect(froms[0] > price.until, model).toBe(true);
+      }
+      for (const l of price.later ?? []) {
+        if ('billedAs' in l) expect(priceFor(l.billedAs, BUILTIN_PRICES), model).toBeDefined();
+      }
+    }
   });
 
   it('keeps the latest exceeded cap until the user raises it', () => {

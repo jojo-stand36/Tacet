@@ -31,7 +31,7 @@ import {
   type PricingTable,
   type Priority,
   type ProfileField,
-  priceFor,
+  priceOn,
   pricingTable,
   redactSecrets,
   rootTaskId,
@@ -1882,9 +1882,7 @@ export class MiniConductor {
     // Workers run on the profile's model, `models[0]` when only a list is set; the planner, the
     // gate's reasoning and the reviewer are given `model` only, else the vendor's default.
     const model = worker ? (tier.model ?? tier.models?.[0]) : tier.model;
-    const price = priceFor(model, this.#pricing);
-    const today = this.#now().toISOString().slice(0, 10);
-    if (price && (price.until === undefined || today <= price.until)) return undefined;
+    if (priceOn(model, this.#now().toISOString().slice(0, 10), this.#pricing)) return undefined;
     return model ?? `default@${tier.adapter}`;
   }
 

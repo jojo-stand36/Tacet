@@ -3533,6 +3533,25 @@ describe('budgets (#35)', () => {
       await expect.poll(() => fake.sessions.length, { timeout: 5000 }).toBeGreaterThan(0);
     });
 
+    it('asks by the price in force today: a model billed as another is not asked about (#363)', async () => {
+      fake = new NoCost('fake', script);
+      const d = make({
+        adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+        config: {
+          ...CONFIG,
+          tiers: { worker: { adapter: 'fake', model: 'gemini-2.5-pro' } },
+          budget: { per_day_usd: 10 },
+        },
+        // Past 2.5 Pro's own price: it is billed as 3.8 Flash, whose price is known.
+        now: () => new Date('2026-12-05T12:00:00.000Z'),
+      });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      expect(tasks()[`${a}/1`]?.state).toBe('completed');
+      expect(ofType('budget.unpriced')).toHaveLength(0);
+    });
+
     it('runs without asking when no cap applies, or a price is configured', async () => {
       const d = nocost({
         pricing: { cheap: { input_per_mtok: 1, output_per_mtok: 1 } },

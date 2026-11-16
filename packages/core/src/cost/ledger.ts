@@ -9,7 +9,7 @@ import {
 } from '../schema/budget.js';
 import type { EventEnvelope } from '../schema/envelope.js';
 import { WorkerProfile, WorkerStarted } from '../schema/worker.js';
-import { costOf, type PricingTable, priceFor } from './pricing.js';
+import { costOf, type PricingTable, priceOn } from './pricing.js';
 
 /** Spend in one ledger bucket. */
 export interface Spend {
@@ -165,9 +165,10 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
               next = { ...state, tasks, days, months, provisional };
             }
           } else {
-            const price = priceFor(model, table);
-            // A promotional price holds only through its last day (UTC).
-            if (price && (price.until === undefined || e.ts.slice(0, 10) <= price.until)) {
+            // The price in force on the event's UTC day: a promotion ends, a later price or
+            // another model's takes over (#363).
+            const price = priceOn(model, e.ts.slice(0, 10), table);
+            if (price) {
               estimated = costOf(price, inputTokens, outputTokens);
               usd = estimated;
             } else unpriced = inputTokens + outputTokens;
