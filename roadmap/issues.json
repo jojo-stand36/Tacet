@@ -1796,6 +1796,18 @@
       "body": "Track spend from usage events; enforce soft/hard budget policies.\n\n### Tasks\n- [ ] Pricing table per model (config-driven, updatable)\n- [ ] Soft warn → escalate; hard cap → pause\n- [ ] Distinguish API-key spend vs subscription usage\n- [ ] Default API-key budget: $200/month (owner decision, 2026-11-09), config key `api_key_per_month_usd` (ARCHITECTURE §4)\n- [ ] Borrow (ADR-001): Soft `ask_thresholds_usd` (each becomes an Escalation) plus a hard cap, after Omnigent's cost policy (`omnigent/policies/builtins/cost.py`)\n\n### Acceptance criteria\n- Budget caps enforced in tests\n- The $200/month API-key default is enforced in tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Dated and \"billed as\" prices in the cost ledger's price table",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:core",
+        "area:cost",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "The cost ledger's price table (`BUILTIN_PRICES`, #35, #357) can only end a price on a day (`until`); usage after it has no known cost, so the model is asked about again (#35 decision (c)). Two prices on Google's page (read 2026-11-16, capability matrix \"Model API prices (#35)\") need more:\n\n- `gemini-3.8-flash`: \"$0.75 through December 31, 2026. $1.50 starting January 1, 2027.\" (output $3.75, then $7.50).\n- `gemini-2.5-pro`, Gemini CLI 0.67.0's `DEFAULT_GEMINI_MODEL`: \"Effective December 1, 2026, all API requests to `gemini-2.5-pro` will automatically route to Gemini 3.8 Flash (`gemini-3.8-flash`) and be billed at Gemini 3.8 Flash rates.\" From that day every Gemini Worker on the fallback model is asked about an unpriced model, although its price is known.\n\n### Tasks\n- [ ] A price entry can carry later prices from a UTC day on (`from`), and can name another model it is billed as from a day on.\n- [ ] `priceFor` (or the ledger) picks the price in force on the usage event's UTC day.\n- [ ] Use it for the two entries above; record the change in the capability matrix.\n\n### Acceptance criteria\n- Usage on `gemini-3.8-flash` on 2027-01-01 is priced at $1.50 / $7.50 (test).\n- Usage on `gemini-2.5-pro` on 2026-12-01 is priced at `gemini-3.8-flash`'s rate for that day (test).\n- A price whose later rate is not known still ends on its last day, as now (test).\n\n_See docs/ARCHITECTURE.md §4 (Budgets) and docs/adapters/capability-matrix.md \"Model API prices (#35)\"._\n"
+    },
+    {
       "title": "Escalation ladder: retry with stronger model before asking a human",
       "milestone": "M3 · Context handoff & cost tiering",
       "labels": [

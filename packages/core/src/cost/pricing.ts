@@ -23,10 +23,10 @@ export const BUILTIN_PRICES_CHECKED = '2026-11-16';
 
 /**
  * API list prices (capability matrix, "Model API prices (#35)"): Anthropic's, read from
- * https://platform.claude.com/docs/en/about-claude/pricing, and OpenAI's, read from
- * https://developers.openai.com/api/docs/pricing.md, both on 2026-11-16. Google's are not here:
- * their pricing page could not be read, so usage on Gemini models has no known cost and is never
- * guessed.
+ * https://platform.claude.com/docs/en/about-claude/pricing, OpenAI's, read from
+ * https://developers.openai.com/api/docs/pricing.md, and Google's (the Gemini models Gemini CLI
+ * 0.67.0 names that the page lists, #357), read from https://aistudio.google.com/docs/pricing.md,
+ * all on 2026-11-16. A model not here has no known cost and is never guessed.
  */
 export const BUILTIN_PRICES: PricingTable = {
   'claude-fable-5-2': { inputPerMTok: 8, outputPerMTok: 40 },
@@ -60,7 +60,32 @@ export const BUILTIN_PRICES: PricingTable = {
   'gpt-5.6-terra': openai(2, 12, 4, 18),
   'gpt-5.6-luna': openai(0.2, 1.2, 0.4, 1.8),
   'gpt-5.5': openai(5, 30, 10, 45),
+  // Google, read from https://aistudio.google.com/docs/pricing.md on 2026-11-16 (#357): the
+  // paid tier's standard rates, text input. Audio input costs more on some models and is not
+  // told apart. "prompts <= 200k tokens" is read as 200,000.
+  // "$0.75 through December 31, 2026. $1.50 starting January 1, 2027." (output $3.75, then $7.50):
+  // the later price is not applied, so from 2027 the model is asked about again.
+  'gemini-3.8-flash': { inputPerMTok: 0.75, outputPerMTok: 3.75, until: '2026-12-31' },
+  'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
+  'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
+  // The page prices both ids in one section.
+  'gemini-3.1-pro-preview': gemini(2, 12, 4, 18),
+  'gemini-3.1-pro-preview-customtools': gemini(2, 12, 4, 18),
+  'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3 },
+  // Deprecated: "Effective December 1, 2026, all API requests to `gemini-2.5-pro` will
+  // automatically route to Gemini 3.8 Flash (`gemini-3.8-flash`) and be billed at Gemini 3.8
+  // Flash rates." This price holds through November 30.
+  'gemini-2.5-pro': { ...gemini(1.25, 10, 2.5, 15), until: '2026-11-30' },
 };
+
+/** A Gemini price with its tier for prompts above 200k (read as 200,000) tokens. */
+function gemini(input: number, output: number, longInput: number, longOutput: number): ModelPrice {
+  return {
+    inputPerMTok: input,
+    outputPerMTok: output,
+    longContext: { aboveInputTokens: 200_000, inputPerMTok: longInput, outputPerMTok: longOutput },
+  };
+}
 
 /** An OpenAI price with its long-context tier above 272K (read as 272,000) input tokens. */
 function openai(input: number, output: number, longInput: number, longOutput: number): ModelPrice {

@@ -168,6 +168,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Conductor & mini-conductor self-handoff** — `feature` `P1` `either`
 - [ ] **Context usage tracking per session** — `feature` `P0` `either`
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
+- [ ] **Dated and "billed as" prices in the cost ledger's price table** — `feature` `P2` `either`
 - [ ] **Escalation ladder: retry with stronger model before asking a human** — `feature` `P1` `either`
 - [ ] **Gemini API prices for the cost ledger (and the Codex default model)** — `docs` `P2` `claude + human`
 - [ ] **Let the user undo a refusal to run an unpriced model** — `feature` `P3` `either`
