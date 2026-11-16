@@ -32,8 +32,9 @@ import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-res
  */
 /**
  * The error the shell prints for a write the sandbox refused (EROFS, EACCES or EPERM). Codex runs
- * commands in the user's shell: bash capitalises strerror ("Operation not permitted"), zsh, the
- * default login shell on macOS, does not ("zsh:1: operation not permitted: <path>").
+ * commands in the user's shell. A tool such as `touch` prints its own error ("Operation not
+ * permitted"), but a refused redirection (`>`, `>>`) is reported by the shell, and zsh, the
+ * default login shell on macOS, prints it in lower case ("zsh:1: operation not permitted: <path>").
  */
 const DENIED = /Read-only file system|Permission denied|Operation not permitted/i;
 
