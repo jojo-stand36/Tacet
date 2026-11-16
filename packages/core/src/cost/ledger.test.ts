@@ -168,6 +168,46 @@ describe('costLedgerProjection (#35)', () => {
     expect(costOf(sol, 272_001, 0)).toBeCloseTo(1.088004, 9);
   });
 
+  it('prices the Gemini models on Google’s page, with their tiers and end dates (#357)', () => {
+    const pro = priceFor('gemini-3.1-pro-preview', BUILTIN_PRICES);
+    if (!pro) throw new Error('no price');
+    // $2 / $12 up to 200,000 prompt tokens, $4 / $18 above.
+    expect(costOf(pro, 200_000, 1_000_000)).toBeCloseTo(12.4, 9);
+    expect(costOf(pro, 200_001, 1_000_000)).toBeCloseTo(18.800004, 9);
+    expect(priceFor('gemini-3.5-flash-lite', BUILTIN_PRICES)).toEqual({
+      inputPerMTok: 0.3,
+      outputPerMTok: 2.5,
+    });
+    // Gemini CLI 0.67.0 models the page does not list stay unpriced.
+    for (const m of ['gemini-3-pro-preview', 'gemini-3.5-flash', 'gemini-3-flash']) {
+      expect(priceFor(m, BUILTIN_PRICES), m).toBeUndefined();
+    }
+    const l = ledger([
+      // 3.8 Flash's introductory price holds through 2026-12-31; 2.5 Pro is billed as 3.8 Flash
+      // from 2026-12-01, so its own price holds through 2026-11-30.
+      usage(
+        { inputTokens: 1_000_000, outputTokens: 0, model: 'gemini-3.8-flash' },
+        { taskId: 'A', ts: '2026-12-31T23:59:59.000Z' },
+      ),
+      usage(
+        { inputTokens: 1_000_000, outputTokens: 0, model: 'gemini-3.8-flash' },
+        { taskId: 'B', ts: '2027-01-01T00:00:00.000Z' },
+      ),
+      usage(
+        { inputTokens: 100_000, outputTokens: 0, model: 'gemini-2.5-pro' },
+        { taskId: 'C', ts: '2026-11-30T12:00:00.000Z' },
+      ),
+      usage(
+        { inputTokens: 100_000, outputTokens: 0, model: 'gemini-2.5-pro' },
+        { taskId: 'D', ts: '2026-12-01T00:00:00.000Z' },
+      ),
+    ]);
+    expect(l.tasks.A?.usd).toBe(0.75);
+    expect(l.tasks.B).toMatchObject({ usd: 0, unpricedTokens: 1_000_000 });
+    expect(l.tasks.C?.usd).toBe(0.125);
+    expect(l.tasks.D).toMatchObject({ usd: 0, unpricedTokens: 100_000 });
+  });
+
   it('keeps the latest exceeded cap until the user raises it', () => {
     const k = budgetKey('task', 'T');
     const exceeded = ledger([
