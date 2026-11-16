@@ -1,5 +1,6 @@
 import { MINI_EXIT_UNFINISHED } from '@tacet/core/node';
 import type { Io } from '../io.js';
+import { guardMemory } from '../memory-guard.js';
 import { terminalSafe } from '../render.js';
 import {
   DONE_STATES,
@@ -62,6 +63,7 @@ export async function mini(io: Io, o: MiniOptions): Promise<number> {
     return MINI_EXIT.unfinished;
   }
 
+  guardMemory(io);
   const { startStandalone } = await import('@tacet/mini/standalone');
   let sa: Awaited<ReturnType<typeof startStandalone>>;
   try {

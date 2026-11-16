@@ -1,4 +1,4 @@
-import type { WslProbe } from '@tacet/core/node';
+import type { NonDumpable, WslProbe } from '@tacet/core/node';
 import type { StandaloneOptions } from '@tacet/mini/standalone';
 import type { SpawnDetached } from './commands/detach.js';
 
@@ -30,4 +30,19 @@ export interface Io {
   detachStartTimeoutMs?: number;
   /** Tests only: what the WSL checks read (#193). Default: this machine's. */
   wslProbe?: WslProbe;
+  /**
+   * How a command that holds the one-time answer codes (`tacet run`, `tacet mini`) keeps its memory
+   * from code a Worker runs (#316). The `tacet` binary passes the real one (`makeNonDumpable`);
+   * absent (in-process tests, which must not change the test runner), nothing is changed or said.
+   */
+  memoryGuard?: MemoryGuard;
+}
+
+/** What {@link Io.memoryGuard} does and reads. */
+export interface MemoryGuard {
+  harden: () => NonDumpable;
+  /** Yama's `ptrace_scope`, `undefined` without Yama. Default: this machine's. */
+  scope?: () => number | undefined;
+  /** Default `process.platform`. */
+  platform?: NodeJS.Platform;
 }

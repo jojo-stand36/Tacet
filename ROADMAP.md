@@ -28,6 +28,7 @@ Repo, decisions, schemas, spikes. Nothing runs agents yet.
 - [ ] **Spike: verify per-vendor MCP client facts (revisions, config injection, timeouts)** — `spike` `P1` `claude`
 - [ ] **Spike: verify the Claude ACP adapter and codex-acp** — `spike` `P1` `claude`
 - [ ] **Stop roadmap/issues.json and ROADMAP.md merge conflicts between PRs** — `chore` `P1` `claude`
+- [ ] **create-issues.sh: dry-run never checks what exists, and listing breaks past page 1 behind the cloud proxy** — `chore` `P1` `claude`
 
 ## M1 · Mini-conductor MVP
 
@@ -57,6 +58,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Claude Workers: turn Bash off at the source and enable Glob/Grep (closes the #200 gaps)** — `feature` `P1` `claude`
 - [ ] **Claude's sandbox leaves a .git placeholder skeleton in /tmp (an ancestor or write-allowed dir), and Tacet then takes /tmp for a repo** — `feature` `P2` `claude`
 - [ ] **Clean up orphaned Worker processes after a Mini-conductor crash** — `feature` `P1` `claude`
+- [ ] **Clear a crashed Claude session's sandbox placeholders when its task is canceled while no run is live** — `chore` `P3` `claude`
 - [ ] **Codex Worker isolation does not hold for a repo under /tmp or $TMPDIR** — `P2` `claude`
 - [ ] **Codex Worker isolation: own CODEX_HOME, worktree git dir writable, plugins off** — `feature` `P1` `claude`
 - [ ] **Codex Workers on macOS: a private TMPDIR, and sweeping leftover Worker temp dirs** — `feature` `P3` `claude`
@@ -73,6 +75,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Forward events by the ADR-003 §4 allowlist, not a local-namespace denylist** — `feature` `P1` `claude`
 - [ ] **Gemini Workers cannot reach the Mini-conductor's MCP tools in an untrusted checkout** — `feature` `P1` `claude + human`
 - [ ] **Gemini Workers read outside their checkout without asking, through a symlink and Gemini's no-ask shell commands** — `P1` `claude + human`
+- [ ] **Harden the answer code's process (#269): non-dumpable tacet run, ptrace_scope warning, live per-OS checks** — `feature` `claude`
 - [ ] **Hold a task's pinned target commit with a ref so git gc cannot prune it** — `feature` `P2` `claude`
 - [ ] **Integrate unattended Codex Worker commits from the Mini-conductor** — `feature` `P1` `claude + human`
 - [ ] **Keep vendor keys out of Workers' tool subprocesses** — `feature` `P2` `claude`
@@ -81,6 +84,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Mini-conductor MCP server (escalate, report_progress, request_handoff, record_decision…)** — `feature` `P0` `either`
 - [ ] **Mini-conductor daemon: task queue, planner, worker pool** — `feature` `P0` `either`
 - [ ] **Mini-conductor: build Worker adapters from the effective config at startup** — `feature` `P1` `either`
+- [ ] **PTY Claude Workers on Linux: let Claude's sandbox reach only the local hook endpoint** — `feature` `P2` `claude`
 - [ ] **PTY Workers: stop Claude Code cloning the official plugin marketplace at session start** — `feature` `P2` `claude`
 - [ ] **PTY adapter credits an interrupted turn's reply to the next turn** — `feature` `P1` `claude`
 - [ ] **PTY adapter: clean up per-session Claude config directories** — `feature` `P2` `either`
@@ -100,10 +104,12 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Scrub Worker tokens split across streamed message deltas** — `feature` `P2` `either`
 - [ ] **Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)** — `feature` `P1` `claude`
 - [ ] **Standalone Mini-conductor control port: status and live attach over ADR-003 §4** — `feature` `P2` `claude`
+- [ ] **Start dependent sub-tasks from their dependencies' integrated commits** — `feature` `P1` `claude`
 - [ ] **Start the Claude SDK's Claude Code in a session of its own, and verify #269's terminal assumptions per OS** — `feature` `P2` `claude`
 - [ ] **Submodules and nested repos for unattended Codex Workers** — `feature` `P2` `claude + human`
 - [ ] **Sweep stale Worker MCP config files at startup** — `feature` `P2` `either`
 - [ ] **Track ACP v2: prompt ack + state_update lifecycle** — `spike` `P2` `claude`
+- [ ] **Typed refusal for a fork an adapter cannot do, so a caller can fall back to a HandoffPacket** — `feature` `P3` `claude`
 - [ ] **Unattended Worker tool policy before #25: let Workers change their own worktree** — `feature` `P1` `claude`
 - [ ] **Verification pipeline: commands + reviewer agent** — `feature` `P1` `either`
 - [ ] **Verify Claude Code transcript facts behind PTY usage: [1m] model id and subagent calls** — `spike` `P3` `claude`
@@ -118,6 +124,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Worktree manager state into the event log** — `chore` `P2` `either`
 - [ ] **Worktree test "keeps no state files" times out at 5s on macOS, then fails cleanup with ENOTEMPTY** — `chore` `P3` `either`
 - [ ] **`tacet init` installer for repos** — `feature` `P0` `copilot`
+- [ ] **attach: test the clipboard filter on real terminals, then restore non-ASCII titles safely** — `feature` `human`
 - [ ] **buildWorkerAdapters: pass repoRoot to the Codex adapter** — `feature` `P1` `claude`
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **claude-sdk Workers have no commit path, so their work is never integrated** — `P1`
@@ -125,6 +132,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
 - [ ] **pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments** — `feature` `P1` `claude`
 - [ ] **pty:claude: evaluate permissions.blockReadsOutsideWorkingDirectories as defence in depth for pasted reads** — `chore` `P3` `claude`
+- [ ] **tacet attach: strip OSC 52 (clipboard writes) from a Worker's terminal bytes** — `feature` `P1` `claude`
 - [ ] **tacet cancel <task> in standalone mode** — `feature` `P2` `either`
 - [ ] **tacet uninstall --purge: also remove the repo's run state, through the worktree manager** — `feature` `P2` `claude`
 
@@ -145,6 +153,7 @@ Global conductor, multi-repo registry, decision inbox, summary packets.
 - [ ] **Summary packets (no transcripts upward)** — `feature` `P1` `either`
 - [ ] **Tasks down the Conductor link: create tasks and answer escalations** — `feature` `P1` `claude + human`
 - [ ] **Tool policies: searches that walk through symlinks below their start** — `feature` `P2` `claude`
+- [ ] **Tool policy for Gemini CLI's tool names, so acp:gemini Workers can edit code** — `feature` `claude`
 - [ ] **UI custom event schemas (tacet.usage, tacet.escalation, tacet.decision, tacet.budget)** — `feature` `P2` `either`
 - [ ] **read_task: report the root task's remaining budget to a Worker on a sub-task** — `feature` `P2` `either`
 
@@ -163,6 +172,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
 - [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
+- [ ] **Threshold handoff for Workers without an MCP client** — `feature` `claude`
 
 ## M4 · Visual & terminal UI
 
