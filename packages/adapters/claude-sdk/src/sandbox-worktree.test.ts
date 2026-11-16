@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -111,5 +112,63 @@ describe.runIf(sandbox || Boolean(process.env.CI))('Claude sandbox and the Worke
     expect(seen).toContain('github-visible');
     expect(readFileSync(join(cwd, '.env'), 'utf8')).toBe('EXISTING=1\n');
     expect(readFileSync(join(cwd, 'package.json'), 'utf8')).toMatch(/^\{"name":"x"\}\n/);
+  });
+
+  it('keeps its temp files in a dir of its own, gone after close (#326)', {
+    timeout: 120_000,
+  }, async () => {
+    const home = join(root, 'home-326');
+    const cwd = join(root, 'wt-326');
+    mkdirSync(home);
+    mkdirSync(cwd);
+    // Short enough for `<dir>/tacet-c-XXXXXX/claude-<uid>` to fit Claude's budget.
+    const short = realpathSync(mkdtempSync(join(tmpdir(), 't-')));
+    const adapter = new ClaudeSdkAdapter({
+      authRoute: 'api_key',
+      baseEnv: {
+        PATH: process.env.PATH,
+        HOME: home,
+        CLAUDE_CONFIG_DIR: join(home, '.claude'),
+        ANTHROPIC_BASE_URL: api.url,
+        ANTHROPIC_API_KEY: 'sk-ant-sandbox-placeholder-0000000000000',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        DISABLE_AUTOUPDATER: '1',
+      },
+      mcpConfigDir: join(root, 'run-326'),
+      sdkOptions: { settingSources: [] },
+      tmpRoot: short,
+    });
+    try {
+      const h = await adapter.start({ cwd });
+      // Made on Linux only (#326: macOS unverified).
+      const own = readdirSync(short).filter((n) => !n.endsWith('.owner'));
+      expect(own).toHaveLength(process.platform === 'linux' ? 1 : 0);
+      const priv = join(short, own[0] ?? '');
+      let seen = '';
+      try {
+        const tap = new EventTap(adapter.events(h));
+        const from = api.requests.length;
+        await adapter.send(h, {
+          text: 'RUN_CMD echo "tmp=$TMPDIR"; echo x > "$TMPDIR/probe-326"; echo "wrote: $?"',
+        });
+        const req = await tap.waitFor((e) => e.t === 'approval.request', 60_000);
+        if (req.event.t !== 'approval.request') throw new Error('no approval');
+        await adapter.respond(h, req.event.id, { kind: 'allow_once', persist: false });
+        await tap.waitFor((e) => e.t === 'status' && e.state === 'idle', 60_000, req.index + 1);
+        seen = api.requests.slice(from).find((r) => r.toolOutput)?.toolOutput ?? '(no output)';
+        console.log(`#326 sandbox temp dir on ${process.platform}\n${seen}`);
+        if (process.platform === 'linux') {
+          // The command's temp dir is the session's own, and writable.
+          expect(seen).toContain(`tmp=${priv}/claude-`);
+          expect(seen).toContain('wrote: 0');
+        }
+      } finally {
+        await adapter.close(h);
+      }
+      // Nothing of it is left: no dir, no owner record.
+      expect(readdirSync(short)).toEqual([]);
+    } finally {
+      rmSync(short, { recursive: true, force: true });
+    }
   });
 });
