@@ -16,7 +16,8 @@
         "stuck",
         "restart",
         "canceled",
-        "handoff"
+        "handoff",
+        "budget"
       ],
       "x-tacet-fallback": "failed",
       "type": "string"

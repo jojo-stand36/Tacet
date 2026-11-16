@@ -27,7 +27,9 @@ export type Script =
   | { do: 'vanish' }
   | { do: 'tool-hold' }
   | { do: 'auth' }
-  | { do: 'approval'; toolName?: string; grant?: unknown };
+  | { do: 'approval'; toolName?: string; grant?: unknown }
+  /** Report a call that cost `costUsd`, then hold the turn like `hold` (#35). */
+  | { do: 'spend'; costUsd: number };
 
 interface FakeSession {
   handle: SessionHandle;
@@ -181,6 +183,17 @@ export class ScriptedAdapter implements AgentAdapter {
         id: `tool-${s.handle.id}`,
         name: 'Bash',
         input: { command: 'pnpm test' },
+      });
+      await new Promise<void>((resolve) => {
+        s.held = resolve;
+      });
+    } else if (step.do === 'spend') {
+      this.#emit(s, {
+        t: 'usage',
+        inputTokens: 100,
+        outputTokens: 10,
+        costUsd: step.costUsd,
+        source: 'reported',
       });
       await new Promise<void>((resolve) => {
         s.held = resolve;

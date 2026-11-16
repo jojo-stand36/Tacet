@@ -13,6 +13,12 @@ import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-
 import {
   type AgentEvent,
   type AgentTerminal,
+  BUILTIN_PRICES,
+  type BudgetExceeded,
+  type BudgetScope,
+  budgetKey,
+  type CostLedger,
+  costLedgerProjection,
   Decision,
   type DecisionScope,
   Escalation,
@@ -25,7 +31,9 @@ import {
   type Priority,
   type ProfileField,
   redactSecrets,
+  rootTaskId,
   type SessionHandle,
+  type Spend,
   type SummaryPacket,
   type TacetConfig,
   type Task,
@@ -176,6 +184,8 @@ interface View {
   pendingHandoffs: Map<string, { handoffId: string; sessionId: string; packet?: HandoffPacket }>;
   /** Handoffs requested per sub-task, for `workers.max_handoffs`. */
   handoffCount: Map<string, number>;
+  /** Spend per root task, day and month, and the caps raised (#35). */
+  ledger: CostLedger;
 }
 
 /** What a Mini-conductor session of its own used (`aside`). */
@@ -969,6 +979,7 @@ export class MiniConductor {
   }
 
   async #tick(gen: number): Promise<void> {
+    await this.#enforceBudgets();
     for (const run of [...this.#runs.values()]) {
       if (!this.#live(gen)) return;
       await this.#deliverAnswers(run);
@@ -1088,9 +1099,11 @@ export class MiniConductor {
       const open = [...this.#state().escalations.values()].some(
         (x) => x.taskId === v.task.id && !x.resolved,
       );
-      return open ? 'blocked' : 'pending';
+      return open || this.#overBudget(v.task.id) ? 'blocked' : 'pending';
     }
     if (WAITING.has(v.state)) return 'blocked';
+    // A spent hard cap holds every sub-task it covers until the user raises it (#35).
+    if (this.#overBudget(v.task.id)) return 'blocked';
     return 'pending';
   }
 
@@ -1703,9 +1716,11 @@ export class MiniConductor {
     taskId: string,
     question: string,
     extra: Pick<Escalation, 'urgency'> & Partial<Pick<Escalation, 'category' | 'contextRef'>>,
-  ): void {
+    also: EventEnvelope[] = [],
+    id: string = newUlid(this.#now().getTime()),
+  ): string {
     const escalation = Escalation.parse({
-      id: newUlid(this.#now().getTime()),
+      id,
       taskId,
       ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
       question,
@@ -1716,7 +1731,129 @@ export class MiniConductor {
     this.#o.store.append([
       this.#env(taskId, 'escalation.raised', escalation),
       this.#env(taskId, 'task.status', { state: 'input_required' }),
+      ...also,
     ]);
+    return escalation.id;
+  }
+
+  // ---- Budgets (#35) -------------------------------------------------------------------------
+
+  /** The cap on a budget instance, or undefined when there is none: a raise wins, then config. */
+  #capFor(scope: BudgetScope, key: string): number | undefined {
+    const v = this.#state();
+    const raised = v.ledger.raised[budgetKey(scope, key)];
+    if (raised !== undefined) return raised;
+    if (scope === 'task') {
+      return v.tasks[key]?.task.budget?.usd ?? this.#o.config.budget?.per_task_usd;
+    }
+    if (scope === 'day') return this.#o.config.budget?.per_day_usd;
+    return undefined;
+  }
+
+  /**
+   * The cap `taskId` is over, if any: its root task's (`task.budget.usd`, else
+   * `budget.per_task_usd`) or today's (UTC, `budget.per_day_usd`), counting known spend only.
+   * A cap recorded as exceeded stays so until the user raises it. The month cap and usage with no
+   * known cost are not enforced here yet (#35, owner decisions pending).
+   */
+  #overBudget(taskId: string): Omit<BudgetExceeded, 'escalationId'> | undefined {
+    const { ledger } = this.#state();
+    const root = rootTaskId(taskId);
+    const day = this.#now().toISOString().slice(0, 10);
+    const checks: [BudgetScope, string, Spend | undefined][] = [
+      ['task', root, ledger.tasks[root]],
+      ['day', day, ledger.days[day]],
+    ];
+    for (const [scope, key, spend] of checks) {
+      const cap = this.#capFor(scope, key);
+      if (cap === undefined) continue;
+      const spentUsd = spend?.usd ?? 0;
+      if (spentUsd >= cap || ledger.exceeded[budgetKey(scope, key)]) {
+        return {
+          scope,
+          key,
+          capUsd: cap,
+          spentUsd,
+          ...(spend?.unpricedTokens ? { unpricedTokens: spend.unpricedTokens } : {}),
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Fail safe on a hard cap (#35): once spend reaches it, stop every Worker it covers (its root
+   * task's, or all of today's), start none, and ask the user, once per cap, to raise it. Checked
+   * after every usage event and on every tick. Answers are read here too.
+   */
+  async #enforceBudgets(): Promise<void> {
+    if (!this.#started) return;
+    this.#readBudgetAnswers();
+    const v = this.#state();
+    const candidates = new Set<string>([...this.#runs.keys()]);
+    for (const s of this.#schedulable())
+      if (s.phase !== 'done' && s.phase !== 'failed') candidates.add(s.id);
+    const stops: Promise<void>[] = [];
+    for (const id of candidates) {
+      const over = this.#overBudget(id);
+      if (!over) continue;
+      const k = budgetKey(over.scope, over.key);
+      const prior = v.ledger.exceeded[k]?.escalationId;
+      const asking = prior !== undefined && v.escalations.get(prior)?.resolved === false;
+      if (!asking) {
+        // The question and the record go in one batch: the record names the question.
+        const escalationId = newUlid(this.#now().getTime());
+        this.#raise(
+          id,
+          budgetQuestion(over),
+          { urgency: 'high', category: 'blocked', contextRef: `tacet:budget:${k}` },
+          [this.#env(id, 'budget.exceeded', { ...over, escalationId })],
+          escalationId,
+        );
+      }
+      for (const run of [...this.#runs.values()]) {
+        if (over.scope === 'day' || rootTaskId(run.subtaskId) === over.key) {
+          stops.push(
+            this.#end(
+              run,
+              'budget',
+              `stopped: the ${over.scope} budget ($${over.capUsd}) is spent`,
+            ),
+          );
+        }
+      }
+      // One cap at a time: the next check reads the log afresh.
+      break;
+    }
+    await Promise.all(stops);
+  }
+
+  /**
+   * Read the user's answers to budget escalations: a dollar amount above what is spent raises the
+   * cap (`budget.raised`); anything else leaves it, and the next check asks again. Either way the
+   * answer is consumed here, so it never reaches a Worker as its next message.
+   */
+  #readBudgetAnswers(): void {
+    const v = this.#state();
+    for (const rec of Object.values(v.ledger.exceeded)) {
+      const x = rec.escalationId ? v.escalations.get(rec.escalationId) : undefined;
+      if (!x?.resolved || x.delivered) continue;
+      const cap = parseUsd(x.answer);
+      const consumed = this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id });
+      if (cap !== undefined && cap > rec.spentUsd) {
+        this.#o.store.append([
+          consumed,
+          this.#env(x.taskId, 'budget.raised', {
+            scope: rec.scope,
+            key: rec.key,
+            capUsd: cap,
+            escalationId: x.id,
+          }),
+        ]);
+      } else {
+        this.#o.store.append(consumed);
+      }
+    }
   }
 
   // ---- Workers ---------------------------------------------------------------------------
@@ -1724,6 +1861,7 @@ export class MiniConductor {
   async #run(subtaskId: string, gen: number): Promise<void> {
     // A tick's ready list can outlive a cancellation made while an earlier run of it started.
     if (this.#runs.has(subtaskId) || !this.#live(gen) || this.#ended(subtaskId)) return;
+    if (this.#overBudget(subtaskId)) return;
     const v = this.#state();
     const view = v.tasks[subtaskId];
     if (!view) return;
@@ -2155,6 +2293,8 @@ export class MiniConductor {
     }
     batch.push(this.#env(run.subtaskId, `agent.${e.t}`, e, run.sessionId));
     this.#o.store.append(batch);
+    // Checked on every usage event, so spend overshoots a cap by one call at most (#35).
+    if (e.t === 'usage') this.#track(this.#enforceBudgets());
   }
 
   async #turnEnded(run: Run): Promise<void> {
@@ -2780,7 +2920,7 @@ export class MiniConductor {
 
   async #end(
     run: Run,
-    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff',
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff' | 'budget',
     message?: string,
     extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
@@ -2798,7 +2938,7 @@ export class MiniConductor {
 
   async #endRun(
     run: Run,
-    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff',
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff' | 'budget',
     message: string | undefined,
     extra: { workspaceRefused?: boolean },
   ): Promise<void> {
@@ -3360,6 +3500,8 @@ function readView(store: EventStore, prev?: View): View {
     progressAt,
     pendingHandoffs,
     handoffCount,
+    // Priced with the built-in table only until a `pricing:` config is decided (#35).
+    ledger: store.replay(costLedgerProjection(BUILTIN_PRICES)),
   };
 }
 
@@ -3426,6 +3568,27 @@ function refusedField(err: unknown): ProfileField | undefined {
   if (!(err instanceof Error) || err.name !== 'ProfileRefusedError') return undefined;
   const field = (err as { field?: unknown }).field;
   return field === 'model' || field === 'effort' || field === 'contextWindow' ? field : undefined;
+}
+
+/** What the Mini-conductor asks when a hard cap is spent (#35). */
+function budgetQuestion(over: Omit<BudgetExceeded, 'escalationId'>): string {
+  const usd = (n: number) => `$${n.toFixed(2)}`;
+  const what =
+    over.scope === 'task'
+      ? `Task ${over.key} has spent ${usd(over.spentUsd)} of its ${usd(over.capUsd)} budget`
+      : `Today (${over.key}, UTC) this repo has spent ${usd(over.spentUsd)} of its ${usd(over.capUsd)} daily budget`;
+  const unpriced = over.unpricedTokens
+    ? ` (plus ${over.unpricedTokens} tokens on models with no known price, not counted)`
+    : '';
+  return `${what}${unpriced}. Its Workers are stopped and none start until you raise the cap. Answer with a new cap in dollars, above ${usd(over.spentUsd)}, to continue; or cancel the task with tacet cancel.`;
+}
+
+/** The first dollar amount in an answer (`12`, `$12.50`, `raise it to 12.5`), or undefined. */
+export function parseUsd(answer: string | undefined): number | undefined {
+  const m = /(\d+(?:\.\d+)?)/.exec(answer ?? '');
+  if (!m?.[1]) return undefined;
+  const n = Number.parseFloat(m[1]);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 function answerText(x: EscalationRecord, mcp = true): string {

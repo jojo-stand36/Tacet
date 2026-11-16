@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tacet:schema:budget-exceeded:v1",
+  "title": "Tacet budget.exceeded payload",
+  "type": "object",
+  "properties": {
+    "scope": {
+      "enum": [
+        "task",
+        "day",
+        "month"
+      ],
+      "x-tacet-fallback": "task",
+      "type": "string"
+    },
+    "key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "capUsd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "spentUsd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "unpricedTokens": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "escalationId": {
+      "description": "The Escalation that asks the user to raise the cap",
+      "type": "string",
+      "pattern": "^[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    }
+  },
+  "required": [
+    "scope",
+    "key",
+    "capUsd",
+    "spentUsd"
+  ]
+}

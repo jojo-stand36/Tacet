@@ -117,7 +117,47 @@ Two ways in: the Agent SDK (TS/Python, wraps the Claude Code binary) and the CLI
 
 The Claude adapter uses `@anthropic-ai/claude-agent-sdk`. Raw `claude -p` lacks interrupt (signal only), mid-session model switch and live context usage, and needs an extra MCP process for approvals. The SDK talks to the same binary over an internal control protocol that is only documented as SDK internals. Use `pathToClaudeCodeExecutable` to launch the user's own `claude` where their login should apply. Details, fixtures and the mock harness: [`spikes/64-claude/README.md`](spikes/64-claude/README.md).
 
+### Model API prices (#35)
+
+Checked **2026-11-16**. USD per million tokens (MTok), standard (non-batch, global, non-fast) rates on the first-party API. Cache write is shown as 5-minute / 1-hour. The cost ledger may price tokens from this table only when an adapter reports no cost; today only `claude-sdk` reports one.
+
+**Reachability:** `platform.claude.com` was read. `developers.openai.com`, `ai.google.dev` and `geminicli.com` **did not resolve** from this session (they are outside its allowed network domains), so **no OpenAI or Google price could be read from a primary page and none is recorded**. Both vendors' rows are UNVERIFIED placeholders. Those hosts must be allowed (or a human must paste the pages) before a price table for Codex and Gemini exists.
+
+| Model | Id (API) | Input | Output | Cache read | Cache write (5m / 1h) | Long-context tier | Status | Source | Checked |
+|---|---|---|---|---|---|---|---|---|---|
+| Claude Fable 5.2 | `claude-fable-5-2` | $8 | $40 | $0.20 (0.025x) | $10 / $16 | none, 1M at standard rates | verified | pricing, models overview | 2026-11-16 |
+| Claude Opus 5.5 | `claude-opus-5-5` | $4 | $20 | $0.20 (0.05x) | $5 / $8 | none, 1M at standard rates | verified | pricing, models overview | 2026-11-16 |
+| Claude Sonnet 5.5 | `claude-sonnet-5-5` | $2 | $10 | $0.10 (0.05x) | $2.50 / $4 | none, 1M at standard rates | verified | pricing, models overview | 2026-11-16 |
+| Claude Haiku 5.5, prompt up to 100,000 tokens | `claude-haiku-5-5` | $0.10 | $0.50 | $0.01 | $0.125 / $0.20 | **tier boundary: prompt over 100,000 tokens** (next row) | verified | pricing | 2026-11-16 |
+| Claude Haiku 5.5, prompt over 100,000 tokens | `claude-haiku-5-5` | $0.50 | $2.50 | $0.05 | $0.625 / $1 | applies per request; prompt length counts all input tokens including cache reads and writes | verified | pricing | 2026-11-16 |
+| Claude Fable 5.1 | `claude-fable-5-1` (id from earlier matrix row, not re-read) | $10 | $50 | $0.25 (0.025x) | $12.50 / $20 | none | verified (price); id per matrix 2026-11-11 | pricing | 2026-11-16 |
+| Claude Fable 5 | `claude-fable-5` (same caveat) | $10 | $50 | $1 | $12.50 / $20 | none | verified (price); id per matrix 2026-11-11 | pricing | 2026-11-16 |
+| Claude Opus 5 | `claude-opus-5` (same caveat) | $5 | $25 | $0.50 | $6.25 / $10 | none | verified (price); id per matrix 2026-11-11 | pricing | 2026-11-16 |
+| Claude Opus 4.8 / 4.7 / 4.6 | `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6` (same caveat) | $5 | $25 | $0.50 | $6.25 / $10 | none (1M at standard rates) | verified (price); id per matrix 2026-11-11 | pricing | 2026-11-16 |
+| Claude Opus 4.5 | `claude-opus-4-5-20251101`, alias `claude-opus-4-5` (per matrix 2026-11-11) | $5 | $25 | $0.50 | $6.25 / $10 | none (window is 200K) | verified (price) | pricing | 2026-11-16 |
+| Claude Sonnet 5 | `claude-sonnet-5` (same caveat) | $2 | $10 | $0.20 (0.1x) | $2.50 / $4 | none | verified | pricing | 2026-11-16 |
+| Claude Sonnet 4.6 | `claude-sonnet-4-6` (same caveat) | $3 | $15 | $0.30 | $3.75 / $6 | none (1M at standard rates) | verified (price) | pricing | 2026-11-16 |
+| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929`, alias `claude-sonnet-4-5` (per matrix 2026-11-11) | $3 | $15 | $0.30 | $3.75 / $6 | none (window is 200K) | verified (price); deprecated, retires 2026-11-30 per matrix | pricing | 2026-11-16 |
+| Claude Haiku 4.5 | `claude-haiku-4-5-20251001`, alias `claude-haiku-4-5` (per matrix 2026-11-11) | $1 | $5 | $0.10 | $1.25 / $2 | none (window is 200K) | verified (price) | pricing | 2026-11-16 |
+| OpenAI: Codex CLI default and offered models | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED (host unreachable) | https://developers.openai.com/api/docs/pricing, https://developers.openai.com/codex/models | not read |
+| Google: Gemini CLI default models (Gemini API) | see remark | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED | UNVERIFIED (>200k tier unknown) | UNVERIFIED (host unreachable) | https://ai.google.dev/gemini-api/docs/pricing | not read |
+
+Sources: https://platform.claude.com/docs/en/about-claude/pricing (prices, tiers, remarks), https://platform.claude.com/docs/en/about-claude/models/overview (ids, aliases). Both read 2026-11-16.
+
+Remarks:
+- **Ids:** the overview states every Claude API id is a pinned snapshot, including the dateless ids used from 4.6 on; for older models the undated alias resolves to the dated id. Ids for the current four models were read in the overview table today. Other ids were not in that table (only model page links), so they rest on the 2026-11-11 "Model context windows (#255)" row.
+- **Cache read multipliers differ by model:** 0.025x on Fable 5.2, 5.1 and Mythos 5.2, 5.1; 0.05x on Opus 5.5 and Sonnet 5.5; 0.1x elsewhere. But Fable 5 and Mythos 5 list $1 (0.1x), and Sonnet 5 lists $0.20 (0.1x). A flat 0.1x rule would misprice the newest models. Cache writes are 1.25x (5m) and 2x (1h) of base input on every row above.
+- **Claude Mythos** 5, 5.1 and 5.2 are limited availability (Cyber Verification Program); prices equal Fable of the same version. Not tabled.
+- **1M context:** Claude 4.6 and later (except Haiku 5.5) bill the full 1M window at standard rates, no surcharge (a 900k request costs the same per token as a 9k one). Only Haiku 5.5 has a tier. A matrix note elsewhere says Opus 4.6 and Sonnet 4.6 reach 1M in Claude Code only with `[1m]`; that concerns the window, not price.
+- **Tokenizer:** Claude 4.7 and later use a newer tokenizer that yields about 30 percent more tokens for the same text; per-token prices are not comparable across that line.
+- **Not table rows:** Batch API is 50 percent off input and output (for example Opus 5.5 $2 / $10, Haiku 5.5 $0.05 / $0.25 up to 100k and $0.25 / $1.25 above); multipliers stack with caching. Fast mode (Fable 5.2 $16 / $80, Opus 5.5 $8 / $40, Opus 5 and 4.8 $10 / $50; not with Batch; applies across the full context window). `inference_geo: "us"` is 1.1x on every category for Claude 4.6 and later. Server tools such as web search add per-use charges.
+- **Subscription runs:** these are API list prices. A Worker on a subscription login is not billed per token, so the ledger should label such cost "list-price equivalent", not spend.
+- **Gemini remark (not a price):** `google-gemini/gemini-cli` `main`, `packages/core/src/config/models.ts`, read 2026-11-16, exports `gemini-3-pro-preview`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-3.5-flash` (base flash), `gemini-3.8-flash` (latest flash), `gemini-3.1-flash-lite`, `gemini-3.5-flash-lite`, and `DEFAULT_GEMINI_MODEL = gemini-2.5-pro` as the fallback when no preview access. Which of these the CLI picks by default for a given auth type was not established (the model docs page was unreachable). `main` is not tied to the pinned 0.67.0.
+- **Codex remark (not a price):** `openai/codex` `main`, `codex-rs/models-manager/models.json`, read 2026-11-16 (first 100,000 of about 539,000 characters only), lists slugs `gpt-6-astra` and `gpt-6.1-sol` among its first entries, with no price fields. This is `main`, not the pinned 0.167.0, and the file was not read to the end, so the default and the full list are UNVERIFIED.
+
 ## 1b. MCP client facts (ADR-003 section 6)
+
+
 
 Facts the mini-conductor's MCP server depends on. Source: the "Verified protocol facts" table in [ADR-003](../adr/003-wire-protocols.md), checked 2026-11-09 from the MCP and Claude Code docs. Re-check before MCP work in M1.
 

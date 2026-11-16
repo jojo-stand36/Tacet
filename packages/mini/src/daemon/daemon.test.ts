@@ -29,6 +29,7 @@ import {
   MiniConductor,
   type MiniConductorOptions,
   miniLockHolder,
+  parseUsd,
   VERIFY_CODEX_WORKERS,
 } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
@@ -3183,5 +3184,99 @@ describe('Workers without the Mini-conductor MCP tools (#184)', () => {
   it('never takes a tool on an empty server name for its own', () => {
     expect(isOwnMcpTool({ toolName: 'mcp____escalate' }, '')).toBe(false);
     expect(isOwnMcpTool({ toolName: 'mcp__tacet__escalate' }, 'tacet')).toBe(true);
+  });
+});
+
+describe('hard budget caps (#35)', () => {
+  const answerOf = (id: string) =>
+    (ofType('escalation.raised', `${id}/1`).at(-1)?.data as { id: string; question: string }) ??
+    undefined;
+
+  it('stops the Worker at the task cap, starts none, and resumes once the user raises it', async () => {
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 1.5 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_task_usd: 1 } } });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    const sub = `${id}/1`;
+    await expect.poll(() => ofType('budget.exceeded', sub).length, { timeout: 5000 }).toBe(1);
+    await expect
+      .poll(() => ofType('worker.ended', sub).map((e) => (e.data as { reason: string }).reason))
+      .toEqual(['budget']);
+    expect(ofType('budget.exceeded', sub)[0]?.data).toMatchObject({
+      scope: 'task',
+      key: id,
+      capUsd: 1,
+      spentUsd: 1.5,
+    });
+    const x = answerOf(id);
+    expect(x?.question).toMatch(/has spent \$1\.50 of its \$1\.00 budget/);
+    expect(ofType('escalation.raised', sub)[0]?.data).toMatchObject({
+      urgency: 'high',
+      category: 'blocked',
+    });
+    expect(tasks()[sub]?.state).toBe('input_required');
+    // Nothing starts while the cap is spent.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fake.sessions).toHaveLength(1);
+
+    // An answer that is not a raise leaves the cap, and asks again.
+    d.answer(x?.id ?? '', 'no');
+    await expect.poll(() => ofType('escalation.raised', sub).length, { timeout: 5000 }).toBe(2);
+    expect(fake.sessions).toHaveLength(1);
+
+    // A raise: the answer is consumed, never sent to a Worker, and the sub-task runs again.
+    d.answer(answerOf(id)?.id ?? '', 'Raise it to $5');
+    await d.settled();
+    expect(ofType('budget.raised', sub)[0]?.data).toMatchObject({
+      scope: 'task',
+      key: id,
+      capUsd: 5,
+    });
+    expect(fake.sessions).toHaveLength(2);
+    expect(fake.sessions[1]?.inputs.join('\n')).not.toMatch(/Raise it to/);
+    expect(tasks()[sub]?.state).toBe('completed');
+    // A budget stop is not a failed attempt.
+    expect(
+      ofType('worker.started', sub).map((e) => (e.data as { attempt?: number }).attempt),
+    ).toEqual([1, 1]);
+  });
+
+  it("takes the task's own budget over the config default", async () => {
+    fake = new ScriptedAdapter('fake', () => ({ do: 'spend', costUsd: 0.6 }));
+    const d = make({ config: { ...CONFIG, budget: { per_task_usd: 100 } } });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'], budget: { usd: 0.5 } });
+    await expect
+      .poll(() => ofType('budget.exceeded', `${id}/1`)[0]?.data, { timeout: 5000 })
+      .toMatchObject({ scope: 'task', capUsd: 0.5, spentUsd: 0.6 });
+  });
+
+  it("holds every task's Workers once today's cap is spent", async () => {
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } } });
+    await d.start();
+    const first = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('budget.exceeded', `${first}/1`)[0]?.data, { timeout: 5000 })
+      .toMatchObject({ scope: 'day', capUsd: 2, spentUsd: 2 });
+    // A second task submitted now does not start a Worker.
+    const second = d.submit({ goal: 'h', acceptanceCriteria: ['ok'] });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(fake.sessions).toHaveLength(1);
+    expect(ofType('worker.started', `${second}/1`)).toHaveLength(0);
+  });
+
+  it('reads a dollar amount from an answer', () => {
+    expect(parseUsd('5')).toBe(5);
+    expect(parseUsd('$12.50 please')).toBe(12.5);
+    expect(parseUsd('raise it to 7.25 USD')).toBe(7.25);
+    expect(parseUsd('no')).toBeUndefined();
+    expect(parseUsd(undefined)).toBeUndefined();
   });
 });

@@ -362,3 +362,21 @@ Status of this addendum: **accepted** on 2026-11-12, approved by the owner on PR
 3. **`escalation.resolved` carries `source`, `decisionId` and `rationale`.** `source` is `user`, `policy`, `precedent` or `mini` (core's `DecisionSource`, an open enum whose fallback is `mini` and never `user`, since precedent depends on it; already written by every writer, and in core's schema with #25 PR1). `decisionId` names the Decision that records the answer (written for the user's answers since #25 PR1). `rationale` is the gate's, when it answered; PR3 adds it with its first writer. Additive under §2.
 4. **`record_decision` with scope `repo` needs the user's approval, always.** The row's "become precedent only if repo policy and the autonomy setting allow it" is replaced: a repo-scope decision a Worker records is always an approval request, which only the user answers (ADR-004 A, E). Approving records it as the user's, under the `decisionId` the Worker was given (#25 PR1).
 5. **Where repo precedent comes from (security note, with #269 and #330).** A repo-scope Decision multiplies the effect of a forged answer, so one is made only by the user: an answer kept for the repo through a path that needs the escalation's one-time answer code (`tacet answer --repo-wide` over the control port), or a Worker's proposal the user approves at the run's own terminal or with that code. Over the Conductor link, only once the link is authenticated (#330).
+
+
+### Addendum (2026-11-16): budget events and hard caps (#35)
+
+Status of this addendum: **proposed**. It needs the owner's approving comment on the PR. It covers only the parts of #35 that do not wait on owner decisions. The month cap's scope, soft thresholds, usage with no known price and a `pricing:` config are left for later and are not in this addendum.
+
+1. **Two `budget.*` event types** in the namespace §1 already names:
+   - `budget.exceeded`: `{scope, key, capUsd, spentUsd, unpricedTokens?, escalationId?}`. `scope` is an open enum `task | day | month` with fallback `task`. `key` is the root task id, the UTC day (`YYYY-MM-DD`) or the month (`YYYY-MM`).
+   - `budget.raised`: `{scope, key, capUsd, escalationId?}`. Only the user's answer to a `budget.exceeded` Escalation writes it.
+2. **They stay local to the Mini-conductor:** `budget` is not on §4's upward allowlist. The Conductor can rebuild spend from `agent.usage`, which is forwarded already, and the Escalation itself crosses the link as `escalation.*`. Whether to forward `budget.*` too is left to the owner. It would widen the allowlist, so it would need its own line here.
+3. **A new `worker.ended` reason, `budget`.** The session was stopped because a hard cap was spent. Like `restart`, `handoff` and `canceled`, it is not a failed attempt. A reader that does not know it reads it as `failed` (the enum's fallback) and so counts an attempt. That is safe, but an older Conductor's view may over-count failures.
+4. **What a hard cap does:**
+   - **Which caps.** A root task's cap is `task.budget.usd`, else `budget.per_task_usd`. The day cap is `budget.per_day_usd` for this repo, UTC.
+   - **When it trips.** Spend comes from the ledger: reported costs plus tokens priced from the built-in table, with no guessing. It is checked after every `agent.usage` event and on every tick. Once it reaches the cap, the Mini-conductor stops every Worker the cap covers (`worker.ended` with reason `budget`) and starts none.
+   - **What it asks.** It raises one high-urgency `blocked` Escalation per cap, with `contextRef` `tacet:budget:<scope>:<key>`, in the same batch as `budget.exceeded`.
+   - **The answer.** It is read by the Mini-conductor itself and never sent to a Worker. A dollar amount above the spend becomes `budget.raised`, and the work continues. Anything else leaves the cap, and the question is asked again. The user can also cancel the task.
+
+Additive under §2: event types in a named namespace, and an open-enum value with a safe fallback. The upward allowlist is not widened.
