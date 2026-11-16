@@ -49,6 +49,13 @@ import {
   SANDBOX_ENV,
   type SandboxResidue,
 } from './placeholders.js';
+import {
+  claudeTmpEnv,
+  makeClaudeTmpdir,
+  refuseSharedCwd,
+  releaseClaudeTmpdir,
+  sweepClaudeTmpdirs,
+} from './private-tmp.js';
 import { StderrTail, signalGroup, spawnInOwnSession } from './spawn.js';
 
 /** Vendor session ids are UUIDs: they name each session's config directory. */
@@ -113,6 +120,11 @@ export interface ClaudeSdkAdapterOptions {
   retentionDays?: number;
   /** Directory for per-session MCP config files. Default `~/.tacet/run/mcp`. */
   mcpConfigDir?: string;
+  /**
+   * For tests: where API-key sessions' private temp dirs are made and stale ones swept (#326).
+   * Default `os.tmpdir()`.
+   */
+  tmpRoot?: string;
   /**
    * Told how many stale MCP config files (of Mini-conductors no longer running) were removed when
    * this adapter started its first session (#108). Only the count: never names or contents.
@@ -194,6 +206,8 @@ interface Session {
   secrets: string[];
   /** Under the scrub: the checkout and HOME, and which placeholder paths they had (#263). */
   placeholders: SandboxResidue | undefined;
+  /** Under the scrub: its private temp dir, removed at close (#326). */
+  tmpDir: string | undefined;
   /** Scrubs message text across delta boundaries (#109); made on the first event. */
   deltas?: DeltaScrubber;
   model: string | undefined;
@@ -297,6 +311,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     // An API-key Worker's commands never see the key (#150); a login session has none to hide.
     const scrub =
       route === 'api_key' && !(this.#opts.subprocessScrub === false && this.#opts.query);
+    // The sandbox makes its cwd a write root and leaves placeholders there: never a shared dir.
+    if (scrub) refuseSharedCwd(opts.cwd, base, routed.HOME);
     const env = scrub ? { ...withSubprocessScrub(routed), ...SANDBOX_ENV } : routed;
     // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
     // runs with; removed at close (#263).
@@ -372,7 +388,9 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       env.CLAUDE_CONFIG_DIR = configDir;
     }
     // A session that never started leaves nothing to resume.
+    let tmpDir: string | undefined;
     const unmake = () => {
+      if (tmpDir) releaseClaudeTmpdir(tmpDir);
       if (madeConfigDir && configDir) rmSync(configDir, { recursive: true, force: true });
     };
 
@@ -385,6 +403,22 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         this.#opts.onSweep?.(removed);
       } catch {
         // Tried again by the next Mini-conductor that starts.
+      }
+      sweepClaudeTmpdirs(this.#opts.tmpRoot);
+    }
+    if (scrub) {
+      // Claude Code's own temp files and the sandbox's placeholders in a dir of this session's,
+      // not the shared temp dir (#326).
+      try {
+        const made = makeClaudeTmpdir(this.#opts.tmpRoot);
+        if (made.warning) this.#opts.onWarning?.(made.warning);
+        if (made.dir) {
+          tmpDir = made.dir;
+          Object.assign(env, claudeTmpEnv(made.dir));
+        }
+      } catch (err) {
+        unmake();
+        throw err;
       }
     }
     let mcpConfigPath: string | undefined;
@@ -528,6 +562,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       ended: false,
       secrets: mcpHeaderSecrets(opts.mcpServers),
       placeholders,
+      tmpDir,
       model: opts.model,
       effort,
       contextWindow: opts.contextWindow,
@@ -550,6 +585,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         await this.#checkEffort(s, s.model, effort);
       } catch (err) {
         await this.close(handle);
+        // `close` removed the temp dir already.
+        tmpDir = undefined;
         // Refused before its first turn: its handle is never returned, so nothing resumes it.
         unmake();
         throw err;
@@ -636,6 +673,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
       }
       if (s.mcpConfigPath) removeMcpConfig(s.mcpConfigPath);
       if (s.placeholders) removeSandboxResidue(s.placeholders);
+      if (s.tmpDir) releaseClaudeTmpdir(s.tmpDir);
       this.#setState(s, 'done');
       s.events.end();
       this.#sessions.delete(h.id);

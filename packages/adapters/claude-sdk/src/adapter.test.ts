@@ -1,8 +1,11 @@
+import { spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
@@ -506,6 +509,8 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
       query: stub.fn,
       baseEnv: { PATH: bin, ANTHROPIC_API_KEY: FAKE_KEY },
       mcpConfigDir: join(root, 'mcp'),
+      // Too long for a private temp dir: none is made in the machine's own (#326).
+      tmpRoot: root,
     });
     await scrubbed.start({ cwd: root });
     expect(stub.calls[0]?.env?.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
@@ -522,6 +527,114 @@ describe('ClaudeSdkAdapter (stubbed SDK)', () => {
       await none.start({ cwd: root });
       expect(stub.calls[1]?.env?.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
     }
+  });
+
+  describe('under the sandbox: never a shared cwd, and a temp dir of its own (#326)', () => {
+    let short: string;
+    let bin: string;
+    beforeEach(() => {
+      // Short enough for `<dir>/tacet-c-XXXXXX/claude-<uid>` to fit Claude's budget.
+      short = realpathSync(mkdtempSync(join(tmpdir(), 't-')));
+      // Stand-ins for bubblewrap and socat: the stub runs nothing (#150).
+      bin = join(root, 'bin');
+      mkdirSync(bin, { recursive: true });
+      writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
+    });
+    afterEach(() => rmSync(short, { recursive: true, force: true }));
+    const sandboxed = (stub: ReturnType<typeof stubQuery>, warnings: string[] = []) =>
+      new ClaudeSdkAdapter({
+        query: stub.fn,
+        baseEnv: { PATH: bin, ANTHROPIC_API_KEY: FAKE_KEY, HOME: join(root, 'home') },
+        mcpConfigDir: join(root, 'mcp'),
+        stateDir: join(root, 'state'),
+        hostTokenFile: join(root, 'no-host-token'),
+        tmpRoot: short,
+        onWarning: (m) => warnings.push(m),
+      });
+
+    it('refuses a cwd that is, or holds, a shared dir, before anything starts', async () => {
+      const stub = stubQuery();
+      const adapter = sandboxed(stub);
+      for (const cwd of ['/', '/tmp', tmpdir(), join(root, 'home'), root]) {
+        if (cwd === root) mkdirSync(join(root, 'home'), { recursive: true });
+        await expect(adapter.start({ cwd }), cwd).rejects.toThrow(/refusing a Claude session/);
+      }
+      expect(stub.calls).toHaveLength(0);
+      expect(readdirSync(short)).toEqual([]);
+      // Not under the scrub (a login session, or a test's own binary): no sandbox, no guard.
+      const plain = make(stub);
+      await plain.start({ cwd: '/' });
+      expect(stub.calls[0]?.env?.CLAUDE_CODE_TMPDIR).toBeUndefined();
+    });
+
+    it.runIf(process.platform === 'linux')(
+      'gives Claude Code a private TMPDIR, removed at close, and sweeps ones a dead host left',
+      async () => {
+        const dead = spawnSync(process.execPath, ['-e', '']).pid;
+        const left = join(short, 'tacet-c-zzzzzz');
+        mkdirSync(left, { mode: 0o700 });
+        writeFileSync(
+          `${left}.owner`,
+          JSON.stringify({ host: dead, ns: readlinkSync('/proc/self/ns/pid') }),
+        );
+        const stub = stubQuery();
+        const warnings: string[] = [];
+        const adapter = sandboxed(stub, warnings);
+        const h = await adapter.start({ cwd: join(root, 'wt') });
+        expect(existsSync(left)).toBe(false);
+        const env = stub.calls[0]?.env ?? {};
+        const dir = env.CLAUDE_CODE_TMPDIR as string;
+        expect(dir).toMatch(new RegExp(`^${short}/tacet-c-[A-Za-z0-9]{6}$`));
+        expect(env.TMPDIR).toBe(dir);
+        expect(statSync(dir).mode & 0o777).toBe(0o700);
+        expect(JSON.parse(readFileSync(`${dir}.owner`, 'utf8')).host).toBe(process.pid);
+        expect(warnings).toEqual([]);
+        // What Claude Code leaves there goes with it, read-only placeholders included.
+        mkdirSync(join(dir, 'claude-0', '.claude'), { recursive: true });
+        writeFileSync(join(dir, 'claude-0', '.claude', 'p'), '', { mode: 0o444 });
+        await adapter.close(h);
+        expect(readdirSync(short)).toEqual([]);
+      },
+    );
+
+    it.runIf(process.platform === 'linux')(
+      'warns, and makes none, where Claude Code would not use it',
+      async () => {
+        const stub = stubQuery();
+        const warnings: string[] = [];
+        const long = join(short, 'x'.repeat(40));
+        mkdirSync(long);
+        const adapter = new ClaudeSdkAdapter({
+          query: stub.fn,
+          baseEnv: { PATH: bin, ANTHROPIC_API_KEY: FAKE_KEY },
+          mcpConfigDir: join(root, 'mcp'),
+          stateDir: join(root, 'state'),
+          hostTokenFile: join(root, 'no-host-token'),
+          tmpRoot: long,
+          onWarning: (m) => warnings.push(m),
+        });
+        await adapter.start({ cwd: join(root, 'wt') });
+        expect(stub.calls[0]?.env?.CLAUDE_CODE_TMPDIR).toBeUndefined();
+        expect(warnings).toEqual([expect.stringMatching(/too long/)]);
+        expect(readdirSync(long)).toEqual([]);
+      },
+    );
+
+    it('removes the private dir of a session that fails to start', async () => {
+      const adapter = new ClaudeSdkAdapter({
+        query: (() => {
+          throw new Error('spawn failed');
+        }) as unknown as typeof query,
+        baseEnv: { PATH: bin, ANTHROPIC_API_KEY: FAKE_KEY },
+        mcpConfigDir: join(root, 'mcp'),
+        stateDir: join(root, 'state'),
+        hostTokenFile: join(root, 'no-host-token'),
+        tmpRoot: short,
+      });
+      await expect(adapter.start({ cwd: join(root, 'wt') })).rejects.toThrow('spawn failed');
+      expect(readdirSync(short)).toEqual([]);
+    });
   });
 
   it('removes the MCP file if the SDK fails to start', async () => {
