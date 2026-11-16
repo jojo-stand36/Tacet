@@ -116,6 +116,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Verify Claude Code transcript facts behind PTY usage: [1m] model id and subagent calls** — `spike` `P3` `claude`
 - [ ] **Verify live how Codex and Gemini CLI scope resume to a worktree** — `spike` `P2` `claude`
 - [ ] **Verify that resumed Worker sessions pick up a new MCP URL and token** — `spike` `P1` `claude`
+- [ ] **Verify whether Claude's sandbox can create a .git from nothing in a write root or a cwd ancestor** — `spike` `P2` `claude`
 - [ ] **Windows via WSL2: docs, a /mnt/* repo check, and CI inside WSL2** — `feature` `P1` `claude`
 - [ ] **Worker job inside Claude's Linux sandbox sometimes not found by its marker after a crash (#127 test flake)** — `feature` `P2` `claude`
 - [ ] **Worker tool policy: protect .tacet/ (Tacet's own config) from Worker writes** — `feature` `P1` `claude`

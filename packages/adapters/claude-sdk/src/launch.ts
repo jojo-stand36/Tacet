@@ -22,3 +22,11 @@ export {
   SANDBOX_PLACEHOLDERS,
   type SandboxResidue,
 } from './placeholders.js';
+export {
+  CLAUDE_TMP_BUDGET,
+  claudeTmpEnv,
+  makeClaudeTmpdir,
+  refuseSharedCwd,
+  releaseClaudeTmpdir,
+  sweepClaudeTmpdirs,
+} from './private-tmp.js';

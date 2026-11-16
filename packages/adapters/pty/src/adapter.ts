@@ -6,6 +6,10 @@ import { fileURLToPath } from 'node:url';
 import {
   authEnv,
   claudeEnvAllow,
+  claudeTmpEnv,
+  makeClaudeTmpdir,
+  refuseSharedCwd,
+  releaseClaudeTmpdir,
   removeClaudeConfigDir,
   removeSandboxResidue,
   repoOf,
@@ -13,6 +17,7 @@ import {
   SANDBOX_ENV,
   type SandboxResidue,
   sweepClaudeConfigDirs,
+  sweepClaudeTmpdirs,
   withSubprocessScrub,
   writeMcpConfig,
 } from '@tacet/adapter-claude-sdk/launch';
@@ -103,6 +108,11 @@ export interface PtyAdapterOptions {
   onEnvDropped?: (names: string[]) => void;
   /** Told of a start that went ahead with a risk to know about (#291). */
   onWarning?: (message: string) => void;
+  /**
+   * For tests: where sessions' private temp dirs are made and stale ones swept (#326). Default
+   * `os.tmpdir()`.
+   */
+  tmpRoot?: string;
   /** For tests: the host token path checked at start (#291). Default: Claude Code's fixed one. */
   hostTokenFile?: string;
   /**
@@ -176,6 +186,8 @@ interface Session {
   secrets: string[];
   /** Under the scrub: the checkout and HOME, and which placeholder paths they had (#263). */
   placeholders: SandboxResidue | undefined;
+  /** Under the scrub: its private temp dir, removed at close (#326). */
+  tmpDir: string | undefined;
   hookKey: string;
   files: string[];
   approvals: Map<string, PendingApproval>;
@@ -301,6 +313,7 @@ export class PtyAdapter implements AgentAdapter {
       } catch {
         // Tried again by the next adapter that starts.
       }
+      sweepClaudeTmpdirs(this.#opts.tmpRoot);
     }
 
     // Environment: the allowlist of the user's (#147), checked for an API key, then Tacet's own.
@@ -326,6 +339,8 @@ export class PtyAdapter implements AgentAdapter {
     const vendorSessionId = opts.resume?.vendorSessionId ?? randomUUID();
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
     const cwd = realpathSync(opts.cwd);
+    // The sandbox makes its cwd a write root and leaves placeholders there: never a shared dir.
+    if (scrub) refuseSharedCwd(cwd, base, keyed.HOME);
     // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
     // runs with; removed at close (#263).
     const placeholders = scrub ? residueSnapshot(cwd, env.HOME) : undefined;
@@ -350,8 +365,11 @@ export class PtyAdapter implements AgentAdapter {
     if (opts.resume && !existsSync(configDir)) {
       throw new Error(`no PTY session ${vendorSessionId} to resume`);
     }
-    // A new session that fails to start leaves no directory; a resumed one keeps its own.
+    // A new session that fails to start leaves no directory; a resumed one keeps its own. Its
+    // private temp dir goes either way.
+    let tmpDir: string | undefined;
     const dropDir = () => {
+      if (tmpDir) releaseClaudeTmpdir(tmpDir);
       if (!opts.resume) removeClaudeConfigDir(root, vendorSessionId);
     };
     try {
@@ -359,6 +377,16 @@ export class PtyAdapter implements AgentAdapter {
         cwd,
         ...(env.ANTHROPIC_API_KEY ? { apiKey: env.ANTHROPIC_API_KEY } : {}),
       });
+      if (scrub) {
+        // Claude Code's own temp files and the sandbox's placeholders in a dir of this
+        // session's, not the shared temp dir (#326).
+        const made = makeClaudeTmpdir(this.#opts.tmpRoot);
+        if (made.warning) this.#opts.onWarning?.(made.warning);
+        if (made.dir) {
+          tmpDir = made.dir;
+          Object.assign(env, claudeTmpEnv(made.dir));
+        }
+      }
     } catch (err) {
       dropDir();
       throw err;
@@ -458,6 +486,7 @@ export class PtyAdapter implements AgentAdapter {
         state: 'idle',
         secrets,
         placeholders,
+        tmpDir,
         hookKey: reg.key,
         files,
         approvals: new Map(),
@@ -630,6 +659,7 @@ export class PtyAdapter implements AgentAdapter {
     this.#usage(s);
     for (const f of s.files) removeSessionFile(f);
     if (s.placeholders) removeSandboxResidue(s.placeholders);
+    if (s.tmpDir) releaseClaudeTmpdir(s.tmpDir);
     await this.#hooks.unregister(s.hookKey);
     this.#setState(s, 'done');
     s.events.end();

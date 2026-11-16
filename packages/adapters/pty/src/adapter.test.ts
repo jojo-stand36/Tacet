@@ -265,10 +265,30 @@ describe('PtyAdapter (fake claude)', () => {
     mkdirSync(bin, { recursive: true });
     writeFileSync(join(bin, 'bwrap'), '#!/bin/sh\n', { mode: 0o755 });
     writeFileSync(join(bin, 'socat'), '#!/bin/sh\n', { mode: 0o755 });
-    const adapter = make({ PATH: bin }, { subprocessScrub: true });
-    const h = await adapter.start({ cwd: join(root, 'wt') });
-    expect(fake().opts.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
-    await adapter.close(h);
+    // Short enough for `<dir>/tacet-c-XXXXXX/claude-<uid>` to fit Claude's budget (#326).
+    const short = realpathSync(mkdtempSync(join(tmpdir(), 't-')));
+    try {
+      const adapter = make({ PATH: bin }, { subprocessScrub: true, tmpRoot: short });
+      // The sandbox makes its cwd a write root: never a shared dir, nor one that holds it (#326).
+      for (const cwd of ['/', '/tmp', join(root, 'home'), root]) {
+        mkdirSync(join(root, 'home'), { recursive: true });
+        await expect(adapter.start({ cwd }), cwd).rejects.toThrow(/refusing a Claude session/);
+      }
+      expect(fakes).toHaveLength(0);
+      const h = await adapter.start({ cwd: join(root, 'wt') });
+      const env = fake().opts.env;
+      expect(env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB).toBe('1');
+      if (process.platform === 'linux') {
+        // Claude Code's temp files and placeholders in a dir of the session's own (#326).
+        expect(env.CLAUDE_CODE_TMPDIR).toMatch(new RegExp(`^${short}/tacet-c-[A-Za-z0-9]{6}$`));
+        expect(env.TMPDIR).toBe(env.CLAUDE_CODE_TMPDIR);
+        expect(existsSync(env.CLAUDE_CODE_TMPDIR as string)).toBe(true);
+      }
+      await adapter.close(h);
+      expect(readdirSync(short)).toEqual([]);
+    } finally {
+      rmSync(short, { recursive: true, force: true });
+    }
   });
 
   it('refuses what it cannot do safely', async () => {
