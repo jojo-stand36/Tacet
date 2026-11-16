@@ -13,6 +13,12 @@ import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-
 import {
   type AgentEvent,
   type AgentTerminal,
+  BUILTIN_PRICES,
+  type BudgetExceeded,
+  type BudgetScope,
+  budgetKey,
+  type CostLedger,
+  costLedgerProjection,
   Decision,
   type DecisionScope,
   Escalation,
@@ -22,10 +28,15 @@ import {
   type MaintenanceOp,
   type MaintenanceProblem,
   newUlid,
+  type PricingTable,
   type Priority,
   type ProfileField,
+  priceFor,
+  pricingTable,
   redactSecrets,
+  rootTaskId,
   type SessionHandle,
+  type Spend,
   type SummaryPacket,
   type TacetConfig,
   type Task,
@@ -56,6 +67,7 @@ import { reviewConfigProblem } from '../review/config.js';
 import {
   type Integrator,
   MergeConflictError,
+  PlanFailed,
   type Planner,
   type Reviewer,
   type ReviewResult,
@@ -91,6 +103,20 @@ export interface MiniConductorOptions {
   planner: Planner;
   /** Default: passes, with the configured `verify` commands recorded as not run (#19). */
   verifier?: Verifier;
+  /**
+   * What the other repos registered with the Conductor spent in `month` (`YYYY-MM`, UTC), for the
+   * machine-wide month cap (#35, owner decision (a)). Absent when this repo is not registered:
+   * the month cap then counts this repo alone.
+   */
+  monthSpendElsewhere?: (month: string) => number;
+  /**
+   * The tiers that spend for a task beside its Workers, for the unpriced-model question (#35,
+   * owner decision (c)): the planner's (asked before a root task is planned) and the escalation
+   * gate's own reasoning (asked before a sub-task runs, as its Worker's questions use it). Absent
+   * when no such session runs. The reviewer's tier is `tiers.review`, when a reviewer is given.
+   */
+  plannerTier?: TierConfig;
+  reasonerTier?: TierConfig;
   /**
    * Reviews each sub-task's integrated change after its commands pass, when `review.enabled`
    * (#19): an `AdapterReviewer` on `tiers.review`. Required when review is on.
@@ -176,6 +202,10 @@ interface View {
   pendingHandoffs: Map<string, { handoffId: string; sessionId: string; packet?: HandoffPacket }>;
   /** Handoffs requested per sub-task, for `workers.max_handoffs`. */
   handoffCount: Map<string, number>;
+  /** Spend per root task, day and month, and the caps raised (#35). */
+  ledger: CostLedger;
+  /** The last `seq` folded into `ledger`, so a rebuild folds only what came after (#35). */
+  ledgerSeq: number;
 }
 
 /** What a Mini-conductor session of its own used (`aside`). */
@@ -427,6 +457,10 @@ export class MiniConductor {
   #started = false;
   #ticking: Promise<void> = Promise.resolve();
   #view: View | undefined;
+  /** The built-in prices with the user's `pricing:` over them (#35, user layer only). */
+  #pricing: PricingTable = BUILTIN_PRICES;
+  /** Root tasks whose planner a spent cap stopped: not a failed planning (#35). */
+  readonly #budgetAborted = new Set<string>();
   readonly #errors: unknown[] = [];
 
   constructor(opts: MiniConductorOptions) {
@@ -462,6 +496,7 @@ export class MiniConductor {
       throw new Error('review.enabled: review is on but no reviewer was given');
     }
     this.#o = opts;
+    this.#pricing = pricingTable(opts.config.pricing);
   }
 
   /** Errors from background work (planning, Worker runs), for logs and tests. */
@@ -877,6 +912,19 @@ export class MiniConductor {
 
   #plan(task: Task): void {
     if (this.#planning.has(task.id)) return;
+    // A spent cap holds the planner too: the task is planned once the cap is raised (#35). So does
+    // a question about the planner's model, whose cost cannot be known.
+    if (this.#overBudget(task.id) || this.#unpricedPending(task.id)) return;
+    const refused = this.#unpricedRefused(task.id);
+    if (refused) {
+      this.#o.store.append(
+        this.#env(task.id, 'task.status', {
+          state: 'failed',
+          message: `not planned: the cost of ${refused} is not known, and you chose not to run it (#35)`,
+        }),
+      );
+      return;
+    }
     this.#planning.add(task.id);
     const gen = this.#gen;
     const abort = new AbortController();
@@ -884,7 +932,11 @@ export class MiniConductor {
     // A task canceled while it was being planned keeps its state: the plan is dropped.
     const dropped = () => {
       const state = this.#state().tasks[task.id]?.state;
-      return !this.#live(gen) || (state !== undefined && TERMINAL.has(state));
+      return (
+        !this.#live(gen) ||
+        (state !== undefined && TERMINAL.has(state)) ||
+        this.#budgetAborted.has(task.id)
+      );
     };
     this.#track(
       (async () => {
@@ -939,16 +991,31 @@ export class MiniConductor {
             this.#env(task.id, 'task.status', { state: 'working' }),
           ]);
         } catch (err) {
-          if (dropped()) return;
+          // A failed or dropped plan's session spent all the same: charge it (#35).
+          const u = err instanceof PlanFailed ? err.usage : undefined;
+          const charge =
+            u && (u.inputTokens || u.outputTokens || u.costUsd)
+              ? [this.#env(task.id, 'agent.usage', { t: 'usage', source: 'reported', ...u })]
+              : [];
+          if (dropped()) {
+            try {
+              if (charge.length > 0) this.#o.store.append(charge);
+            } catch (e) {
+              if (this.#live(gen)) this.#errors.push(e);
+            }
+            return;
+          }
           this.#errors.push(err);
-          this.#o.store.append(
+          this.#o.store.append([
+            ...charge,
             this.#env(task.id, 'task.status', {
               state: 'failed',
               message: redactSecrets(`planning failed: ${(err as Error).message}`),
             }),
-          );
+          ]);
         } finally {
           this.#planning.delete(task.id);
+          this.#budgetAborted.delete(task.id);
           if (this.#planAborts.get(task.id) === abort) this.#planAborts.delete(task.id);
           this.#kick();
         }
@@ -969,6 +1036,11 @@ export class MiniConductor {
   }
 
   async #tick(gen: number): Promise<void> {
+    await this.#enforceBudgets();
+    // Tasks a spent cap kept from being planned, once it is raised (#35).
+    for (const t of Object.values(this.#state().tasks)) {
+      if (!t.task.parentId && !TERMINAL.has(t.state) && t.plan === undefined) this.#plan(t.task);
+    }
     for (const run of [...this.#runs.values()]) {
       if (!this.#live(gen)) return;
       await this.#deliverAnswers(run);
@@ -1088,9 +1160,14 @@ export class MiniConductor {
       const open = [...this.#state().escalations.values()].some(
         (x) => x.taskId === v.task.id && !x.resolved,
       );
-      return open ? 'blocked' : 'pending';
+      return open || this.#overBudget(v.task.id) || this.#unpricedPending(v.task.id)
+        ? 'blocked'
+        : 'pending';
     }
     if (WAITING.has(v.state)) return 'blocked';
+    // A spent hard cap holds every sub-task it covers until the user raises it, and an unpriced
+    // model holds its sub-tasks until the user says whether to run it (#35).
+    if (this.#overBudget(v.task.id) || this.#unpricedPending(v.task.id)) return 'blocked';
     return 'pending';
   }
 
@@ -1703,9 +1780,11 @@ export class MiniConductor {
     taskId: string,
     question: string,
     extra: Pick<Escalation, 'urgency'> & Partial<Pick<Escalation, 'category' | 'contextRef'>>,
-  ): void {
+    also: EventEnvelope[] = [],
+    id: string = newUlid(this.#now().getTime()),
+  ): string {
     const escalation = Escalation.parse({
-      id: newUlid(this.#now().getTime()),
+      id,
       taskId,
       ...(this.#o.repo !== undefined ? { repo: this.#o.repo } : {}),
       question,
@@ -1716,7 +1795,356 @@ export class MiniConductor {
     this.#o.store.append([
       this.#env(taskId, 'escalation.raised', escalation),
       this.#env(taskId, 'task.status', { state: 'input_required' }),
+      ...also,
     ]);
+    return escalation.id;
+  }
+
+  // ---- Budgets (#35) -------------------------------------------------------------------------
+
+  /** The cap on a budget instance, or undefined when there is none: a raise wins, then config. */
+  #capFor(scope: BudgetScope, key: string): number | undefined {
+    const v = this.#state();
+    const raised = v.ledger.raised[budgetKey(scope, key)];
+    if (raised !== undefined) return raised;
+    const b = this.#o.config.budget;
+    if (scope === 'task') return v.tasks[key]?.task.budget?.usd ?? b?.per_task_usd;
+    if (scope === 'day') return b?.per_day_usd;
+    return b?.api_key_per_month_usd;
+  }
+
+  /**
+   * What other repos spent this month, for the machine-wide month cap (owner decision (a) on #35):
+   * the sum over every repo registered with the Conductor, read from their logs, read-only.
+   * Undefined when this repo is not registered: the cap then counts this repo alone.
+   */
+  #elsewhere(month: string): number {
+    try {
+      return this.#o.monthSpendElsewhere?.(month) ?? 0;
+    } catch (err) {
+      this.#errors.push(err);
+      return 0;
+    }
+  }
+
+  /**
+   * The cap `taskId` is over, if any: its root task's (`task.budget.usd`, else
+   * `budget.per_task_usd`), today's (UTC, `budget.per_day_usd`, this repo) or this month's
+   * (`budget.api_key_per_month_usd`, every registered repo), counting known spend. A cap recorded
+   * as exceeded stays so until the user raises it, even if the config raises it meanwhile.
+   */
+  #overBudget(taskId: string): Omit<BudgetExceeded, 'escalationId'> | undefined {
+    const { ledger } = this.#state();
+    const root = rootTaskId(taskId);
+    const now = this.#now().toISOString();
+    const day = now.slice(0, 10);
+    const month = now.slice(0, 7);
+    const checks: [BudgetScope, string, Spend | undefined, number][] = [
+      ['task', root, ledger.tasks[root], 0],
+      ['day', day, ledger.days[day], 0],
+      ['month', month, ledger.months[month], this.#elsewhere(month)],
+    ];
+    for (const [scope, key, spend, more] of checks) {
+      const cap = this.#capFor(scope, key);
+      if (cap === undefined) continue;
+      const spentUsd = Math.round(((spend?.usd ?? 0) + more) * 1e6) / 1e6;
+      if (spentUsd >= cap || ledger.exceeded[budgetKey(scope, key)]) {
+        return {
+          scope,
+          key,
+          capUsd: cap,
+          spentUsd,
+          ...(spend?.unpricedTokens ? { unpricedTokens: spend.unpricedTokens } : {}),
+        };
+      }
+    }
+    return undefined;
+  }
+
+  /** Any hard cap applies to `taskId` at all (for the unpriced-model question). */
+  #anyCap(taskId: string): boolean {
+    const now = this.#now().toISOString();
+    return (
+      this.#capFor('task', rootTaskId(taskId)) !== undefined ||
+      this.#capFor('day', now.slice(0, 10)) !== undefined ||
+      this.#capFor('month', now.slice(0, 7)) !== undefined
+    );
+  }
+
+  /**
+   * A tier's model when its cost cannot be known (owner decision (c) on #35): its adapter reports
+   * no cost and no price is known for the model today. The tier's model is the profile's
+   * (`chooseProfile`); with none, the vendor's default, named `default@<adapter>`.
+   */
+  #unpricedTier(tier: TierConfig, worker: boolean): string | undefined {
+    const adapter = this.#o.adapters[tier.adapter]?.adapter;
+    if (adapter?.capabilities().usage.cost !== 'none') return undefined;
+    // Workers run on the profile's model, `models[0]` when only a list is set; the planner, the
+    // gate's reasoning and the reviewer are given `model` only, else the vendor's default.
+    const model = worker ? (tier.model ?? tier.models?.[0]) : tier.model;
+    const price = priceFor(model, this.#pricing);
+    const today = this.#now().toISOString().slice(0, 10);
+    if (price && (price.until === undefined || today <= price.until)) return undefined;
+    return model ?? `default@${tier.adapter}`;
+  }
+
+  /**
+   * The models whose cost cannot be known that working on `taskId` would run, when a cap applies:
+   * for a root task, its planner's; for a sub-task, its Worker's, the escalation gate's reasoning
+   * and the reviewer's. Empty when every cost is known or nothing caps it.
+   */
+  #unpricedModels(taskId: string): string[] {
+    if (!this.#anyCap(taskId)) return [];
+    const v = this.#state();
+    const tiers: [TierConfig, boolean][] = [];
+    if (!v.tasks[taskId]?.task.parentId) {
+      if (this.#o.plannerTier) tiers.push([this.#o.plannerTier, false]);
+    } else {
+      tiers.push([this.#tierFor(v.kinds.get(taskId)), true]);
+      if (this.#o.reasonerTier) tiers.push([this.#o.reasonerTier, false]);
+      const review = this.#o.config.tiers?.review;
+      if (this.#o.config.review?.enabled && this.#o.reviewer && review) tiers.push([review, false]);
+    }
+    const out = new Set<string>();
+    for (const [t, worker] of tiers) {
+      const m = this.#unpricedTier(t, worker);
+      if (m !== undefined) out.add(m);
+    }
+    return [...out];
+  }
+
+  /** Waiting on the user's answer about an unpriced model: not started, and not failed. */
+  #unpricedPending(taskId: string): boolean {
+    const { unpriced } = this.#state().ledger;
+    return this.#unpricedModels(taskId).some((m) => unpriced[m]?.allowed === undefined);
+  }
+
+  /** An unpriced model the user chose not to run that working on `taskId` needs. */
+  #unpricedRefused(taskId: string): string | undefined {
+    const { unpriced } = this.#state().ledger;
+    return this.#unpricedModels(taskId).find((m) => unpriced[m]?.allowed === false);
+  }
+
+  /**
+   * A budget question still being asked: raised, not answered, and on a task that has not ended.
+   * One on a task that was canceled meanwhile is asked again on a task still waiting for it.
+   */
+  #asking(escalationId: string | undefined): boolean {
+    const v = this.#state();
+    const x = escalationId ? v.escalations.get(escalationId) : undefined;
+    if (!x || x.resolved) return false;
+    const state = v.tasks[x.taskId]?.state;
+    return state === undefined || !TERMINAL.has(state);
+  }
+
+  /** Retire a budget question left on a task that has ended, when it is asked again elsewhere. */
+  #retire(escalationId: string | undefined, why: string): EventEnvelope[] {
+    const x = escalationId ? this.#state().escalations.get(escalationId) : undefined;
+    if (!x || x.resolved) return [];
+    return [
+      this.#env(x.taskId, 'escalation.resolved', {
+        escalationId: x.id,
+        answer: why,
+        source: 'mini',
+      }),
+      this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
+    ];
+  }
+
+  /**
+   * Fail safe on the hard caps (#35): once spend reaches one, stop every Worker and planner it
+   * covers (its root task's, or all of today's or this month's), start none, and ask the user,
+   * once per cap, to raise it. Also: tell the user about soft thresholds (notify only), ask about
+   * unpriced models before they run, retire questions about a day or month that has passed, and
+   * read the answers. Run after every usage event and on every tick.
+   */
+  async #enforceBudgets(): Promise<void> {
+    if (!this.#started) return;
+    this.#readBudgetAnswers();
+    this.#retireStaleBudgetQuestions();
+    this.#notifyThresholds();
+    const candidates = new Set<string>([...this.#runs.keys()]);
+    for (const s of this.#schedulable()) {
+      if (s.phase !== 'done' && s.phase !== 'failed') candidates.add(s.id);
+    }
+    for (const id of this.#planning) candidates.add(id);
+    // Root tasks not planned yet: a spent cap or an unpriced planner holds them, and the question
+    // is asked on the task itself.
+    for (const t of Object.values(this.#state().tasks)) {
+      if (!t.task.parentId && !TERMINAL.has(t.state) && t.plan === undefined) {
+        candidates.add(t.task.id);
+      }
+    }
+    const handled = new Set<string>();
+    const stops: Promise<void>[] = [];
+    for (const id of candidates) {
+      const over = this.#overBudget(id);
+      if (over) {
+        const k = budgetKey(over.scope, over.key);
+        if (handled.has(k)) continue;
+        handled.add(k);
+        const prior = this.#state().ledger.exceeded[k]?.escalationId;
+        if (!this.#asking(prior)) {
+          // The question and the record go in one batch: the record names the question.
+          const escalationId = newUlid(this.#now().getTime());
+          this.#raise(
+            id,
+            budgetQuestion(over),
+            { urgency: 'high', category: 'blocked', contextRef: `tacet:budget:${k}` },
+            [
+              ...this.#retire(prior, `asked again on ${id}: the task it was asked on has ended`),
+              this.#env(id, 'budget.exceeded', { ...over, escalationId }),
+            ],
+            escalationId,
+          );
+        }
+        const covers = (taskId: string) => over.scope !== 'task' || rootTaskId(taskId) === over.key;
+        for (const run of [...this.#runs.values()]) {
+          if (covers(run.subtaskId)) {
+            stops.push(
+              this.#end(
+                run,
+                'budget',
+                `stopped: the ${over.scope} budget ($${over.capUsd}) is spent`,
+              ),
+            );
+          }
+        }
+        for (const [root, abort] of this.#planAborts) {
+          if (covers(root)) {
+            this.#budgetAborted.add(root);
+            abort.abort();
+          }
+        }
+        continue;
+      }
+      // Never run silently on a model whose cost cannot be known: ask once per model.
+      if (this.#runs.has(id) || this.#planning.has(id)) continue;
+      for (const model of this.#unpricedModels(id)) {
+        if (handled.has(`unpriced:${model}`)) continue;
+        const rec = this.#state().ledger.unpriced[model];
+        if (rec && (rec.allowed !== undefined || this.#asking(rec.escalationId))) continue;
+        handled.add(`unpriced:${model}`);
+        const escalationId = newUlid(this.#now().getTime());
+        this.#raise(
+          id,
+          unpricedQuestion(model),
+          { urgency: 'high', category: 'blocked', contextRef: `tacet:budget:unpriced:${model}` },
+          [
+            ...this.#retire(
+              rec?.escalationId,
+              `asked again on ${id}: the task it was asked on has ended`,
+            ),
+            this.#env(id, 'budget.unpriced', { model, escalationId }),
+          ],
+          escalationId,
+        );
+      }
+    }
+    await Promise.all(stops);
+  }
+
+  /** One `budget.threshold` per soft threshold a root task's spend passed (notify only). */
+  #notifyThresholds(): void {
+    const thresholds = [...(this.#o.config.budget?.ask_thresholds_usd ?? [])].sort((a, b) => a - b);
+    if (thresholds.length === 0) return;
+    const { ledger } = this.#state();
+    const events: EventEnvelope[] = [];
+    for (const [root, spend] of Object.entries(ledger.tasks)) {
+      const told = ledger.thresholds[budgetKey('task', root)] ?? [];
+      for (const t of thresholds) {
+        if (spend.usd >= t && !told.includes(t)) {
+          events.push(
+            this.#env(root, 'budget.threshold', {
+              scope: 'task',
+              key: root,
+              thresholdUsd: t,
+              spentUsd: spend.usd,
+            }),
+          );
+        }
+      }
+    }
+    if (events.length > 0) this.#o.store.append(events);
+  }
+
+  /**
+   * A question about a day's or month's cap that has passed answers itself: the new day's (or
+   * month's) cap applies, so the sub-task it held goes back to work rather than wait for an
+   * answer that no longer matters.
+   */
+  #retireStaleBudgetQuestions(): void {
+    const now = this.#now().toISOString();
+    for (const rec of Object.values(this.#state().ledger.exceeded)) {
+      // Read again per record: retiring one question changes what is open on its task.
+      const v = this.#state();
+      const current =
+        rec.scope === 'day'
+          ? now.slice(0, 10)
+          : rec.scope === 'month'
+            ? now.slice(0, 7)
+            : undefined;
+      if (current === undefined || rec.key === current) continue;
+      const x = rec.escalationId ? v.escalations.get(rec.escalationId) : undefined;
+      if (!x || x.resolved) continue;
+      this.#o.store.append([
+        this.#env(x.taskId, 'escalation.resolved', {
+          escalationId: x.id,
+          answer: `no longer needed: the ${rec.scope} (${rec.key}) is over, and the next one's cap applies`,
+          source: 'mini',
+        }),
+        this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
+        // Back to work only when nothing else is asked of the user on it.
+        ...(v.tasks[x.taskId]?.state === 'input_required' &&
+        ![...v.escalations.values()].some(
+          (o) => o.id !== x.id && o.taskId === x.taskId && !o.resolved,
+        )
+          ? [this.#env(x.taskId, 'task.status', { state: 'working' })]
+          : []),
+      ]);
+    }
+  }
+
+  /**
+   * Read the user's answers to budget questions. For a spent cap, an answer that is only a dollar
+   * amount above the spend raises it (`budget.raised`); anything else leaves it, and the next check
+   * asks again. For an unpriced model, a plain yes allows it and anything else refuses it, for
+   * this repo. Either way the answer is consumed here, so it never reaches a Worker.
+   */
+  #readBudgetAnswers(): void {
+    const v = this.#state();
+    for (const rec of Object.values(v.ledger.exceeded)) {
+      const x = rec.escalationId ? v.escalations.get(rec.escalationId) : undefined;
+      if (!x?.resolved || x.delivered) continue;
+      const cap = parseUsd(x.answer);
+      const consumed = this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id });
+      if (cap !== undefined && cap > rec.spentUsd) {
+        this.#o.store.append([
+          consumed,
+          this.#env(x.taskId, 'budget.raised', {
+            scope: rec.scope,
+            key: rec.key,
+            capUsd: cap,
+            escalationId: x.id,
+          }),
+        ]);
+      } else {
+        this.#o.store.append(consumed);
+      }
+    }
+    for (const rec of Object.values(v.ledger.unpriced)) {
+      if (rec.allowed !== undefined || !rec.escalationId) continue;
+      const x = v.escalations.get(rec.escalationId);
+      if (!x?.resolved || x.delivered) continue;
+      this.#o.store.append([
+        this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
+        this.#env(x.taskId, 'budget.unpriced', {
+          model: rec.model,
+          escalationId: x.id,
+          allowed: isYes(x.answer),
+        }),
+      ]);
+    }
   }
 
   // ---- Workers ---------------------------------------------------------------------------
@@ -1724,6 +2152,17 @@ export class MiniConductor {
   async #run(subtaskId: string, gen: number): Promise<void> {
     // A tick's ready list can outlive a cancellation made while an earlier run of it started.
     if (this.#runs.has(subtaskId) || !this.#live(gen) || this.#ended(subtaskId)) return;
+    if (this.#overBudget(subtaskId) || this.#unpricedPending(subtaskId)) return;
+    const unpriced = this.#unpricedRefused(subtaskId);
+    if (unpriced) {
+      this.#o.store.append(
+        this.#env(subtaskId, 'task.status', {
+          state: 'failed',
+          message: `not run: the cost of ${unpriced} is not known, and you chose not to run it (#35)`,
+        }),
+      );
+      return;
+    }
     const v = this.#state();
     const view = v.tasks[subtaskId];
     if (!view) return;
@@ -1785,7 +2224,7 @@ export class MiniConductor {
     const seed = v.pendingHandoffs.get(subtaskId);
     const resume =
       seed === undefined &&
-      last?.ended === 'restart' &&
+      (last?.ended === 'restart' || last?.ended === 'budget') &&
       last.vendorSessionId !== undefined &&
       last.adapter === tier.adapter &&
       existing !== undefined &&
@@ -1798,7 +2237,7 @@ export class MiniConductor {
     // restart, and a second discard is harmless.
     if (
       !resume &&
-      (last?.ended === 'restart' || last?.ended === 'handoff') &&
+      (last?.ended === 'restart' || last?.ended === 'handoff' || last?.ended === 'budget') &&
       last.vendorSessionId &&
       last.adapter
     ) {
@@ -1807,8 +2246,9 @@ export class MiniConductor {
       await this.#discard(last.adapter, last.vendorSessionId, (old ?? workspace).path);
       if (!this.#live(gen)) return;
     }
-    // Canceled while the checkout was being made: start nothing (#202).
-    if (this.#ended(subtaskId)) return;
+    // Canceled while the checkout was being made: start nothing (#202). Nor when a cap was spent
+    // meanwhile (#35).
+    if (this.#ended(subtaskId) || this.#overBudget(subtaskId)) return;
     // Intent first: a crash after this leaves a record of the session and its checkout.
     this.#o.store.append([
       this.#env(
@@ -1945,6 +2385,44 @@ export class MiniConductor {
       if (canceled && handle.vendorSessionId) {
         await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
       }
+      return;
+    }
+    const spent = this.#overBudget(subtaskId);
+    if (spent) {
+      // A cap was spent while the session started (#35): end it before its first message. The end
+      // is written first, so a cancel or a crash meanwhile cannot end it a second time. A resumed
+      // session keeps the conversation it resumed, for the run after a raise; a fresh one, in
+      // which nothing ran, gives its vendor state back.
+      const keep = resume !== undefined && handle.vendorSessionId !== undefined;
+      this.#o.store.append([
+        ...(keep
+          ? [
+              this.#env(
+                subtaskId,
+                'worker.vendor_session',
+                { sessionId, vendorSessionId: handle.vendorSessionId },
+                sessionId,
+              ),
+            ]
+          : []),
+        this.#env(
+          subtaskId,
+          'worker.ended',
+          {
+            sessionId,
+            reason: 'budget',
+            message: `stopped: the ${spent.scope} budget ($${spent.capUsd}) is spent`,
+          },
+          sessionId,
+        ),
+      ]);
+      revoke();
+      await worker.adapter.close(handle).catch(() => {});
+      if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      if (!keep && handle.vendorSessionId) {
+        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
+      }
+      this.#kick();
       return;
     }
     const run: Run = {
@@ -2155,6 +2633,8 @@ export class MiniConductor {
     }
     batch.push(this.#env(run.subtaskId, `agent.${e.t}`, e, run.sessionId));
     this.#o.store.append(batch);
+    // Checked on every usage event, so a Worker overshoots a cap by one usage event at most (#35).
+    if (e.t === 'usage') this.#track(this.#enforceBudgets());
   }
 
   async #turnEnded(run: Run): Promise<void> {
@@ -2780,7 +3260,7 @@ export class MiniConductor {
 
   async #end(
     run: Run,
-    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff',
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff' | 'budget',
     message?: string,
     extra: { workspaceRefused?: boolean } = {},
   ): Promise<void> {
@@ -2798,7 +3278,7 @@ export class MiniConductor {
 
   async #endRun(
     run: Run,
-    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff',
+    reason: 'finished' | 'failed' | 'restart' | 'stuck' | 'canceled' | 'handoff' | 'budget',
     message: string | undefined,
     extra: { workspaceRefused?: boolean },
   ): Promise<void> {
@@ -2821,7 +3301,8 @@ export class MiniConductor {
     // Only a session stopped for a restart is ever resumed (#153).
     const vendor =
       run.handle.vendorSessionId ?? this.#state().sessions.get(run.sessionId)?.vendorSessionId;
-    if (reason !== 'restart' && vendor) {
+    // A budget stop is resumed once the cap is raised, like a restart (#35).
+    if (reason !== 'restart' && reason !== 'budget' && vendor) {
       await this.#discard(run.adapterId, vendor, run.workspace.path);
     }
   }
@@ -2890,8 +3371,14 @@ export class MiniConductor {
 
   /** Answered escalations of a sub-task that its Worker has not been sent yet. */
   #undelivered(subtaskId: string): EscalationRecord[] {
+    // Budget questions (#35) are the Mini-conductor's own: their answers are read by it, never
+    // sent to a Worker, whatever order the tick runs in.
     return [...this.#state().escalations.values()].filter(
-      (x) => x.taskId === subtaskId && x.resolved && !x.delivered,
+      (x) =>
+        x.taskId === subtaskId &&
+        x.resolved &&
+        !x.delivered &&
+        !x.contextRef?.startsWith('tacet:budget:'),
     );
   }
 
@@ -2941,7 +3428,7 @@ export class MiniConductor {
 
   /** The current reading of the log, rebuilt only when it has grown. */
   #state(): View {
-    this.#view = readView(this.#o.store, this.#view);
+    this.#view = readView(this.#o.store, this.#view, this.#pricing);
     return this.#view;
   }
 
@@ -3228,7 +3715,26 @@ export async function withStoppedMini<T>(
 }
 
 /** One reading of the log, rebuilt only when it has grown since `prev`. */
-function readView(store: EventStore, prev?: View): View {
+/**
+ * The cost ledger, folded on from the last view's (the ledger is a pure fold, so folding only the
+ * new events gives the same result as a replay of the whole log, at a fraction of the cost).
+ */
+function foldLedger(
+  store: EventStore,
+  pricing: PricingTable,
+  prev: View | undefined,
+): { ledger: CostLedger; ledgerSeq: number } {
+  const projection = costLedgerProjection(pricing);
+  let ledger = prev?.ledger ?? projection.initial();
+  let ledgerSeq = prev?.ledgerSeq ?? 0;
+  for (const e of store.query(prev ? { afterSeq: ledgerSeq } : {})) {
+    ledger = projection.apply(ledger, e.envelope);
+    ledgerSeq = e.seq;
+  }
+  return { ledger, ledgerSeq };
+}
+
+function readView(store: EventStore, prev?: View, pricing: PricingTable = BUILTIN_PRICES): View {
   const count = store.count();
   if (prev && prev.count === count) return prev;
   const tasks = store.replay(tasksProjection).tasks;
@@ -3360,6 +3866,7 @@ function readView(store: EventStore, prev?: View): View {
     progressAt,
     pendingHandoffs,
     handoffCount,
+    ...foldLedger(store, pricing, prev),
   };
 }
 
@@ -3426,6 +3933,45 @@ function refusedField(err: unknown): ProfileField | undefined {
   if (!(err instanceof Error) || err.name !== 'ProfileRefusedError') return undefined;
   const field = (err as { field?: unknown }).field;
   return field === 'model' || field === 'effort' || field === 'contextWindow' ? field : undefined;
+}
+
+/** What the Mini-conductor asks when a hard cap is spent (#35). */
+function budgetQuestion(over: Omit<BudgetExceeded, 'escalationId'>): string {
+  const usd = (n: number) => `$${n.toFixed(2)}`;
+  const unpriced = over.unpricedTokens
+    ? ` (plus ${over.unpricedTokens} tokens on models with no known price, not counted)`
+    : '';
+  const raise = `Answer with only the new cap in dollars, above ${usd(over.spentUsd)}, for example ${usd(Math.ceil(over.spentUsd * 2) || 1)}`;
+  if (over.scope === 'task') {
+    return `Task ${over.key} has spent ${usd(over.spentUsd)} of its ${usd(over.capUsd)} budget${unpriced}. Its Workers are stopped and none start until you raise the cap. ${raise}; or cancel the task with tacet cancel.`;
+  }
+  const what =
+    over.scope === 'day'
+      ? `Today (${over.key}, UTC) this repo has spent ${usd(over.spentUsd)} of its ${usd(over.capUsd)} daily budget`
+      : `This month (${over.key}, UTC) ${usd(over.spentUsd)} of the ${usd(over.capUsd)} monthly API-key budget is spent`;
+  return `${what}${unpriced}. Every Worker it covers is stopped and none start until you raise the cap or the ${over.scope} ends. ${raise}.`;
+}
+
+/** What the Mini-conductor asks before running a model whose cost it cannot know (#35). */
+function unpricedQuestion(model: string): string {
+  return `A Worker would run on ${model}, whose cost Tacet cannot know: its adapter reports none and no price is known for it, so your budgets cannot count it. Run it anyway in this repo? Answer yes to allow it; anything else refuses it, and its sub-tasks fail. Prices can be added under pricing: in ~/.tacet/config.yaml.`;
+}
+
+/**
+ * The new cap in an answer that is only a dollar amount (`5`, `$12.50`, `7.25 USD`), or
+ * undefined. Anything else (`don't raise past 5`, `1,000`, `.5`) is not a raise: the cap stays and
+ * the question is asked again, because a misread here is the one way spending continues.
+ */
+export function parseUsd(answer: string | undefined): number | undefined {
+  const m = /^\$?\s*(\d+(?:\.\d+)?)\s*(?:usd|dollars?)?$/i.exec((answer ?? '').trim());
+  if (!m?.[1]) return undefined;
+  const n = Number.parseFloat(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** A plain yes (`yes`, `y`, `ok`, `run it`, `allow`), and nothing that only contains one. */
+export function isYes(answer: string | undefined): boolean {
+  return /^(yes|y|ok|okay|allow|run|run it|go|go ahead)[.!]?$/i.test((answer ?? '').trim());
 }
 
 function answerText(x: EscalationRecord, mcp = true): string {

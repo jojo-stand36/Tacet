@@ -33,6 +33,8 @@ export function isSummaryEvent(type: string): boolean {
 }
 
 type Data = Record<string, unknown>;
+/** A dollar amount from event data, or `?`. */
+const usd = (v: unknown): string => (typeof v === 'number' ? `$${v.toFixed(2)}` : '?');
 const str = (d: Data, k: string): string | undefined =>
   typeof d[k] === 'string' ? (d[k] as string) : undefined;
 
@@ -83,6 +85,18 @@ export function formatEvent(e: EventEnvelope): string {
       break;
     case 'agent.status':
       what = `status ${str(d, 'state') ?? '?'}${str(d, 'message') ? `: ${oneLine(str(d, 'message') ?? '')}` : ''}`;
+      break;
+    case 'budget.threshold':
+      what = `budget: spent ${usd(d.spentUsd)}, past the ${usd(d.thresholdUsd)} you asked to hear about (nothing stops)`;
+      break;
+    case 'budget.exceeded':
+      what = `budget: the ${str(d, 'scope') ?? '?'} cap ${usd(d.capUsd)} is spent (${usd(d.spentUsd)}); Workers stopped until it is raised`;
+      break;
+    case 'budget.raised':
+      what = `budget: the ${str(d, 'scope') ?? '?'} cap raised to ${usd(d.capUsd)}`;
+      break;
+    case 'budget.unpriced':
+      what = `budget: ${str(d, 'model') ?? '?'} has no known price: ${d.allowed === true ? 'allowed' : d.allowed === false ? 'refused' : 'asking whether to run it'}`;
       break;
     case 'maintenance.problem':
       what = `problem (${[str(d, 'op') ?? '?', str(d, 'workspaceId')].filter(Boolean).join(' ')}): ${oneLine(str(d, 'message') ?? '', 300)}`;

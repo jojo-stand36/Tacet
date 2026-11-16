@@ -232,6 +232,21 @@ export interface Reviewer {
   review(subtask: Task, ctx: ReviewContext): Promise<ReviewResult>;
 }
 
+/**
+ * A planner's failure (or abort) that carries what its session spent, so a plan that is dropped
+ * is still charged to the task (#35).
+ */
+export class PlanFailed extends Error {
+  constructor(
+    message: string,
+    readonly usage: NonNullable<PlanResult['usage']>,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'PlanFailed';
+  }
+}
+
 /** A sub-task as the planner proposes it; the Mini-conductor assigns ids. */
 export interface ProposedSubtask {
   key: string;

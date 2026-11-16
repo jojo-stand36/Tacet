@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import { AgentEvent, ApprovalDecision } from './agent-event.js';
+import { BudgetExceeded, BudgetRaised, BudgetThreshold, BudgetUnpriced } from './budget.js';
 import { Decision, DecisionExt } from './decision.js';
 import { EventEnvelope } from './envelope.js';
 import { Escalation, EscalationExt } from './escalation.js';
@@ -34,6 +35,7 @@ import { WorkspaceCreated, WorkspaceRemoved } from './workspace.js';
 
 export * from './a2a.js';
 export * from './agent-event.js';
+export * from './budget.js';
 export * from './common.js';
 export * from './decision.js';
 export * from './envelope.js';
@@ -86,6 +88,10 @@ export const jsonSchemas = {
   'summary-packet': { schema: SummaryPacket, title: 'Tacet SummaryPacket (task.result)' },
   'task-landed': { schema: TaskLanded, title: 'Tacet task.landed payload' },
   'task-target': { schema: TaskTarget, title: 'Tacet task.target payload' },
+  'budget-exceeded': { schema: BudgetExceeded, title: 'Tacet budget.exceeded payload' },
+  'budget-raised': { schema: BudgetRaised, title: 'Tacet budget.raised payload' },
+  'budget-threshold': { schema: BudgetThreshold, title: 'Tacet budget.threshold payload' },
+  'budget-unpriced': { schema: BudgetUnpriced, title: 'Tacet budget.unpriced payload' },
   'worker-started': { schema: WorkerStarted, title: 'Tacet worker.started payload' },
   'worker-vendor-session': {
     schema: WorkerVendorSession,

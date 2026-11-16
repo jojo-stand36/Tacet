@@ -27,7 +27,9 @@ export type Script =
   | { do: 'vanish' }
   | { do: 'tool-hold' }
   | { do: 'auth' }
-  | { do: 'approval'; toolName?: string; grant?: unknown };
+  | { do: 'approval'; toolName?: string; grant?: unknown }
+  /** Report a call that cost `costUsd`, then hold the turn like `hold` (#35). */
+  | { do: 'spend'; costUsd: number };
 
 interface FakeSession {
   handle: SessionHandle;
@@ -181,6 +183,17 @@ export class ScriptedAdapter implements AgentAdapter {
         id: `tool-${s.handle.id}`,
         name: 'Bash',
         input: { command: 'pnpm test' },
+      });
+      await new Promise<void>((resolve) => {
+        s.held = resolve;
+      });
+    } else if (step.do === 'spend') {
+      this.#emit(s, {
+        t: 'usage',
+        inputTokens: 100,
+        outputTokens: 10,
+        costUsd: step.costUsd,
+        source: 'reported',
       });
       await new Promise<void>((resolve) => {
         s.held = resolve;
@@ -339,5 +352,30 @@ export class ScriptedTerminalAdapter extends ScriptedAdapter {
   override async close(h: SessionHandle): Promise<void> {
     await super.close(h);
     if (this.endOnClose) this.#terms.get(h.id)?.end();
+  }
+}
+
+/**
+ * Answer yes to the one question a Worker on a model with no known cost raises before it runs
+ * (#35): a CLI or ACP agent that reports no cost, under the default month cap. For tests about
+ * something else.
+ */
+export async function allowUnpriced(
+  store: { query(f: { typePrefix: string }): { envelope: { type: string; data: unknown } }[] },
+  mini: { answer(escalationId: string, text: string): unknown },
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const asked = store
+      .query({ typePrefix: 'budget' })
+      .find((e) => e.envelope.type === 'budget.unpriced');
+    const id = (asked?.envelope.data as { escalationId?: string } | undefined)?.escalationId;
+    if (id) {
+      mini.answer(id, 'yes');
+      return;
+    }
+    if (Date.now() > deadline) throw new Error('no question about an unpriced model was raised');
+    await new Promise((r) => setTimeout(r, 20));
   }
 }

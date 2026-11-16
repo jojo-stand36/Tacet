@@ -1,6 +1,7 @@
 import { type PolicyRule, planIssues, type Task } from '@tacet/core';
 import { z } from 'zod';
 import {
+  PlanFailed,
   type Planner,
   type PlanResult,
   type ProposedSubtask,
@@ -105,6 +106,12 @@ export class AdapterPlanner implements Planner {
       ...(this.#o.effort !== undefined ? { effort: this.#o.effort } : {}),
     });
     const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    const spent = () => ({
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      ...(usage.costUsd > 0 ? { costUsd: Math.round(usage.costUsd * 1e6) / 1e6 } : {}),
+      ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
+    });
     const onAbort = () => void adapter.close(h).catch(() => {});
     opts.signal?.addEventListener('abort', onAbort, { once: true });
     try {
@@ -129,12 +136,7 @@ export class AdapterPlanner implements Planner {
               adapter: this.#o.adapterId,
               ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
             },
-            usage: {
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              ...(usage.costUsd > 0 ? { costUsd: Math.round(usage.costUsd * 1e6) / 1e6 } : {}),
-              ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
-            },
+            usage: spent(),
           };
         } catch (err) {
           lastError = err;
@@ -146,6 +148,9 @@ export class AdapterPlanner implements Planner {
         }
       }
       throw new Error(`planner reply invalid: ${(lastError as Error).message}`);
+    } catch (err) {
+      // Failed or aborted (a spent cap, #35): what the session spent is still charged.
+      throw new PlanFailed((err as Error).message ?? String(err), spent(), { cause: err });
     } finally {
       opts.signal?.removeEventListener('abort', onAbort);
       await adapter.close(h).catch(() => {});
