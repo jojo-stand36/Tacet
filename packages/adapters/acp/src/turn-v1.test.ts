@@ -150,6 +150,23 @@ describe('ACP v1 prompt turn (recorded Gemini CLI 0.67.0 transcripts)', () => {
       cacheReadTokens: 900,
       cacheWriteTokens: 95,
     });
+    // As Gemini CLI 0.67.0 sends them: its `promptTokenCount`, cache included, and a total of
+    // input plus output. The cache is already in the input.
+    const gemini = {
+      stopReason: 'end_turn',
+      usage: { inputTokens: 1000, outputTokens: 7, cachedReadTokens: 900, totalTokens: 1007 },
+    } as unknown as Parameters<typeof turnUsage>[0];
+    expect(turnUsage(gemini, newTurnState())).toMatchObject({
+      inputTokens: 1000,
+      outputTokens: 7,
+      cacheReadTokens: 900,
+    });
+    // No total: taken as already in the input, and never more cache than input.
+    const odd = {
+      stopReason: 'end_turn',
+      usage: { inputTokens: 10, outputTokens: 1, cachedReadTokens: 50 },
+    } as unknown as Parameters<typeof turnUsage>[0];
+    expect(turnUsage(odd, newTurnState())).toMatchObject({ inputTokens: 10, cacheReadTokens: 10 });
     // Without them, nothing changes.
     const plain = {
       stopReason: 'end_turn',

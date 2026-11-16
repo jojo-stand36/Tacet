@@ -212,6 +212,9 @@ interface View {
 export interface AsideUsage {
   inputTokens: number;
   outputTokens: number;
+  /** Of `inputTokens`, read from and written to the prompt cache (#355). */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   costUsd?: number;
   model?: string;
 }

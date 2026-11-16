@@ -280,8 +280,14 @@ export class TranscriptReader {
       out.push({
         inputTokens: input - (before?.input ?? 0),
         outputTokens: output - (before?.output ?? 0),
-        cacheReadTokens: read - (before?.read ?? 0),
-        cacheWriteTokens: write - (before?.write ?? 0),
+        // Never more cache than the input this delta adds.
+        cacheReadTokens: Math.min(read - (before?.read ?? 0), input - (before?.input ?? 0)),
+        cacheWriteTokens: Math.min(
+          write - (before?.write ?? 0),
+          input -
+            (before?.input ?? 0) -
+            Math.min(read - (before?.read ?? 0), input - (before?.input ?? 0)),
+        ),
         contextUsed: input + output,
         model: p.model,
       });

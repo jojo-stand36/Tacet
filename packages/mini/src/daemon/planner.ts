@@ -10,7 +10,7 @@ import {
 } from './ports.js';
 import { PLANNER_SYSTEM_PROMPT, plannerPrompt } from './prompts.js';
 import { unfence } from './reply.js';
-import { sessionTurns } from './turns.js';
+import { cacheFields, sessionTurns, type TurnUsage } from './turns.js';
 
 const Proposal = z.object({
   rationale: z.string().optional(),
@@ -105,10 +105,11 @@ export class AdapterPlanner implements Planner {
       ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
       ...(this.#o.effort !== undefined ? { effort: this.#o.effort } : {}),
     });
-    const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    const usage: TurnUsage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
     const spent = () => ({
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
+      ...cacheFields(usage),
       ...(usage.costUsd > 0 ? { costUsd: Math.round(usage.costUsd * 1e6) / 1e6 } : {}),
       ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
     });

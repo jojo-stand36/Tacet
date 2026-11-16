@@ -124,6 +124,10 @@ describe('TranscriptReader', () => {
     appendFileSync(file, assistantLine('m1', { input: 10, read: 90, output: 50 }));
     // A delta, with the context gauge after the whole call; the cache was reported already.
     expect(r.read()).toEqual([{ ...call(0, 49), contextUsed: 150 }]);
+    // A later line that moves tokens into the cache without adding input reports no cache beyond
+    // the input it adds.
+    appendFileSync(file, assistantLine('m1', { input: 0, read: 100, output: 60 }));
+    expect(r.read()).toEqual([{ ...call(0, 10), contextUsed: 160 }]);
     // An earlier line seen again (a rewrite) adds nothing.
     appendFileSync(file, assistantLine('m1', { input: 10, read: 90, output: 1 }));
     expect(r.read()).toEqual([]);

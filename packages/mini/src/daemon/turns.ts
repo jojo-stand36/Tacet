@@ -12,6 +12,20 @@ export interface TurnUsage {
   inputTokens: number;
   outputTokens: number;
   costUsd: number;
+  /** Of `inputTokens`, read from and written to the prompt cache (#355). */
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
+/** The cache counts of `usage`, for a usage report: only those the session reported (#355). */
+export function cacheFields(usage: TurnUsage): {
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+} {
+  return {
+    ...(usage.cacheReadTokens ? { cacheReadTokens: usage.cacheReadTokens } : {}),
+    ...(usage.cacheWriteTokens ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
+  };
 }
 
 /**
@@ -64,6 +78,11 @@ export function sessionTurns(
         usage.inputTokens += e.inputTokens;
         usage.outputTokens += e.outputTokens;
         usage.costUsd += e.costUsd ?? 0;
+        if (e.cacheReadTokens)
+          usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + e.cacheReadTokens;
+        if (e.cacheWriteTokens) {
+          usage.cacheWriteTokens = (usage.cacheWriteTokens ?? 0) + e.cacheWriteTokens;
+        }
       } else if (e.t === 'approval.request') {
         const d =
           o.reads !== undefined && READ_TOOLS.has(e.toolName ?? '')
