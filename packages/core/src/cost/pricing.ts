@@ -10,10 +10,20 @@ export interface ModelPrice {
   longContext?: { aboveInputTokens: number; inputPerMTok: number; outputPerMTok: number };
   /**
    * The last UTC day (`YYYY-MM-DD`) this price holds, for a promotional price: usage after it has
-   * no known price, rather than the promotion's.
+   * no known price, rather than the promotion's, unless `later` says what follows (#363).
    */
   until?: string;
+  /**
+   * What applies from a later UTC day on, oldest first (#363): another price, or another model's
+   * price (`billedAs`, for a model the vendor bills as another). See {@link priceOn}.
+   */
+  later?: readonly LaterPrice[];
 }
+
+/** A price that takes over from `from` (a UTC day, `YYYY-MM-DD`) on. */
+export type LaterPrice =
+  | { from: string; price: Omit<ModelPrice, 'later'> }
+  | { from: string; billedAs: string };
 
 /** Model id → price. */
 export type PricingTable = Readonly<Record<string, ModelPrice>>;
@@ -63,9 +73,13 @@ export const BUILTIN_PRICES: PricingTable = {
   // Google, read from https://aistudio.google.com/docs/pricing.md on 2026-11-16 (#357): the
   // paid tier's standard rates, text input. Audio input costs more on some models and is not
   // told apart. "prompts <= 200k tokens" is read as 200,000.
-  // "$0.75 through December 31, 2026. $1.50 starting January 1, 2027." (output $3.75, then $7.50):
-  // the later price is not applied, so from 2027 the model is asked about again.
-  'gemini-3.8-flash': { inputPerMTok: 0.75, outputPerMTok: 3.75, until: '2026-12-31' },
+  // "$0.75 through December 31, 2026. $1.50 starting January 1, 2027." (output $3.75, then $7.50).
+  'gemini-3.8-flash': {
+    inputPerMTok: 0.75,
+    outputPerMTok: 3.75,
+    until: '2026-12-31',
+    later: [{ from: '2027-01-01', price: { inputPerMTok: 1.5, outputPerMTok: 7.5 } }],
+  },
   'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
   'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
   // The page prices both ids in one section.
@@ -75,7 +89,11 @@ export const BUILTIN_PRICES: PricingTable = {
   // Deprecated: "Effective December 1, 2026, all API requests to `gemini-2.5-pro` will
   // automatically route to Gemini 3.8 Flash (`gemini-3.8-flash`) and be billed at Gemini 3.8
   // Flash rates." This price holds through November 30.
-  'gemini-2.5-pro': { ...gemini(1.25, 10, 2.5, 15), until: '2026-11-30' },
+  'gemini-2.5-pro': {
+    ...gemini(1.25, 10, 2.5, 15),
+    until: '2026-11-30',
+    later: [{ from: '2026-12-01', billedAs: 'gemini-3.8-flash' }],
+  },
 };
 
 /** A Gemini price with its tier for prompts above 200k (read as 200,000) tokens. */
@@ -120,6 +138,30 @@ export function priceFor(model: string | undefined, table: PricingTable): ModelP
 }
 
 /**
+ * The price of `model` in force on `day` (a UTC day, `YYYY-MM-DD`), or undefined when none is
+ * known (#363). The latest `later` entry from on or before `day` wins: its price, or the price of
+ * the model it is billed as on that day. With none, the entry's own price holds, through `until`
+ * when it has one. A model billed as another is followed a few steps at most, so a loop in the
+ * table prices nothing rather than hang.
+ */
+export function priceOn(
+  model: string | undefined,
+  day: string,
+  table: PricingTable,
+  depth = 0,
+): Omit<ModelPrice, 'later' | 'until'> | undefined {
+  const price = priceFor(model, table);
+  if (!price || depth > 4) return undefined;
+  const step = [...(price.later ?? [])].reverse().find((l) => l.from <= day);
+  if (step) {
+    return 'billedAs' in step ? priceOn(step.billedAs, day, table, depth + 1) : step.price;
+  }
+  if (price.until !== undefined && day > price.until) return undefined;
+  const { later: _later, until: _until, ...own } = price;
+  return own;
+}
+
+/**
  * The cost in USD of one usage event's tokens at `price`. Every input token is charged at the
  * input rate: usage events do not split out cache reads (0.025x to 0.1x of it) or writes (1.25x to
  * 2x), so for a cache-heavy agent loop this can be several times the bill, and a call that writes
@@ -127,7 +169,11 @@ export function priceFor(model: string | undefined, table: PricingTable): ModelP
  * the tier's threshold: per request where the adapter reports per call, per turn where it reports
  * a turn's total (so a tier may apply to a turn of small requests).
  */
-export function costOf(price: ModelPrice, inputTokens: number, outputTokens: number): number {
+export function costOf(
+  price: Omit<ModelPrice, 'later' | 'until'>,
+  inputTokens: number,
+  outputTokens: number,
+): number {
   const rate =
     price.longContext && inputTokens > price.longContext.aboveInputTokens
       ? price.longContext
