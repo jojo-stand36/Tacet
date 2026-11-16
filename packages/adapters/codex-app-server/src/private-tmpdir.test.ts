@@ -30,7 +30,12 @@ import { type MockResponsesApi, startMockResponsesApi } from './testing/mock-res
  * (`getconf DARWIN_USER_TEMP_DIR`) is the private TMPDIR, and the host's own per-user temp dir
  * is not writable (#294).
  */
-const DENIED = /Read-only file system|Permission denied|Operation not permitted/;
+/**
+ * The error the shell prints for a write the sandbox refused (EROFS, EACCES or EPERM). Codex runs
+ * commands in the user's shell: bash capitalises strerror ("Operation not permitted"), zsh, the
+ * default login shell on macOS, does not ("zsh:1: operation not permitted: <path>").
+ */
+const DENIED = /Read-only file system|Permission denied|Operation not permitted/i;
 
 describe('Codex Worker private TMPDIR (#294)', () => {
   let api: MockResponsesApi;

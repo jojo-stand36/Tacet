@@ -131,6 +131,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **claude-agent-acp Workers: route in-checkout reads through the Worker policy (#206 gap)** — `feature` `P2` `claude`
 - [ ] **claude-sdk Workers have no commit path, so their work is never integrated** — `P1`
 - [ ] **codex-acp Workers trust the checkout: refuse, accept or patch** — `feature` `P1` `claude + human`
+- [ ] **macOS with SIP on: the Worker-process sweep cannot read Apple-signed processes' marker, so their leftovers are not ended** — `P1` `claude + human`
 - [ ] **pty:claude Workers: an @path in a prompt may read files unasked** — `feature` `P1` `claude`
 - [ ] **pty:claude: an image path in a Worker prompt hangs the turn; check pasted-image attachments** — `feature` `P1` `claude`
 - [ ] **pty:claude: evaluate permissions.blockReadsOutsideWorkingDirectories as defence in depth for pasted reads** — `chore` `P3` `claude`
