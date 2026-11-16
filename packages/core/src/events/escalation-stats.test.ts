@@ -56,10 +56,32 @@ describe('escalationStats (#25)', () => {
       answeredByUser: 1,
       answeredUnknown: 1,
       open: 1,
+      withdrawn: 0,
       rate: 0.5,
       approvals: 1,
       raisedByMini: 1,
     });
+  });
+
+  it('counts a question withdrawn by a cancel apart, outside the rate (#362)', () => {
+    const s = escalationStats([
+      raise('e1'),
+      resolve('e1', 'user'),
+      raise('e2'),
+      resolve('e2', 'canceled'),
+      raise('e3'),
+      resolve('e3', 'precedent'),
+    ]);
+    expect(s).toMatchObject({
+      raised: 3,
+      withdrawn: 1,
+      answeredByUser: 1,
+      answeredUnknown: 0,
+      resolvedLocally: { policy: 0, precedent: 1, mini: 0 },
+      rate: 0.5,
+    });
+    // Only withdrawn: no rate.
+    expect(escalationStats([raise('x'), resolve('x', 'canceled')]).rate).toBeNull();
   });
 
   it('counts only escalations raised since a time, and has no rate without any', () => {

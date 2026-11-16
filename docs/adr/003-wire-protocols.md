@@ -384,3 +384,14 @@ Status of this addendum: **accepted** on 2026-11-16, approved by the owner on PR
 5. **Prices.** Spend is what an adapter reports. Otherwise tokens are priced from the built-in table (Anthropic and OpenAI list prices, checked 2026-11-16) with the user's `pricing:` laid over it. A refusal in any other layer is a config error. Table estimates are provisional per session: a cost the session reports later replaces them. A model with no price has no known cost, and its tokens are counted as unpriced, never guessed.
 
 Additive under §2: event types in a named namespace, and an open-enum value with a safe fallback. The upward allowlist is not widened.
+
+### Addendum (2026-11-16): questions withdrawn by a cancel (#362)
+
+Status of this addendum: **accepted** on 2026-11-16, approved by the owner on PR #366 ([comment 6931679396](https://github.com/jojo-stand36/Tacet/pull/366#issuecomment-6931679396): "Approve the ADR-003 addendum"). The owner chose this option (A of three) in chat on 2026-11-16 ("go with recs"), relayed by the coordinator.
+
+1. **`canceled` joins `DecisionSource`.** A cancel (`tacet cancel`, live or with no run) resolves every escalation still open on the task and its sub-tasks with `escalation.resolved` `{escalationId, answer: "no longer needed: the task was canceled", source: "canceled"}` and `escalation.delivered`, in the batch that records the cancel. Nobody answered it: it is withdrawn.
+2. **What reads it.** Escalation stats count it as withdrawn and leave it out of the escalation rate, so the gate is not credited with an answer it never gave. MCP `get_decision` reports no `source` for it (its `source` stays `policy | precedent | mini | user`). A budget question withdrawn this way is neither a raise nor a refusal: the next task that needs the cap or the model is asked again. Recorded Decisions never carry it.
+3. **Late questions.** A question raised on a canceled task after the cancel (a gated `escalate` already in flight that times out, a budget question on a task being planned) is withdrawn the same way on the Mini-conductor's next tick, as is one left open in a log written before this addendum.
+4. **Older readers.** A reader that parses `source` as the open enum reads `canceled` as `mini` (its fallback, never `user`): safe for precedent, since only `user` Decisions are precedent. Older escalation stats read the raw string and count it as an answer of unknown source, so as sent to the user, which raises their rate until they update.
+
+Additive under §2: an open-enum value with a safe fallback. The upward allowlist is not widened (`escalation.*` is already on it).

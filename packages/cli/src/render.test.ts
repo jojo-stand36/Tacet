@@ -54,5 +54,16 @@ describe('render (#21)', () => {
     expect(at('budget.unpriced', { model: 'm', allowed: false })).toMatch(
       /m has no known price: refused/,
     );
+    // A question withdrawn by a cancel is not an answer (#362).
+    expect(
+      at('escalation.resolved', {
+        escalationId: 'x',
+        answer: 'no longer needed: the task was canceled',
+        source: 'canceled',
+      }),
+    ).toBe('12:34:56 t escalation x withdrawn (task canceled)');
+    expect(at('escalation.resolved', { escalationId: 'x', answer: 'yes', source: 'user' })).toBe(
+      '12:34:56 t escalation x answered: yes',
+    );
   });
 });

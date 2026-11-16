@@ -48,7 +48,8 @@
         "precedent",
         "mini",
         "user",
-        "worker"
+        "worker",
+        "canceled"
       ],
       "x-tacet-fallback": "mini",
       "type": "string"

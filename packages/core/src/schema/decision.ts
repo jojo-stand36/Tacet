@@ -11,9 +11,14 @@ export type DecisionScope = z.infer<typeof DecisionScope>;
 /**
  * Who made the decision. `policy`, `precedent`, `mini` and `user` match the `source` of the MCP
  * `escalate` result (ADR-003 §6); `worker` is a task-scope decision a Worker recorded itself
- * through MCP `record_decision`. Unknown values fall back to `mini`, never to `user`.
+ * through MCP `record_decision`. `canceled` resolves an escalation nobody answered because its task
+ * was canceled (#362): it is withdrawn, not answered. Unknown values fall back to `mini`, never to
+ * `user`.
  */
-export const DecisionSource = openEnum(['policy', 'precedent', 'mini', 'user', 'worker'], 'mini');
+export const DecisionSource = openEnum(
+  ['policy', 'precedent', 'mini', 'user', 'worker', 'canceled'],
+  'mini',
+);
 export type DecisionSource = z.infer<typeof DecisionSource>;
 
 /**
