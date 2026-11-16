@@ -30,7 +30,7 @@ import {
 import { type Script, ScriptedAdapter, ScriptedTerminalAdapter } from '@tacet/mini/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SpawnDetached } from './commands/detach.js';
-import type { Io } from './io.js';
+import type { Io, MemoryGuard } from './io.js';
 import { main } from './main.js';
 import { repoRootFrom } from './state.js';
 
@@ -993,6 +993,8 @@ ws.close();
     /** The background run, in this process: what it was started with, and how it ended. */
     const started: { argv: string[]; env: Record<string, string | undefined> }[] = [];
     let child: Promise<number> | undefined;
+    /** The background run's memory guard (#316), when a test gives one. */
+    let childGuard: MemoryGuard | undefined;
     const inProcess: SpawnDetached = (argv, childEnv) => {
       started.push({ argv, env: childEnv });
       // Its output to the log, as the real one's: its own descriptor, as a child inherits one.
@@ -1008,12 +1010,36 @@ ws.close();
         pollMs: 20,
         signal: abort.signal,
         standalone: { adapters: { 'claude-sdk': { adapter: fake(), authRoute: 'api_key' } } },
+        ...(childGuard ? { memoryGuard: childGuard } : {}),
       }).finally(() => closeSync(fd));
       return { pid: process.pid, exited: child, stop: () => abort.abort() };
     };
     beforeEach(() => {
       started.length = 0;
       child = undefined;
+      childGuard = undefined;
+    });
+
+    it('guards the background run, and says so on the terminal that started it too (#316)', async () => {
+      const calls: string[] = [];
+      const guard = (who: string): MemoryGuard => ({
+        harden: () => {
+          calls.push(who);
+          return { state: 'unavailable', reason: 'Node v24 has no node:ffi' };
+        },
+        scope: () => undefined,
+        platform: 'linux',
+      });
+      childGuard = guard('child');
+      const r = await tacet(['run', ...user(), '--detach', 'add work.txt'], {
+        spawnDetached: inProcess,
+        memoryGuard: guard('parent'),
+      });
+      expect(r.code, r.err).toBe(0);
+      expect(r.err).toMatch(/warning: this kernel has no Yama, .*answer codes/);
+      expect(await child).toBe(0);
+      expect(calls).toEqual(['parent', 'child']);
+      expect(readFileSync(logFile(), 'utf8')).toMatch(/warning: this kernel has no Yama/);
     });
 
     it('runs in the background, stops for an answer as a run without a terminal does, and passes no secret', async () => {

@@ -56,7 +56,8 @@ function makeNonDumpable() {
     const { prctl } = ffi.dlopen(null, {
       prctl: { arguments: ['i32', 'u64', 'u64', 'u64', 'u64'], return: 'i32' },
     }).functions;
-    prctl(4, 0, 0, 0, 0); // PR_SET_DUMPABLE, TASK_DUMPABLE_OFF
+    const rc = prctl(4, 0, 0, 0, 0); // PR_SET_DUMPABLE, TASK_DUMPABLE_OFF
+    if (rc !== 0) return `prctl returned ${rc}`;
     return prctl(3, 0, 0, 0, 0) === 0 ? 'set' : 'still dumpable'; // PR_GET_DUMPABLE
   } catch (err) {
     return `refused: ${err.message}`;

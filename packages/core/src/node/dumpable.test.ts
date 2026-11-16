@@ -11,7 +11,20 @@ describe('memoryReadWarning (#316)', () => {
     expect(memoryReadWarning(unavailable, undefined, 'linux')).toMatch(
       /^warning: this kernel has no Yama, .*\(Node v24 has no node:ffi\)\. .*answer codes/,
     );
-    expect(memoryReadWarning(unavailable, 0, 'linux')).toMatch(/Yama ptrace_scope is 0/);
+    expect(memoryReadWarning(unavailable, 0, 'linux', '24.22.2')).toMatch(
+      /Yama ptrace_scope is 0, .* Run Tacet on Node 26\.1 or later, or set kernel\.yama\.ptrace_scope to 1\.$/,
+    );
+    // On a Node that has node:ffi, the advice is to stop turning it off or denying it.
+    expect(
+      memoryReadWarning(
+        { state: 'unavailable', reason: 'node:ffi refused: …' },
+        0,
+        'linux',
+        '26.13.1',
+      ),
+    ).toMatch(
+      /Let Tacet use node:ffi \(no --no-experimental-ffi; --allow-ffi under the Permission Model\)/,
+    );
   });
 
   it('says nothing once non-dumpable, with Yama at 1 or more, or off Linux', () => {
@@ -62,6 +75,7 @@ describe('makeNonDumpable, live (#316)', () => {
       const r = ${set ? 'makeNonDumpable()' : "({ state: 'kept' })"};
       process.stdout.write(JSON.stringify(r) + '\\n');
       process.stdin.resume();
+      process.stdin.on('end', () => process.exit(0));
     `;
     const c = spawn(process.execPath, ['--input-type=module', '-e', code], {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -80,7 +94,14 @@ describe('makeNonDumpable, live (#316)', () => {
       });
       c.on('exit', (code) => reject(new Error(`child exited ${code}: ${err}`)));
     });
-    return { pid: c.pid ?? 0, result: JSON.parse(line) as { state: string }, stderr: () => err };
+    /** End the child and wait for its streams, so all it wrote to stderr is in. */
+    const finish = async () => {
+      const closed = new Promise<void>((resolve) => c.on('close', () => resolve()));
+      c.stdin?.end();
+      await closed;
+      return err;
+    };
+    return { pid: c.pid ?? 0, result: JSON.parse(line) as { state: string }, finish };
   };
 
   const openMem = (pid: number): string => {
@@ -106,11 +127,13 @@ describe('makeNonDumpable, live (#316)', () => {
       expect(hardened.result).toEqual({ state: 'set' });
       expect(openMem(hardened.pid)).toMatch(/^(EACCES|EPERM)$/);
       // The ExperimentalWarning node:ffi prints on load stays off the user's terminal.
-      expect(hardened.stderr()).not.toMatch(/ExperimentalWarning/);
+      expect(await hardened.finish()).not.toMatch(/ExperimentalWarning/);
+      await kept.finish();
     },
   );
 
   // On CI the Ubuntu Node 26 job runs as a normal user: the check above must really run there.
+  // A CI job run as root (a container job) would fail here on purpose: run it as a normal user.
   it.runIf(process.env.CI === 'true' && process.platform === 'linux')(
     'runs the live check on CI wherever Node has node:ffi',
     () => {

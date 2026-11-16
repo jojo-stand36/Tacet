@@ -115,9 +115,15 @@ export function memoryReadWarning(
   result: NonDumpable,
   scope: number | undefined,
   platform: NodeJS.Platform = process.platform,
+  nodeVersion: string = process.versions.node,
 ): string | undefined {
   if (platform !== 'linux' || result.state === 'set') return undefined;
   if (scope !== undefined && scope >= 1) return undefined;
   const yama = scope === undefined ? 'this kernel has no Yama' : 'Yama ptrace_scope is 0';
-  return `warning: ${yama}, and this process could not make itself non-dumpable (${result.reason}). Programs a Worker runs could read the answer codes from its memory. Run Tacet on Node 26 or later, or set kernel.yama.ptrace_scope to 1.`;
+  const [major = 0, minor = 0] = nodeVersion.split('.').map(Number);
+  const fix =
+    major > 26 || (major === 26 && minor >= 1)
+      ? 'Let Tacet use node:ffi (no --no-experimental-ffi; --allow-ffi under the Permission Model)'
+      : 'Run Tacet on Node 26.1 or later';
+  return `warning: ${yama}, and this process could not make itself non-dumpable (${result.reason}). Programs a Worker runs could read the answer codes from its memory. ${fix}, or set kernel.yama.ptrace_scope to 1.`;
 }
