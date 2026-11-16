@@ -20,10 +20,14 @@ export interface ModelPrice {
   later?: readonly LaterPrice[];
 }
 
-/** A price that takes over from `from` (a UTC day, `YYYY-MM-DD`) on. */
-export type LaterPrice =
-  | { from: string; price: Omit<ModelPrice, 'later'> }
-  | { from: string; billedAs: string };
+/**
+ * A price that takes over from `from` (a UTC day, `YYYY-MM-DD`) on. It holds until a later step
+ * replaces it: a later price that ends is written as another step.
+ */
+export type LaterPrice = { from: string; price: DayPrice } | { from: string; billedAs: string };
+
+/** A price as it holds on one day: no end date, nothing after it. */
+export type DayPrice = Omit<ModelPrice, 'later' | 'until'>;
 
 /** Model id → price. */
 export type PricingTable = Readonly<Record<string, ModelPrice>>;
@@ -88,7 +92,7 @@ export const BUILTIN_PRICES: PricingTable = {
   'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3 },
   // Deprecated: "Effective December 1, 2026, all API requests to `gemini-2.5-pro` will
   // automatically route to Gemini 3.8 Flash (`gemini-3.8-flash`) and be billed at Gemini 3.8
-  // Flash rates." This price holds through November 30.
+  // Flash rates." This price holds through November 30, then it is billed as 3.8 Flash.
   'gemini-2.5-pro': {
     ...gemini(1.25, 10, 2.5, 15),
     until: '2026-11-30',
@@ -148,13 +152,27 @@ export function priceOn(
   model: string | undefined,
   day: string,
   table: PricingTable,
-  depth = 0,
-): Omit<ModelPrice, 'later' | 'until'> | undefined {
+): DayPrice | undefined {
+  return resolve(model, day, table, 0);
+}
+
+function resolve(
+  model: string | undefined,
+  day: string,
+  table: PricingTable,
+  depth: number,
+): DayPrice | undefined {
   const price = priceFor(model, table);
   if (!price || depth > 4) return undefined;
-  const step = [...(price.later ?? [])].reverse().find((l) => l.from <= day);
+  // The step with the latest `from` on or before `day`, whatever order the list is in.
+  let step: LaterPrice | undefined;
+  for (const l of price.later ?? []) {
+    if (l.from <= day && (step === undefined || l.from >= step.from)) step = l;
+  }
   if (step) {
-    return 'billedAs' in step ? priceOn(step.billedAs, day, table, depth + 1) : step.price;
+    if ('billedAs' in step) return resolve(step.billedAs, day, table, depth + 1);
+    const { inputPerMTok, outputPerMTok, longContext } = step.price;
+    return { inputPerMTok, outputPerMTok, ...(longContext ? { longContext } : {}) };
   }
   if (price.until !== undefined && day > price.until) return undefined;
   const { later: _later, until: _until, ...own } = price;
@@ -169,11 +187,7 @@ export function priceOn(
  * the tier's threshold: per request where the adapter reports per call, per turn where it reports
  * a turn's total (so a tier may apply to a turn of small requests).
  */
-export function costOf(
-  price: Omit<ModelPrice, 'later' | 'until'>,
-  inputTokens: number,
-  outputTokens: number,
-): number {
+export function costOf(price: DayPrice, inputTokens: number, outputTokens: number): number {
   const rate =
     price.longContext && inputTokens > price.longContext.aboveInputTokens
       ? price.longContext
