@@ -4,6 +4,7 @@
  */
 export * from './auth/index.js';
 export * from './config/index.js';
+export * from './dumpable.js';
 export * from './event-log/index.js';
 export * from './git/index.js';
 export * from './process-group.js';
