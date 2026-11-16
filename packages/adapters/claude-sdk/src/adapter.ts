@@ -312,7 +312,7 @@ export class ClaudeSdkAdapter implements AgentAdapter {
     const scrub =
       route === 'api_key' && !(this.#opts.subprocessScrub === false && this.#opts.query);
     // The sandbox makes its cwd a write root and leaves placeholders there: never a shared dir.
-    if (scrub) refuseSharedCwd(opts.cwd, base);
+    if (scrub) refuseSharedCwd(opts.cwd, base, routed.HOME);
     const env = scrub ? { ...withSubprocessScrub(routed), ...SANDBOX_ENV } : routed;
     // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
     // runs with; removed at close (#263).
@@ -585,6 +585,8 @@ export class ClaudeSdkAdapter implements AgentAdapter {
         await this.#checkEffort(s, s.model, effort);
       } catch (err) {
         await this.close(handle);
+        // `close` removed the temp dir already.
+        tmpDir = undefined;
         // Refused before its first turn: its handle is never returned, so nothing resumes it.
         unmake();
         throw err;

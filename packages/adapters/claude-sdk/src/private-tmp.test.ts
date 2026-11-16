@@ -151,6 +151,33 @@ describe.runIf(linux)('sweepClaudeTmpdirs', () => {
     expect(existsSync(dir)).toBe(true);
   });
 
+  it('keeps a dir whose record has no namespace', () => {
+    const dir = leftDir('tacet-c-aB3dE9', { host: deadPid(), ns: '' });
+    expect(sweepClaudeTmpdirs(root)).toBe(0);
+    expect(existsSync(dir)).toBe(true);
+  });
+
+  it('trusts no record that is a link, has other links, or is not a file', () => {
+    const owner = JSON.stringify({ host: deadPid(), ns: ns() });
+    const real = join(root, 'real-record');
+    writeFileSync(real, owner);
+    const linked = leftDir('tacet-c-llllll');
+    symlinkSync(real, `${linked}.owner`);
+    const hard = leftDir('tacet-c-hhhhhh');
+    spawnSync('ln', [real, `${hard}.owner`]);
+    const dirRecord = leftDir('tacet-c-dddddd');
+    mkdirSync(`${dirRecord}.owner`);
+    expect(sweepClaudeTmpdirs(root)).toBe(0);
+    for (const p of [linked, hard, dirRecord]) expect(existsSync(p)).toBe(true);
+  });
+
+  it.runIf(root0)("trusts no record of another user's", () => {
+    const dir = leftDir('tacet-c-oooooo', { host: deadPid(), ns: ns() });
+    chownSync(`${dir}.owner`, 4242, 4242);
+    expect(sweepClaudeTmpdirs(root)).toBe(0);
+    expect(existsSync(dir)).toBe(true);
+  });
+
   it('keeps a dir with no record, or an unreadable one, however old', () => {
     const none = leftDir('tacet-c-aaaaaa');
     const bad = leftDir('tacet-c-bbbbbb');

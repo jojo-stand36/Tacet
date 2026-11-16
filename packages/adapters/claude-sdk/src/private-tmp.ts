@@ -31,6 +31,8 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 export function refuseSharedCwd(
   cwd: string,
   env: Readonly<Record<string, string | undefined>>,
+  /** The HOME the session itself runs with, when it differs from `env`'s. */
+  sessionHome?: string,
 ): void {
   const real = (p: string): string => {
     try {
@@ -41,7 +43,7 @@ export function refuseSharedCwd(
   };
   const at = real(cwd);
   const shared = new Set(
-    ['/', '/tmp', tmpdir(), env.TMPDIR, env.HOME, homedir()]
+    ['/', '/tmp', tmpdir(), env.TMPDIR, env.HOME, sessionHome, homedir()]
       .filter((p): p is string => typeof p === 'string' && p !== '' && isAbsolute(p))
       .map(real),
   );
@@ -125,6 +127,7 @@ export function makeClaudeTmpdir(
     });
     renameSync(tmp, `${dir}.owner`);
   } catch (err) {
+    rmSync(`${dir}.owner.${process.pid}`, { force: true });
     releaseClaudeTmpdir(dir);
     throw err;
   }
@@ -142,7 +145,12 @@ export function releaseClaudeTmpdir(dir: string): void {
   }
 }
 
-/** `rm -r` that never follows a symlink, making read-only directories writable first. */
+/**
+ * `rm -r` that never follows a symlink, making read-only directories writable first. The unlock
+ * pass checks each entry with `lstat` before it chmods and lists it, so it is safe while nothing
+ * else writes in the tree; a writer swapping a directory for a link in between could make it
+ * chmod a directory of the user's elsewhere (never remove one: `rmSync` does not follow links).
+ */
 function removeTree(dir: string): void {
   try {
     rmSync(dir, { recursive: true, force: true });
@@ -167,8 +175,11 @@ function removeTree(dir: string): void {
   }
 }
 
-function readOwner(dir: string): TmpOwner | undefined {
+/** The owner record of `dir`: only a regular file of this user's, never through a link. */
+function readOwner(dir: string, me: number | undefined): TmpOwner | undefined {
   try {
+    const st = lstatSync(`${dir}.owner`);
+    if (!st.isFile() || st.nlink !== 1 || (me !== undefined && st.uid !== me)) return undefined;
     const o = JSON.parse(readFileSync(`${dir}.owner`, 'utf8')) as Partial<TmpOwner>;
     if (!Number.isInteger(o.host) || typeof o.ns !== 'string') return undefined;
     return o as TmpOwner;
@@ -181,7 +192,9 @@ function readOwner(dir: string): TmpOwner | undefined {
  * Remove the private temp dirs under `root` that hosts killed before they could clean up left:
  * only a real directory (never a symlink) named `tacet-c-XXXXXX`, owned by this user, whose owner
  * record names a host in this PID namespace that is gone. A dir with no readable record, from
- * another namespace, or whose host still runs is kept, whatever its age. A record whose dir is
+ * another namespace (or where either namespace is unknown), or whose host still runs is kept,
+ * whatever its age. Only the host is checked: a Claude Code process that outlived its host (#127)
+ * may still be writing in a dir this removes. A record whose dir is
  * gone goes too. Returns how many dirs were removed; never throws.
  */
 export function sweepClaudeTmpdirs(root = tmpdir()): number {
@@ -210,8 +223,8 @@ export function sweepClaudeTmpdirs(root = tmpdir()): number {
         continue;
       }
       if (!st.isDirectory()) continue;
-      const owner = readOwner(path);
-      if (!owner || owner.ns !== here || running(owner.host)) continue;
+      const owner = readOwner(path, me);
+      if (!owner?.ns || !here || owner.ns !== here || running(owner.host)) continue;
       releaseClaudeTmpdir(path);
       if (!existsSync(path)) removed++;
     } catch {

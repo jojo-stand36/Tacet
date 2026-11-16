@@ -340,7 +340,7 @@ export class PtyAdapter implements AgentAdapter {
     const handle: SessionHandle = { id: randomUUID(), vendorSessionId };
     const cwd = realpathSync(opts.cwd);
     // The sandbox makes its cwd a write root and leaves placeholders there: never a shared dir.
-    if (scrub) refuseSharedCwd(cwd, base);
+    if (scrub) refuseSharedCwd(cwd, base, keyed.HOME);
     // The sandbox the scrub turns on leaves empty placeholders in the checkout and the HOME it
     // runs with; removed at close (#263).
     const placeholders = scrub ? residueSnapshot(cwd, env.HOME) : undefined;
