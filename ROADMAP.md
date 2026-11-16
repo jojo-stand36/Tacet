@@ -100,6 +100,7 @@ One repo, one mini-conductor, real workers via adapters, worktrees, verification
 - [ ] **Record crash-placeholder cleanup failures as maintenance problems** — `chore` `P3` `claude`
 - [ ] **Remove worktrees automatically once their task's work is merged (setting)** — `feature` `P2` `claude`
 - [ ] **Resolve keychain secret references in config** — `feature` `P2` `claude`
+- [ ] **Resolve open questions when a task is canceled** — `feature` `P2` `either`
 - [ ] **Resume in-flight handoffs after a Mini-conductor restart** — `feature` `P2` `either`
 - [ ] **Scrub Worker tokens split across streamed message deltas** — `feature` `P2` `either`
 - [ ] **Standalone Claude Code handoff plugin (HandoffPacket + fresh session, no daemon)** — `feature` `P1` `claude`
@@ -167,12 +168,16 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Context usage tracking per session** — `feature` `P0` `either`
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
 - [ ] **Escalation ladder: retry with stronger model before asking a human** — `feature` `P1` `either`
+- [ ] **Gemini API prices for the cost ledger (and the Codex default model)** — `docs` `P2` `claude + human`
+- [ ] **Let the user undo a refusal to run an unpriced model** — `feature` `P3` `either`
 - [ ] **Measure orchestration overhead** — `spike` `P1` `claude`
 - [ ] **Merge queue: batch-then-bisect for parallel Worker branches** — `feature` `P2` `either`
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
 - [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
 - [ ] **Threshold handoff for Workers without an MCP client** — `feature` `claude`
+- [ ] **Usage events: split out cache reads and writes, so the cost ledger can price them** — `feature` `P2` `claude`
+- [ ] **Use the cost ledger's headroom in the escalation gate and the session profile** — `feature` `P2` `claude`
 
 ## M4 · Visual & terminal UI
 

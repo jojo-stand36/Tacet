@@ -1133,6 +1133,17 @@
       "body": "Follow-up from #149. Config accepts `{ keychain: \"service/account\" }` secret references (`SecretRef`), but `resolveSecretRef` (`@tacet/core/node`) resolves only `{ env: NAME }`: a keychain reference used by a Worker's agent is a startup error naming its config path. Resolve them from the OS keychain without the value touching disk, argv of long-lived processes, logs or events.\n\n### Tasks\n- [ ] Verify the platform tools and their exact invocation and exit codes (`verify-vendor-facts`): macOS `security find-generic-password`, Linux Secret Service (`secret-tool lookup`, libsecret); decide what `service/account` maps to on each\n- [ ] Resolve keychain references in `resolveSecretRef`, returning a `Secret`; a missing item, a locked keychain or a missing tool is an error naming the config path, never a value\n- [ ] Keep `{ env }` behaviour unchanged; update ARCHITECTURE.md §4\n\n### Acceptance criteria\n- Unit tests with the platform tool replaced by a fake cover found, missing, locked and tool-not-installed\n- No resolved value appears in errors, logs or events (test)\n\n_See packages/core/src/node/config/secret-ref.ts, docs/ARCHITECTURE.md §4 and §6._"
     },
     {
+      "title": "Resolve open questions when a task is canceled",
+      "milestone": "M1 · Mini-conductor MVP",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "priority:p2",
+        "agent:either"
+      ],
+      "body": "`MiniConductor.cancel` (#202) ends the task's Workers and marks it and its sub-tasks canceled, but leaves their open escalations unresolved. They stay in `tacet status` and the inbox for a task that will never run. Budget questions (#35) are retired when they are asked again on a task still waiting, but a question on a canceled task with nothing else waiting stays open. Found in review of #360; it predates it. Owner decision (2026-11-16, relayed by the coordinator): file it as a follow-up.\n\n### Tasks\n- [ ] On cancel, resolve every open escalation on the task and its sub-tasks (`escalation.resolved`, `source: mini`, an answer saying the task was canceled) in the same batch as the cancellation, and mark them delivered so no Worker receives them.\n- [ ] A budget question resolved this way is not read as a refusal or a raise: a later task that needs the cap or the model is asked afresh.\n- [ ] The Conductor's view of forwarded escalations closes them too.\n\n### Acceptance criteria\n- After cancel, no escalation on the task or its sub-tasks is pending (test).\n- A budget question resolved by a cancel neither raises the cap nor refuses the model, and the next task that needs it asks again (test).\n\n_See docs/ARCHITECTURE.md §4 (Budgets) and #202._\n"
+    },
+    {
       "title": "Resume in-flight handoffs after a Mini-conductor restart",
       "milestone": "M1 · Mini-conductor MVP",
       "labels": [
@@ -1784,6 +1795,30 @@
       "body": "Worker fails verification N times → bump tier → then escalate to mini → then user.\n\n### Tasks\n- [ ] Configurable N and ladder\n- [ ] Record which tier finally succeeded (learning signal)\n\n### Acceptance criteria\n- Ladder behaviour covered by tests\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Gemini API prices for the cost ledger (and the Codex default model)",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:docs",
+        "area:cost",
+        "priority:p2",
+        "agent:claude",
+        "needs-human"
+      ],
+      "body": "Follow-up from #35.\n\nThe cost ledger's built-in prices (`BUILTIN_PRICES`, capability matrix \"Model API prices (#35)\") cover Anthropic and OpenAI. Both were verified on 2026-11-16 from the vendors' own pages.\n\nGemini prices are missing: `ai.google.dev` and `geminicli.com` don't resolve from the cloud sessions. Until then, Gemini usage has no known cost, so a Gemini Worker asks the user once per model before it runs (#35, owner decision (c)), and its tokens are not counted against a cap.\n\nThe Codex 0.167.0 default model is also unverified. The models list (`codex-rs/models-manager/models.json`) has priorities but no default flag.\n\n### Tasks\n- [ ] A human or an allowed session reads the Gemini API pricing page for the models Gemini CLI 0.67.0 uses, including the over-200k tier, and records them in the matrix. Then add them to `BUILTIN_PRICES` with a test.\n- [ ] Read Codex's default-model constant at the pinned tag and record it.\n\nNeeds-human: the hosts have to be allowed in the environment, or the pages pasted.\n"
+    },
+    {
+      "title": "Let the user undo a refusal to run an unpriced model",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:cost",
+        "priority:p3",
+        "agent:either"
+      ],
+      "body": "Under owner decision (c) on #35, the user is asked once per model per repo before anything runs on a model whose cost cannot be known. Anything but a plain yes is recorded as a refusal (`budget.unpriced` with `allowed: false`), and it is permanent: \"yes, but only once\" refuses too. Today the only way back is to give the model a price in the user's `pricing:` config, after which it is no longer asked about. Owner decision (2026-11-16, relayed by the coordinator on #360): no undo in #360; this issue adds one.\n\n### Tasks\n- [ ] A way for the user to withdraw a refusal (and an allowance) for a model in this repo, e.g. `tacet budget allow <model>` / `tacet budget forget <model>`, written as a new `budget.unpriced` event so the ledger fold stays the only state.\n- [ ] After a withdrawal, the next task that needs the model asks again.\n- [ ] Docs: ARCHITECTURE §4 Budgets and the CLI reference.\n\n### Acceptance criteria\n- After a refusal and a withdrawal, a new task that needs the model raises the question again and runs on a yes (test).\n- A withdrawal is an event in the log; nothing else stores the answer (test).\n\n_See docs/ARCHITECTURE.md §4 (Budgets) and the ADR-003 addendum (#35)._\n"
+    },
+    {
       "title": "Measure orchestration overhead",
       "milestone": "M3 · Context handoff & cost tiering",
       "labels": [
@@ -1849,6 +1884,30 @@
         "agent:claude"
       ],
       "body": "Follow-up to #184 (owner decision (D), relayed by the coordinator), for #31.\n\nWorkers whose adapter declares `capabilities.mcp: false` have no `request_handoff` or `read_task` tools. Today that covers `acp:gemini` and custom ACP agents without `capabilities: { mcp: true }`. Under #184 a reseeded session gets its HandoffPacket inline in its first message (`inlineHandoffNote`, redacted, capped at 16k). Nothing else lets such a Worker hand off before its context degrades.\n\nWhen #31 adds threshold-based handoff, it needs a path for these Workers.\n\n### Tasks\n- [ ] Decide how the Mini-conductor triggers handoff for them: from usage or context events (`usage.context`), not a Worker tool call.\n- [ ] Generate the packet without the Worker's help (from the event log and the git state), or ask for a summary in a final turn.\n- [ ] Reseed with the inline packet, and test it with the mock adapter declaring `mcp: false`.\n\n### Acceptance criteria\n- An MCP-less Worker past the threshold is replaced by a fresh session that gets the packet inline and continues the sub-task."
+    },
+    {
+      "title": "Usage events: split out cache reads and writes, so the cost ledger can price them",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:cost",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #35.\n\nThe cost ledger prices tokens from a table when an adapter reports no cost. `Usage` (`agent.usage`) has only `inputTokens` and `outputTokens`, and claude-sdk's `inputTokens` includes cache reads. So every input token is priced at the full input rate.\n\nAgent loops are mostly cache reads, billed at 0.025x to 0.1x of the input rate depending on the model (Opus 5.5: 0.05x; capability matrix \"Model API prices (#35)\"). For an adapter whose table estimate is final (the PTY adapters, ACP agents that report no cost), the estimate can be several times the real bill. Cache writes go the other way: they cost 1.25x to 2x and are undercounted.\n\n### Tasks\n- [ ] Add optional `cacheReadTokens` and `cacheWriteTokens` to `Usage` in `@tacet/core`, as an additive schema change.\n- [ ] Fill them in where the vendor reports them: claude-sdk, ACP `usage_update` if it carries them, and Codex `tokenUsage` (`cached_input_tokens`). Verify each against the pinned version.\n- [ ] Price them in `costOf` from per-model cache rates in the pricing table.\n\n### Acceptance criteria\n- A claude-sdk-shaped usage sequence with mostly cache reads is priced within 5% of the list-price bill (test).\n"
+    },
+    {
+      "title": "Use the cost ledger's headroom in the escalation gate and the session profile",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:mini",
+        "area:cost",
+        "priority:p2",
+        "agent:claude"
+      ],
+      "body": "Follow-up from #35. It also carries over #110's \"budget headroom as a policy input\", recorded on #35.\n\nTwo places still read spend without the ledger:\n- **Escalation gate.** The \"under a tenth of budget left\" check (`packages/mini/src/gate/escalation-gate.ts`) uses `tasksProjection`'s reported cost and `task.budget.usd` only. It ignores table-priced estimates, `budget.per_task_usd` and caps the user raised (`budget.raised`).\n- **Session profile.** `chooseProfile` (`packages/mini/src/daemon/profile.ts`) takes no budget headroom at all (\"Budget headroom is not an input yet: the cost ledger is #35\").\n\n### Tasks\n- [ ] Give the gate the ledger's spend and the effective cap: a raise wins, then `task.budget.usd`, then `per_task_usd`.\n- [ ] Pass the task's and the day's remaining budget into `ProfileInput`. Lower the effort, or keep the default window, as headroom shrinks, and record the reason in `worker.profile` `reasons`.\n- [ ] Join `worker.profile` with the ledger to show cost by profile.\n\n### Acceptance criteria\n- The gate and the hard caps agree on spend and cap (test).\n- A profile chosen with little headroom says so in its reasons (test).\n"
     },
     {
       "title": "Epic: Visual and terminal modes",
