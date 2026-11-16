@@ -67,6 +67,7 @@ import { reviewConfigProblem } from '../review/config.js';
 import {
   type Integrator,
   MergeConflictError,
+  PlanFailed,
   type Planner,
   type Reviewer,
   type ReviewResult,
@@ -108,6 +109,14 @@ export interface MiniConductorOptions {
    * the month cap then counts this repo alone.
    */
   monthSpendElsewhere?: (month: string) => number;
+  /**
+   * The tiers that spend for a task beside its Workers, for the unpriced-model question (#35,
+   * owner decision (c)): the planner's (asked before a root task is planned) and the escalation
+   * gate's own reasoning (asked before a sub-task runs, as its Worker's questions use it). Absent
+   * when no such session runs. The reviewer's tier is `tiers.review`, when a reviewer is given.
+   */
+  plannerTier?: TierConfig;
+  reasonerTier?: TierConfig;
   /**
    * Reviews each sub-task's integrated change after its commands pass, when `review.enabled`
    * (#19): an `AdapterReviewer` on `tiers.review`. Required when review is on.
@@ -903,8 +912,19 @@ export class MiniConductor {
 
   #plan(task: Task): void {
     if (this.#planning.has(task.id)) return;
-    // A spent cap holds the planner too: the task is planned once the cap is raised (#35).
-    if (this.#overBudget(task.id)) return;
+    // A spent cap holds the planner too: the task is planned once the cap is raised (#35). So does
+    // a question about the planner's model, whose cost cannot be known.
+    if (this.#overBudget(task.id) || this.#unpricedPending(task.id)) return;
+    const refused = this.#unpricedRefused(task.id);
+    if (refused) {
+      this.#o.store.append(
+        this.#env(task.id, 'task.status', {
+          state: 'failed',
+          message: `not planned: the cost of ${refused} is not known, and you chose not to run it (#35)`,
+        }),
+      );
+      return;
+    }
     this.#planning.add(task.id);
     const gen = this.#gen;
     const abort = new AbortController();
@@ -971,14 +991,28 @@ export class MiniConductor {
             this.#env(task.id, 'task.status', { state: 'working' }),
           ]);
         } catch (err) {
-          if (dropped()) return;
+          // A failed or dropped plan's session spent all the same: charge it (#35).
+          const u = err instanceof PlanFailed ? err.usage : undefined;
+          const charge =
+            u && (u.inputTokens || u.outputTokens || u.costUsd)
+              ? [this.#env(task.id, 'agent.usage', { t: 'usage', source: 'reported', ...u })]
+              : [];
+          if (dropped()) {
+            try {
+              if (charge.length > 0) this.#o.store.append(charge);
+            } catch (e) {
+              if (this.#live(gen)) this.#errors.push(e);
+            }
+            return;
+          }
           this.#errors.push(err);
-          this.#o.store.append(
+          this.#o.store.append([
+            ...charge,
             this.#env(task.id, 'task.status', {
               state: 'failed',
               message: redactSecrets(`planning failed: ${(err as Error).message}`),
             }),
-          );
+          ]);
         } finally {
           this.#planning.delete(task.id);
           this.#budgetAborted.delete(task.id);
@@ -1838,16 +1872,13 @@ export class MiniConductor {
   }
 
   /**
-   * The model a sub-task's Worker would run on when its cost cannot be known (owner decision (c)
-   * on #35): its adapter reports no cost, no price is known for the model today, and a cap applies.
-   * The tier's model is the profile's (`chooseProfile`); with none, the vendor's default, named
-   * `default@<adapter>`. Undefined when the cost is known or nothing caps it.
+   * A tier's model when its cost cannot be known (owner decision (c) on #35): its adapter reports
+   * no cost and no price is known for the model today. The tier's model is the profile's
+   * (`chooseProfile`); with none, the vendor's default, named `default@<adapter>`.
    */
-  #unpricedModel(subtaskId: string): string | undefined {
-    const tier = this.#tierFor(this.#state().kinds.get(subtaskId));
+  #unpricedTier(tier: TierConfig): string | undefined {
     const adapter = this.#o.adapters[tier.adapter]?.adapter;
     if (adapter?.capabilities().usage.cost !== 'none') return undefined;
-    if (!this.#anyCap(subtaskId)) return undefined;
     const model = tier.model ?? tier.models?.[0];
     const price = priceFor(model, this.#pricing);
     const today = this.#now().toISOString().slice(0, 10);
@@ -1855,10 +1886,67 @@ export class MiniConductor {
     return model ?? `default@${tier.adapter}`;
   }
 
+  /**
+   * The models whose cost cannot be known that working on `taskId` would run, when a cap applies:
+   * for a root task, its planner's; for a sub-task, its Worker's, the escalation gate's reasoning
+   * and the reviewer's. Empty when every cost is known or nothing caps it.
+   */
+  #unpricedModels(taskId: string): string[] {
+    if (!this.#anyCap(taskId)) return [];
+    const v = this.#state();
+    const tiers: TierConfig[] = [];
+    if (!v.tasks[taskId]?.task.parentId) {
+      if (this.#o.plannerTier) tiers.push(this.#o.plannerTier);
+    } else {
+      tiers.push(this.#tierFor(v.kinds.get(taskId)));
+      if (this.#o.reasonerTier) tiers.push(this.#o.reasonerTier);
+      const review = this.#o.config.tiers?.review;
+      if (this.#o.config.review?.enabled && this.#o.reviewer && review) tiers.push(review);
+    }
+    const out = new Set<string>();
+    for (const t of tiers) {
+      const m = this.#unpricedTier(t);
+      if (m !== undefined) out.add(m);
+    }
+    return [...out];
+  }
+
   /** Waiting on the user's answer about an unpriced model: not started, and not failed. */
-  #unpricedPending(subtaskId: string): boolean {
-    const model = this.#unpricedModel(subtaskId);
-    return model !== undefined && this.#state().ledger.unpriced[model]?.allowed === undefined;
+  #unpricedPending(taskId: string): boolean {
+    const { unpriced } = this.#state().ledger;
+    return this.#unpricedModels(taskId).some((m) => unpriced[m]?.allowed === undefined);
+  }
+
+  /** An unpriced model the user chose not to run that working on `taskId` needs. */
+  #unpricedRefused(taskId: string): string | undefined {
+    const { unpriced } = this.#state().ledger;
+    return this.#unpricedModels(taskId).find((m) => unpriced[m]?.allowed === false);
+  }
+
+  /**
+   * A budget question still being asked: raised, not answered, and on a task that has not ended.
+   * One on a task that was canceled meanwhile is asked again on a task still waiting for it.
+   */
+  #asking(escalationId: string | undefined): boolean {
+    const v = this.#state();
+    const x = escalationId ? v.escalations.get(escalationId) : undefined;
+    if (!x || x.resolved) return false;
+    const state = v.tasks[x.taskId]?.state;
+    return state === undefined || !TERMINAL.has(state);
+  }
+
+  /** Retire a budget question left on a task that has ended, when it is asked again elsewhere. */
+  #retire(escalationId: string | undefined, why: string): EventEnvelope[] {
+    const x = escalationId ? this.#state().escalations.get(escalationId) : undefined;
+    if (!x || x.resolved) return [];
+    return [
+      this.#env(x.taskId, 'escalation.resolved', {
+        escalationId: x.id,
+        answer: why,
+        source: 'mini',
+      }),
+      this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
+    ];
   }
 
   /**
@@ -1878,6 +1966,13 @@ export class MiniConductor {
       if (s.phase !== 'done' && s.phase !== 'failed') candidates.add(s.id);
     }
     for (const id of this.#planning) candidates.add(id);
+    // Root tasks not planned yet: a spent cap or an unpriced planner holds them, and the question
+    // is asked on the task itself.
+    for (const t of Object.values(this.#state().tasks)) {
+      if (!t.task.parentId && !TERMINAL.has(t.state) && t.plan === undefined) {
+        candidates.add(t.task.id);
+      }
+    }
     const handled = new Set<string>();
     const stops: Promise<void>[] = [];
     for (const id of candidates) {
@@ -1886,17 +1981,18 @@ export class MiniConductor {
         const k = budgetKey(over.scope, over.key);
         if (handled.has(k)) continue;
         handled.add(k);
-        const v = this.#state();
-        const prior = v.ledger.exceeded[k]?.escalationId;
-        const asking = prior !== undefined && v.escalations.get(prior)?.resolved === false;
-        if (!asking) {
+        const prior = this.#state().ledger.exceeded[k]?.escalationId;
+        if (!this.#asking(prior)) {
           // The question and the record go in one batch: the record names the question.
           const escalationId = newUlid(this.#now().getTime());
           this.#raise(
             id,
             budgetQuestion(over),
             { urgency: 'high', category: 'blocked', contextRef: `tacet:budget:${k}` },
-            [this.#env(id, 'budget.exceeded', { ...over, escalationId })],
+            [
+              ...this.#retire(prior, `asked again on ${id}: the task it was asked on has ended`),
+              this.#env(id, 'budget.exceeded', { ...over, escalationId }),
+            ],
             escalationId,
           );
         }
@@ -1921,15 +2017,24 @@ export class MiniConductor {
         continue;
       }
       // Never run silently on a model whose cost cannot be known: ask once per model.
-      const model = this.#runs.has(id) ? undefined : this.#unpricedModel(id);
-      if (model && !handled.has(`unpriced:${model}`) && !this.#state().ledger.unpriced[model]) {
+      if (this.#runs.has(id) || this.#planning.has(id)) continue;
+      for (const model of this.#unpricedModels(id)) {
+        if (handled.has(`unpriced:${model}`)) continue;
+        const rec = this.#state().ledger.unpriced[model];
+        if (rec && (rec.allowed !== undefined || this.#asking(rec.escalationId))) continue;
         handled.add(`unpriced:${model}`);
         const escalationId = newUlid(this.#now().getTime());
         this.#raise(
           id,
           unpricedQuestion(model),
           { urgency: 'high', category: 'blocked', contextRef: `tacet:budget:unpriced:${model}` },
-          [this.#env(id, 'budget.unpriced', { model, escalationId })],
+          [
+            ...this.#retire(
+              rec?.escalationId,
+              `asked again on ${id}: the task it was asked on has ended`,
+            ),
+            this.#env(id, 'budget.unpriced', { model, escalationId }),
+          ],
           escalationId,
         );
       }
@@ -1986,7 +2091,11 @@ export class MiniConductor {
           source: 'mini',
         }),
         this.#env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
-        ...(v.tasks[x.taskId]?.state === 'input_required'
+        // Back to work only when nothing else is asked of the user on it.
+        ...(v.tasks[x.taskId]?.state === 'input_required' &&
+        ![...v.escalations.values()].some(
+          (o) => o.id !== x.id && o.taskId === x.taskId && !o.resolved,
+        )
           ? [this.#env(x.taskId, 'task.status', { state: 'working' })]
           : []),
       ]);
@@ -2041,8 +2150,8 @@ export class MiniConductor {
     // A tick's ready list can outlive a cancellation made while an earlier run of it started.
     if (this.#runs.has(subtaskId) || !this.#live(gen) || this.#ended(subtaskId)) return;
     if (this.#overBudget(subtaskId) || this.#unpricedPending(subtaskId)) return;
-    const unpriced = this.#unpricedModel(subtaskId);
-    if (unpriced && this.#state().ledger.unpriced[unpriced]?.allowed === false) {
+    const unpriced = this.#unpricedRefused(subtaskId);
+    if (unpriced) {
       this.#o.store.append(
         this.#env(subtaskId, 'task.status', {
           state: 'failed',
@@ -2273,6 +2382,31 @@ export class MiniConductor {
       if (canceled && handle.vendorSessionId) {
         await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
       }
+      return;
+    }
+    const spent = this.#overBudget(subtaskId);
+    if (spent) {
+      // A cap was spent while the session started (#35): end it before its first message. Nothing
+      // ran in it, so its vendor state goes; the run after a raise starts afresh.
+      revoke();
+      await worker.adapter.close(handle).catch(() => {});
+      if (this.#markers.delete(sessionId)) this.#saveMarkers();
+      if (handle.vendorSessionId) {
+        await this.#discard(tier.adapter, handle.vendorSessionId, workspace.path);
+      }
+      this.#o.store.append(
+        this.#env(
+          subtaskId,
+          'worker.ended',
+          {
+            sessionId,
+            reason: 'budget',
+            message: `stopped: the ${spent.scope} budget ($${spent.capUsd}) is spent`,
+          },
+          sessionId,
+        ),
+      );
+      this.#kick();
       return;
     }
     const run: Run = {

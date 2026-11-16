@@ -247,12 +247,12 @@ events:
 - **Hard caps fail safe.** The caps are a root task's (`task.budget.usd`, else `budget.per_task_usd`), this repo's for the UTC day (`budget.per_day_usd`), and the month's API-key cap (`budget.api_key_per_month_usd`, default 200).
   - **What happens at a cap.** Once spend reaches a cap, the Mini-conductor stops the Workers and planners the cap covers (`worker.ended` reason `budget`: not a failed attempt, and resumed after a raise) and starts none. It also raises one high-urgency `blocked` Escalation.
   - **The answer.** An answer that is only a dollar amount above the spend raises the cap (`budget.raised`). Anything else asks again. A question about a day or month that has passed resolves itself.
-  - **Overshoot.** Spend can overshoot a cap by one usage event per running Worker, and by a whole planner or reviewer session, whose usage is written at its end.
+  - **Overshoot.** Spend can overshoot a cap by one usage event per running Worker, and by a whole planner or reviewer session, whose usage is written at its end. A planner stopped or failed part-way is charged what it spent all the same.
   - **The month cap.** It counts every repo registered with the Conductor, read-only from their logs (`monthSpendElsewhere`, readings reused for 60 s). When this repo is not registered, it counts this repo alone and the run warns.
 - **Owner decisions on #35 (2026-11-16, relayed by the coordinator):**
   - (a) the month cap, as above;
   - (b) soft thresholds (`budget.ask_thresholds_usd`) only notify: one `budget.threshold` event per threshold a task passes, and nothing stops;
-  - (c) before a Worker runs on a model whose cost cannot be known (its adapter reports none, no price is known, and a cap applies), the user is asked once per model per repo (`budget.unpriced`). A plain yes allows it; anything else refuses it, and its sub-tasks fail;
+  - (c) before anything runs on a model whose cost cannot be known (its adapter reports none, no price is known, and a cap applies), the user is asked once per model per repo (`budget.unpriced`). That covers the planner's tier, asked before a task is planned, and, before a sub-task runs, its Worker's, the reviewer's and the escalation gate's own reasoning. A plain yes allows it; anything else refuses it, and the tasks that need it fail. A question left on a task that was canceled is asked again on a task still waiting;
   - (d) `pricing:` is taken from the user layer only. In any other layer it is a config error, since a committed file could otherwise set prices to 0.
 - **Elsewhere:** the ADR-003 addendum (#35) is proposed. The gate's and the profile's budget headroom are #356, and Gemini prices are #357.
 

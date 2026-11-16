@@ -121,7 +121,7 @@ The Claude adapter uses `@anthropic-ai/claude-agent-sdk`. Raw `claude -p` lacks 
 
 Checked **2026-11-16**. USD per million tokens (MTok), standard (non-batch, global, non-fast) rates on the first-party API. Cache write is shown as 5-minute / 1-hour. The cost ledger prices tokens from this table when an adapter reports no cost. `claude-sdk` reports one (per turn, with the tokens sent per call before it), as do ACP agents that send `usage_update` with a cost; a reported cost replaces the session's estimates since its last report.
 
-**Reachability:** `platform.claude.com` was read. `developers.openai.com` was later read with `curl` (OpenAI rows below); `ai.google.dev` and `geminicli.com` **did not resolve** from this session (they are outside its allowed network domains), so **no OpenAI or Google price could be read from a primary page and none is recorded**. Both vendors' rows are UNVERIFIED placeholders. Those hosts must be allowed (or a human must paste the pages) before a price table for Codex and Gemini exists.
+**Reachability:** `platform.claude.com` was read, and `developers.openai.com` was read with `curl` (the OpenAI rows below). `ai.google.dev` and `geminicli.com` **did not resolve** from this session (they are outside its allowed network domains), so **no Google price could be read from a primary page and none is recorded**: the Google row is an UNVERIFIED placeholder until those hosts are allowed or a human pastes the pages (#357).
 
 | Model | Id (API) | Input | Output | Cache read | Cache write (5m / 1h) | Long-context tier | Status | Source | Checked |
 |---|---|---|---|---|---|---|---|---|---|

@@ -34,16 +34,17 @@ import {
   VERIFY_CODEX_WORKERS,
 } from './daemon.js';
 import { AdapterPlanner, parseProposal, SingleStepPlanner } from './planner.js';
-import type {
-  Integrator,
-  Planner,
-  ProposedSubtask,
-  ReviewContext,
-  Reviewer,
-  ReviewResult,
-  Verifier,
-  VerifyContext,
-  WorkerMcp,
+import {
+  type Integrator,
+  PlanFailed,
+  type Planner,
+  type ProposedSubtask,
+  type ReviewContext,
+  type Reviewer,
+  type ReviewResult,
+  type Verifier,
+  type VerifyContext,
+  type WorkerMcp,
 } from './ports.js';
 import {
   type Script,
@@ -3428,6 +3429,110 @@ describe('budgets (#35)', () => {
       expect(ofType('escalation.raised')).toHaveLength(1);
     });
 
+    it('asks again on a waiting task when the task it asked on was canceled', async () => {
+      const d = nocost({ budget: { per_day_usd: 10 } });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('budget.unpriced').length, { timeout: 5000 }).toBe(1);
+      await d.cancel(a);
+      const b = d.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('budget.unpriced').length, { timeout: 5000 }).toBe(2);
+      expect(ofType('budget.unpriced').map((e) => e.taskId)).toEqual([`${a}/1`, `${b}/1`]);
+      // The first question is retired, so it is not left open on a canceled task.
+      expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({ source: 'mini' });
+      d.answer(lastEscalation(`${b}/1`)?.id ?? '', 'yes');
+      await d.settled();
+      expect(tasks()[`${b}/1`]?.state).toBe('completed');
+    });
+
+    it("asks about the planner's model before planning, and fails the task on a no", async () => {
+      let planned = 0;
+      const planner: Planner = {
+        async plan() {
+          planned += 1;
+          return { subtasks: [{ key: 'a', goal: 'a', acceptanceCriteria: ['ok'] }] };
+        },
+      };
+      fake = new NoCost('fake', script);
+      const d = make({
+        adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+        config: {
+          ...CONFIG,
+          tiers: { worker: { adapter: 'fake', model: 'cheap' } },
+          budget: { per_day_usd: 10 },
+        },
+        planner,
+        plannerTier: { adapter: 'fake', model: 'thinker' },
+      });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await expect
+        .poll(() => ofType('budget.unpriced', a)[0]?.data, { timeout: 5000 })
+        .toMatchObject({ model: 'thinker' });
+      await new Promise((r) => setTimeout(r, 100));
+      expect(planned).toBe(0);
+      d.answer(lastEscalation(a)?.id ?? '', 'yes');
+      // Planned; then its Worker's model is asked about in turn.
+      await expect
+        .poll(() => ofType('budget.unpriced', `${a}/1`)[0]?.data, { timeout: 5000 })
+        .toMatchObject({ model: 'cheap' });
+      expect(planned).toBe(1);
+      d.answer(lastEscalation(`${a}/1`)?.id ?? '', 'yes');
+      await d.settled();
+      expect(tasks()[`${a}/1`]?.state).toBe('completed');
+
+      // A no for the planner's model: a task is never planned on it.
+      store.append({
+        v: 1,
+        id: '01JZZZZZZZZZZZZZZZZZZZZZZZ',
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'test' },
+        type: 'budget.unpriced',
+        data: { model: 'thinker', allowed: false },
+      });
+      const b = d.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+      await d.settled();
+      expect(tasks()[b]?.state).toBe('failed');
+      expect(planned).toBe(1);
+    });
+
+    it("asks about the reviewer's model and the gate's reasoning before a sub-task runs", async () => {
+      fake = new NoCost('fake', script);
+      const reviewer: Reviewer = {
+        async review() {
+          return { status: 'passed', adapter: 'fake', model: 'judge', findings: [] };
+        },
+      };
+      const d = make({
+        adapters: { fake: { adapter: fake, authRoute: 'api_key' } },
+        config: {
+          ...CONFIG,
+          tiers: {
+            worker: { adapter: 'fake', model: 'cheap' },
+            review: { adapter: 'fake', model: 'judge', cross_vendor: false },
+          },
+          review: { enabled: true },
+          budget: { per_day_usd: 10 },
+        },
+        reviewer,
+        reasonerTier: { adapter: 'fake', model: 'gatekeeper' },
+      });
+      await d.start();
+      const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('budget.unpriced').length, { timeout: 5000 }).toBe(3);
+      expect(ofType('budget.unpriced').map((e) => (e.data as { model: string }).model)).toEqual([
+        'cheap',
+        'gatekeeper',
+        'judge',
+      ]);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(fake.sessions).toHaveLength(0);
+      for (const e of ofType('escalation.raised', `${a}/1`)) {
+        d.answer((e.data as { id: string }).id, 'yes');
+      }
+      await expect.poll(() => fake.sessions.length, { timeout: 5000 }).toBeGreaterThan(0);
+    });
+
     it('runs without asking when no cap applies, or a price is configured', async () => {
       const d = nocost({
         pricing: { cheap: { input_per_mtok: 1, output_per_mtok: 1 } },
@@ -3439,6 +3544,128 @@ describe('budgets (#35)', () => {
       expect(tasks()[`${a}/1`]?.state).toBe('completed');
       expect(ofType('budget.unpriced')).toHaveLength(0);
     });
+  });
+
+  it('asks on a task not yet planned when the task the day cap asked on was canceled', async () => {
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } } });
+    await d.start();
+    const a = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(1);
+    await d.cancel(a);
+    const b = d.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+    // b is held before planning, and the question is asked again, on b itself.
+    await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(2);
+    expect(ofType('budget.exceeded')[1]?.taskId).toBe(b);
+    expect(ofType('task.planned', b)).toHaveLength(0);
+    d.answer(lastEscalation(b)?.id ?? '', '10');
+    await d.settled();
+    expect(tasks()[`${b}/1`]?.state).toBe('completed');
+  });
+
+  it('keeps holding the work across a restart while a cap is spent, without asking twice', async () => {
+    let turns = 0;
+    const steps = (): Script =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' };
+    fake = new ScriptedAdapter('fake', steps);
+    const first = make({ config: { ...CONFIG, budget: { per_task_usd: 1 } } });
+    await first.start();
+    const id = first.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => reasonsOf(`${id}/1`), { timeout: 5000 }).toEqual(['budget']);
+    await first.stop();
+    fake = new ScriptedAdapter('fake', steps);
+    const second = make({ config: { ...CONFIG, budget: { per_task_usd: 1 } } });
+    await second.start();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(fake.sessions).toHaveLength(0);
+    expect(ofType('escalation.raised')).toHaveLength(1);
+    second.answer(lastEscalation(`${id}/1`)?.id ?? '', '5');
+    await second.settled();
+    expect(tasks()[`${id}/1`]?.state).toBe('completed');
+  });
+
+  it("charges the reviewer's usage, and starts no more work once it spends the cap", async () => {
+    const reviewer: Reviewer = {
+      async review() {
+        return {
+          status: 'passed',
+          adapter: 'other',
+          findings: [],
+          usage: { inputTokens: 1, outputTokens: 1, costUsd: 5 },
+        };
+      },
+    };
+    const planner: Planner = {
+      async plan() {
+        return {
+          subtasks: [
+            { key: 'a', goal: 'a', acceptanceCriteria: ['ok'] },
+            { key: 'b', goal: 'b', acceptanceCriteria: ['ok'], dependsOn: ['a'] },
+          ],
+        };
+      },
+    };
+    const integrator: Integrator = {
+      integrate: async (subtaskId) => ({
+        commit: 'c'.repeat(40),
+        ref: `refs/heads/tacet/${subtaskId}`,
+      }),
+      combine: async () => undefined,
+      publish: async (taskId) => `refs/heads/tacet/result/${taskId}`,
+    };
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: {
+          worker: { adapter: 'fake', model: 'cheap' },
+          review: { adapter: 'other', model: 'x', cross_vendor: false },
+        },
+        review: { enabled: true },
+        budget: { per_task_usd: 2 },
+      },
+      planner,
+      reviewer,
+      integrator,
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await expect
+      .poll(() => ofType('budget.exceeded')[0]?.data, { timeout: 5000 })
+      .toMatchObject({ scope: 'task', key: id, spentUsd: 5 });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(ofType('worker.started', `${id}/2`)).toHaveLength(0);
+  });
+
+  it("charges a planner's spend when its plan is dropped or fails", async () => {
+    const spent = { inputTokens: 7, outputTokens: 3, costUsd: 0.25 };
+    let calls = 0;
+    const planner: Planner = {
+      plan: (_task, opts) =>
+        new Promise((_resolve, reject) => {
+          calls += 1;
+          if (calls === 1) {
+            reject(new PlanFailed('planner reply invalid: no JSON', spent));
+            return;
+          }
+          opts?.signal?.addEventListener('abort', () => reject(new PlanFailed('aborted', spent)));
+        }),
+    };
+    const d = make({ planner });
+    await d.start();
+    const failed = d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => tasks()[failed]?.state, { timeout: 5000 }).toBe('failed');
+    expect(ofType('agent.usage', failed).map((e) => e.data)).toEqual([
+      { t: 'usage', source: 'reported', ...spent },
+    ]);
+    const dropped = d.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+    await expect.poll(() => calls, { timeout: 5000 }).toBe(2);
+    await d.cancel(dropped);
+    await expect
+      .poll(() => ofType('agent.usage', dropped).map((e) => e.data), { timeout: 5000 })
+      .toEqual([{ t: 'usage', source: 'reported', ...spent }]);
   });
 
   it('reads only a bare dollar amount, and only a plain yes', () => {

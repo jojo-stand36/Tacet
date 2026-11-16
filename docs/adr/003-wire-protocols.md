@@ -365,7 +365,7 @@ Status of this addendum: **accepted** on 2026-11-12, approved by the owner on PR
 
 ### Addendum (2026-11-16): budget events and hard caps (#35)
 
-Status of this addendum: **proposed**. It needs the owner's approving comment on the PR. The owner decided four questions in chat on 2026-11-16 ("go with recs"), relayed by the coordinator: (a) the month cap counts every repo registered with the Conductor, and only this repo with a clear warning when it is not registered; (b) soft thresholds notify and stop nothing; (c) a model whose cost cannot be known is asked about once per model per repo before it runs, never run silently; (d) `pricing:` comes from the user layer only.
+Status of this addendum: **proposed**. It needs the owner's approving comment on the PR. The owner decided four questions in chat on 2026-11-16 ("go with recs"), relayed by the coordinator: (a) the month cap counts every repo registered with the Conductor, and only this repo with a clear warning when it is not registered; (b) soft thresholds notify and stop nothing; (c) a model whose cost cannot be known (a Worker's, the planner's, the reviewer's or the escalation gate's) is asked about once per model per repo before it runs, never run silently; (d) `pricing:` comes from the user layer only.
 
 1. **Four `budget.*` event types**, in the namespace §1 already names:
    - `budget.exceeded` `{scope, key, capUsd, spentUsd, unpricedTokens?, escalationId?}`. `scope` is an open enum `task | day | month` with fallback `task`. `key` is the root task id, the UTC day (`YYYY-MM-DD`) or the month (`YYYY-MM`).

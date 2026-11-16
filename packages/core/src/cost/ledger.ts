@@ -50,7 +50,7 @@ export interface CostLedger {
   provisional: Record<string, Provisional[]>;
 }
 
-/** One usage event's provisional share in the buckets it was added to. */
+/** A session's provisional estimates in one set of buckets (root task and UTC day, so month). */
 interface Provisional {
   root: string;
   day: string;
@@ -176,16 +176,23 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
           const root = rootTaskId(e.taskId);
           const day = e.ts.slice(0, 10);
           const month = e.ts.slice(0, 7);
-          const provisional =
-            sid && costUsd === undefined
-              ? {
-                  ...next.provisional,
-                  [sid]: [
-                    ...(next.provisional[sid] ?? []),
-                    { root, day, month, usd: estimated, tokens: unpriced },
-                  ],
-                }
-              : next.provisional;
+          // Kept as running sums per bucket, so a long session's estimates stay a few entries.
+          let provisional = next.provisional;
+          if (sid && costUsd === undefined) {
+            const shares = [...(next.provisional[sid] ?? [])];
+            const i = shares.findIndex((p) => p.root === root && p.day === day);
+            const prior = i < 0 ? undefined : shares[i];
+            const share = {
+              root,
+              day,
+              month,
+              usd: (prior?.usd ?? 0) + estimated,
+              tokens: (prior?.tokens ?? 0) + unpriced,
+            };
+            if (i < 0) shares.push(share);
+            else shares[i] = share;
+            provisional = { ...next.provisional, [sid]: shares };
+          }
           return {
             ...next,
             provisional,

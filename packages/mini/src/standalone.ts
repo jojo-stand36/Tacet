@@ -256,6 +256,9 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
       store,
       config,
       ...(elsewhere ? { monthSpendElsewhere: elsewhere } : {}),
+      // What spends beside the Workers, for the unpriced-model question (#35).
+      ...(planner instanceof CheckoutPlanner && tiers.mini ? { plannerTier: tiers.mini } : {}),
+      ...(reasoner && tiers.mini ? { reasonerTier: tiers.mini } : {}),
       adapters,
       workspaces,
       planner,
