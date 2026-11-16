@@ -174,12 +174,39 @@ describe('costLedgerProjection (#35)', () => {
     // $2 / $12 up to 200,000 prompt tokens, $4 / $18 above.
     expect(costOf(pro, 200_000, 1_000_000)).toBeCloseTo(12.4, 9);
     expect(costOf(pro, 200_001, 1_000_000)).toBeCloseTo(18.800004, 9);
-    expect(priceFor('gemini-3.5-flash-lite', BUILTIN_PRICES)).toEqual({
-      inputPerMTok: 0.3,
-      outputPerMTok: 2.5,
+    // Every entry as transcribed from the page's Standard tab, paid tier.
+    const tier = (input: number, output: number) => ({
+      aboveInputTokens: 200_000,
+      inputPerMTok: input,
+      outputPerMTok: output,
     });
+    for (const [model, price] of Object.entries({
+      'gemini-3.8-flash': { inputPerMTok: 0.75, outputPerMTok: 3.75, until: '2026-12-31' },
+      'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
+      'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
+      'gemini-3.1-pro-preview': { inputPerMTok: 2, outputPerMTok: 12, longContext: tier(4, 18) },
+      'gemini-3.1-pro-preview-customtools': {
+        inputPerMTok: 2,
+        outputPerMTok: 12,
+        longContext: tier(4, 18),
+      },
+      'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3 },
+      'gemini-2.5-pro': {
+        inputPerMTok: 1.25,
+        outputPerMTok: 10,
+        longContext: tier(2.5, 15),
+        until: '2026-11-30',
+      },
+    })) {
+      expect(priceFor(model, BUILTIN_PRICES), model).toEqual(price);
+    }
     // Gemini CLI 0.67.0 models the page does not list stay unpriced.
-    for (const m of ['gemini-3-pro-preview', 'gemini-3.5-flash', 'gemini-3-flash']) {
+    for (const m of [
+      'gemini-3-pro-preview',
+      'gemini-3.5-flash',
+      'gemini-3-flash',
+      'gemma-4-31b-it',
+    ]) {
       expect(priceFor(m, BUILTIN_PRICES), m).toBeUndefined();
     }
     const l = ledger([

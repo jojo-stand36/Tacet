@@ -239,7 +239,7 @@ events:
 
 **Budgets** (#35). The cost ledger is a projection over the event log (`costLedgerProjection` in `@tacet/core`), folded on incrementally by the Mini-conductor. It keeps spend per root task, per UTC day and per month.
 
-- **What each usage costs.** An `agent.usage` costs what the adapter reported. Where it reported nothing, its tokens are priced from a table of list prices: `BUILTIN_PRICES`, Anthropic, OpenAI and the Gemini models on Google's page (#357), checked 2026-11-16 (capability matrix "Model API prices (#35)"), with the user's `pricing:` laid over it.
+- **What each usage costs.** An `agent.usage` costs what the adapter reported. Where it reported nothing, its tokens are priced from a table of list prices: `BUILTIN_PRICES`, Anthropic, OpenAI and the Gemini CLI models on Google's page (#357), checked 2026-11-16 (capability matrix "Model API prices (#35)"), with the user's `pricing:` laid over it.
   - **Provisional estimates.** Table estimates are provisional per session: a cost the session reports later (claude-sdk's per turn, an ACP agent's `usage_update`) replaces them, so nothing is counted twice.
   - **Input rate for every input token.** Usage events do not split out cache reads and writes, so an estimate prices every input token at the input rate. For a cache-heavy agent loop that can be several times the bill, and cache writes are undercounted (#355).
   - **Promotional prices** hold only through their last day (`until`).

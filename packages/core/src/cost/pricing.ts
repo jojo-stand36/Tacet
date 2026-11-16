@@ -68,7 +68,9 @@ export const BUILTIN_PRICES: PricingTable = {
   'gemini-3.8-flash': { inputPerMTok: 0.75, outputPerMTok: 3.75, until: '2026-12-31' },
   'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
   'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
+  // The page prices both ids in one section.
   'gemini-3.1-pro-preview': gemini(2, 12, 4, 18),
+  'gemini-3.1-pro-preview-customtools': gemini(2, 12, 4, 18),
   'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3 },
   // Deprecated: "Effective December 1, 2026, all API requests to `gemini-2.5-pro` will
   // automatically route to Gemini 3.8 Flash (`gemini-3.8-flash`) and be billed at Gemini 3.8
