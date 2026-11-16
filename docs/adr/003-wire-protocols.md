@@ -384,3 +384,13 @@ Status of this addendum: **accepted** on 2026-11-16, approved by the owner on PR
 5. **Prices.** Spend is what an adapter reports. Otherwise tokens are priced from the built-in table (Anthropic and OpenAI list prices, checked 2026-11-16) with the user's `pricing:` laid over it. A refusal in any other layer is a config error. Table estimates are provisional per session: a cost the session reports later replaces them. A model with no price has no known cost, and its tokens are counted as unpriced, never guessed.
 
 Additive under §2: event types in a named namespace, and an open-enum value with a safe fallback. The upward allowlist is not widened.
+
+### Addendum (2026-11-16): questions withdrawn by a cancel (#362)
+
+Status of this addendum: **proposed**. It needs the owner's approving comment on the PR. The owner chose this option (A of three) in chat on 2026-11-16 ("go with recs"), relayed by the coordinator.
+
+1. **`canceled` joins `DecisionSource`.** A cancel (`tacet cancel`, live or with no run) resolves every escalation still open on the task and its sub-tasks with `escalation.resolved` `{escalationId, answer: "no longer needed: the task was canceled", source: "canceled"}` and `escalation.delivered`, in the batch that records the cancel. Nobody answered it: it is withdrawn.
+2. **What reads it.** Escalation stats count it as withdrawn and leave it out of the escalation rate, so the gate is not credited with an answer it never gave. MCP `get_decision` reports no `source` for it (its `source` stays `policy | precedent | mini | user`). A budget question withdrawn this way is neither a raise nor a refusal: the next task that needs the cap or the model is asked again. Recorded Decisions never carry it.
+3. **Older readers.** `DecisionSource` is an open enum whose fallback is `mini`, never `user`, so a reader that does not know `canceled` reads it as `mini`: safe for precedent (only `user` decisions are precedent), but its stats count the question as answered by the Mini-conductor until it updates.
+
+Additive under §2: an open-enum value with a safe fallback. The upward allowlist is not widened (`escalation.*` is already on it).

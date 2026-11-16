@@ -3543,8 +3543,10 @@ type MakeEnvelope = (
 
 /**
  * The events that cancel `taskId`: `worker.ended` (`canceled`) for each of its sessions with no
- * end recorded, except `open` ones the caller ends itself, then `task.status canceled` for each
- * unfinished sub-task and the task last.
+ * end recorded, except `open` ones the caller ends itself; every escalation still open on the task
+ * or a sub-task resolved as withdrawn (`source: canceled`, and delivered, so no Worker or budget
+ * check reads it as an answer; #362); then `task.status canceled` for each unfinished sub-task and
+ * the task last.
  */
 function cancelEvents(
   v: View,
@@ -3565,6 +3567,17 @@ function cancelEvents(
         ),
       );
     }
+  }
+  for (const x of v.escalations.values()) {
+    if (x.resolved || !ours(x.taskId)) continue;
+    events.push(
+      env(x.taskId, 'escalation.resolved', {
+        escalationId: x.id,
+        answer: 'no longer needed: the task was canceled',
+        source: 'canceled',
+      }),
+      env(x.taskId, 'escalation.delivered', { escalationId: x.id }),
+    );
   }
   const subs = Object.values(v.tasks)
     .filter((t) => t.task.id !== taskId && ours(t.task.id) && !TERMINAL.has(t.state))

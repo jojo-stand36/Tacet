@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   type Decision,
   type EventEnvelope,
+  escalationStats,
   newUlid,
   type PolicyRule,
   ProfileRefusedError,
@@ -1460,6 +1461,90 @@ describe('MiniConductor', () => {
         }
       },
     );
+
+    /** A question a Worker asked, written to the log as the MCP server would. */
+    const ask = (taskId: string, id: string) =>
+      store.append({
+        v: 1,
+        id,
+        ts: new Date().toISOString(),
+        source: { kind: 'worker', id: 'w-test' },
+        type: 'escalation.raised',
+        taskId,
+        data: {
+          id,
+          taskId,
+          question: 'which way?',
+          urgency: 'normal',
+          createdAt: new Date().toISOString(),
+        },
+      });
+    const resolutions = (taskId: string) =>
+      ofType('escalation.resolved', taskId).map(
+        (e) => e.data as { escalationId: string; source?: string; answer?: string },
+      );
+
+    it('withdraws the questions still open on the task and its sub-tasks (#362)', async () => {
+      const d = make({ planner: plan3() });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => fake.open, { timeout: 5000 }).toBe(2);
+      ask(`${id}/1`, '01JZZZZZZZZZZZZZZZZZZZZZA1');
+      ask(`${id}/2`, '01JZZZZZZZZZZZZZZZZZZZZZA2');
+      ask(id, '01JZZZZZZZZZZZZZZZZZZZZZA3');
+      // One already answered stays as it was.
+      ask(`${id}/1`, '01JZZZZZZZZZZZZZZZZZZZZZA4');
+      d.answer('01JZZZZZZZZZZZZZZZZZZZZZA4', 'left');
+      await d.cancel(id);
+      await d.settled();
+      for (const [task, x] of [
+        [`${id}/1`, '01JZZZZZZZZZZZZZZZZZZZZZA1'],
+        [`${id}/2`, '01JZZZZZZZZZZZZZZZZZZZZZA2'],
+        [id, '01JZZZZZZZZZZZZZZZZZZZZZA3'],
+      ] as const) {
+        expect(resolutions(task).find((r) => r.escalationId === x)).toEqual({
+          escalationId: x,
+          answer: 'no longer needed: the task was canceled',
+          source: 'canceled',
+        });
+        // Delivered: no Worker, and no budget check, reads it as an answer.
+        expect(
+          ofType('escalation.delivered', task).some(
+            (e) => (e.data as { escalationId: string }).escalationId === x,
+          ),
+        ).toBe(true);
+      }
+      expect(
+        resolutions(`${id}/1`).filter((r) => r.escalationId === '01JZZZZZZZZZZZZZZZZZZZZZA4'),
+      ).toHaveLength(1);
+      // The task view, as `tacet status` and the Conductor's replica read it, has none pending.
+      for (const t of [id, `${id}/1`, `${id}/2`]) {
+        expect(
+          Object.values(tasks()[t]?.escalations ?? {}).filter((x) => x.status === 'pending'),
+        ).toEqual([]);
+      }
+      // Counted as withdrawn, not as answered by the gate.
+      const stats = escalationStats(store.query({}).map((e) => e.envelope));
+      expect(stats).toMatchObject({ withdrawn: 3, resolvedLocally: { mini: 0 }, open: 0 });
+    });
+
+    it('withdraws the open questions when no Mini-conductor is running (cancelStopped, #362)', async () => {
+      const d = make({ planner: plan3() });
+      await d.start();
+      const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => fake.open, { timeout: 5000 }).toBe(2);
+      await d.stop();
+      ask(`${id}/2`, '01JZZZZZZZZZZZZZZZZZZZZZB1');
+      const r = await cancelStopped(id, { store, lockPath: join(dir, 'mini.lock') });
+      expect(r.errors).toEqual([]);
+      expect(resolutions(`${id}/2`)).toEqual([
+        {
+          escalationId: '01JZZZZZZZZZZZZZZZZZZZZZB1',
+          answer: 'no longer needed: the task was canceled',
+          source: 'canceled',
+        },
+      ]);
+    });
 
     it('refuses an unknown task, a sub-task and a task that has ended', async () => {
       const d = make();
@@ -3439,7 +3524,10 @@ describe('budgets (#35)', () => {
       await expect.poll(() => ofType('budget.unpriced').length, { timeout: 5000 }).toBe(2);
       expect(ofType('budget.unpriced').map((e) => e.taskId)).toEqual([`${a}/1`, `${b}/1`]);
       // The first question is retired, so it is not left open on a canceled task.
-      expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({ source: 'mini' });
+      // The cancel withdrew it (#362); it is asked again on b.
+      expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({
+        source: 'canceled',
+      });
       d.answer(lastEscalation(`${b}/1`)?.id ?? '', 'yes');
       await d.settled();
       expect(tasks()[`${b}/1`]?.state).toBe('completed');
@@ -3580,7 +3668,8 @@ describe('budgets (#35)', () => {
     await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(2);
     expect(ofType('budget.exceeded')[1]?.taskId).toBe(b);
     expect(ofType('task.planned', b)).toHaveLength(0);
-    expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({ source: 'mini' });
+    // The cancel withdrew it (#362); it is asked again on b.
+    expect(ofType('escalation.resolved', `${a}/1`)[0]?.data).toMatchObject({ source: 'canceled' });
     d.answer(lastEscalation(b)?.id ?? '', '10');
     await d.settled();
     expect(tasks()[`${b}/1`]?.state).toBe('completed');

@@ -60,7 +60,10 @@ export const TaskEventData = {
     escalationId: Ulid,
     decisionId: Ulid.optional(),
     answer: z.string().optional(),
-    /** Who answered: the user, or the gate (`policy`, `precedent`, `mini`). Absent in older logs. */
+    /**
+     * Who answered: the user, or the gate (`policy`, `precedent`, `mini`); `canceled` when nobody
+     * did and the task was canceled (#362). Absent in older logs.
+     */
     source: DecisionSource.optional(),
     /** Why the gate answered as it did (ADR-003 addendum on the escalation gate, item 3). */
     rationale: z.string().optional(),

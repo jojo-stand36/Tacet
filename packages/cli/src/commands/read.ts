@@ -185,7 +185,10 @@ export function formatEscalationStats(s: EscalationStats): string {
     ].filter(Boolean);
     parts.push(`${local} answered without you${by.length > 0 ? ` (${by.join(', ')})` : ''}`);
     const open = s.open > 0 ? `; ${s.open} still open` : '';
-    parts.push(`${s.raised - local} to you (${Math.round((s.rate ?? 0) * 100)}%${open})`);
+    parts.push(
+      `${s.raised - s.withdrawn - local} to you (${Math.round((s.rate ?? 0) * 100)}%${open})`,
+    );
+    if (s.withdrawn > 0) parts.push(`${s.withdrawn} withdrawn (task canceled)`);
   }
   if (s.approvals > 0) parts.push(`${s.approvals} proposals to approve`);
   if (s.raisedByMini > 0) parts.push(`${s.raisedByMini} from the Mini-conductor`);

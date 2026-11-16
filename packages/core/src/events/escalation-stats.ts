@@ -15,9 +15,11 @@ export interface EscalationStats {
   answeredUnknown: number;
   /** Of those, still waiting on an answer. */
   open: number;
+  /** Of those, withdrawn unanswered because their task was canceled (#362). */
+  withdrawn: number;
   /**
    * The share of Worker escalations that went to the user: those not answered locally, over all
-   * raised. Null when none were raised.
+   * raised and not withdrawn. Null when none were.
    */
   rate: number | null;
   /** Approval requests for a Worker's repo-wide proposal: always the user's. */
@@ -33,6 +35,7 @@ export const NO_ESCALATIONS: EscalationStats = {
   answeredByUser: 0,
   answeredUnknown: 0,
   open: 0,
+  withdrawn: 0,
   rate: null,
   approvals: 0,
   raisedByMini: 0,
@@ -80,9 +83,11 @@ export function escalationStats(
     if (by === undefined) s.open += 1;
     else if (by === 'policy' || by === 'precedent' || by === 'mini') s.resolvedLocally[by] += 1;
     else if (by === 'user') s.answeredByUser += 1;
+    else if (by === 'canceled') s.withdrawn += 1;
     else s.answeredUnknown += 1;
   }
   const local = s.resolvedLocally.policy + s.resolvedLocally.precedent + s.resolvedLocally.mini;
-  if (s.raised > 0) s.rate = (s.raised - local) / s.raised;
+  const asked = s.raised - s.withdrawn;
+  if (asked > 0) s.rate = (asked - local) / asked;
   return s;
 }
