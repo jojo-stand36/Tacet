@@ -387,7 +387,7 @@ Additive under §2: event types in a named namespace, and an open-enum value wit
 
 ### Addendum (2026-11-16): questions withdrawn by a cancel (#362)
 
-Status of this addendum: **proposed**. It needs the owner's approving comment on the PR. The owner chose this option (A of three) in chat on 2026-11-16 ("go with recs"), relayed by the coordinator.
+Status of this addendum: **accepted** on 2026-11-16, approved by the owner on PR #366 ([comment 6931679396](https://github.com/jojo-stand36/Tacet/pull/366#issuecomment-6931679396): "Approve the ADR-003 addendum"). The owner chose this option (A of three) in chat on 2026-11-16 ("go with recs"), relayed by the coordinator.
 
 1. **`canceled` joins `DecisionSource`.** A cancel (`tacet cancel`, live or with no run) resolves every escalation still open on the task and its sub-tasks with `escalation.resolved` `{escalationId, answer: "no longer needed: the task was canceled", source: "canceled"}` and `escalation.delivered`, in the batch that records the cancel. Nobody answered it: it is withdrawn.
 2. **What reads it.** Escalation stats count it as withdrawn and leave it out of the escalation rate, so the gate is not credited with an answer it never gave. MCP `get_decision` reports no `source` for it (its `source` stays `policy | precedent | mini | user`). A budget question withdrawn this way is neither a raise nor a refusal: the next task that needs the cap or the model is asked again. Recorded Decisions never carry it.
