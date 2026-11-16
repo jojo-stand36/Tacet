@@ -319,6 +319,31 @@ describe('tacet standalone (#21)', () => {
     expect(inDistro.err).not.toMatch(/warning: the/);
   });
 
+  it('makes the run non-dumpable, and warns when it cannot and nothing else protects it (#316)', async () => {
+    let hardened = 0;
+    const unavailable = () => {
+      hardened += 1;
+      return { state: 'unavailable', reason: 'Node v24 has no node:ffi' } as const;
+    };
+    const exposed = await tacet(['run', ...user(), 'add work.txt'], {
+      memoryGuard: { harden: unavailable, scope: () => undefined, platform: 'linux' },
+    });
+    expect(exposed.code).toBe(0);
+    expect(hardened).toBe(1);
+    expect(exposed.err).toMatch(
+      /warning: this kernel has no Yama, and this process could not make itself non-dumpable \(Node v24 has no node:ffi\)\. Programs a Worker runs could read the answer codes/,
+    );
+    // Yama at 1 keeps a Worker (a descendant) out already; non-dumpable keeps everyone out.
+    for (const memoryGuard of [
+      { harden: unavailable, scope: () => 1, platform: 'linux' as const },
+      { harden: () => ({ state: 'set' }) as const, scope: () => 0, platform: 'linux' as const },
+    ]) {
+      const r = await tacet(['run', ...user(), 'again'], { memoryGuard });
+      expect(r.code).toBe(0);
+      expect(r.err).not.toMatch(/answer codes/);
+    }
+  });
+
   it("warns that a repo autonomy above the user's is ignored (#25, ADR-004 B)", async () => {
     const cfg = join(repo, '.tacet', 'tacet.yaml');
     writeFileSync(cfg, `${readFileSync(cfg, 'utf8')}escalation: { autonomy: high }\n`);

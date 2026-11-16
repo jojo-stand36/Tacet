@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { fstatSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
+import { makeNonDumpable } from '@tacet/core/node';
 import { cappedLog } from './capped-log.js';
 import { isDetachedChild } from './commands/detach.js';
 import { main } from './main.js';
@@ -46,4 +47,5 @@ process.exitCode = await main(argv, {
   cwd: process.cwd(),
   signal: abort.signal,
   ...(prompt ? { prompt } : {}),
+  memoryGuard: { harden: makeNonDumpable },
 });

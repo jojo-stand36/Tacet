@@ -4,6 +4,7 @@ import type { SummaryPacket } from '@tacet/core';
 import { wslPathWarnings } from '@tacet/core/node';
 import type { Standalone } from '@tacet/mini/standalone';
 import type { Io } from '../io.js';
+import { guardMemory } from '../memory-guard.js';
 import { formatEvent, formatTask, isSummaryEvent, safeJson, terminalSafe } from '../render.js';
 import {
   DONE_STATES,
@@ -79,6 +80,7 @@ export async function run(io: Io, goal: string | undefined, o: RunOptions): Prom
   )) {
     io.err(w);
   }
+  guardMemory(io);
   const { startStandalone } = await import('@tacet/mini/standalone');
   const dropped = new Set<string>();
   const warned = new Set<string>();
