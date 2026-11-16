@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import { EventTap } from '@tacet/core/testing';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { AcpAdapter } from './adapter.js';
-import { type AcpAgentSpec, GEMINI_AGENT } from './agents.js';
+import { type AcpAgentSpec, GEMINI_AGENT, GEMINI_WORKER_SETTINGS } from './agents.js';
 import { type MockGeminiApi, startMockGeminiApi } from './testing/mock-gemini-api.js';
 
 const require = createRequire(import.meta.url);
@@ -104,7 +104,10 @@ describe('Gemini Worker tool environment', () => {
   it('Worker settings: no API key in tool commands; the user’s ~/.gemini untouched', {
     timeout: 120_000,
   }, async () => {
-    const { out, home } = await toolEnv(GEMINI_AGENT);
+    // Gemini Workers have no shell (#350): the scrub is checked with it put back, as the defence
+    // it stays should shell ever return.
+    const { tools: _noShell, ...settings } = GEMINI_WORKER_SETTINGS;
+    const { out, home } = await toolEnv(withSettings(settings));
     expect(out).toContain('MYAPP_SETTING=kept');
     expect(out).not.toContain(KEY);
     expect(out).not.toMatch(/^GEMINI_API_KEY=/m);

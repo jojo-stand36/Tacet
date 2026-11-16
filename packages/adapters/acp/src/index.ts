@@ -20,5 +20,6 @@ export {
   codexAcpConfig,
   customAcpAgent,
   GEMINI_AGENT,
+  GEMINI_WORKER_POLICY,
   GEMINI_WORKER_SETTINGS,
 } from './agents.js';

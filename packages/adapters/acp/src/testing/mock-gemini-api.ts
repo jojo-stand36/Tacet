@@ -10,7 +10,10 @@ import type { AddressInfo } from 'node:net';
  * always get the routing answer it expects. Streaming calls are the conversation, scripted by the
  * last user text:
  * - `SAY <word>`: streams `You said <word>.` in several chunks.
- * - `RUN_TOOL`: calls `run_shell_command` (`touch tool-ran.txt`), which needs approval.
+ * - `RUN_TOOL`: calls `write_file` (`tool-ran.txt`), which needs approval. Not the shell: Gemini
+ *   Workers have none (#350).
+ * - `CAT_GLOB`, `GREP_R`: call `run_shell_command` with `cat ln*` and `grep -R . .`, which Gemini
+ *   runs without asking unless shell is removed (#350).
  * - `ENV_TOOL`: calls `run_shell_command` writing its environment to `tool-env.txt` (#150).
  * - `SLOW`: streams for about ten seconds, for interrupts.
  * - `WHO`: replies with the model in the request path.
@@ -102,8 +105,24 @@ function script(model: string, body: Body): { chunks: Part[][]; delayMs: number 
         [
           {
             functionCall: {
+              name: 'write_file',
+              args: { file_path: 'tool-ran.txt', content: 'ran\n' },
+            },
+          },
+        ],
+      ],
+      delayMs: 0,
+    };
+  }
+  const shell = /CAT_GLOB/.test(text) ? 'cat ln*' : /GREP_R/.test(text) ? 'grep -R . .' : undefined;
+  if (shell !== undefined) {
+    return {
+      chunks: [
+        [
+          {
+            functionCall: {
               name: 'run_shell_command',
-              args: { command: 'touch tool-ran.txt', description: 'create a file' },
+              args: { command: shell, description: 'read' },
             },
           },
         ],
