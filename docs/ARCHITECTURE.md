@@ -255,7 +255,7 @@ events:
   - (c) before anything runs on a model whose cost cannot be known (its adapter reports none, no price is known, and a cap applies), the user is asked once per model per repo (`budget.unpriced`). That covers the planner's tier, asked before a task is planned, and, before a sub-task runs, its Worker's, the reviewer's and the escalation gate's own reasoning. A plain yes allows it; anything else refuses it, and the tasks that need it fail. A refusal cannot be undone yet (#361): giving the model a price in the user's `pricing:` is the way back, as a priced model is not asked about. A question left on a task that was canceled is asked again on a task still waiting;
   - (d) `pricing:` is taken from the user layer only. In any other layer it is a config error, since a committed file could otherwise set prices to 0.
 - **Owner decisions on #360 (2026-11-16, relayed by the coordinator):** no undo for a refusal yet (#361); the month cap counts subscription spend until the split lands; a month-cap raise applies to the repo that answered; a question left open on a canceled task is #362.
-- **Elsewhere:** the ADR-003 addendum (#35) is proposed. The gate's and the profile's budget headroom are #356, and Gemini prices are #357.
+- **Elsewhere:** the ADR-003 addendum (#35) is accepted (owner's approval on PR #360). The gate's and the profile's budget headroom are #356, and Gemini prices are #357.
 
 **Session profile** (#110). Each Worker session runs on a profile, `SessionProfile { model, effort?, contextWindow? }` in `@tacet/core`. The Mini-conductor chooses it with `chooseProfile` (`packages/mini/src/daemon/profile.ts`) from the tier and its bounds, the sub-task and its failed attempts:
 
