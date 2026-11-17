@@ -23,6 +23,7 @@ import {
   formatEvent,
   formatStatusEntry,
   isSummaryEvent,
+  oneLine,
   safeJson,
   terminalSafe,
 } from '../render.js';
@@ -128,7 +129,8 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   // From the log too: how many escalations the gate kept from the user (#25).
   const escalations = readEscalationStats(paths);
   // And what each Worker session profile cost (#356).
-  const profiles = readCostByProfile(paths, pricesFor(repoRoot, o['user-dir']));
+  const prices = pricesFor(repoRoot, o['user-dir']);
+  const profiles = readCostByProfile(paths, prices.table);
   if (o.json) {
     io.out(
       safeJson({
@@ -138,6 +140,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
         problems: problems.map(problemJson),
         escalations,
         costByProfile: profiles,
+        ...(prices.note ? { costByProfileNote: prices.note } : {}),
       }),
     );
     return 0;
@@ -161,17 +164,28 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   const lines = formatCostByProfile(profiles);
   if (lines.length > 0) {
     io.out('cost by session profile, in all:');
+    if (prices.note) io.out(`  ${terminalSafe(prices.note)}`);
     for (const l of lines) io.out(`  ${l}`);
   }
   return 0;
 }
 
-/** The prices the run uses: built in, with the user's `pricing:` over them (#35). */
-function pricesFor(repoRoot: string, userDir: string | undefined): PricingTable {
+/**
+ * The prices the run uses: built in, with the user's `pricing:` over them (#35). When the config
+ * cannot be read, the built-in ones, and a note that says so: they may differ from the run's.
+ */
+export function pricesFor(
+  repoRoot: string,
+  userDir: string | undefined,
+): { table: PricingTable; note?: string } {
   try {
-    return pricingTable(loadConfig({ repoRoot, ...(userDir ? { userDir } : {}) }).config.pricing);
-  } catch {
-    return pricingTable(undefined);
+    const { config } = loadConfig({ repoRoot, ...(userDir ? { userDir } : {}) });
+    return { table: pricingTable(config.pricing) };
+  } catch (err) {
+    return {
+      table: pricingTable(undefined),
+      note: `priced with the built-in prices only: the config could not be read (${oneLine((err as Error).message, 200)})`,
+    };
   }
 }
 

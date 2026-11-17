@@ -1,7 +1,9 @@
 import {
+  budgetKey,
   capOf,
   costLedgerProjection,
   pricingTable,
+  rootTaskId,
   type TacetConfig,
   tasksProjection,
 } from '@tacet/core';
@@ -95,11 +97,17 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     if (!rootView || !view) return undefined;
     // The ledger's spend (reported costs and table estimates) against the cap the hard caps use:
     // a raise, then the task's own budget, then `budget.per_task_usd` (#356).
+    // The ledger keys a task by the part of its id before the first `/` (`rootTaskId`); the gate
+    // finds the root by `parentId`. Sub-task ids are `<root>/<n>` and submitted ids may not hold
+    // a `/`, so the two agree; the ledger's own rule is used for the ledger.
     const ledger = o.store.replay(costLedgerProjection(pricingTable(o.config.pricing)));
-    const budget = capOf(ledger, 'task', root, o.config.budget, rootView.task.budget?.usd);
+    const key = rootTaskId(b.taskId);
+    // A cap recorded as spent stays so until the user raises it, as for the hard caps.
+    if (ledger.exceeded[budgetKey('task', key)]) return undefined;
+    const budget = capOf(ledger, 'task', key, o.config.budget, rootView.task.budget?.usd);
     if (budget !== undefined) {
-      const spent = ledger.tasks[root]?.usd ?? 0;
-      if (budget - spent < budget * BUDGET_FLOOR) return undefined;
+      const spent = ledger.tasks[key]?.usd ?? 0;
+      if (budget <= 0 || budget - spent < budget * BUDGET_FLOOR) return undefined;
     }
     const reasoner = o.reasoner;
     if (reasoning >= cap) return undefined;

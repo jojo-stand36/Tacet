@@ -123,6 +123,51 @@ describe('tacet standalone (#21)', () => {
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+  it("lists cost by session profile in status, priced with the user's prices (#356)", async () => {
+    // A user price for the tier's model: the run and status price it the same way.
+    writeFileSync(
+      join(root, 'user', 'config.yaml'),
+      'pricing:\n  cheap: { input_per_mtok: 2, output_per_mtok: 8 }\n',
+    );
+    const store = openEventStore(repoStatePaths(repo, state).events);
+    const at = '2026-11-16T12:00:00.000Z';
+    const ev = (type: string, data: unknown, taskId: string, sessionId?: string) => ({
+      v: 1 as const,
+      id: newUlid(Date.parse(at)),
+      ts: at,
+      source: { kind: 'mini' as const, id: 'standalone' },
+      type,
+      data,
+      taskId,
+      ...(sessionId ? { sessionId } : {}),
+    });
+    const R = { model: 'm', effort: 'e', contextWindow: 'w' };
+    store.append([
+      ev('task.created', { id: 'T', goal: 'g', acceptanceCriteria: ['a'], createdAt: at }, 'T'),
+      ev('worker.profile', { sessionId: 's', model: 'cheap', effort: 'low', reasons: R }, 'T', 's'),
+      ev(
+        'agent.usage',
+        { t: 'usage', source: 'estimated', inputTokens: 1_000_000, outputTokens: 0 },
+        'T',
+        's',
+      ),
+    ]);
+    store.close();
+    const json = JSON.parse((await tacet(['status', ...user(), '--json'])).out);
+    expect(json.costByProfile).toEqual({
+      'cheap / effort low / window default': {
+        usd: 2,
+        estimatedUsd: 2,
+        unpricedTokens: 0,
+        unpricedModels: [],
+      },
+    });
+    expect(json).not.toHaveProperty('costByProfileNote');
+    expect((await tacet(['status', ...user()])).out).toContain(
+      'cost by session profile, in all:\n  cheap / effort low / window default: $2.00 ($2.00 estimated)',
+    );
+  });
+
   it('runs a task to a result branch, then status, logs and attach read it from the log', async () => {
     const r = await tacet(['run', ...user(), '--accept', 'work.txt exists', 'add work.txt']);
     expect(r.code).toBe(0);

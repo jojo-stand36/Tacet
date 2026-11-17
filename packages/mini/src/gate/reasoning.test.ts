@@ -466,6 +466,13 @@ describe('escalationGate (ADR-004 B)', () => {
     expect(await gate(capped)(escalation('root-7'), b('root-7'))).toMatchObject({
       source: 'mini',
     });
+    // A cap recorded as spent stays so until the user raises it, even with room by config.
+    created('root-8');
+    append('root-8', 'budget.exceeded', { scope: 'task', key: 'root-8', capUsd: 1, spentUsd: 1 });
+    const roomy: TacetConfig = { ...config('high'), budget: { per_task_usd: 100 } };
+    const before = calls.length;
+    expect(await gate(roomy)(escalation('root-8'), b('root-8'))).toBeUndefined();
+    expect(calls).toHaveLength(before);
   });
 
   it("weighs the root task's budget, spent by all its sub-tasks, for a Worker on a sub-task", async () => {

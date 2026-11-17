@@ -42,7 +42,8 @@ export interface CostLedger {
   /**
    * `profileKey` → spend of the Worker sessions that ran on that profile (#356): what each
    * model, effort and context window cost. Sessions with no `worker.profile` (the planner, the
-   * gate's reasoning, the reviewer) are not in it.
+   * gate's reasoning, the reviewer) are not in it. A reported cost goes to the session's latest
+   * profile. The key is for display: not a stable API.
    */
   profiles: Record<string, Spend>;
   /** `scope:key` → the soft thresholds the user was already told about. */
@@ -184,16 +185,16 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
         case 'worker.profile': {
           const d = (e.type === 'worker.started' ? WorkerStarted : WorkerProfile).safeParse(e.data);
           if (!d.success) return state;
-          const next =
-            e.type === 'worker.profile'
-              ? {
-                  ...state,
-                  sessionProfiles: {
-                    ...state.sessionProfiles,
-                    [d.data.sessionId]: profileKey(d.data as WorkerProfile),
-                  },
-                }
-              : state;
+          const p = e.type === 'worker.profile' ? WorkerProfile.safeParse(e.data) : undefined;
+          const next = p?.success
+            ? {
+                ...state,
+                sessionProfiles: {
+                  ...state.sessionProfiles,
+                  [p.data.sessionId]: profileKey(p.data),
+                },
+              }
+            : state;
           if (!d.data.model) return next;
           return {
             ...next,
