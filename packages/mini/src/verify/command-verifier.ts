@@ -9,6 +9,7 @@ import {
 } from '@tacet/core';
 import {
   endMarkedProcesses,
+  type OrphanProbe,
   SAFE_GIT_ARGS,
   WORKER_MARKER_VAR,
   type WorkerWorktree,
@@ -38,6 +39,8 @@ export interface CommandVerifierOptions {
   killGraceMs?: number;
   /** For git in the checkout: PATH and HOME are taken from here. Default `process.env`. */
   gitEnv?: Record<string, string | undefined>;
+  /** @internal Tests only: how orphans are looked for (#367). */
+  orphanProbe?: OrphanProbe;
 }
 
 /** Output kept in memory per command; what is passed on is cut from its end. */
@@ -235,8 +238,21 @@ export class CommandVerifier implements Verifier {
     let killTimer: NodeJS.Timeout | undefined;
     // What the command started and left running (a dev server, a watcher, a daemon in a session
     // of its own) carries the marker: ended with the group whenever the command ends.
+    // On macOS, also what it left running whose marker cannot be read: an orphan, started since,
+    // working in its directory (#367). What is ended so, and what outlives SIGKILL, is reported.
     const sweep = (graceMs: number) =>
-      endMarkedProcesses([ctx.marker], { graceMs }).catch(() => undefined);
+      endMarkedProcesses([ctx.marker], {
+        graceMs,
+        orphans: [{ since: started, dir: cwd }],
+        ...(this.#o.orphanProbe ? { probe: this.#o.orphanProbe } : {}),
+      })
+        .then((r) => {
+          const orphans = r.orphans ?? [];
+          if (orphans.length > 0 || r.left.length > 0) {
+            ctx.onLeftovers?.({ orphans, left: r.left });
+          }
+        })
+        .catch(() => undefined);
     let early: Promise<unknown> | undefined;
     const stop = (why: 'timed_out' | 'aborted') => {
       if (ended) return;

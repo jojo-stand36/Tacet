@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Task, VerifyCommandResult } from '@tacet/core';
-import { isProcessRunning, newWorkerMarker } from '@tacet/core/node';
+import { isProcessRunning, newWorkerMarker, type OrphanProbe } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { type VerifyContext, WorktreeRefusedError } from '../daemon/ports.js';
 import { CommandVerifier, commandVerifierFromConfig } from './command-verifier.js';
@@ -155,6 +155,47 @@ describe('CommandVerifier (#19)', () => {
     started.push(pid);
     expect(r.status).toBe('passed');
     await expect.poll(() => isProcessRunning(pid)).toBe(false);
+  });
+
+  it('ends, and reports, an orphan it left in its checkout that shows no marker (macOS, #367)', async () => {
+    const pidFile = join(root, 'pid');
+    const other = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' });
+    other.unref();
+    started.push(other.pid as number);
+    // A probe as on a Mac with SIP on: the orphan's environment is hidden. Here `env -i` really
+    // clears it, so no marker can find it; only its directory and start time can.
+    const orphan = () => Number(readFileSync(pidFile, 'utf8'));
+    const orphanProbe: OrphanProbe = {
+      platform: 'darwin',
+      candidates: () =>
+        [orphan(), other.pid as number].map((pid) => ({
+          pid,
+          ppid: 1,
+          startMs: Date.now(),
+          envHidden: true,
+          command: '/bin/sleep 60',
+        })),
+      cwdOf: (pids) => new Map(pids.map((p) => [p, p === orphan() ? join(wt, 'sub') : root])),
+    };
+    mkdirSync(join(wt, 'sub'));
+    const reports: { orphans: { pid: number; command: string }[]; left: number[] }[] = [];
+    const cmd = `"${process.execPath}" -e "const c=require('node:child_process').spawn('env',['-i','/bin/sleep','60'],{detached:true,stdio:'ignore'});require('node:fs').writeFileSync(process.argv[1],String(c.pid));c.unref()" "${pidFile}"`;
+    const r = await new CommandVerifier({
+      repoRoot: repo,
+      commands: [cmd],
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: root },
+      killGraceMs: 500,
+      orphanProbe,
+    }).verify(TASK, ws(), ctx({ onLeftovers: (x) => reports.push(x) }));
+    started.push(orphan());
+    expect(r.status).toBe('passed');
+    await expect.poll(() => isProcessRunning(orphan())).toBe(false);
+    expect(reports.flatMap((x) => x.orphans)).toEqual([
+      { pid: orphan(), command: '/bin/sleep 60' },
+    ]);
+    expect(reports.flatMap((x) => x.left)).toEqual([]);
+    // Working elsewhere: left alone.
+    expect(isProcessRunning(other.pid as number)).toBe(true);
   });
 
   it('does not wait on children that hold its output, in its group or out of it (review B1)', async () => {
