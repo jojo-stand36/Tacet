@@ -291,6 +291,24 @@ describe('unreadable orphans on macOS (#367)', () => {
   });
 
   it.runIf(process.platform !== 'win32')(
+    'never reports a process its marker found as an unmarked orphan',
+    async () => {
+      const m = newWorkerMarker();
+      const w = worker(m);
+      await w.grandchild;
+      const pid = w.leader.pid as number;
+      const p = probe([ok({ pid, startMs: Date.now() })], { [pid]: real });
+      const ended = await endMarkedProcesses([m], {
+        graceMs: 300,
+        orphans: [{ since: Date.now() - 5000, dir }],
+        probe: p,
+      });
+      expect(ended.found).toContain(pid);
+      expect(ended.orphans).toEqual([]);
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
     'ends the orphans it takes, and returns them for the caller to record',
     async () => {
       const victim = spawn('/bin/sleep', ['60'], { stdio: 'ignore', detached: true });

@@ -455,15 +455,19 @@ export async function endMarkedProcesses(
   const tracked = new Map<number, string>();
   const found: number[] = [];
   const orphans: { pid: number; command: string }[] = [];
-  const lookForOrphans = (): number[] => {
+  /** Orphans not found by a marker (those are ended as marked), not yet tracked. */
+  const lookForOrphans = (marked: ReadonlySet<number>): number[] => {
     if (!opts.orphans?.length) return [];
-    const fresh = unreadableOrphans(opts.orphans, opts.probe).filter((o) => !tracked.has(o.pid));
+    const fresh = unreadableOrphans(opts.orphans, opts.probe).filter(
+      (o) => !tracked.has(o.pid) && !marked.has(o.pid),
+    );
     for (const o of fresh) if (!orphans.some((x) => x.pid === o.pid)) orphans.push(o);
     return fresh.map((o) => o.pid);
   };
   /** Newly marked processes (and orphans), which are now tracked. */
   const scan = (): number[] => {
-    const pids = [...new Set([...[...find(markers).values()].flat(), ...lookForOrphans()])].filter(
+    const marked = new Set([...find(markers).values()].flat());
+    const pids = [...new Set([...marked, ...lookForOrphans(marked)])].filter(
       (pid) => !tracked.has(pid),
     );
     const ids = identities(pids);

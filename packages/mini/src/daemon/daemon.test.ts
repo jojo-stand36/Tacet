@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -15,8 +15,10 @@ import {
 } from '@tacet/core';
 import {
   type EventStore,
+  isProcessRunning,
   markedProcesses,
   newWorkerMarker,
+  type OrphanProbe,
   openEventStore,
   WORKER_MARKER_VAR,
 } from '@tacet/core/node';
@@ -463,6 +465,40 @@ describe('MiniConductor', () => {
       ofType('worker.verification').map(
         (e) => e.data as { round: number; status: string; sessionId: string },
       );
+
+    it('records what a verify sweep ended without a marker, or could not end (#367)', async () => {
+      const verifier: Verifier = {
+        async verify(_task, _ws, ctx) {
+          ctx.onCommand?.({ command: 'pnpm test', status: 'passed', exitCode: 0, durationMs: 5 });
+          ctx.onLeftovers?.({ orphans: [{ pid: 4242, command: '/bin/sleep 600' }], left: [77] });
+          return { status: 'passed', commands: ['pnpm test'] };
+        },
+      };
+      const d = make({ config: VERIFY, verifier });
+      await d.start();
+      const id = d.submit({ goal: 'Do it', acceptanceCriteria: ['tests pass'] });
+      await d.settled();
+      expect(tasks()[id]?.state).toBe('completed');
+      const problems = ofType('maintenance.problem').map((e) => ({
+        taskId: e.taskId,
+        ...(e.data as { op: string; message: string; workspaceId?: string }),
+      }));
+      expect(problems).toEqual([
+        expect.objectContaining({
+          taskId: `${id}/1`,
+          op: 'workers',
+          message: expect.stringMatching(
+            /^ended pid 4242 \(\/bin\/sleep 600\), which a `verify` command left/,
+          ),
+          workspaceId: expect.any(String),
+        }),
+        expect.objectContaining({
+          taskId: `${id}/1`,
+          op: 'workers',
+          message: 'processes a `verify` command started still running after SIGKILL: 77',
+        }),
+      ]);
+    });
 
     it('sends a failure back to the same session to fix, then completes', async () => {
       const { verifier, calls } = scripted(['failed', 'passed']);
@@ -1619,6 +1655,71 @@ describe('MiniConductor', () => {
       expect(endReasons(id)).toEqual(['canceled', 'canceled']);
     });
   });
+
+  it.runIf(process.platform !== 'win32')(
+    'ends, at start, an orphan a crashed session left in its checkout with no marker, and records it (#367)',
+    async () => {
+      // What a crashed run left: its marker and where its session ran, and an orphan there whose
+      // environment shows no marker (`env -i`, as macOS hides a platform binary's).
+      const marker = newWorkerMarker();
+      const wt = join(dir, 'wt-crashed');
+      mkdirSync(wt);
+      const orphan = spawn('env', ['-i', '/bin/sleep', '60'], {
+        cwd: wt,
+        detached: true,
+        stdio: 'ignore',
+      });
+      orphan.unref();
+      const bystander = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' });
+      bystander.unref();
+      const since = Date.now() - 5000;
+      writeFileSync(join(dir, 'mini.lock.workers'), `${JSON.stringify([marker])}\n`);
+      writeFileSync(
+        join(dir, 'mini.lock.workers.scopes'),
+        `${JSON.stringify({ [marker]: { since, dir: wt } })}\n`,
+      );
+      const pids = [orphan.pid as number, bystander.pid as number];
+      const orphanProbe: OrphanProbe = {
+        platform: 'darwin',
+        candidates: () =>
+          pids.map((pid) => ({
+            pid,
+            ppid: 1,
+            startMs: Date.now(),
+            envHidden: true,
+            command: '/bin/sleep 60',
+          })),
+        cwdOf: (asked) =>
+          new Map(asked.map((p) => [p, p === orphan.pid ? wt : tmpdir()] as [number, string])),
+      };
+      try {
+        const d = make({ orphanProbe });
+        await d.start();
+        await expect.poll(() => isProcessRunning(orphan.pid as number)).toBe(false);
+        expect(isProcessRunning(bystander.pid as number)).toBe(true);
+        expect(ofType('maintenance.problem').map((e) => e.data)).toEqual([
+          {
+            op: 'workers',
+            message: expect.stringMatching(
+              new RegExp(
+                `^ended pid ${orphan.pid} \\(/bin/sleep 60\\), which a crashed Worker session left`,
+              ),
+            ),
+          },
+        ]);
+        expect(readFileSync(join(dir, 'mini.lock.workers'), 'utf8')).toBe('[]\n');
+        expect(readFileSync(join(dir, 'mini.lock.workers.scopes'), 'utf8')).toBe('{}\n');
+      } finally {
+        for (const p of pids) {
+          try {
+            process.kill(p, 'SIGKILL');
+          } catch {
+            // Gone.
+          }
+        }
+      }
+    },
+  );
 
   it('runs a session of its own under a recorded marker, and charges its usage (#25)', async () => {
     const d = make();
