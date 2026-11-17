@@ -861,6 +861,64 @@ describe('MiniConductor', () => {
     ).toEqual(['medium', 'high']);
   });
 
+  it('raises no effort and opens no larger window with little budget left, and logs why (#356)', async () => {
+    let first = true;
+    fake = new ScriptedAdapter('fake', (input) => {
+      if (input.includes('flaky') && first) {
+        first = false;
+        return { do: 'error', message: 'transient' };
+      }
+      return script(input);
+    });
+    const plan = new FixedPlanner([
+      { key: 'flaky', goal: 'flaky step', acceptanceCriteria: ['ok'] },
+      { key: 'read', goal: 'one long read', acceptanceCriteria: ['ok'], indivisible: true },
+    ]);
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: {
+          worker: {
+            adapter: 'fake',
+            model: 'cheap',
+            effort: 'medium',
+            max_effort: 'high',
+            escalate_effort_on_retry: true,
+            max_context_window: 1_000_000,
+          },
+        },
+        budget: { per_task_usd: 10 },
+      },
+      // The planner spent $9 of the task's $10.
+      planner: {
+        plan: async () => ({
+          ...(await plan.plan()),
+          usage: { inputTokens: 1, outputTokens: 1, costUsd: 9 },
+        }),
+      },
+    });
+    await d.start();
+    const id = d.submit({ goal: 'profiles', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    expect(tasks()[id]?.state).toBe('completed');
+    const profiles = (sub: string) =>
+      ofType('worker.profile', `${id}/${sub}`).map(
+        (e) =>
+          e.data as {
+            effort?: string;
+            contextWindow?: number;
+            reasons: { effort: string; contextWindow: string };
+          },
+      );
+    // The retry keeps the tier's effort; the indivisible sub-task keeps the default window.
+    expect(profiles('1').map((p) => p.effort)).toEqual(['medium', 'medium']);
+    expect(profiles('1')[1]?.reasons.effort).toMatch(
+      /not raised after 1 failed attempt\(s\): \$1\.00 of the task's \$10\.00 budget left/,
+    );
+    expect(profiles('2')[0]?.contextWindow).toBeUndefined();
+    expect(profiles('2')[0]?.reasons.contextWindow).toMatch(/budget left/);
+  });
+
   it('runs at the default effort, and logs why, when the adapter refuses the effort (#110)', async () => {
     class NoHigh extends ScriptedAdapter {
       override async start(opts: SessionOptions) {
@@ -3655,6 +3713,64 @@ describe('budgets (#35)', () => {
     await new Promise((r) => setTimeout(r, 100));
     expect(fake.sessions).toHaveLength(0);
     expect(tasks()[id]?.state).not.toBe('failed');
+  });
+
+  it('reports a spent cap to the gate, and runs no session of its own against it (#356)', async () => {
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } } });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    expect(d.budgetSpent(id)).toBe(false);
+    await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(1);
+    // Today's cap: spent for this task and any other.
+    expect(d.budgetSpent(`${id}/1`)).toBe(true);
+    expect(d.budgetSpent('another')).toBe(true);
+    let ran = false;
+    await expect(
+      d.aside(`${id}/1`, 'gate', async () => {
+        ran = true;
+      }),
+    ).rejects.toThrow(/is spent/);
+    expect(ran).toBe(false);
+  });
+
+  it('lets the month cap shape the session profile too (#356)', async () => {
+    let first = true;
+    fake = new ScriptedAdapter('fake', () => {
+      if (first) {
+        first = false;
+        return { do: 'error', message: 'transient' };
+      }
+      return { do: 'reply', text: 'done' };
+    });
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: {
+          worker: {
+            adapter: 'fake',
+            model: 'cheap',
+            effort: 'medium',
+            max_effort: 'high',
+            escalate_effort_on_retry: true,
+          },
+        },
+        budget: { api_key_per_month_usd: 200 },
+      },
+      // Other repos spent $190 of the month's $200.
+      monthSpendElsewhere: () => 190,
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const reasons = ofType('worker.profile', `${id}/1`).map(
+      (e) => e.data as { effort?: string; reasons: { effort: string } },
+    );
+    expect(reasons.map((r) => r.effort)).toEqual(['medium', 'medium']);
+    expect(reasons[1]?.reasons.effort).toMatch(/\$10\.00 of this month's \$200\.00 budget left/);
   });
 
   it('enforces the month cap across the repos registered with the Conductor', async () => {

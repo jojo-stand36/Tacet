@@ -37,6 +37,15 @@ export interface CostLedger {
   exceeded: Record<string, BudgetExceeded>;
   /** Worker session id → the model it ran on, for usage events that name none. */
   sessionModels: Record<string, string>;
+  /** Worker session id → its session profile (`profileKey`), from its latest `worker.profile`. */
+  sessionProfiles: Record<string, string>;
+  /**
+   * `profileKey` → spend of the Worker sessions that ran on that profile (#356): what each
+   * model, effort and context window cost. Sessions with no `worker.profile` (the planner, the
+   * gate's reasoning, the reviewer) are not in it. A reported cost goes to the session's latest
+   * profile. The key is for display: not a stable API.
+   */
+  profiles: Record<string, Spend>;
   /** `scope:key` → the soft thresholds the user was already told about. */
   thresholds: Record<string, number[]>;
   /** Model → the latest question about running it with no known cost, and its answer. */
@@ -50,13 +59,55 @@ export interface CostLedger {
   provisional: Record<string, Provisional[]>;
 }
 
-/** A session's provisional estimates in one set of buckets (root task and UTC day, so month). */
+/**
+ * A session's provisional estimates in one set of buckets (root task and UTC day, so month, and
+ * its profile at the time).
+ */
 interface Provisional {
   root: string;
   day: string;
   month: string;
+  profile?: string | undefined;
   usd: number;
   tokens: number;
+}
+
+/**
+ * The key a session profile's spend is kept under (#356): model, effort and context window, each
+ * `default` when the profile left it to the vendor.
+ */
+export function profileKey(p: {
+  model?: string | undefined;
+  effort?: string | undefined;
+  contextWindow?: number | undefined;
+}): string {
+  return `${p.model ?? 'default model'} / effort ${p.effort ?? 'default'} / window ${p.contextWindow ?? 'default'}`;
+}
+
+/** Config's `budget` caps, as `capOf` reads them. */
+export interface BudgetCaps {
+  per_task_usd?: number | undefined;
+  per_day_usd?: number | undefined;
+  api_key_per_month_usd?: number | undefined;
+}
+
+/**
+ * The cap on one budget (#35, #356), or undefined when there is none: a raise the user made
+ * (`budget.raised`) wins, then for a task its own budget (`taskBudgetUsd`, `task.budget.usd` of
+ * the root task), then config's. One rule for the hard caps and the escalation gate.
+ */
+export function capOf(
+  ledger: CostLedger,
+  scope: BudgetScope,
+  key: string,
+  caps: BudgetCaps | undefined,
+  taskBudgetUsd?: number,
+): number | undefined {
+  const raised = ledger.raised[budgetKey(scope, key)];
+  if (raised !== undefined) return raised;
+  if (scope === 'task') return taskBudgetUsd ?? caps?.per_task_usd;
+  if (scope === 'day') return caps?.per_day_usd;
+  return caps?.api_key_per_month_usd;
 }
 
 /** The ledger key for a cap: `task:<root>`, `day:<YYYY-MM-DD>` or `month:<YYYY-MM>`. */
@@ -122,6 +173,8 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
       raised: {},
       exceeded: {},
       sessionModels: {},
+      sessionProfiles: {},
+      profiles: {},
       thresholds: {},
       unpriced: {},
       provisional: {},
@@ -131,10 +184,21 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
         case 'worker.started':
         case 'worker.profile': {
           const d = (e.type === 'worker.started' ? WorkerStarted : WorkerProfile).safeParse(e.data);
-          if (!d.success || !d.data.model) return state;
+          if (!d.success) return state;
+          const p = e.type === 'worker.profile' ? WorkerProfile.safeParse(e.data) : undefined;
+          const next = p?.success
+            ? {
+                ...state,
+                sessionProfiles: {
+                  ...state.sessionProfiles,
+                  [p.data.sessionId]: profileKey(p.data),
+                },
+              }
+            : state;
+          if (!d.data.model) return next;
           return {
-            ...state,
-            sessionModels: { ...state.sessionModels, [d.data.sessionId]: d.data.model },
+            ...next,
+            sessionModels: { ...next.sessionModels, [d.data.sessionId]: d.data.model },
           };
         }
         case 'agent.usage': {
@@ -156,13 +220,17 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
               const tasks = { ...state.tasks };
               const days = { ...state.days };
               const months = { ...state.months };
+              const profiles = { ...state.profiles };
               for (const b of back) {
                 tasks[b.root] = remove(tasks[b.root], b.usd, b.tokens);
                 days[b.day] = remove(days[b.day], b.usd, b.tokens);
                 months[b.month] = remove(months[b.month], b.usd, b.tokens);
+                if (b.profile !== undefined) {
+                  profiles[b.profile] = remove(profiles[b.profile], b.usd, b.tokens);
+                }
               }
               const { [sid]: _settled, ...provisional } = state.provisional;
-              next = { ...state, tasks, days, months, provisional };
+              next = { ...state, tasks, days, months, profiles, provisional };
             }
           } else {
             // The price in force on the event's UTC day: a promotion ends, a later price or
@@ -180,16 +248,20 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
           const root = rootTaskId(e.taskId);
           const day = e.ts.slice(0, 10);
           const month = e.ts.slice(0, 7);
+          const profile = sid ? next.sessionProfiles[sid] : undefined;
           // Kept as running sums per bucket, so a long session's estimates stay a few entries.
           let provisional = next.provisional;
           if (sid && costUsd === undefined) {
             const shares = [...(next.provisional[sid] ?? [])];
-            const i = shares.findIndex((p) => p.root === root && p.day === day);
+            const i = shares.findIndex(
+              (p) => p.root === root && p.day === day && p.profile === profile,
+            );
             const prior = i < 0 ? undefined : shares[i];
             const share = {
               root,
               day,
               month,
+              profile,
               usd: (prior?.usd ?? 0) + estimated,
               tokens: (prior?.tokens ?? 0) + unpriced,
             };
@@ -209,6 +281,14 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
               ...next.months,
               [month]: add(next.months[month], usd, estimated, unpriced, model),
             },
+            ...(profile !== undefined
+              ? {
+                  profiles: {
+                    ...next.profiles,
+                    [profile]: add(next.profiles[profile], usd, estimated, unpriced, model),
+                  },
+                }
+              : {}),
           };
         }
         case 'budget.exceeded': {

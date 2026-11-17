@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { project } from '../events/projection.js';
 import type { EventEnvelope } from '../schema/envelope.js';
-import { budgetKey, costLedgerProjection, rootTaskId } from './ledger.js';
+import { budgetKey, capOf, costLedgerProjection, profileKey, rootTaskId } from './ledger.js';
 import { BUILTIN_PRICES, costOf, type PricingTable, priceFor, priceOn } from './pricing.js';
 
 describe('priceFor (#35)', () => {
@@ -368,6 +368,44 @@ describe('costLedgerProjection (#35)', () => {
         if ('billedAs' in l) expect(priceFor(l.billedAs, BUILTIN_PRICES), model).toBeDefined();
       }
     }
+  });
+
+  it('takes a cap from a raise, then the task budget, then config (#356)', () => {
+    const caps = { per_task_usd: 3, per_day_usd: 20, api_key_per_month_usd: 200 };
+    const none = ledger([]);
+    expect(capOf(none, 'task', 'T', caps)).toBe(3);
+    expect(capOf(none, 'task', 'T', caps, 1.5)).toBe(1.5);
+    expect(capOf(none, 'task', 'T', undefined)).toBeUndefined();
+    expect(capOf(none, 'day', '2026-11-16', caps)).toBe(20);
+    expect(capOf(none, 'month', '2026-11', caps)).toBe(200);
+    const raised = ledger([env('budget.raised', { scope: 'task', key: 'T', capUsd: 9 })]);
+    expect(capOf(raised, 'task', 'T', caps, 1.5)).toBe(9);
+    expect(capOf(raised, 'task', 'U', caps, 1.5)).toBe(1.5);
+  });
+
+  it('keeps spend per session profile, with reported costs replacing estimates (#356)', () => {
+    const fast = { model: 'claude-sonnet-5-5', effort: 'low' };
+    const deep = { model: 'claude-opus-5-5', effort: 'high', contextWindow: 1_000_000 };
+    const R = { model: 'm', effort: 'e', contextWindow: 'w' };
+    const l = ledger([
+      env('worker.profile', { sessionId: 'a', ...fast, reasons: R }, { taskId: 'T/1' }),
+      env('worker.profile', { sessionId: 'b', ...deep, reasons: R }, { taskId: 'T/2' }),
+      // a: two calls priced from the table ($2 each), then the turn's real cost.
+      usage({ inputTokens: 1_000_000, outputTokens: 0 }, { taskId: 'T/1', sessionId: 'a' }),
+      usage({ inputTokens: 1_000_000, outputTokens: 0 }, { taskId: 'T/1', sessionId: 'a' }),
+      // A session with no profile recorded: in the task's spend only.
+      usage({ inputTokens: 0, outputTokens: 0, costUsd: 3 }, { taskId: 'T/1', sessionId: 'b2' }),
+      usage({ inputTokens: 0, outputTokens: 0, costUsd: 3.5 }, { taskId: 'T/1', sessionId: 'a' }),
+      // b: one estimate, no report: $4.
+      usage({ inputTokens: 1_000_000, outputTokens: 0 }, { taskId: 'T/2', sessionId: 'b' }),
+      // The planner has no profile: in the task's spend, not in a profile's.
+      usage({ inputTokens: 0, outputTokens: 0, costUsd: 1 }, { taskId: 'T' }),
+    ]);
+    expect(profileKey(fast)).toBe('claude-sonnet-5-5 / effort low / window default');
+    expect(l.profiles[profileKey(fast)]).toMatchObject({ usd: 3.5, estimatedUsd: 0 });
+    expect(l.profiles[profileKey(deep)]).toMatchObject({ usd: 4, estimatedUsd: 4 });
+    expect(Object.keys(l.profiles)).toHaveLength(2);
+    expect(l.tasks.T?.usd).toBe(11.5);
   });
 
   it('keeps the latest exceeded cap until the user raises it', () => {

@@ -1,6 +1,6 @@
 import { NO_ESCALATIONS } from '@tacet/core';
 import { describe, expect, it } from 'vitest';
-import { formatEscalationStats } from './commands/read.js';
+import { formatCostByProfile, formatEscalationStats } from './commands/read.js';
 
 describe('the escalation line of tacet status (#25)', () => {
   const stats = (more: Partial<typeof NO_ESCALATIONS>) => ({ ...NO_ESCALATIONS, ...more });
@@ -42,5 +42,28 @@ describe('the escalation line of tacet status (#25)', () => {
     expect(formatEscalationStats(stats({ raisedByMini: 1 }))).toBe(
       '0 from Workers, 1 from the Mini-conductor',
     );
+  });
+});
+
+describe('the cost by profile lines of tacet status (#356)', () => {
+  it('lists each profile, the most spent first, with estimates and unpriced tokens', () => {
+    const spend = (usd: number, estimatedUsd = 0, unpricedTokens = 0) => ({
+      usd,
+      estimatedUsd,
+      unpricedTokens,
+      unpricedModels: unpricedTokens > 0 ? ['x'] : [],
+    });
+    expect(
+      formatCostByProfile({
+        'a / effort low / window default': spend(1.5),
+        'b / effort high / window 1000000': spend(4, 4),
+        'c / effort default / window default': spend(0, 0, 120),
+        'empty / effort default / window default': spend(0),
+      }),
+    ).toEqual([
+      'b / effort high / window 1000000: $4.00 ($4.00 estimated)',
+      'a / effort low / window default: $1.50',
+      'c / effort default / window default: $0.00, 120 tokens with no known cost',
+    ]);
   });
 });

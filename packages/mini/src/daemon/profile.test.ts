@@ -128,3 +128,45 @@ describe('chooseProfile (#110)', () => {
     expect(afterRefusal(raised, 'model', 'worker', tier)).toBeUndefined();
   });
 });
+
+describe('chooseProfile with little budget left (#356)', () => {
+  const base = (headroom?: ProfileInput['headroom']) =>
+    chooseProfile(
+      input(
+        {
+          adapter: 'a',
+          model: 'm',
+          effort: 'low',
+          max_effort: 'high',
+          escalate_effort_on_retry: true,
+          max_context_window: 1_000_000,
+        },
+        { failedAttempts: 1, indivisible: true, ...(headroom ? { headroom } : {}) },
+      ),
+    );
+
+  it('raises no effort and opens no larger window, and says why', () => {
+    const p = base({ scope: 'task', leftUsd: 2, capUsd: 10 });
+    expect(p.effort).toBe('low');
+    expect(p.contextWindow).toBeUndefined();
+    expect(p.reasons.effort).toBe(
+      "tiers.worker.effort; not raised after 1 failed attempt(s): $2.00 of the task's $10.00 budget left",
+    );
+    expect(p.reasons.contextWindow).toBe(
+      "default; indivisible, but $2.00 of the task's $10.00 budget left",
+    );
+    expect(base({ scope: 'month', leftUsd: 10, capUsd: 200 }).reasons.effort).toMatch(
+      /\$10\.00 of this month's \$200\.00 budget left/,
+    );
+    expect(base({ scope: 'day', leftUsd: -1, capUsd: 4 }).reasons.effort).toMatch(
+      /\$0\.00 of today's \$4\.00 budget left/,
+    );
+  });
+
+  it('chooses as before with a quarter or more left, or no cap', () => {
+    for (const p of [base({ scope: 'task', leftUsd: 2.5, capUsd: 10 }), base()]) {
+      expect(p.effort).toBe('medium');
+      expect(p.contextWindow).toBe(1_000_000);
+    }
+  });
+});

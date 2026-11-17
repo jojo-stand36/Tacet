@@ -1,4 +1,12 @@
-import { type TacetConfig, tasksProjection } from '@tacet/core';
+import {
+  budgetKey,
+  capOf,
+  costLedgerProjection,
+  pricingTable,
+  rootTaskId,
+  type TacetConfig,
+  tasksProjection,
+} from '@tacet/core';
 import type { EventStore } from '@tacet/core/node';
 import type { AsideUsage } from '../daemon/daemon.js';
 import type { EscalationGate } from '../mcp/backend.js';
@@ -29,6 +37,11 @@ export interface EscalationGateOptions {
   /** The time the reasoning session may take, for a task. */
   timeoutMs: (taskId: string) => number;
   /**
+   * Whether a hard cap the task spends from is spent (#356): its root task's, today's or this
+   * month's, by the Mini-conductor's own check (`MiniConductor.budgetSpent`). Then no reasoning.
+   */
+  budgetSpent?: (taskId: string) => boolean;
+  /**
    * Reasoning sessions running at once, at most; past it the question goes to the user. Default
    * 2; 0 turns the reasoning step off.
    */
@@ -50,7 +63,9 @@ export const MAX_REASONING_SESSIONS = 2;
  * reasoning: at `medium` only with at least one candidate precedent, which its answer must cite;
  * at `high` also without one. `blocking` questions, approval requests and `always_ask` matches
  * always go to the user. Reasoning is skipped when the task has a budget and less than a tenth
- * of it is left. Its answers are recorded as `source: mini`, never precedent.
+ * of it is left, by the cost ledger's spend and cap, as the hard caps count them, or when any
+ * hard cap it spends from (task, day or month) is spent (#356). Its answers are recorded as
+ * `source: mini`, never precedent.
  */
 export function escalationGate(o: EscalationGateOptions): EscalationGate {
   const alwaysAsk = o.config.escalation?.always_ask ?? [];
@@ -79,6 +94,8 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     // (owner decision, 2026-11-12, relayed by the coordinator).
     const hasOptions = (escalation.options?.length ?? 0) > 0;
     if (autonomy !== 'high' && !hasOptions) return undefined;
+    // Any hard cap spent, as the Mini-conductor counts it: the user answers (#356).
+    if (o.budgetSpent?.(b.taskId)) return undefined;
     // Budgets are the root task's (the user's), and its sub-tasks spend them.
     const rootOf = rootTasks(o.store);
     const root = rootOf(b.taskId);
@@ -86,13 +103,19 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     const rootView = tasks[root];
     const view = tasks[b.taskId];
     if (!rootView || !view) return undefined;
-    const budget = rootView.task.budget?.usd;
+    // The ledger's spend (reported costs and table estimates) against the cap the hard caps use:
+    // a raise, then the task's own budget, then `budget.per_task_usd` (#356).
+    // The ledger keys a task by the part of its id before the first `/` (`rootTaskId`); the gate
+    // finds the root by `parentId`. Sub-task ids are `<root>/<n>` and submitted ids may not hold
+    // a `/`, so the two agree; the ledger's own rule is used for the ledger.
+    const ledger = o.store.replay(costLedgerProjection(pricingTable(o.config.pricing)));
+    const key = rootTaskId(b.taskId);
+    // A cap recorded as spent stays so until the user raises it, as for the hard caps.
+    if (ledger.exceeded[budgetKey('task', key)]) return undefined;
+    const budget = capOf(ledger, 'task', key, o.config.budget, rootView.task.budget?.usd);
     if (budget !== undefined) {
-      let spent = 0;
-      for (const [id, t] of Object.entries(tasks)) {
-        if (rootOf(id) === root) spent += t.usage.costUsd;
-      }
-      if (budget - spent < budget * BUDGET_FLOOR) return undefined;
+      const spent = ledger.tasks[key]?.usd ?? 0;
+      if (budget <= 0 || budget - spent < budget * BUDGET_FLOOR) return undefined;
     }
     const reasoner = o.reasoner;
     if (reasoning >= cap) return undefined;

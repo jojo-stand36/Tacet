@@ -230,6 +230,8 @@ export async function startStandalone(o: StandaloneOptions): Promise<Standalone>
               }
             : {}),
           timeoutMs: (taskId) => gateTimeoutMs(config, effectiveAutonomy(store, config, taskId)),
+          // The same check that stops Workers at a spent cap (#356).
+          budgetSpent: (taskId) => started?.budgetSpent(taskId) ?? false,
         }),
         // A Worker's handoff (#129): the Mini-conductor, made below, decides and reseeds.
         canHandoff: (b) =>

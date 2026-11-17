@@ -20,6 +20,7 @@ import {
   type BudgetScope,
   budgetKey,
   type CostLedger,
+  capOf,
   costLedgerProjection,
   Decision,
   type DecisionScope,
@@ -84,7 +85,7 @@ import {
   WorktreeRefusedError,
   workerRefusal,
 } from './ports.js';
-import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
+import { afterRefusal, type ChosenProfile, chooseProfile, type ProfileInput } from './profile.js';
 import {
   HANDOFF_NOTE,
   inlineHandoffNote,
@@ -655,6 +656,14 @@ export class MiniConductor {
   }
 
   /**
+   * Whether a hard cap `taskId` spends from is spent (#356): its root task's, today's or this
+   * month's, by the same check that stops Workers. False when not running.
+   */
+  budgetSpent(taskId: string): boolean {
+    return this.#started && this.#overBudget(taskId) !== undefined;
+  }
+
+  /**
    * Run a session of the Mini-conductor's own for `taskId` (the escalation gate's reasoning,
    * #25): its process marker recorded first, so a crash leaves nothing running unaccounted for;
    * whatever it left running ended afterwards; aborted when the Mini-conductor stops, and waited
@@ -671,6 +680,10 @@ export class MiniConductor {
     }) => Promise<T>,
   ): Promise<T> {
     if (!this.#started) return Promise.reject(new Error('the Mini-conductor is not running'));
+    // A spent cap holds the Mini-conductor's own sessions too (#356).
+    if (this.budgetSpent(taskId)) {
+      return Promise.reject(new Error(`a budget ${taskId} spends from is spent`));
+    }
     const marker = newWorkerMarker();
     const key = `${label}:${newUlid(this.#now().getTime())}`;
     this.#markers.set(key, marker);
@@ -1845,12 +1858,13 @@ export class MiniConductor {
   /** The cap on a budget instance, or undefined when there is none: a raise wins, then config. */
   #capFor(scope: BudgetScope, key: string): number | undefined {
     const v = this.#state();
-    const raised = v.ledger.raised[budgetKey(scope, key)];
-    if (raised !== undefined) return raised;
-    const b = this.#o.config.budget;
-    if (scope === 'task') return v.tasks[key]?.task.budget?.usd ?? b?.per_task_usd;
-    if (scope === 'day') return b?.per_day_usd;
-    return b?.api_key_per_month_usd;
+    return capOf(
+      v.ledger,
+      scope,
+      key,
+      this.#o.config.budget,
+      scope === 'task' ? v.tasks[key]?.task.budget?.usd : undefined,
+    );
   }
 
   /**
@@ -1899,6 +1913,34 @@ export class MiniConductor {
       }
     }
     return undefined;
+  }
+
+  /**
+   * The tightest of the root task's, today's and this month's budgets for a session profile
+   * (#356): the one with the smaller share left, by the ledger's spend. Nothing when none has a
+   * cap.
+   */
+  #headroom(taskId: string): { headroom?: NonNullable<ProfileInput['headroom']> } {
+    const { ledger } = this.#state();
+    const root = rootTaskId(taskId);
+    const now = this.#now().toISOString();
+    const day = now.slice(0, 10);
+    const month = now.slice(0, 7);
+    let best: NonNullable<ProfileInput['headroom']> | undefined;
+    // The month's cap counts every repo registered with the Conductor, as the hard cap does.
+    for (const [scope, key, spent] of [
+      ['task', root, ledger.tasks[root]?.usd ?? 0],
+      ['day', day, ledger.days[day]?.usd ?? 0],
+      ['month', month, (ledger.months[month]?.usd ?? 0) + this.#elsewhere(month)],
+    ] as const) {
+      const capUsd = this.#capFor(scope, key);
+      if (capUsd === undefined || capUsd <= 0) continue;
+      const leftUsd = Math.round((capUsd - spent) * 1e6) / 1e6;
+      if (!best || leftUsd / capUsd < best.leftUsd / best.capUsd) {
+        best = { scope, leftUsd, capUsd };
+      }
+    }
+    return best ? { headroom: best } : {};
   }
 
   /** Any hard cap applies to `taskId` at all (for the unpriced-model question). */
@@ -2229,6 +2271,7 @@ export class MiniConductor {
         capabilities: worker.adapter.capabilities(),
         failedAttempts: failed,
         indivisible: v.indivisible.has(subtaskId),
+        ...this.#headroom(subtaskId),
       });
     } catch (err) {
       this.#o.store.append(

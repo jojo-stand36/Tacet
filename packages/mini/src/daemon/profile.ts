@@ -24,6 +24,24 @@ export interface ProfileInput {
   failedAttempts: number;
   /** The planner marked the sub-task as one that cannot be handed off cleanly part-way. */
   indivisible: boolean;
+  /**
+   * The tightest budget the session spends from, by the cost ledger (#356): the root task's,
+   * today's or this month's, whichever has the smallest share left. Absent when none has a cap.
+   */
+  headroom?: { scope: 'task' | 'day' | 'month'; leftUsd: number; capUsd: number };
+}
+
+/**
+ * Below this share of a budget left, a session gets no more than the tier asks for: no effort
+ * raised on a retry, no larger context window (#356).
+ */
+export const LOW_HEADROOM = 0.25;
+
+/** "$1.20 of the task's $10.00 budget left", or undefined when headroom is not low. */
+function lowHeadroom(h: ProfileInput['headroom']): string | undefined {
+  if (!h || h.capUsd <= 0 || h.leftUsd >= h.capUsd * LOW_HEADROOM) return undefined;
+  const whose = h.scope === 'task' ? "the task's" : h.scope === 'day' ? "today's" : "this month's";
+  return `$${Math.max(0, h.leftUsd).toFixed(2)} of ${whose} $${h.capUsd.toFixed(2)} budget left`;
 }
 
 /** A profile outside the configured bounds: refused before launch. */
@@ -42,7 +60,9 @@ export class ProfileOutOfBoundsError extends Error {
  *   indivisible sub-task, when `max_context_window` allows it: the largest size the adapter lists
  *   that fits.
  *
- * Budget headroom is not an input yet: the cost ledger is #35.
+ * - Budget headroom (#356): with less than a quarter of the task's, today's or this month's
+ *   budget left, no effort is raised on a retry and no larger window is chosen, and the
+ *   reasons say so.
  */
 export function chooseProfile(i: ProfileInput): ChosenProfile {
   const { role, tier } = i;
@@ -71,7 +91,10 @@ export function chooseProfile(i: ProfileInput): ChosenProfile {
     }
     let rank = base;
     effortWhy = `${at}.effort`;
-    if (tier.escalate_effort_on_retry && i.failedAttempts > 0) {
+    const low = lowHeadroom(i.headroom);
+    if (tier.escalate_effort_on_retry && i.failedAttempts > 0 && low !== undefined) {
+      effortWhy = `${at}.effort; not raised after ${i.failedAttempts} failed attempt(s): ${low}`;
+    } else if (tier.escalate_effort_on_retry && i.failedAttempts > 0) {
       if (max === undefined) {
         // Config validation rejects this combination; kept for direct callers.
         effortWhy += `; not raised after ${i.failedAttempts} failed attempt(s): no ${at}.max_effort`;
@@ -101,7 +124,10 @@ export function chooseProfile(i: ProfileInput): ChosenProfile {
   } else {
     const cap = tier.max_context_window;
     const fits = (i.capabilities.contextSizes ?? []).filter((n) => n <= cap);
-    if (fits.length === 0) {
+    const low = lowHeadroom(i.headroom);
+    if (low !== undefined) {
+      windowWhy = `default; indivisible, but ${low}`;
+    } else if (fits.length === 0) {
       windowWhy = `default; indivisible, but the adapter offers no window up to ${cap}`;
     } else {
       out.contextWindow = Math.max(...fits);

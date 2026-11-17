@@ -1,12 +1,21 @@
 import {
+  costLedgerProjection,
   type EscalationStats,
   escalationStats,
   NO_ESCALATIONS,
+  type PricingTable,
+  pricingTable,
+  type Spend,
   statusEntries,
   type TaskStatusEntry,
   TaskTarget,
 } from '@tacet/core';
-import type { EventStore, RepoStatePaths, StoredEvent } from '@tacet/core/node';
+import {
+  type EventStore,
+  loadConfig,
+  type RepoStatePaths,
+  type StoredEvent,
+} from '@tacet/core/node';
 import { liveControl, livePty, liveStatus } from '../control.js';
 import type { Io } from '../io.js';
 import { OscFilter } from '../osc-filter.js';
@@ -14,6 +23,7 @@ import {
   formatEvent,
   formatStatusEntry,
   isSummaryEvent,
+  oneLine,
   safeJson,
   terminalSafe,
 } from '../render.js';
@@ -102,6 +112,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
             tasks: [],
             problems: [],
             escalations: { last7Days: NO_ESCALATIONS, total: NO_ESCALATIONS },
+            costByProfile: {},
           }),
         );
       } else io.out(`no Tacet state for ${repoRoot}`);
@@ -117,6 +128,9 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   const problems = readProblems(paths);
   // From the log too: how many escalations the gate kept from the user (#25).
   const escalations = readEscalationStats(paths);
+  // And what each Worker session profile cost (#356).
+  const prices = pricesFor(repoRoot, o['user-dir']);
+  const profiles = readCostByProfile(paths, prices.table);
   if (o.json) {
     io.out(
       safeJson({
@@ -125,6 +139,8 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
         tasks,
         problems: problems.map(problemJson),
         escalations,
+        costByProfile: profiles,
+        ...(prices.note ? { costByProfileNote: prices.note } : {}),
       }),
     );
     return 0;
@@ -145,7 +161,59 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
     io.out(`escalations, last 7 days: ${formatEscalationStats(escalations.last7Days)}`);
     io.out(`escalations, in all: ${formatEscalationStats(escalations.total)}`);
   }
+  const lines = formatCostByProfile(profiles);
+  if (lines.length > 0) {
+    io.out('cost by session profile, in all:');
+    if (prices.note) io.out(`  ${terminalSafe(prices.note)}`);
+    for (const l of lines) io.out(`  ${l}`);
+  }
   return 0;
+}
+
+/**
+ * The prices the run uses: built in, with the user's `pricing:` over them (#35). When the config
+ * cannot be read, the built-in ones, and a note that says so: they may differ from the run's.
+ */
+export function pricesFor(
+  repoRoot: string,
+  userDir: string | undefined,
+): { table: PricingTable; note?: string } {
+  try {
+    const { config } = loadConfig({ repoRoot, ...(userDir ? { userDir } : {}) });
+    return { table: pricingTable(config.pricing) };
+  } catch (err) {
+    return {
+      table: pricingTable(undefined),
+      note: `priced with the built-in prices only: the config could not be read (${oneLine((err as Error).message, 200)})`,
+    };
+  }
+}
+
+/** Spend per Worker session profile, from the log (#356); none without a log. */
+export function readCostByProfile(
+  paths: Parameters<typeof openLog>[0],
+  prices: PricingTable,
+): Record<string, Spend> {
+  const store = openLog(paths);
+  if (!store) return {};
+  try {
+    return store.replay(costLedgerProjection(prices)).profiles;
+  } finally {
+    store.close();
+  }
+}
+
+/** One line per profile, the most spent first: its spend, and tokens with no known cost. */
+export function formatCostByProfile(profiles: Record<string, Spend>): string[] {
+  return Object.entries(profiles)
+    .filter(([, s]) => s.usd > 0 || s.unpricedTokens > 0)
+    .sort(([, a], [, b]) => b.usd - a.usd)
+    .map(([key, s]) => {
+      const estimated = s.estimatedUsd > 0 ? ` ($${s.estimatedUsd.toFixed(2)} estimated)` : '';
+      const unpriced =
+        s.unpricedTokens > 0 ? `, ${s.unpricedTokens} tokens with no known cost` : '';
+      return terminalSafe(`${key}: $${s.usd.toFixed(2)}${estimated}${unpriced}`);
+    });
 }
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
