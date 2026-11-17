@@ -7,7 +7,7 @@ import { type EventStore, WORKER_MARKER_VAR } from '@tacet/core/node';
 import { z } from 'zod';
 import { type WorkerAdapter, workerRefusal } from '../daemon/ports.js';
 import { unfence } from '../daemon/reply.js';
-import { sessionTurns } from '../daemon/turns.js';
+import { cacheFields, sessionTurns, type TurnUsage } from '../daemon/turns.js';
 import { normalizeQuestion, rootTasks } from './gate.js';
 
 /**
@@ -250,7 +250,14 @@ export interface ReasonRequest {
 /** The reasoning step's outcome and what its session used. */
 export interface ReasonResult {
   verdict: ReasonedVerdict;
-  usage: { inputTokens: number; outputTokens: number; costUsd?: number; model?: string };
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    costUsd?: number;
+    model?: string;
+  };
 }
 
 /**
@@ -275,10 +282,11 @@ export class AdapterReasoner {
   }
 
   async reason(req: ReasonRequest): Promise<ReasonResult> {
-    const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    const usage: TurnUsage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
     const usageOut = () => ({
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
+      ...cacheFields(usage),
       ...(usage.costUsd > 0 ? { costUsd: Math.round(usage.costUsd * 1e6) / 1e6 } : {}),
       ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
     });

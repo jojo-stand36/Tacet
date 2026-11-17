@@ -89,16 +89,37 @@ function finished(
  */
 export function turnUsage(r: PromptResponse, st: TurnState): AgentEvent | undefined {
   const u = (r as { usage?: unknown }).usage as
-    | { inputTokens?: unknown; outputTokens?: unknown }
+    | {
+        inputTokens?: unknown;
+        outputTokens?: unknown;
+        cachedReadTokens?: unknown;
+        cachedWriteTokens?: unknown;
+        totalTokens?: unknown;
+      }
     | undefined;
   const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined);
   const input = n(u?.inputTokens);
   const output = n(u?.outputTokens);
   if (input === undefined || output === undefined) return undefined;
+  // The draft's cache counts (#355). Agents differ on whether `inputTokens` counts them:
+  // claude-agent-acp 0.101.0 reports Anthropic's `input_tokens`, which leaves the cache out, and a
+  // `totalTokens` with the cache added; Gemini CLI 0.67.0 reports its `promptTokenCount`, cache
+  // included, and a `totalTokens` of input plus output. So the cache is added to the input only
+  // when the total says it is not in it.
+  const read = n(u?.cachedReadTokens) ?? 0;
+  const write = n(u?.cachedWriteTokens) ?? 0;
+  const total = n(u?.totalTokens);
+  const outside = total !== undefined && read + write > 0 && total >= input + output + read + write;
+  const inputTokens = outside ? input + read + write : input;
+  // Never more cache than input.
+  const cacheRead = Math.min(read, inputTokens);
+  const cacheWrite = Math.min(write, inputTokens - cacheRead);
   return {
     t: 'usage',
-    inputTokens: input,
+    inputTokens,
     outputTokens: output,
+    ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
+    ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
     // The gauges as last reported: still the context's size at the end of the turn.
     ...(st.context ? { contextUsed: st.context.used, contextMax: st.context.size } : {}),
     source: 'reported',

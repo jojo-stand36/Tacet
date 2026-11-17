@@ -159,6 +159,9 @@ export class ScriptedAdapter implements AgentAdapter {
     return this.#open.size;
   }
 
+  /** Added to the usage a `reply` step reports, e.g. its cache counts (#355). */
+  replyUsage: { cacheReadTokens?: number; cacheWriteTokens?: number } = {};
+
   async #turn(s: FakeSession, input: string): Promise<void> {
     if (!this.#open.has(s)) return;
     this.#emit(s, { t: 'status', state: 'running' });
@@ -167,7 +170,13 @@ export class ScriptedAdapter implements AgentAdapter {
       for (const part of step.text.match(/\S+\s*/g) ?? [step.text]) {
         this.#emit(s, { t: 'message.delta', text: part });
       }
-      this.#emit(s, { t: 'usage', inputTokens: 10, outputTokens: 2, source: 'estimated' });
+      this.#emit(s, {
+        t: 'usage',
+        inputTokens: 10,
+        outputTokens: 2,
+        ...this.replyUsage,
+        source: 'estimated',
+      });
       this.#emit(s, { t: 'status', state: 'idle' });
     } else if (step.do === 'error') {
       this.#emit(s, { t: 'status', state: 'error', message: step.message });

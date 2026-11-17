@@ -263,7 +263,15 @@ export interface PlanResult {
   rationale?: string;
   planner?: { sessionId?: string; adapter?: string; model?: string };
   /** Tokens and cost the planning used, charged to the planned task. */
-  usage?: { inputTokens: number; outputTokens: number; costUsd?: number; model?: string };
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    /** Of `inputTokens`, read from and written to the prompt cache (#355). */
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    costUsd?: number;
+    model?: string;
+  };
 }
 
 export interface Planner {

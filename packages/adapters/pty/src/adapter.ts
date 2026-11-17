@@ -1010,6 +1010,8 @@ export class PtyAdapter implements AgentAdapter {
         t: 'usage',
         inputTokens: c.inputTokens,
         outputTokens: c.outputTokens,
+        ...(c.cacheReadTokens > 0 ? { cacheReadTokens: c.cacheReadTokens } : {}),
+        ...(c.cacheWriteTokens > 0 ? { cacheWriteTokens: c.cacheWriteTokens } : {}),
         ...(max !== undefined ? { contextUsed: c.contextUsed, contextMax: max } : {}),
         ...(c.model !== undefined ? { model: c.model } : {}),
         source: 'reported',

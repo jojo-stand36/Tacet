@@ -237,7 +237,10 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
             // another model's takes over (#363).
             const price = priceOn(model, e.ts.slice(0, 10), table);
             if (price) {
-              estimated = costOf(price, inputTokens, outputTokens);
+              estimated = costOf(price, inputTokens, outputTokens, {
+                read: u.data.cacheReadTokens,
+                write: u.data.cacheWriteTokens,
+              });
               usd = estimated;
             } else unpriced = inputTokens + outputTokens;
           }

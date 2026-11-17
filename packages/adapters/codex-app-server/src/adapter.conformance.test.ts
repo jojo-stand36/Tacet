@@ -100,6 +100,13 @@ describe('CodexAppServerAdapter conformance (real codex, mock Responses API)', (
     const h1 = await adapter.start({ cwd: worktree, model: 'gpt-5.5' });
     const tap1 = new EventTap(adapter.events(h1));
     expect(await turn(h1, tap1, 'SAY first', { effort: 'low' })).toBe('You said first.');
+    // The mock API reports 100 input tokens, 20 of them cached: the real binary's usage keeps the
+    // cached ones within `inputTokens` and names them (#355).
+    expect(tap1.events.find((e) => e.t === 'usage')).toMatchObject({
+      inputTokens: 100,
+      cacheReadTokens: 20,
+      outputTokens: 10,
+    });
     expect(await turn(h1, tap1, 'SAY second', { effort: 'high' })).toBe('You said second.');
     expect(api.requests.findLast((r) => r.text === 'SAY first')?.effort).toBe('low');
     expect(api.requests.findLast((r) => r.text === 'SAY second')?.effort).toBe('high');

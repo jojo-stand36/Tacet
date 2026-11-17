@@ -166,6 +166,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 
 - [ ] **Epic: Context handoff and cost tiering** — `epic` `P0` `human`
 - [ ] **Automatic handoff: thresholds, packet generation, validation, reseed** — `feature` `P0` `claude`
+- [ ] **Cache rates in the user's `pricing:` config** — `feature` `P3` `either`
 - [ ] **Conductor & mini-conductor self-handoff** — `feature` `P1` `either`
 - [ ] **Context usage tracking per session** — `feature` `P0` `either`
 - [ ] **Cost ledger + budgets (per task/repo/day)** — `feature` `P1` `copilot`
@@ -178,6 +179,7 @@ Token-budget-driven fresh-session handoffs, model tiers, escalation ladder, cost
 - [ ] **Model tier policies and per-task overrides** — `feature` `P0` `either`
 - [ ] **PTY Workers: context-pressure injection through a UserPromptSubmit hook** — `feature` `P2` `claude`
 - [ ] **Per-session model, effort and context-size selection** — `feature` `P1` `claude`
+- [ ] **Price 1-hour Anthropic cache writes at the 1-hour rate** — `feature` `P3` `either`
 - [ ] **Threshold handoff for Workers without an MCP client** — `feature` `claude`
 - [ ] **Usage events: split out cache reads and writes, so the cost ledger can price them** — `feature` `P2` `claude`
 - [ ] **Use the cost ledger's headroom in the escalation gate and the session profile** — `feature` `P2` `claude`

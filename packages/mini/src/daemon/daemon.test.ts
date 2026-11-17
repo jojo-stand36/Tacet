@@ -2247,6 +2247,7 @@ describe('planning', () => {
       do: 'reply',
       text: replies.shift() ?? '',
     }));
+    planner.replyUsage = { cacheReadTokens: 8 };
     const p = new AdapterPlanner({
       worker: { adapter: planner, authRoute: 'api_key' },
       adapterId: 'planner',
@@ -2262,6 +2263,9 @@ describe('planning', () => {
     });
     expect(plan.subtasks).toEqual([{ key: 'x', goal: 'X', acceptanceCriteria: ['done'] }]);
     expect(plan.planner).toMatchObject({ adapter: 'planner', model: 'mid' });
+    // Each of the two turns reported 10 input tokens, 8 of them read from the cache (#355).
+    expect(plan.usage).toMatchObject({ inputTokens: 20, outputTokens: 4, cacheReadTokens: 16 });
+    expect(plan.usage).not.toHaveProperty('cacheWriteTokens');
     expect(planner.sessions[0]?.inputs).toHaveLength(2);
     expect(planner.sessions[0]?.opts.systemPrompt).toContain('never write or change code');
     expect(planner.open).toBe(0);

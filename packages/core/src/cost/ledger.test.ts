@@ -9,6 +9,8 @@ describe('priceFor (#35)', () => {
     expect(priceFor('claude-sonnet-5-5', BUILTIN_PRICES)).toEqual({
       inputPerMTok: 2,
       outputPerMTok: 10,
+      cacheReadPerMTok: 0.1,
+      cacheWritePerMTok: 2.5,
     });
     expect(priceFor('claude-opus-5-5[1m]', BUILTIN_PRICES)?.inputPerMTok).toBe(4);
     // The table holds the dated id; Claude Code may report the undated alias.
@@ -27,6 +29,65 @@ describe('priceFor (#35)', () => {
     ]) {
       expect(priceFor(m, BUILTIN_PRICES), String(m)).toBeUndefined();
     }
+  });
+});
+
+describe('costOf with the cache (#355)', () => {
+  it('prices a cache-heavy claude-sdk usage sequence within 5% of the list-price bill', () => {
+    // An agent loop on Opus 5.5: each call reads the conversation so far from the cache, writes
+    // the newest turn to it, and sends a little uncached input. Usage as claude-sdk reports it:
+    // `inputTokens` counts all three, the cache fields say how much of it was cache.
+    const calls = Array.from({ length: 40 }, (_, i) => ({
+      uncached: 300,
+      read: 20_000 + i * 2_500,
+      write: 2_500,
+      output: 800,
+    }));
+    const l = project(
+      costLedgerProjection(BUILTIN_PRICES),
+      calls.map((c) =>
+        usage(
+          {
+            inputTokens: c.uncached + c.read + c.write,
+            outputTokens: c.output,
+            cacheReadTokens: c.read,
+            cacheWriteTokens: c.write,
+            model: 'claude-opus-5-5',
+          },
+          { taskId: 'T/1', sessionId: 's' },
+        ),
+      ),
+    );
+    // The bill at list price: $4 input, $0.20 cache read, $5 cache write (5 minutes), $20 output.
+    const bill = calls.reduce(
+      (sum, c) => sum + (c.uncached * 4 + c.read * 0.2 + c.write * 5 + c.output * 20) / 1e6,
+      0,
+    );
+    const priced = l.tasks.T?.usd ?? 0;
+    expect(Math.abs(priced - bill) / bill).toBeLessThan(0.05);
+    // Without the split it would be several times the bill.
+    const flat = calls.reduce(
+      (sum, c) => sum + ((c.uncached + c.read + c.write) * 4 + c.output * 20) / 1e6,
+      0,
+    );
+    expect(flat / bill).toBeGreaterThan(3);
+  });
+
+  it('charges cache at the input rate where the price has no cache rate, and never more cache than input', () => {
+    const plain = { inputPerMTok: 1, outputPerMTok: 2 };
+    expect(costOf(plain, 1_000_000, 0, { read: 900_000, write: 50_000 })).toBeCloseTo(1, 9);
+    const p = { inputPerMTok: 1, outputPerMTok: 2, cacheReadPerMTok: 0.1, cacheWritePerMTok: 1.25 };
+    // A malformed report: more cache than input. The input is all cache read, no write.
+    expect(costOf(p, 100, 0, { read: 500, write: 500 })).toBeCloseTo((100 * 0.1) / 1e6, 12);
+    // Negative counts are no cache.
+    expect(costOf(p, 100, 0, { read: -5 })).toBeCloseTo(100 / 1e6, 12);
+    // The long-context tier has its own cache rate (OpenAI: above 272,000 input tokens).
+    const sol = priceFor('gpt-6.1-sol', BUILTIN_PRICES);
+    if (!sol) throw new Error('no price');
+    expect(costOf(sol, 300_000, 0, { read: 200_000 })).toBeCloseTo(
+      (100_000 * 4 + 200_000 * 0.2) / 1e6,
+      9,
+    );
   });
 });
 
@@ -175,31 +236,45 @@ describe('costLedgerProjection (#35)', () => {
     expect(costOf(pro, 200_000, 1_000_000)).toBeCloseTo(12.4, 9);
     expect(costOf(pro, 200_001, 1_000_000)).toBeCloseTo(18.800004, 9);
     // Every entry as transcribed from the page's Standard tab, paid tier.
-    const tier = (input: number, output: number) => ({
+    const tier = (input: number, output: number, read: number) => ({
       aboveInputTokens: 200_000,
       inputPerMTok: input,
       outputPerMTok: output,
+      cacheReadPerMTok: read,
     });
     for (const [model, price] of Object.entries({
       'gemini-3.8-flash': {
         inputPerMTok: 0.75,
         outputPerMTok: 3.75,
+        cacheReadPerMTok: 0.075,
         until: '2026-12-31',
-        later: [{ from: '2027-01-01', price: { inputPerMTok: 1.5, outputPerMTok: 7.5 } }],
+        later: [
+          {
+            from: '2027-01-01',
+            price: { inputPerMTok: 1.5, outputPerMTok: 7.5, cacheReadPerMTok: 0.15 },
+          },
+        ],
       },
-      'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
-      'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
-      'gemini-3.1-pro-preview': { inputPerMTok: 2, outputPerMTok: 12, longContext: tier(4, 18) },
+      'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5, cacheReadPerMTok: 0.03 },
+      'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5, cacheReadPerMTok: 0.025 },
+      'gemini-3.1-pro-preview': {
+        inputPerMTok: 2,
+        outputPerMTok: 12,
+        cacheReadPerMTok: 0.2,
+        longContext: tier(4, 18, 0.4),
+      },
       'gemini-3.1-pro-preview-customtools': {
         inputPerMTok: 2,
         outputPerMTok: 12,
-        longContext: tier(4, 18),
+        cacheReadPerMTok: 0.2,
+        longContext: tier(4, 18, 0.4),
       },
-      'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3 },
+      'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3, cacheReadPerMTok: 0.05 },
       'gemini-2.5-pro': {
         inputPerMTok: 1.25,
         outputPerMTok: 10,
-        longContext: tier(2.5, 15),
+        cacheReadPerMTok: 0.125,
+        longContext: tier(2.5, 15, 0.25),
         until: '2026-11-30',
         later: [{ from: '2026-12-01', billedAs: 'gemini-3.8-flash' }],
       },
@@ -246,16 +321,19 @@ describe('costLedgerProjection (#35)', () => {
     expect(priceOn('gemini-3.8-flash', '2026-12-31', BUILTIN_PRICES)).toEqual({
       inputPerMTok: 0.75,
       outputPerMTok: 3.75,
+      cacheReadPerMTok: 0.075,
     });
     expect(priceOn('gemini-3.8-flash', '2027-01-01', BUILTIN_PRICES)).toEqual({
       inputPerMTok: 1.5,
       outputPerMTok: 7.5,
+      cacheReadPerMTok: 0.15,
     });
     // Acceptance: 2.5 Pro from 2026-12-01 at 3.8 Flash's rate for that day, which itself changes.
     expect(priceOn('gemini-2.5-pro', '2026-11-30', BUILTIN_PRICES)?.inputPerMTok).toBe(1.25);
     expect(priceOn('gemini-2.5-pro', '2026-12-01', BUILTIN_PRICES)).toEqual({
       inputPerMTok: 0.75,
       outputPerMTok: 3.75,
+      cacheReadPerMTok: 0.075,
     });
     expect(priceOn('gemini-2.5-pro', '2027-02-01', BUILTIN_PRICES)?.outputPerMTok).toBe(7.5);
     // Acceptance: a price whose later rate is not known still ends on its last day.

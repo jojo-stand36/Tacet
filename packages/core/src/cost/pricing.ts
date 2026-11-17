@@ -3,11 +3,27 @@
  * Prices are US dollars per million tokens, standard (not batch or fast) rates.
  */
 export interface ModelPrice {
-  /** Every input token, cache reads and writes included (see `costOf`). */
+  /** Input tokens not read from or written to a cache (see `costOf`). */
   inputPerMTok: number;
   outputPerMTok: number;
+  /** Input tokens read from a cache (#355). Absent: charged at the input rate. */
+  cacheReadPerMTok?: number;
+  /**
+   * Input tokens written to a cache, at the shortest cache lifetime the vendor prices (#355):
+   * Anthropic's 5 minutes, OpenAI's 30 minutes. A write that lives longer costs more and is
+   * undercounted. Absent: charged at the input rate.
+   */
+  cacheWritePerMTok?: number;
   /** A higher rate for a request whose prompt is longer than `aboveInputTokens`. */
-  longContext?: { aboveInputTokens: number; inputPerMTok: number; outputPerMTok: number };
+  longContext?: {
+    aboveInputTokens: number;
+    inputPerMTok: number;
+    outputPerMTok: number;
+    /** Absent: the tier's input rate. */
+    cacheReadPerMTok?: number;
+    /** Absent: the tier's input rate. */
+    cacheWritePerMTok?: number;
+  };
   /**
    * The last UTC day (`YYYY-MM-DD`) this price holds, for a promotional price: usage after it has
    * no known price, rather than the promotion's, unless `later` says what follows (#363).
@@ -43,78 +59,133 @@ export const BUILTIN_PRICES_CHECKED = '2026-11-16';
  * all on 2026-11-16. A model not here has no known cost and is never guessed.
  */
 export const BUILTIN_PRICES: PricingTable = {
-  'claude-fable-5-2': { inputPerMTok: 8, outputPerMTok: 40 },
-  'claude-fable-5-1': { inputPerMTok: 10, outputPerMTok: 50 },
-  'claude-fable-5': { inputPerMTok: 10, outputPerMTok: 50 },
-  'claude-opus-5-5': { inputPerMTok: 4, outputPerMTok: 20 },
-  'claude-opus-5': { inputPerMTok: 5, outputPerMTok: 25 },
-  'claude-opus-4-8': { inputPerMTok: 5, outputPerMTok: 25 },
-  'claude-opus-4-7': { inputPerMTok: 5, outputPerMTok: 25 },
-  'claude-opus-4-6': { inputPerMTok: 5, outputPerMTok: 25 },
-  'claude-opus-4-5-20251101': { inputPerMTok: 5, outputPerMTok: 25 },
-  'claude-sonnet-5-5': { inputPerMTok: 2, outputPerMTok: 10 },
-  'claude-sonnet-5': { inputPerMTok: 2, outputPerMTok: 10 },
-  'claude-sonnet-4-6': { inputPerMTok: 3, outputPerMTok: 15 },
-  'claude-sonnet-4-5-20250929': { inputPerMTok: 3, outputPerMTok: 15 },
+  // Anthropic: input, output, cache read, cache write (5 minutes).
+  'claude-fable-5-2': claude(8, 40, 0.2, 10),
+  'claude-fable-5-1': claude(10, 50, 0.25, 12.5),
+  'claude-fable-5': claude(10, 50, 1, 12.5),
+  'claude-opus-5-5': claude(4, 20, 0.2, 5),
+  'claude-opus-5': claude(5, 25, 0.5, 6.25),
+  'claude-opus-4-8': claude(5, 25, 0.5, 6.25),
+  'claude-opus-4-7': claude(5, 25, 0.5, 6.25),
+  'claude-opus-4-6': claude(5, 25, 0.5, 6.25),
+  'claude-opus-4-5-20251101': claude(5, 25, 0.5, 6.25),
+  'claude-sonnet-5-5': claude(2, 10, 0.1, 2.5),
+  'claude-sonnet-5': claude(2, 10, 0.2, 2.5),
+  'claude-sonnet-4-6': claude(3, 15, 0.3, 3.75),
+  'claude-sonnet-4-5-20250929': claude(3, 15, 0.3, 3.75),
   'claude-haiku-5-5': {
-    inputPerMTok: 0.1,
-    outputPerMTok: 0.5,
-    longContext: { aboveInputTokens: 100_000, inputPerMTok: 0.5, outputPerMTok: 2.5 },
+    ...claude(0.1, 0.5, 0.01, 0.125),
+    longContext: {
+      aboveInputTokens: 100_000,
+      inputPerMTok: 0.5,
+      outputPerMTok: 2.5,
+      cacheReadPerMTok: 0.05,
+      cacheWritePerMTok: 0.625,
+    },
   },
-  'claude-haiku-4-5-20251001': { inputPerMTok: 1, outputPerMTok: 5 },
+  'claude-haiku-4-5-20251001': claude(1, 5, 0.1, 1.25),
   // OpenAI, read from https://developers.openai.com/api/docs/pricing.md on 2026-11-16, standard
-  // tier ("Short context: ≤272K input tokens. Long context: >272K input tokens.").
-  'gpt-6-astra': openai(10, 50, 20, 75),
-  'gpt-6.1-sol': openai(2, 10, 4, 15),
-  'gpt-6.1-terra': openai(1, 5, 2, 7.5),
-  'gpt-6-luna': openai(0.1, 0.5, 0.2, 0.75),
-  'gpt-6-sol': openai(2, 10, 4, 15),
+  // tier ("Short context: ≤272K input tokens. Long context: >272K input tokens."): input, output,
+  // cached input, cache write (30 minutes), then the long tier's input, output and cached input.
+  'gpt-6-astra': openai(10, 50, 1, 12.5, 20, 75, 2),
+  'gpt-6.1-sol': openai(2, 10, 0.1, 2.5, 4, 15, 0.2),
+  'gpt-6.1-terra': openai(1, 5, 0.05, 1.25, 2, 7.5, 0.1),
+  'gpt-6-luna': openai(0.1, 0.5, 0.01, 0.125, 0.2, 0.75, 0.02),
+  'gpt-6-sol': openai(2, 10, 0.2, 2.5, 4, 15, 0.4),
   // "GPT-5.6 Sol's promotional pricing is available until November 30, 2026."
-  'gpt-5.6-sol': { ...openai(4, 20, 8, 30), until: '2026-11-30' },
-  'gpt-5.6-terra': openai(2, 12, 4, 18),
-  'gpt-5.6-luna': openai(0.2, 1.2, 0.4, 1.8),
-  'gpt-5.5': openai(5, 30, 10, 45),
+  'gpt-5.6-sol': { ...openai(4, 20, 0.4, 5, 8, 30, 0.8), until: '2026-11-30' },
+  'gpt-5.6-terra': openai(2, 12, 0.2, 2.5, 4, 18, 0.4),
+  'gpt-5.6-luna': openai(0.2, 1.2, 0.02, 0.25, 0.4, 1.8, 0.04),
+  // The page lists no cache write rate for GPT-5.5: writes are charged at the input rate.
+  'gpt-5.5': openai(5, 30, 0.5, undefined, 10, 45, 1),
   // Google, read from https://aistudio.google.com/docs/pricing.md on 2026-11-16 (#357): the
   // paid tier's standard rates, text input. Audio input costs more on some models and is not
-  // told apart. "prompts <= 200k tokens" is read as 200,000.
-  // "$0.75 through December 31, 2026. $1.50 starting January 1, 2027." (output $3.75, then $7.50).
+  // told apart. "prompts <= 200k tokens" is read as 200,000. Cache reads at the "context caching"
+  // rate; the page prices no cache write per token (storage is per hour), so writes are charged
+  // at the input rate.
+  // "$0.75 through December 31, 2026. $1.50 starting January 1, 2027." (output $3.75, then $7.50;
+  // caching $0.075, then $0.15).
   'gemini-3.8-flash': {
     inputPerMTok: 0.75,
     outputPerMTok: 3.75,
+    cacheReadPerMTok: 0.075,
     until: '2026-12-31',
-    later: [{ from: '2027-01-01', price: { inputPerMTok: 1.5, outputPerMTok: 7.5 } }],
+    later: [
+      {
+        from: '2027-01-01',
+        price: { inputPerMTok: 1.5, outputPerMTok: 7.5, cacheReadPerMTok: 0.15 },
+      },
+    ],
   },
-  'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5 },
-  'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5 },
+  'gemini-3.5-flash-lite': { inputPerMTok: 0.3, outputPerMTok: 2.5, cacheReadPerMTok: 0.03 },
+  'gemini-3.1-flash-lite': { inputPerMTok: 0.25, outputPerMTok: 1.5, cacheReadPerMTok: 0.025 },
   // The page prices both ids in one section.
-  'gemini-3.1-pro-preview': gemini(2, 12, 4, 18),
-  'gemini-3.1-pro-preview-customtools': gemini(2, 12, 4, 18),
-  'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3 },
+  'gemini-3.1-pro-preview': gemini(2, 12, 0.2, 4, 18, 0.4),
+  'gemini-3.1-pro-preview-customtools': gemini(2, 12, 0.2, 4, 18, 0.4),
+  'gemini-3-flash-preview': { inputPerMTok: 0.5, outputPerMTok: 3, cacheReadPerMTok: 0.05 },
   // Deprecated: "Effective December 1, 2026, all API requests to `gemini-2.5-pro` will
   // automatically route to Gemini 3.8 Flash (`gemini-3.8-flash`) and be billed at Gemini 3.8
   // Flash rates." This price holds through November 30, then it is billed as 3.8 Flash.
   'gemini-2.5-pro': {
-    ...gemini(1.25, 10, 2.5, 15),
+    ...gemini(1.25, 10, 0.125, 2.5, 15, 0.25),
     until: '2026-11-30',
     later: [{ from: '2026-12-01', billedAs: 'gemini-3.8-flash' }],
   },
 };
 
-/** A Gemini price with its tier for prompts above 200k (read as 200,000) tokens. */
-function gemini(input: number, output: number, longInput: number, longOutput: number): ModelPrice {
+/** An Anthropic price: no long-context tier unless given. */
+function claude(input: number, output: number, read: number, write: number): ModelPrice {
   return {
     inputPerMTok: input,
     outputPerMTok: output,
-    longContext: { aboveInputTokens: 200_000, inputPerMTok: longInput, outputPerMTok: longOutput },
+    cacheReadPerMTok: read,
+    cacheWritePerMTok: write,
+  };
+}
+
+/** A Gemini price with its tier for prompts above 200k (read as 200,000) tokens. */
+function gemini(
+  input: number,
+  output: number,
+  read: number,
+  longInput: number,
+  longOutput: number,
+  longRead: number,
+): ModelPrice {
+  return {
+    inputPerMTok: input,
+    outputPerMTok: output,
+    cacheReadPerMTok: read,
+    longContext: {
+      aboveInputTokens: 200_000,
+      inputPerMTok: longInput,
+      outputPerMTok: longOutput,
+      cacheReadPerMTok: longRead,
+    },
   };
 }
 
 /** An OpenAI price with its long-context tier above 272K (read as 272,000) input tokens. */
-function openai(input: number, output: number, longInput: number, longOutput: number): ModelPrice {
+function openai(
+  input: number,
+  output: number,
+  read: number,
+  write: number | undefined,
+  longInput: number,
+  longOutput: number,
+  longRead: number,
+): ModelPrice {
   return {
     inputPerMTok: input,
     outputPerMTok: output,
-    longContext: { aboveInputTokens: 272_000, inputPerMTok: longInput, outputPerMTok: longOutput },
+    cacheReadPerMTok: read,
+    ...(write !== undefined ? { cacheWritePerMTok: write } : {}),
+    longContext: {
+      aboveInputTokens: 272_000,
+      inputPerMTok: longInput,
+      outputPerMTok: longOutput,
+      cacheReadPerMTok: longRead,
+    },
   };
 }
 
@@ -171,8 +242,15 @@ function resolve(
   }
   if (step) {
     if ('billedAs' in step) return resolve(step.billedAs, day, table, depth + 1);
-    const { inputPerMTok, outputPerMTok, longContext } = step.price;
-    return { inputPerMTok, outputPerMTok, ...(longContext ? { longContext } : {}) };
+    const { inputPerMTok, outputPerMTok, cacheReadPerMTok, cacheWritePerMTok, longContext } =
+      step.price;
+    return {
+      inputPerMTok,
+      outputPerMTok,
+      ...(cacheReadPerMTok !== undefined ? { cacheReadPerMTok } : {}),
+      ...(cacheWritePerMTok !== undefined ? { cacheWritePerMTok } : {}),
+      ...(longContext ? { longContext } : {}),
+    };
   }
   if (price.until !== undefined && day > price.until) return undefined;
   const { later: _later, until: _until, ...own } = price;
@@ -180,19 +258,35 @@ function resolve(
 }
 
 /**
- * The cost in USD of one usage event's tokens at `price`. Every input token is charged at the
- * input rate: usage events do not split out cache reads (0.025x to 0.1x of it) or writes (1.25x to
- * 2x), so for a cache-heavy agent loop this can be several times the bill, and a call that writes
- * much cache is undercounted (#355). The long-context rate applies when the event's input is above
- * the tier's threshold: per request where the adapter reports per call, per turn where it reports
- * a turn's total (so a tier may apply to a turn of small requests).
+ * The cost in USD of one usage event's tokens at `price`. `inputTokens` counts every input token;
+ * of those, `cache.read` were read from a cache and `cache.write` written to one (#355), each at
+ * its own rate where the price has one, else at the input rate. Without the split, every input
+ * token is charged at the input rate: several times the bill for a cache-heavy agent loop.
+ * The long-context rate applies when the event's input (cache included) is above the tier's
+ * threshold: per request where the adapter reports per call, per turn where it reports a turn's
+ * total (so a tier may apply to a turn of small requests).
  */
-export function costOf(price: DayPrice, inputTokens: number, outputTokens: number): number {
+export function costOf(
+  price: DayPrice,
+  inputTokens: number,
+  outputTokens: number,
+  cache: { read?: number | undefined; write?: number | undefined } = {},
+): number {
   const rate =
     price.longContext && inputTokens > price.longContext.aboveInputTokens
       ? price.longContext
       : price;
-  return (inputTokens * rate.inputPerMTok + outputTokens * rate.outputPerMTok) / 1_000_000;
+  // Never more cache than input: a malformed report is charged as plain input.
+  const read = Math.min(Math.max(cache.read ?? 0, 0), inputTokens);
+  const write = Math.min(Math.max(cache.write ?? 0, 0), inputTokens - read);
+  const plain = inputTokens - read - write;
+  return (
+    (plain * rate.inputPerMTok +
+      read * (rate.cacheReadPerMTok ?? rate.inputPerMTok) +
+      write * (rate.cacheWritePerMTok ?? rate.inputPerMTok) +
+      outputTokens * rate.outputPerMTok) /
+    1_000_000
+  );
 }
 
 /** The `pricing:` config (#35): user-layer prices, keyed by model id. */
