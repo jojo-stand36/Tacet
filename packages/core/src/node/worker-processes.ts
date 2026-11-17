@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, relative } from 'node:path';
 
 /**
  * Finding and ending the processes of Worker sessions a crashed Mini-conductor left running
@@ -204,18 +204,25 @@ export function unreadableOrphans(
     );
   if (picked.length === 0) return [];
   const cwds = probe.cwdOf(picked.map((c) => c.pid));
-  const real = (p: string): string => {
+  // Never on doubt: a scope whose directory cannot be resolved takes nothing, and neither does a
+  // working directory that cannot be read, is gone, or is not already its own real path (lsof
+  // reports the resolved one, so a different real path means a link was in the way).
+  const realOrUndefined = (p: string): string | undefined => {
     try {
       return realpathSync(p);
     } catch {
-      return resolve(p);
+      return undefined;
     }
   };
-  const dirs = scopes.map((s) => ({ since: Math.floor(s.since / 1000) * 1000, dir: real(s.dir) }));
+  const dirs = scopes.flatMap((s) => {
+    const dir = realOrUndefined(s.dir);
+    return dir === undefined ? [] : [{ since: Math.floor(s.since / 1000) * 1000, dir }];
+  });
   return picked.flatMap((c) => {
     const cwd = cwds.get(c.pid);
     if (cwd === undefined || !isAbsolute(cwd)) return [];
-    const at = real(cwd);
+    const at = realOrUndefined(cwd);
+    if (at === undefined || at !== cwd) return [];
     const inside = dirs.some((d) => {
       if (c.startMs < d.since) return false;
       const rel = relative(d.dir, at);

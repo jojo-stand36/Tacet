@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import {
   endMarkedProcesses,
   isProcessRunning,
@@ -198,6 +198,10 @@ describe('unreadable orphans on macOS (#367)', () => {
   const since = Date.UTC(2026, 10, 17, 10, 0, 0, 500);
   const dir = '/tmp';
   const real = realpathSync('/tmp');
+  // Real directories: a working directory that does not exist is never taken.
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'orph-base-')));
+  for (const d of ['wt', 'wt-other', 'a', 'b']) mkdirSync(join(base, d));
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
   const ok = (over: Partial<OrphanCandidate> = {}): OrphanCandidate => ({
     pid: 4242,
     ppid: 1,
@@ -224,8 +228,8 @@ describe('unreadable orphans on macOS (#367)', () => {
   };
 
   it('takes an orphan whose environment is hidden, started since, in the directory', () => {
-    const p = probe([ok()], { 4242: join(real, 'wt') });
-    expect(unreadableOrphans([{ since, dir }], p)).toEqual([
+    const p = probe([ok()], { 4242: join(base, 'wt') });
+    expect(unreadableOrphans([{ since, dir: base }], p)).toEqual([
       { pid: 4242, command: '/bin/sleep 600' },
     ]);
     // The same second as `since` counts: ps reports whole seconds.
@@ -241,37 +245,48 @@ describe('unreadable orphans on macOS (#367)', () => {
       ['start unknown', ok({ startMs: Number.NaN }), real],
       ['is this process', ok({ pid: process.pid }), real],
       ['runs elsewhere', ok(), '/var'],
-      ['in a sibling named alike', ok(), `${real}-other`],
+      ['in a sibling named alike', ok(), join(base, 'wt-other')],
       ['cwd unknown', ok(), undefined],
       ['cwd not absolute', ok(), 'tmp'],
+      ['cwd gone', ok(), join(real, `no-such-dir-${process.pid}`)],
     ];
     for (const [why, c, cwd] of cases) {
       const p = probe([c], cwd === undefined ? {} : { [c.pid]: cwd });
-      expect(unreadableOrphans([{ since, dir }], p), why).toEqual([]);
+      expect(unreadableOrphans([{ since, dir: join(base, 'wt') }], p), why).toEqual([]);
     }
   });
 
   it('compares directories after symlinks', () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'orph-')));
     try {
-      mkdirSync(join(root, 'wt'));
+      mkdirSync(join(root, 'wt', 'sub'), { recursive: true });
       symlinkSync(join(root, 'wt'), join(root, 'link'));
+      mkdirSync(join(root, 'link-not'));
+      // The checkout named through a link: compared by its real path.
       const p = probe([ok()], { 4242: join(root, 'wt', 'sub') });
       expect(unreadableOrphans([{ since, dir: join(root, 'link') }], p)).toHaveLength(1);
       const out = probe([ok()], { 4242: join(root, 'link-not') });
       expect(unreadableOrphans([{ since, dir: join(root, 'link') }], out)).toEqual([]);
+      // A working directory reported through a link is doubt: never taken.
+      const viaLink = probe([ok()], { 4242: join(root, 'link', 'sub') });
+      expect(unreadableOrphans([{ since, dir: join(root, 'wt') }], viaLink)).toEqual([]);
+      // Nor anything for a checkout that cannot be resolved.
+      const gone = probe([ok()], { 4242: join(root, 'wt', 'sub') });
+      expect(unreadableOrphans([{ since, dir: join(root, 'gone') }], gone)).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
   it('matches each scope with its own start time', () => {
-    const p = probe([ok({ startMs: since + 2000 })], { 4242: join(real, 'b') });
+    const p = probe([ok({ startMs: since + 2000 })], { 4242: join(base, 'b') });
     const scopes = [
-      { since, dir: join(real, 'a') },
-      { since: since + 60_000, dir: join(real, 'b') },
+      { since, dir: join(base, 'a') },
+      { since: since + 60_000, dir: join(base, 'b') },
     ];
     expect(unreadableOrphans(scopes, p)).toEqual([]);
+    // The scope that started before it does take it.
+    expect(unreadableOrphans([{ since, dir: join(base, 'b') }], p)).toHaveLength(1);
   });
 
   it('does nothing off macOS or with no scope, and asks for no working directory needlessly', () => {

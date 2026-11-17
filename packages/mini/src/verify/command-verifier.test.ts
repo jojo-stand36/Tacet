@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Task, VerifyCommandResult } from '@tacet/core';
@@ -177,6 +177,7 @@ describe('CommandVerifier (#19)', () => {
         })),
       cwdOf: (pids) => new Map(pids.map((p) => [p, p === orphan() ? join(wt, 'sub') : root])),
     };
+    mkdirSync(join(wt, 'sub'));
     const reports: { orphans: { pid: number; command: string }[]; left: number[] }[] = [];
     const cmd = `"${process.execPath}" -e "const c=require('node:child_process').spawn('env',['-i','/bin/sleep','60'],{detached:true,stdio:'ignore'});require('node:fs').writeFileSync(process.argv[1],String(c.pid));c.unref()" "${pidFile}"`;
     const r = await new CommandVerifier({
