@@ -1,4 +1,10 @@
-import { type TacetConfig, tasksProjection } from '@tacet/core';
+import {
+  capOf,
+  costLedgerProjection,
+  pricingTable,
+  type TacetConfig,
+  tasksProjection,
+} from '@tacet/core';
 import type { EventStore } from '@tacet/core/node';
 import type { AsideUsage } from '../daemon/daemon.js';
 import type { EscalationGate } from '../mcp/backend.js';
@@ -50,7 +56,8 @@ export const MAX_REASONING_SESSIONS = 2;
  * reasoning: at `medium` only with at least one candidate precedent, which its answer must cite;
  * at `high` also without one. `blocking` questions, approval requests and `always_ask` matches
  * always go to the user. Reasoning is skipped when the task has a budget and less than a tenth
- * of it is left. Its answers are recorded as `source: mini`, never precedent.
+ * of it is left, by the cost ledger's spend and cap, as the hard caps count them (#356). Its
+ * answers are recorded as `source: mini`, never precedent.
  */
 export function escalationGate(o: EscalationGateOptions): EscalationGate {
   const alwaysAsk = o.config.escalation?.always_ask ?? [];
@@ -86,12 +93,12 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     const rootView = tasks[root];
     const view = tasks[b.taskId];
     if (!rootView || !view) return undefined;
-    const budget = rootView.task.budget?.usd;
+    // The ledger's spend (reported costs and table estimates) against the cap the hard caps use:
+    // a raise, then the task's own budget, then `budget.per_task_usd` (#356).
+    const ledger = o.store.replay(costLedgerProjection(pricingTable(o.config.pricing)));
+    const budget = capOf(ledger, 'task', root, o.config.budget, rootView.task.budget?.usd);
     if (budget !== undefined) {
-      let spent = 0;
-      for (const [id, t] of Object.entries(tasks)) {
-        if (rootOf(id) === root) spent += t.usage.costUsd;
-      }
+      const spent = ledger.tasks[root]?.usd ?? 0;
       if (budget - spent < budget * BUDGET_FLOOR) return undefined;
     }
     const reasoner = o.reasoner;

@@ -1,5 +1,12 @@
 import { existsSync } from 'node:fs';
-import { type Escalation, newUlid, type TacetConfig } from '@tacet/core';
+import {
+  BUILTIN_PRICES,
+  capOf,
+  costLedgerProjection,
+  type Escalation,
+  newUlid,
+  type TacetConfig,
+} from '@tacet/core';
 import { type EventStore, openEventStore, WORKER_MARKER_VAR } from '@tacet/core/node';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ScriptedAdapter } from '../daemon/testing.js';
@@ -433,6 +440,30 @@ describe('escalationGate (ADR-004 B)', () => {
       costUsd: 0.5,
     });
     expect(await gate(config('high'))(escalation('root-5'), b('root-5'))).toMatchObject({
+      source: 'mini',
+    });
+  });
+
+  it('counts spend and cap as the hard caps do: estimates, the config cap, a raise (#356)', async () => {
+    const capped: TacetConfig = { ...config('high'), budget: { per_task_usd: 1 } };
+    // No task budget: the config's per-task cap applies. No reported cost: the tokens are priced
+    // from the table, Opus 5.5 at $4 per million input tokens, so $0.96 of $1.
+    created('root-7');
+    append('root-7', 'agent.usage', {
+      t: 'usage',
+      source: 'estimated',
+      inputTokens: 240_000,
+      outputTokens: 0,
+      model: 'claude-opus-5-5',
+    });
+    const ledger = store.replay(costLedgerProjection(BUILTIN_PRICES));
+    expect(ledger.tasks['root-7']?.usd).toBe(0.96);
+    expect(capOf(ledger, 'task', 'root-7', capped.budget)).toBe(1);
+    expect(await gate(capped)(escalation('root-7'), b('root-7'))).toBeUndefined();
+    expect(calls).toHaveLength(0);
+    // The user raised the cap: a raise wins, and there is room again.
+    append('root-7', 'budget.raised', { scope: 'task', key: 'root-7', capUsd: 10 });
+    expect(await gate(capped)(escalation('root-7'), b('root-7'))).toMatchObject({
       source: 'mini',
     });
   });

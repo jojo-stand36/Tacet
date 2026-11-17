@@ -18,6 +18,7 @@ import {
   type BudgetScope,
   budgetKey,
   type CostLedger,
+  capOf,
   costLedgerProjection,
   Decision,
   type DecisionScope,
@@ -80,7 +81,7 @@ import {
   WorktreeRefusedError,
   workerRefusal,
 } from './ports.js';
-import { afterRefusal, type ChosenProfile, chooseProfile } from './profile.js';
+import { afterRefusal, type ChosenProfile, chooseProfile, type ProfileInput } from './profile.js';
 import {
   HANDOFF_NOTE,
   inlineHandoffNote,
@@ -1830,12 +1831,13 @@ export class MiniConductor {
   /** The cap on a budget instance, or undefined when there is none: a raise wins, then config. */
   #capFor(scope: BudgetScope, key: string): number | undefined {
     const v = this.#state();
-    const raised = v.ledger.raised[budgetKey(scope, key)];
-    if (raised !== undefined) return raised;
-    const b = this.#o.config.budget;
-    if (scope === 'task') return v.tasks[key]?.task.budget?.usd ?? b?.per_task_usd;
-    if (scope === 'day') return b?.per_day_usd;
-    return b?.api_key_per_month_usd;
+    return capOf(
+      v.ledger,
+      scope,
+      key,
+      this.#o.config.budget,
+      scope === 'task' ? v.tasks[key]?.task.budget?.usd : undefined,
+    );
   }
 
   /**
@@ -1884,6 +1886,29 @@ export class MiniConductor {
       }
     }
     return undefined;
+  }
+
+  /**
+   * The tightest of the root task's and today's budgets for a session profile (#356): the one
+   * with the smaller share left, by the ledger's spend. Nothing when neither has a cap.
+   */
+  #headroom(taskId: string): { headroom?: NonNullable<ProfileInput['headroom']> } {
+    const { ledger } = this.#state();
+    const root = rootTaskId(taskId);
+    const day = this.#now().toISOString().slice(0, 10);
+    let best: NonNullable<ProfileInput['headroom']> | undefined;
+    for (const [scope, key, spend] of [
+      ['task', root, ledger.tasks[root]],
+      ['day', day, ledger.days[day]],
+    ] as const) {
+      const capUsd = this.#capFor(scope, key);
+      if (capUsd === undefined || capUsd <= 0) continue;
+      const leftUsd = Math.round((capUsd - (spend?.usd ?? 0)) * 1e6) / 1e6;
+      if (!best || leftUsd / capUsd < best.leftUsd / best.capUsd) {
+        best = { scope, leftUsd, capUsd };
+      }
+    }
+    return best ? { headroom: best } : {};
   }
 
   /** Any hard cap applies to `taskId` at all (for the unpriced-model question). */
@@ -2214,6 +2239,7 @@ export class MiniConductor {
         capabilities: worker.adapter.capabilities(),
         failedAttempts: failed,
         indivisible: v.indivisible.has(subtaskId),
+        ...this.#headroom(subtaskId),
       });
     } catch (err) {
       this.#o.store.append(
