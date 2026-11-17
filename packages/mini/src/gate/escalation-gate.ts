@@ -64,8 +64,8 @@ export const MAX_REASONING_SESSIONS = 2;
  * at `high` also without one. `blocking` questions, approval requests and `always_ask` matches
  * always go to the user. Reasoning is skipped when the task has a budget and less than a tenth
  * of it is left, by the cost ledger's spend and cap, as the hard caps count them, or when any
- * hard cap it spends from (task, day or month) is spent (#356). Its
- * answers are recorded as `source: mini`, never precedent.
+ * hard cap it spends from (task, day or month) is spent (#356). Its answers are recorded as
+ * `source: mini`, never precedent.
  */
 export function escalationGate(o: EscalationGateOptions): EscalationGate {
   const alwaysAsk = o.config.escalation?.always_ask ?? [];
@@ -94,6 +94,8 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
     // (owner decision, 2026-11-12, relayed by the coordinator).
     const hasOptions = (escalation.options?.length ?? 0) > 0;
     if (autonomy !== 'high' && !hasOptions) return undefined;
+    // Any hard cap spent, as the Mini-conductor counts it: the user answers (#356).
+    if (o.budgetSpent?.(b.taskId)) return undefined;
     // Budgets are the root task's (the user's), and its sub-tasks spend them.
     const rootOf = rootTasks(o.store);
     const root = rootOf(b.taskId);
@@ -115,8 +117,6 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
       const spent = ledger.tasks[key]?.usd ?? 0;
       if (budget <= 0 || budget - spent < budget * BUDGET_FLOOR) return undefined;
     }
-    // Any hard cap spent, as the Mini-conductor counts it: the user answers (#356).
-    if (o.budgetSpent?.(b.taskId)) return undefined;
     const reasoner = o.reasoner;
     if (reasoning >= cap) return undefined;
     reasoning++;

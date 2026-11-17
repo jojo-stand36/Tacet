@@ -61,8 +61,8 @@ export class ProfileOutOfBoundsError extends Error {
  *   that fits.
  *
  * - Budget headroom (#356): with less than a quarter of the task's, today's or this month's
- *   budget left, no
- *   effort is raised on a retry and no larger window is chosen, and the reasons say so.
+ *   budget left, no effort is raised on a retry and no larger window is chosen, and the
+ *   reasons say so.
  */
 export function chooseProfile(i: ProfileInput): ChosenProfile {
   const { role, tier } = i;
