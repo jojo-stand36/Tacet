@@ -16,7 +16,13 @@
 // Terminals to cover (#311): iTerm2; kitty; xterm (on macOS it needs an X server); tmux, run inside
 // one of those after `tmux set -g allow-passthrough on \; set -g set-clipboard on`; GNU screen,
 // started as `TERM=xterm-256color screen`; optionally WezTerm, Alacritty, foot or GNOME Terminal.
-// For tmux and screen, say which terminal they ran in.
+// For tmux and screen, say which terminal they ran in, and run it in that terminal alone too: inside
+// a multiplexer an image or the control may not reach the outer terminal (tacet attach drops DCS
+// passthrough), so a "no" there may be the multiplexer's, not the filter's.
+//
+// One case (a terminal reset, ESC c) clears the screen part way through; the summary is printed at
+// the end. Ctrl-C stops it and puts the clipboard back. TACET_CHECK_WAIT_MS sets how long it waits
+// after each case before reading the clipboard (default 400), for a slow tmux or X round trip.
 //
 // What it does, and does not do:
 // - It first sends one unfiltered OSC 52 whose only content is a marker of its own (the control).
@@ -33,7 +39,8 @@
 //   (OSC 5113), which move data out of the machine rather than into the clipboard.
 //
 // `--dry-run` prints what the filter does to each case and touches neither the clipboard nor the
-// terminal's state (used by the script's own test).
+// terminal's state. `TACET_CHECK_FAKE_CLIPBOARD=<file>` uses a file as the clipboard. Both are for
+// the script's own test (scripts/check-terminal-filter.test.mjs).
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
@@ -54,7 +61,11 @@ const hex = (h) => Uint8Array.from(Buffer.from(h.replace(/ /g, ''), 'hex'));
 /**
  * The repros of the attach filter's tests that must never write the clipboard, as the tests feed
  * them (copied from osc-filter.test.ts and osc-filter.xterm.test.ts at #311; the tests are not
- * changed). `from` names the test.
+ * changed, and both say this list mirrors them: a repro added there belongs here too). `from`
+ * names the test. Left out: inputs that are not clipboard repros (C0 and CSI handling, UTF-8 and C1
+ * text, the kept ESC sequences), the length limit (a smaller filter than attach's), the split and
+ * flush cases (attach feeds whole chunks; the tests check every split), and the xterm.js test's
+ * unfiltered control and random fuzz.
  */
 export const BLOCKED = [
   ...[
@@ -127,6 +138,10 @@ export const BLOCKED = [
     from: 'drops every DCS but q, tmux passthrough however it is spelled',
     input: latin1(`a${seq}b`),
   })),
+  {
+    from: 'drops every DCS but q, tmux passthrough however it is spelled',
+    input: latin1(`a${E}Ptmux;x\x18\x07${ST}b`),
+  },
   ...[
     '1b 20 50 1b 5d 35 1b 5c 1b 20 50 32 3b 63 3b 5a 6d 39 76 07 1b 5c',
     '1b 23 5d 35 32 3b 63 3b 41 07',
@@ -211,7 +226,10 @@ export function renderCases() {
   return [
     {
       id: 'render-text',
-      what: 'the well-formed text and sequences osc-filter.test.ts passes byte for byte',
+      // A subset of the text osc-filter.test.ts passes byte for byte, its link made a local file:
+      // left out are a DECRQSS (the terminal's reply would reach this script's prompt), the
+      // alternate screen and a reset (they hide the run), and iTerm2's CopyMode (interactive).
+      what: 'a subset of the well-formed text and sequences osc-filter.test.ts passes byte for byte',
       input: utf8(
         [
           `${E}]2;win${ST}`,
@@ -267,12 +285,18 @@ export function filtered(OscFilter, input) {
 function clipboardBackend() {
   const has = (cmd) =>
     spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
-  const read = (cmd, args) => () =>
-    spawnSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).stdout ?? '';
+  // A stuck selection owner times out.
+  const read = (cmd, args, env = process.env) => () =>
+    spawnSync(cmd, args, {
+      encoding: 'utf8',
+      env,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    }).stdout ?? '';
   // The writer may stay in the background owning the selection (xclip, xsel): never wait on its
   // output, only on its exit.
-  const write = (cmd, args) => (text) =>
-    spawnSync(cmd, args, { input: text, stdio: ['pipe', 'ignore', 'ignore'] });
+  const write = (cmd, args, env = process.env) => (text) =>
+    spawnSync(cmd, args, { input: text, env, stdio: ['pipe', 'ignore', 'ignore'], timeout: 5000 });
   // For the script's own test only: a file stands in for the clipboard.
   const fake = process.env.TACET_CHECK_FAKE_CLIPBOARD;
   if (fake) {
@@ -283,7 +307,14 @@ function clipboardBackend() {
     };
   }
   if (process.platform === 'darwin') {
-    return { name: 'pbpaste/pbcopy', read: read('pbpaste', []), write: write('pbcopy', []) };
+    // pbcopy and pbpaste pick their text encoding from the locale; the same UTF-8 one for both
+    // makes the text round-trip whatever locale the terminal set.
+    const utf8Env = { ...process.env, LC_ALL: 'en_US.UTF-8' };
+    return {
+      name: 'pbpaste/pbcopy',
+      read: read('pbpaste', [], utf8Env),
+      write: write('pbcopy', [], utf8Env),
+    };
   }
   if (process.env.WAYLAND_DISPLAY && has('wl-paste') && has('wl-copy')) {
     return {
@@ -377,15 +408,32 @@ async function main() {
   const original = clip?.read();
   const seenBuffers = new Set(tmuxBuffers());
   const added = new Set();
+  let restored = false;
   const restore = () => {
+    if (restored) return;
+    restored = true;
     if (clip && original !== undefined) clip.write(original);
     for (const b of added) spawnSync('tmux', ['delete-buffer', '-b', b], { stdio: 'ignore' });
   };
-  process.on('SIGINT', () => {
+  // Ctrl-C (which readline, holding the terminal, receives as a key), a closed window (SIGHUP) or
+  // a kill: the clipboard is put back before it stops.
+  const stop = (code) => () => {
     restore();
-    out(utf8(`\r\n${E}[0m`));
-    process.exit(130);
-  });
+    try {
+      out(utf8(`\r\n${E}[0m`));
+    } catch {
+      // The terminal is gone.
+    }
+    process.exit(code);
+  };
+  rl.on('SIGINT', stop(130));
+  for (const [sig, code] of [
+    ['SIGINT', 130],
+    ['SIGHUP', 129],
+    ['SIGTERM', 143],
+  ]) {
+    process.on(sig, stop(code));
+  }
 
   console.log('#311 terminal check: clipboard writes and rendering through tacet attach\'s filter.');
   console.log(
@@ -421,14 +469,15 @@ async function main() {
     const c = await changes(
       utf8(`${E}]52;c;${Buffer.from(control).toString('base64')}\x07`),
     );
-    const enabled = c.now === control || c.tmux;
+    const system = !clip ? 'not checked' : c.now === control ? 'written' : 'NOT written';
+    const tmux = process.env.TMUX ? `; tmux buffer: ${c.tmux ? 'added' : 'none'}` : '';
     say(
       'control (unfiltered OSC 52, marker only)',
-      !clip
-        ? 'not checked'
-        : enabled
-          ? `clipboard written${c.tmux ? ' (a tmux buffer too)' : ''}: programs may write this clipboard`
-          : 'clipboard NOT written: this terminal does not let programs write the clipboard, so the results below prove nothing; allow it and run again',
+      `system clipboard: ${system}${tmux}${
+        clip && c.now !== control && !c.tmux
+          ? ' (programs cannot write the clipboard here, so the results below prove nothing: allow it in the terminal\'s settings if it has one, and run again)'
+          : ''
+      }`,
     );
 
     let changed = 0;

@@ -37,6 +37,8 @@ const ST = `${E}\\`;
 const CLIP = `${E}]52;c;ZWNobyBwd25lZA==\x07`;
 const TITLE = `${E}]0;my title\x07`;
 
+// scripts/check-terminal-filter.mjs mirrors this file's clipboard repros for real terminals
+// (#311): a repro added here belongs in its BLOCKED list too.
 describe('OscFilter (#302)', () => {
   it('passes well-formed text and sequences byte for byte', () => {
     const text = [

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { BLOCKED, filtered, redPng, renderCases } from './check-terminal-filter.mjs';
 
 const script = fileURLToPath(new URL('./check-terminal-filter.mjs', import.meta.url));
-// Built by `pnpm check:generated` (tsc -b) before this runs on CI.
+// `pnpm check:scripts` builds the CLI before running this.
 const built = fileURLToPath(new URL('../packages/cli/dist/osc-filter.js', import.meta.url));
 
 /**
@@ -87,7 +87,7 @@ test(
       // Enter to start, then, paced so each lands at its question, an answer for each.
       const asks = renderCases().filter((c) => c.ask).length;
       const feed = `sleep 1; printf '\\n'; sleep 1; for i in $(seq ${asks}); do printf 'y\\n'; sleep 0.7; done`;
-      const r = spawnSync('sh', ['-c', `(${feed}) | script -qec "$0 $1" /dev/null`, process.execPath, script], {
+      const r = spawnSync('sh', ['-c', `(${feed}) | script -qec "\\"$0\\" \\"$1\\"" /dev/null`, process.execPath, script], {
         encoding: 'utf8',
         env: {
           ...process.env,
@@ -100,9 +100,44 @@ test(
       const out = r.stdout.replaceAll('\r', '');
       assert.match(out, /^- clipboard: a file \(test\)$/m, out.slice(-2000));
       // A file is no terminal clipboard: the control says so, and nothing changed it.
-      assert.match(out, /^- control \(unfiltered OSC 52, marker only\): clipboard NOT written/m);
+      assert.match(out, /^- control \(unfiltered OSC 52, marker only\): system clipboard: NOT written \(/m);
       assert.match(out, new RegExp(`^- blocked cases that changed the clipboard: 0 of ${BLOCKED.length}$`, 'm'));
-      assert.match(out, /^- render-sixel: filter passed it unchanged: yes; seen: yes; clipboard: unchanged$/m);
+      // The answers are paced, so a slow machine may miss one: only the filter and clipboard count.
+      assert.match(
+        out,
+        /^- render-sixel: filter passed it unchanged: yes; seen: (yes|not answered); clipboard: unchanged$/m,
+      );
+      assert.equal(readFileSync(clipboard, 'utf8'), 'what the user had');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'Ctrl-C stops it at once, and puts back what the clipboard held',
+  { skip: !canPty || !existsSync(built) ? 'needs util-linux script and the built CLI' : false },
+  () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tacet-311-'));
+    try {
+      const clipboard = join(dir, 'clipboard');
+      writeFileSync(clipboard, 'what the user had');
+      // Enter, then Ctrl-C (a byte readline receives in raw mode) while the cases run.
+      const feed = `sleep 1; printf '\\n'; sleep 1; printf '\\003'; sleep 2`;
+      const t0 = Date.now();
+      const r = spawnSync('sh', ['-c', `(${feed}) | script -qec "\\"$0\\" \\"$1\\"" /dev/null`, process.execPath, script], {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          TACET_CHECK_FAKE_CLIPBOARD: clipboard,
+          TACET_CHECK_WAIT_MS: '200',
+          TMUX: '',
+        },
+        timeout: 60_000,
+      });
+      // 77 cases at 200 ms would take over 15 s: it stopped well before.
+      assert.ok(Date.now() - t0 < 12_000, `took ${Date.now() - t0} ms: ${r.stdout.slice(-500)}`);
+      assert.doesNotMatch(r.stdout, /Paste everything/);
       assert.equal(readFileSync(clipboard, 'utf8'), 'what the user had');
     } finally {
       rmSync(dir, { recursive: true, force: true });
