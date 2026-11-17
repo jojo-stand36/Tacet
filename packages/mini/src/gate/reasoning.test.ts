@@ -475,6 +475,25 @@ describe('escalationGate (ADR-004 B)', () => {
     expect(calls).toHaveLength(before);
   });
 
+  it('leaves reasoning out while any hard cap the task spends from is spent (#356)', async () => {
+    created('root-9');
+    const spentCaps = new Set<string>(['root-9']);
+    const guarded = escalationGate({
+      store,
+      config: config('high'),
+      reasoner,
+      aside: async (_taskId, _label, fn) =>
+        fn({ marker: 'm', signal: new AbortController().signal, charge: () => {} }),
+      timeoutMs: () => 30_000,
+      budgetSpent: (taskId) => spentCaps.has(taskId),
+    });
+    const before = calls.length;
+    expect(await guarded(escalation('root-9'), b('root-9'))).toBeUndefined();
+    expect(calls).toHaveLength(before);
+    spentCaps.clear();
+    expect(await guarded(escalation('root-9'), b('root-9'))).toMatchObject({ source: 'mini' });
+  });
+
   it("weighs the root task's budget, spent by all its sub-tasks, for a Worker on a sub-task", async () => {
     created('root-6', undefined, { budget: { usd: 1 } });
     created('root-6/1', 'root-6');

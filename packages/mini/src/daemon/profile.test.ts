@@ -155,6 +155,9 @@ describe('chooseProfile with little budget left (#356)', () => {
     expect(p.reasons.contextWindow).toBe(
       "default; indivisible, but $2.00 of the task's $10.00 budget left",
     );
+    expect(base({ scope: 'month', leftUsd: 10, capUsd: 200 }).reasons.effort).toMatch(
+      /\$10\.00 of this month's \$200\.00 budget left/,
+    );
     expect(base({ scope: 'day', leftUsd: -1, capUsd: 4 }).reasons.effort).toMatch(
       /\$0\.00 of today's \$4\.00 budget left/,
     );

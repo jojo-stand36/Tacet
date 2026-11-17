@@ -3499,6 +3499,64 @@ describe('budgets (#35)', () => {
     expect(tasks()[id]?.state).not.toBe('failed');
   });
 
+  it('reports a spent cap to the gate, and runs no session of its own against it (#356)', async () => {
+    let turns = 0;
+    fake = new ScriptedAdapter('fake', () =>
+      ++turns === 1 ? { do: 'spend', costUsd: 2 } : { do: 'reply', text: 'done' },
+    );
+    const d = make({ config: { ...CONFIG, budget: { per_day_usd: 2 } } });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    expect(d.budgetSpent(id)).toBe(false);
+    await expect.poll(() => ofType('budget.exceeded').length, { timeout: 5000 }).toBe(1);
+    // Today's cap: spent for this task and any other.
+    expect(d.budgetSpent(`${id}/1`)).toBe(true);
+    expect(d.budgetSpent('another')).toBe(true);
+    let ran = false;
+    await expect(
+      d.aside(`${id}/1`, 'gate', async () => {
+        ran = true;
+      }),
+    ).rejects.toThrow(/is spent/);
+    expect(ran).toBe(false);
+  });
+
+  it('lets the month cap shape the session profile too (#356)', async () => {
+    let first = true;
+    fake = new ScriptedAdapter('fake', () => {
+      if (first) {
+        first = false;
+        return { do: 'error', message: 'transient' };
+      }
+      return { do: 'reply', text: 'done' };
+    });
+    const d = make({
+      config: {
+        ...CONFIG,
+        tiers: {
+          worker: {
+            adapter: 'fake',
+            model: 'cheap',
+            effort: 'medium',
+            max_effort: 'high',
+            escalate_effort_on_retry: true,
+          },
+        },
+        budget: { api_key_per_month_usd: 200 },
+      },
+      // Other repos spent $190 of the month's $200.
+      monthSpendElsewhere: () => 190,
+    });
+    await d.start();
+    const id = d.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+    await d.settled();
+    const reasons = ofType('worker.profile', `${id}/1`).map(
+      (e) => e.data as { effort?: string; reasons: { effort: string } },
+    );
+    expect(reasons.map((r) => r.effort)).toEqual(['medium', 'medium']);
+    expect(reasons[1]?.reasons.effort).toMatch(/\$10\.00 of this month's \$200\.00 budget left/);
+  });
+
   it('enforces the month cap across the repos registered with the Conductor', async () => {
     fake = new ScriptedAdapter('fake', () => ({ do: 'spend', costUsd: 1 }));
     const months: string[] = [];

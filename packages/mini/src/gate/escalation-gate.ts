@@ -37,6 +37,11 @@ export interface EscalationGateOptions {
   /** The time the reasoning session may take, for a task. */
   timeoutMs: (taskId: string) => number;
   /**
+   * Whether a hard cap the task spends from is spent (#356): its root task's, today's or this
+   * month's, by the Mini-conductor's own check (`MiniConductor.budgetSpent`). Then no reasoning.
+   */
+  budgetSpent?: (taskId: string) => boolean;
+  /**
    * Reasoning sessions running at once, at most; past it the question goes to the user. Default
    * 2; 0 turns the reasoning step off.
    */
@@ -58,7 +63,8 @@ export const MAX_REASONING_SESSIONS = 2;
  * reasoning: at `medium` only with at least one candidate precedent, which its answer must cite;
  * at `high` also without one. `blocking` questions, approval requests and `always_ask` matches
  * always go to the user. Reasoning is skipped when the task has a budget and less than a tenth
- * of it is left, by the cost ledger's spend and cap, as the hard caps count them (#356). Its
+ * of it is left, by the cost ledger's spend and cap, as the hard caps count them, or when any
+ * hard cap it spends from (task, day or month) is spent (#356). Its
  * answers are recorded as `source: mini`, never precedent.
  */
 export function escalationGate(o: EscalationGateOptions): EscalationGate {
@@ -109,6 +115,8 @@ export function escalationGate(o: EscalationGateOptions): EscalationGate {
       const spent = ledger.tasks[key]?.usd ?? 0;
       if (budget <= 0 || budget - spent < budget * BUDGET_FLOOR) return undefined;
     }
+    // Any hard cap spent, as the Mini-conductor counts it: the user answers (#356).
+    if (o.budgetSpent?.(b.taskId)) return undefined;
     const reasoner = o.reasoner;
     if (reasoning >= cap) return undefined;
     reasoning++;

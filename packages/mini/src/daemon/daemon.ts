@@ -644,6 +644,14 @@ export class MiniConductor {
   }
 
   /**
+   * Whether a hard cap `taskId` spends from is spent (#356): its root task's, today's or this
+   * month's, by the same check that stops Workers. False when not running.
+   */
+  budgetSpent(taskId: string): boolean {
+    return this.#started && this.#overBudget(taskId) !== undefined;
+  }
+
+  /**
    * Run a session of the Mini-conductor's own for `taskId` (the escalation gate's reasoning,
    * #25): its process marker recorded first, so a crash leaves nothing running unaccounted for;
    * whatever it left running ended afterwards; aborted when the Mini-conductor stops, and waited
@@ -660,6 +668,10 @@ export class MiniConductor {
     }) => Promise<T>,
   ): Promise<T> {
     if (!this.#started) return Promise.reject(new Error('the Mini-conductor is not running'));
+    // A spent cap holds the Mini-conductor's own sessions too (#356).
+    if (this.budgetSpent(taskId)) {
+      return Promise.reject(new Error(`a budget ${taskId} spends from is spent`));
+    }
     const marker = newWorkerMarker();
     const key = `${label}:${newUlid(this.#now().getTime())}`;
     this.#markers.set(key, marker);
@@ -1892,21 +1904,26 @@ export class MiniConductor {
   }
 
   /**
-   * The tightest of the root task's and today's budgets for a session profile (#356): the one
-   * with the smaller share left, by the ledger's spend. Nothing when neither has a cap.
+   * The tightest of the root task's, today's and this month's budgets for a session profile
+   * (#356): the one with the smaller share left, by the ledger's spend. Nothing when none has a
+   * cap.
    */
   #headroom(taskId: string): { headroom?: NonNullable<ProfileInput['headroom']> } {
     const { ledger } = this.#state();
     const root = rootTaskId(taskId);
-    const day = this.#now().toISOString().slice(0, 10);
+    const now = this.#now().toISOString();
+    const day = now.slice(0, 10);
+    const month = now.slice(0, 7);
     let best: NonNullable<ProfileInput['headroom']> | undefined;
-    for (const [scope, key, spend] of [
-      ['task', root, ledger.tasks[root]],
-      ['day', day, ledger.days[day]],
+    // The month's cap counts every repo registered with the Conductor, as the hard cap does.
+    for (const [scope, key, spent] of [
+      ['task', root, ledger.tasks[root]?.usd ?? 0],
+      ['day', day, ledger.days[day]?.usd ?? 0],
+      ['month', month, (ledger.months[month]?.usd ?? 0) + this.#elsewhere(month)],
     ] as const) {
       const capUsd = this.#capFor(scope, key);
       if (capUsd === undefined || capUsd <= 0) continue;
-      const leftUsd = Math.round((capUsd - (spend?.usd ?? 0)) * 1e6) / 1e6;
+      const leftUsd = Math.round((capUsd - spent) * 1e6) / 1e6;
       if (!best || leftUsd / capUsd < best.leftUsd / best.capUsd) {
         best = { scope, leftUsd, capUsd };
       }

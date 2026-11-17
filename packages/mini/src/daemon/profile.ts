@@ -25,10 +25,10 @@ export interface ProfileInput {
   /** The planner marked the sub-task as one that cannot be handed off cleanly part-way. */
   indivisible: boolean;
   /**
-   * The tightest budget the session spends from, by the cost ledger (#356): the root task's or
-   * today's, whichever has the smaller share left. Absent when neither has a cap.
+   * The tightest budget the session spends from, by the cost ledger (#356): the root task's,
+   * today's or this month's, whichever has the smallest share left. Absent when none has a cap.
    */
-  headroom?: { scope: 'task' | 'day'; leftUsd: number; capUsd: number };
+  headroom?: { scope: 'task' | 'day' | 'month'; leftUsd: number; capUsd: number };
 }
 
 /**
@@ -40,7 +40,7 @@ export const LOW_HEADROOM = 0.25;
 /** "$1.20 of the task's $10.00 budget left", or undefined when headroom is not low. */
 function lowHeadroom(h: ProfileInput['headroom']): string | undefined {
   if (!h || h.capUsd <= 0 || h.leftUsd >= h.capUsd * LOW_HEADROOM) return undefined;
-  const whose = h.scope === 'task' ? "the task's" : "today's";
+  const whose = h.scope === 'task' ? "the task's" : h.scope === 'day' ? "today's" : "this month's";
   return `$${Math.max(0, h.leftUsd).toFixed(2)} of ${whose} $${h.capUsd.toFixed(2)} budget left`;
 }
 
@@ -60,7 +60,8 @@ export class ProfileOutOfBoundsError extends Error {
  *   indivisible sub-task, when `max_context_window` allows it: the largest size the adapter lists
  *   that fits.
  *
- * - Budget headroom (#356): with less than a quarter of the task's or today's budget left, no
+ * - Budget headroom (#356): with less than a quarter of the task's, today's or this month's
+ *   budget left, no
  *   effort is raised on a retry and no larger window is chosen, and the reasons say so.
  */
 export function chooseProfile(i: ProfileInput): ChosenProfile {
