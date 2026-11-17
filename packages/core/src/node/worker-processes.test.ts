@@ -1,4 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   endMarkedProcesses,
@@ -6,7 +9,14 @@ import {
   isWorkerMarker,
   markedProcesses,
   newWorkerMarker,
+  type OrphanCandidate,
+  type OrphanProbe,
+  type ProcessInfo,
+  parseLstart,
+  processTable,
+  unreadableOrphans,
   WORKER_MARKER_VAR,
+  withTrees,
 } from './worker-processes.js';
 
 const alive = isProcessRunning;
@@ -122,4 +132,192 @@ describe.skipIf(process.platform === 'win32')('Worker processes by marker (#127)
     expect(alive(other.leader.pid as number)).toBe(true);
     expect(await endMarkedProcesses([m1, m2])).toEqual({ found: [], left: [] });
   });
+});
+
+describe('process trees of marked processes (#367)', () => {
+  const row = (pid: number, ppid: number, pgid = pid, sid?: number): ProcessInfo => ({
+    pid,
+    ppid,
+    pgid,
+    ...(sid !== undefined ? { sid } : {}),
+    zombie: false,
+  });
+
+  it('adds descendants, and members of groups and sessions they lead, and nothing else', () => {
+    const m = newWorkerMarker();
+    const table = [
+      row(100, 50), // marked
+      row(101, 100), // child
+      row(102, 101), // grandchild
+      row(200, 1, 100), // orphan still in the marked process's group
+      row(201, 1, 201, 101), // orphan in a session the child leads (Linux)
+      row(300, 1), // unrelated orphan
+      row(301, 50, 50), // a sibling: same parent, the parent's group
+      { ...row(103, 100), zombie: true },
+    ];
+    const out = withTrees(new Map([[m, [100]]]), table);
+    expect(out.get(m)?.sort()).toEqual([100, 101, 102, 200, 201]);
+  });
+
+  it('never adds this process, and follows no group or session 0 or 1', () => {
+    const m = newWorkerMarker();
+    const table = [row(process.pid, 100), row(500, 1, 1, 0), row(501, 1, 0, 1)];
+    expect(withTrees(new Map([[m, [100]]]), table).get(m)).toEqual([100]);
+    expect(withTrees(new Map([[m, [1]]]), table).get(m)).toEqual([1]);
+  });
+
+  it.runIf(process.platform === 'linux')(
+    'finds a child whose environment shows no marker through its marked parent',
+    async () => {
+      const m = newWorkerMarker();
+      // `env -i` clears the child's environment, as macOS hides a platform binary's.
+      const leader = spawn('/bin/sh', ['-c', 'env -i /bin/sleep 60 & wait'], {
+        env: { PATH: process.env.PATH ?? '/usr/bin:/bin', [WORKER_MARKER_VAR]: m },
+        stdio: 'ignore',
+      });
+      started.push(leader);
+      let kid: number | undefined;
+      await expect
+        .poll(() => {
+          kid = processTable().find((p) => p.ppid === leader.pid)?.pid;
+          return kid;
+        })
+        .toBeDefined();
+      grandchildren.push(kid as number);
+      expect(markedProcesses([m]).get(m)).toEqual(
+        expect.arrayContaining([leader.pid, kid as number]),
+      );
+      const ended = await endMarkedProcesses([m], { graceMs: 300 });
+      expect(ended.found).toEqual(expect.arrayContaining([leader.pid, kid as number]));
+      await expect.poll(() => alive(kid as number)).toBe(false);
+    },
+  );
+});
+
+describe('unreadable orphans on macOS (#367)', () => {
+  const since = Date.UTC(2026, 10, 17, 10, 0, 0, 500);
+  const dir = '/tmp';
+  const real = realpathSync('/tmp');
+  const ok = (over: Partial<OrphanCandidate> = {}): OrphanCandidate => ({
+    pid: 4242,
+    ppid: 1,
+    startMs: since + 2000,
+    envHidden: true,
+    command: '/bin/sleep 600',
+    ...over,
+  });
+  const probe = (
+    cands: OrphanCandidate[],
+    cwds: Record<number, string>,
+    platform: NodeJS.Platform = 'darwin',
+  ): OrphanProbe & { asked: number[][] } => {
+    const asked: number[][] = [];
+    return {
+      platform,
+      asked,
+      candidates: () => cands,
+      cwdOf: (pids) => {
+        asked.push([...pids]);
+        return new Map(pids.flatMap((p) => (cwds[p] ? [[p, cwds[p]] as [number, string]] : [])));
+      },
+    };
+  };
+
+  it('takes an orphan whose environment is hidden, started since, in the directory', () => {
+    const p = probe([ok()], { 4242: join(real, 'wt') });
+    expect(unreadableOrphans([{ since, dir }], p)).toEqual([
+      { pid: 4242, command: '/bin/sleep 600' },
+    ]);
+    // The same second as `since` counts: ps reports whole seconds.
+    const same = probe([ok({ startMs: since - 500 })], { 4242: real });
+    expect(unreadableOrphans([{ since, dir }], same)).toHaveLength(1);
+  });
+
+  it('takes nothing that fails any condition', () => {
+    const cases: [string, OrphanCandidate, string | undefined][] = [
+      ['has a live parent', ok({ ppid: 77 }), real],
+      ['shows its environment', ok({ envHidden: false }), real],
+      ['started before', ok({ startMs: since - 1500 }), real],
+      ['start unknown', ok({ startMs: Number.NaN }), real],
+      ['is this process', ok({ pid: process.pid }), real],
+      ['runs elsewhere', ok(), '/var'],
+      ['in a sibling named alike', ok(), `${real}-other`],
+      ['cwd unknown', ok(), undefined],
+      ['cwd not absolute', ok(), 'tmp'],
+    ];
+    for (const [why, c, cwd] of cases) {
+      const p = probe([c], cwd === undefined ? {} : { [c.pid]: cwd });
+      expect(unreadableOrphans([{ since, dir }], p), why).toEqual([]);
+    }
+  });
+
+  it('compares directories after symlinks', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'orph-')));
+    try {
+      mkdirSync(join(root, 'wt'));
+      symlinkSync(join(root, 'wt'), join(root, 'link'));
+      const p = probe([ok()], { 4242: join(root, 'wt', 'sub') });
+      expect(unreadableOrphans([{ since, dir: join(root, 'link') }], p)).toHaveLength(1);
+      const out = probe([ok()], { 4242: join(root, 'link-not') });
+      expect(unreadableOrphans([{ since, dir: join(root, 'link') }], out)).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('matches each scope with its own start time', () => {
+    const p = probe([ok({ startMs: since + 2000 })], { 4242: join(real, 'b') });
+    const scopes = [
+      { since, dir: join(real, 'a') },
+      { since: since + 60_000, dir: join(real, 'b') },
+    ];
+    expect(unreadableOrphans(scopes, p)).toEqual([]);
+  });
+
+  it('does nothing off macOS or with no scope, and asks for no working directory needlessly', () => {
+    const linux = probe([ok()], { 4242: real }, 'linux');
+    expect(unreadableOrphans([{ since, dir }], linux)).toEqual([]);
+    const none = probe([ok({ ppid: 5 })], {});
+    expect(unreadableOrphans([], none)).toEqual([]);
+    expect(unreadableOrphans([{ since, dir }], none)).toEqual([]);
+    expect(none.asked).toEqual([]);
+  });
+
+  it('reads ps lstart in UTC', () => {
+    expect(parseLstart('Tue Nov 17 10:48:32 2026'.split(' '))).toBe(
+      Date.UTC(2026, 10, 17, 10, 48, 32),
+    );
+    expect(parseLstart(['Tue', 'Xyz', '1', '00:00:00', '2026'])).toBeNaN();
+  });
+
+  it.runIf(process.platform !== 'win32')(
+    'ends the orphans it takes, and returns them for the caller to record',
+    async () => {
+      const victim = spawn('/bin/sleep', ['60'], { stdio: 'ignore', detached: true });
+      victim.unref();
+      grandchildren.push(victim.pid as number);
+      const bystander = spawn('/bin/sleep', ['60'], { stdio: 'ignore', detached: true });
+      bystander.unref();
+      grandchildren.push(bystander.pid as number);
+      const p = probe(
+        [
+          ok({ pid: victim.pid as number, startMs: Date.now() }),
+          ok({ pid: bystander.pid as number, startMs: Date.now() }),
+        ],
+        { [victim.pid as number]: real, [bystander.pid as number]: '/var' },
+      );
+      const ended = await endMarkedProcesses([newWorkerMarker()], {
+        graceMs: 300,
+        orphans: [{ since: Date.now() - 5000, dir }],
+        probe: p,
+      });
+      expect(ended).toEqual({
+        found: [victim.pid],
+        left: [],
+        orphans: [{ pid: victim.pid, command: '/bin/sleep 600' }],
+      });
+      await expect.poll(() => alive(victim.pid as number)).toBe(false);
+      expect(alive(bystander.pid as number)).toBe(true);
+    },
+  );
 });

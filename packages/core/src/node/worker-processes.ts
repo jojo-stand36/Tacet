@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { isAbsolute, relative, resolve } from 'node:path';
 
 /**
  * Finding and ending the processes of Worker sessions a crashed Mini-conductor left running
@@ -24,11 +25,289 @@ export function isWorkerMarker(value: unknown): value is string {
 }
 
 /**
- * Pids of this user's processes that carry one of `markers`, by marker. Linux reads
+ * Pids of this user's processes that carry one of `markers`, by marker, and each one's process
+ * tree (#367): its descendants (by parent pid), and the members of a process group (or, on Linux,
+ * a session) that one of them leads, which inherited the marker even when their environment cannot
+ * be read (macOS hides a platform binary's from `ps -E` while SIP is on). Linux reads
  * `/proc/<pid>/environ` (only readable for the user's own processes); macOS asks `/bin/ps -E`.
  * This process is never listed.
  */
-export function markedProcesses(markers: readonly string[]): Map<string, number[]> {
+export function markedProcesses(
+  markers: readonly string[],
+  /** @internal Tests only: replaces the process table the trees are read from. */
+  table?: () => readonly ProcessInfo[],
+): Map<string, number[]> {
+  const byEnv = markedByEnvironment(markers);
+  if (byEnv.size === 0) return byEnv;
+  return withTrees(byEnv, (table ?? processTable)());
+}
+
+/** One process of the user, as the process table shows it. */
+export interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  /** Its process group. */
+  pgid: number;
+  /** Its session, where the platform tells it (Linux; macOS `ps` prints 0). */
+  sid?: number;
+  zombie: boolean;
+}
+
+/**
+ * Add to each marker's pids the processes of their trees (see `markedProcesses`), until nothing
+ * more is added. Only the user's own processes are in `table`; this process never is added.
+ */
+export function withTrees(
+  found: ReadonlyMap<string, readonly number[]>,
+  table: readonly ProcessInfo[],
+): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  for (const [marker, pids] of found) {
+    const tree = new Set(pids);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const p of table) {
+        if (tree.has(p.pid) || p.pid === process.pid || p.zombie) continue;
+        const led = (id: number | undefined) => id !== undefined && id > 1 && tree.has(id);
+        if (led(p.ppid) || led(p.pgid) || led(p.sid)) {
+          tree.add(p.pid);
+          grew = true;
+        }
+      }
+    }
+    out.set(marker, [...tree]);
+  }
+  return out;
+}
+
+/**
+ * The user's processes. Linux: `/proc/<pid>/stat` (parent, group, session, state) of each process
+ * the user owns. macOS: one `ps` of the user's processes.
+ */
+export function processTable(): ProcessInfo[] {
+  const me = process.getuid?.();
+  const out: ProcessInfo[] = [];
+  if (process.platform === 'linux') {
+    for (const name of readdirSync('/proc')) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        if (me !== undefined && statSync(`/proc/${name}`).uid !== me) continue;
+        const stat = readFileSync(`/proc/${name}/stat`, 'utf8');
+        const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+        out.push({
+          pid: Number(name),
+          ppid: Number(f[1]),
+          pgid: Number(f[2]),
+          sid: Number(f[3]),
+          zombie: f[0] === 'Z',
+        });
+      } catch {
+        // Gone.
+      }
+    }
+    return out;
+  }
+  for (const row of psRows(['pid=', 'ppid=', 'pgid=', 'stat='])) {
+    const [pid, ppid, pgid, stat] = row;
+    if (pid === undefined || ppid === undefined || pgid === undefined) continue;
+    out.push({
+      pid: Number(pid),
+      ppid: Number(ppid),
+      pgid: Number(pgid),
+      zombie: (stat ?? '').startsWith('Z'),
+    });
+  }
+  return out;
+}
+
+/** macOS: the user's processes from `/bin/ps -x -U <uid>`, each line split into its columns. */
+function psRows(columns: readonly string[]): string[][] {
+  return psLines(columns).map((l) => l.trim().split(/\s+/));
+}
+
+/** macOS: the lines `/bin/ps -x -U <uid>` prints for `columns`, in UTC and the C locale. */
+function psLines(columns: readonly string[], extra: readonly string[] = []): string[] {
+  let text: string;
+  try {
+    text = execFileSync(
+      '/bin/ps',
+      [...extra, '-ww', '-x', '-U', String(process.getuid?.() ?? ''), '-o', columns.join(',')],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', TZ: 'UTC0' },
+        maxBuffer: 64 * 1024 * 1024,
+      },
+    );
+  } catch {
+    return [];
+  }
+  return text.split('\n').filter((l) => l.trim() !== '');
+}
+
+/**
+ * Where a session or a `verify` command ran, for finding on macOS what it left running whose
+ * marker cannot be read (#367): processes started at or after `since` (ms since the epoch) whose
+ * working directory is `dir` or inside it.
+ */
+export interface OrphanScope {
+  since: number;
+  dir: string;
+}
+
+/** A process `unreadableOrphans` may take, as the platform shows it. */
+export interface OrphanCandidate {
+  pid: number;
+  ppid: number;
+  /** When it started, in ms since the epoch, to the second `ps` reports. */
+  startMs: number;
+  /** Its environment cannot be read (`ps -E` shows none). */
+  envHidden: boolean;
+  command: string;
+}
+
+/** How `unreadableOrphans` looks at processes; replaced in tests. */
+export interface OrphanProbe {
+  platform: NodeJS.Platform;
+  /** The user's orphaned processes (parent pid 1). */
+  candidates(): OrphanCandidate[];
+  /** The working directory of each of `pids` that can be read. */
+  cwdOf(pids: readonly number[]): Map<number, string>;
+}
+
+/**
+ * macOS only (#367): the user's processes that a Worker session or a `verify` command in one of
+ * `scopes` most likely left running, though no marker shows it. A process is taken only if all of
+ * these hold: it is orphaned (parent pid 1), so nothing of the user's own still holds it; its
+ * environment cannot be read, so it is not one whose environment shows it is not ours (with SIP
+ * on, macOS hides a platform binary's from every other process); it started at or after a scope's
+ * `since` (to the second `ps` reports); and its working directory, after symlinks, is that
+ * scope's `dir` or inside it. One that moved out of the directory is missed; one the user started
+ * there themselves meanwhile, from a shell since gone, would be taken, so the caller records every
+ * one. Elsewhere, or with no scope, none.
+ */
+export function unreadableOrphans(
+  scopes: readonly OrphanScope[],
+  probe: OrphanProbe = darwinProbe,
+): { pid: number; command: string }[] {
+  if (probe.platform !== 'darwin' || scopes.length === 0) return [];
+  const earliest = Math.min(...scopes.map((s) => Math.floor(s.since / 1000) * 1000));
+  const picked = probe
+    .candidates()
+    .filter(
+      (c) =>
+        c.ppid === 1 &&
+        c.envHidden &&
+        c.pid !== process.pid &&
+        Number.isFinite(c.startMs) &&
+        c.startMs >= earliest,
+    );
+  if (picked.length === 0) return [];
+  const cwds = probe.cwdOf(picked.map((c) => c.pid));
+  const real = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  const dirs = scopes.map((s) => ({ since: Math.floor(s.since / 1000) * 1000, dir: real(s.dir) }));
+  return picked.flatMap((c) => {
+    const cwd = cwds.get(c.pid);
+    if (cwd === undefined || !isAbsolute(cwd)) return [];
+    const at = real(cwd);
+    const inside = dirs.some((d) => {
+      if (c.startMs < d.since) return false;
+      const rel = relative(d.dir, at);
+      return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+    });
+    return inside ? [{ pid: c.pid, command: c.command }] : [];
+  });
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** `ps -o lstart` in the C locale and UTC (`Tue Nov 17 10:48:32 2026`), in ms since the epoch. */
+export function parseLstart(words: readonly string[]): number {
+  const [, mon, day, time, year] = words;
+  const [h, m, sec] = (time ?? '').split(':').map(Number);
+  const month = MONTHS.indexOf(mon ?? '');
+  if (month < 0) return Number.NaN;
+  return Date.UTC(
+    Number(year),
+    month,
+    Number(day),
+    h ?? Number.NaN,
+    m ?? Number.NaN,
+    sec ?? Number.NaN,
+  );
+}
+
+/** The real probe: `ps` with and without `-E`, and `lsof` for working directories. */
+const darwinProbe: OrphanProbe = {
+  platform: process.platform,
+  candidates() {
+    // `pid ppid` then `lstart` (five words) then the command; with `-E`, the environment follows
+    // it, and nothing follows it when the environment cannot be read.
+    const parse = (line: string) => {
+      const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\S+\s+\S+\s+\S+)\s(.*)$/);
+      return m
+        ? { pid: Number(m[1]), ppid: Number(m[2]), lstart: m[3] ?? '', rest: m[4] ?? '' }
+        : undefined;
+    };
+    const cols = ['pid=', 'ppid=', 'lstart=', 'command='];
+    const plain = new Map<number, ReturnType<typeof parse>>();
+    for (const l of psLines(cols)) {
+      const r = parse(l);
+      if (r && r.ppid === 1) plain.set(r.pid, r);
+    }
+    if (plain.size === 0) return [];
+    const withEnv = new Map<number, string>();
+    for (const l of psLines(cols, ['-E'])) {
+      const r = parse(l);
+      if (r && plain.has(r.pid)) withEnv.set(r.pid, r.rest);
+    }
+    return [...plain.values()].flatMap((r) => {
+      if (!r) return [];
+      const env = withEnv.get(r.pid);
+      return [
+        {
+          pid: r.pid,
+          ppid: r.ppid,
+          startMs: parseLstart(r.lstart.split(/\s+/)),
+          // Seen in both, and `-E` added nothing: no environment shown.
+          envHidden: env !== undefined && env.trimEnd() === r.rest.trimEnd(),
+          command: r.rest.trimEnd(),
+        },
+      ];
+    });
+  },
+  cwdOf(pids) {
+    const out = new Map<number, string>();
+    if (pids.length === 0) return out;
+    let text = '';
+    try {
+      text = execFileSync('/usr/sbin/lsof', ['-a', '-d', 'cwd', '-Fn', '-p', pids.join(',')], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: '/usr/bin:/bin:/usr/sbin', LC_ALL: 'C' },
+        maxBuffer: 16 * 1024 * 1024,
+      });
+    } catch (err) {
+      // lsof exits 1 when some pid is gone, and still prints the others.
+      text = String((err as { stdout?: unknown }).stdout ?? '');
+    }
+    let pid: number | undefined;
+    for (const line of text.split('\n')) {
+      if (line.startsWith('p')) pid = Number(line.slice(1));
+      else if (line.startsWith('n') && pid !== undefined && !out.has(pid))
+        out.set(pid, line.slice(1));
+    }
+    return out;
+  },
+};
+
+function markedByEnvironment(markers: readonly string[]): Map<string, number[]> {
   const wanted = new Map<string, string>();
   for (const m of markers) if (isWorkerMarker(m)) wanted.set(`${WORKER_MARKER_VAR}=${m}`, m);
   const found = new Map<string, number[]>();
@@ -154,8 +433,11 @@ function signal(pid: number, sig: NodeJS.Signals): void {
  * marker again, so it is never taken for gone only because its environment can no longer be read
  * (macOS reads it from the process's memory). Its start time is
  * checked before every signal, so a pid reused meanwhile is never signalled. Each round also
- * looks for marked processes forked meanwhile. Returns the pids found, and those still running
- * after SIGKILL (normally none).
+ * looks for marked processes forked meanwhile, and their trees (`markedProcesses`). Returns the
+ * pids found, and those still running after SIGKILL (normally none).
+ *
+ * With `orphans`, on macOS also the processes `unreadableOrphans` takes for those scopes (#367),
+ * ended the same way and returned as `orphans` too, for the caller to record each one.
  */
 export async function endMarkedProcesses(
   markers: readonly string[],
@@ -163,14 +445,27 @@ export async function endMarkedProcesses(
     graceMs?: number;
     /** @internal Tests only: replaces the marker scan. */
     find?: (markers: readonly string[]) => Map<string, number[]>;
+    /** Where the sessions or commands ran, for their unreadable orphans (macOS, #367). */
+    orphans?: readonly OrphanScope[];
+    /** @internal Tests only: replaces how orphans are looked for. */
+    probe?: OrphanProbe;
   } = {},
-): Promise<{ found: number[]; left: number[] }> {
+): Promise<{ found: number[]; left: number[]; orphans?: { pid: number; command: string }[] }> {
   const find = opts.find ?? markedProcesses;
   const tracked = new Map<number, string>();
   const found: number[] = [];
-  /** Newly marked processes, which are now tracked. */
+  const orphans: { pid: number; command: string }[] = [];
+  const lookForOrphans = (): number[] => {
+    if (!opts.orphans?.length) return [];
+    const fresh = unreadableOrphans(opts.orphans, opts.probe).filter((o) => !tracked.has(o.pid));
+    for (const o of fresh) if (!orphans.some((x) => x.pid === o.pid)) orphans.push(o);
+    return fresh.map((o) => o.pid);
+  };
+  /** Newly marked processes (and orphans), which are now tracked. */
   const scan = (): number[] => {
-    const pids = [...find(markers).values()].flat().filter((pid) => !tracked.has(pid));
+    const pids = [...new Set([...[...find(markers).values()].flat(), ...lookForOrphans()])].filter(
+      (pid) => !tracked.has(pid),
+    );
     const ids = identities(pids);
     const fresh: number[] = [];
     for (const pid of pids) {
@@ -192,20 +487,25 @@ export async function endMarkedProcesses(
       return [];
     });
   };
+  const result = (left: number[]) => ({
+    found,
+    left,
+    ...(opts.orphans ? { orphans: orphans.filter((o) => found.includes(o.pid)) } : {}),
+  });
   scan();
-  if (tracked.size === 0) return { found: [], left: [] };
+  if (tracked.size === 0) return result([]);
   for (const pid of running()) signal(pid, 'SIGTERM');
   const deadline = Date.now() + (opts.graceMs ?? 5000);
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 100));
     for (const pid of scan()) signal(pid, 'SIGTERM');
-    if (running().length === 0) return { found, left: [] };
+    if (running().length === 0) return result([]);
   }
   const killDeadline = Date.now() + 2000;
   for (;;) {
     scan();
     const left = running();
-    if (left.length === 0 || Date.now() >= killDeadline) return { found, left };
+    if (left.length === 0 || Date.now() >= killDeadline) return result(left);
     for (const pid of left) signal(pid, 'SIGKILL');
     await new Promise((r) => setTimeout(r, 100));
   }
