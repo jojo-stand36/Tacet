@@ -93,6 +93,8 @@ function prng(seed: number): (n: number) => number {
   };
 }
 
+// scripts/check-terminal-filter.mjs mirrors this file's clipboard repros for real terminals
+// (#311): a repro added here belongs in its BLOCKED list too.
 describe('OscFilter against xterm.js (#302)', () => {
   it('sees a clipboard write when unfiltered (the checks work)', async () => {
     expect(await clipboardWrites(hex('1b 5d 35 32 3b 63 3b 51 51 3d 3d 07'))).toBe(1);
