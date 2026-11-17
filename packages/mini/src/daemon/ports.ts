@@ -180,6 +180,12 @@ export interface VerifyContext {
   marker: string;
   /** Told each command's result as it finishes (for `worker.verification`). */
   onCommand?(result: VerifyCommandResult): void;
+  /**
+   * Told, after a command, what its sweep ended that showed no marker (on macOS, orphans of the
+   * command taken by their working directory and start time, #367) and what still ran after
+   * SIGKILL, so it is recorded rather than lost.
+   */
+  onLeftovers?(report: { orphans: { pid: number; command: string }[]; left: number[] }): void;
 }
 
 /** A verification, and on failure what to tell the Worker so it can fix it. */
