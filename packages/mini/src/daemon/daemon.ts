@@ -4,11 +4,13 @@ import {
   lstatSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { removeSandboxPlaceholders, SANDBOX_PLACEHOLDERS } from '@tacet/adapter-claude-sdk/launch';
 import {
   type AgentEvent,
@@ -2317,7 +2319,8 @@ export class MiniConductor {
     const marker = newWorkerMarker();
     this.#markers.set(sessionId, marker);
     // Wall-clock time, as the process table reports start times: not the log's clock.
-    this.#scopes.set(marker, { since: Date.now(), dir: workspace.path });
+    const scope = orphanScope(workspace.path);
+    if (scope) this.#scopes.set(marker, scope);
     this.#saveMarkers();
     // A Worker whose adapter connects no MCP server gets no token and no MCP tools (#184). It can
     // still reach the Mini-conductor through its approval requests; one that has neither (a
@@ -3043,7 +3046,8 @@ export class MiniConductor {
     const marker = newWorkerMarker();
     const key = `verify:${run.sessionId}`;
     this.#markers.set(key, marker);
-    this.#scopes.set(marker, { since: Date.now(), dir: run.workspace.path });
+    const verifyScope = orphanScope(run.workspace.path);
+    if (verifyScope) this.#scopes.set(marker, verifyScope);
     this.#saveMarkers();
     let ranCommand = false;
     try {
@@ -3681,6 +3685,8 @@ export interface CancelStoppedOptions {
   repo?: string;
   miniId?: string;
   now?: () => Date;
+  /** @internal Tests only: how the sweep looks for unmarked orphans (#367). */
+  orphanProbe?: OrphanProbe;
 }
 
 /** `id` is `taskId` or one of its sub-tasks (`taskId/...`): never `taskId10`. */
@@ -3739,16 +3745,35 @@ export async function cancelStopped(
     const problem = cancelProblem(readView(o.store), taskId);
     if (problem) throw new Error(problem);
     const file = o.processFile ?? `${o.lockPath}.workers`;
-    const errors = await endStaleWorkerProcesses(file);
-    // As `#saveMarkers` writes it: a crash mid-write never leaves a half-written file.
-    const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      writeFileSync(tmp, '[]\n', { flag: 'wx', mode: 0o600 });
-      renameSync(tmp, file);
-    } catch (err) {
-      rmSync(tmp, { force: true });
-      errors.push(err);
+    const errors = await endStaleWorkerProcesses(file, o.orphanProbe);
+    // What was ended without a marker, and what outlived SIGKILL, goes to the log as the start-up
+    // sweep records it (#367), besides the note `tacet cancel` prints.
+    const now = o.now?.() ?? new Date();
+    const problems = errors.filter(
+      (e): e is Error => e instanceof UnmarkedProcessEnded || e instanceof StaleWorkersLeftError,
+    );
+    if (problems.length > 0) {
+      o.store.append(
+        problems.map(
+          (e) =>
+            ({
+              v: 1,
+              id: newUlid(now.getTime()),
+              ts: now.toISOString(),
+              source: { kind: 'mini', id: o.miniId ?? 'mini' },
+              ...(o.repo !== undefined ? { repo: o.repo } : {}),
+              type: 'maintenance.problem',
+              data: {
+                op: 'workers',
+                message: redactSecrets(e.message).slice(0, 2000),
+              } satisfies MaintenanceProblem,
+            }) as EventEnvelope,
+        ),
+      );
     }
+    // As `#saveMarkers` writes them: a crash mid-write never leaves a half-written file.
+    writeAtomic(file, '[]\n', errors);
+    writeAtomic(`${file}.scopes`, '{}\n', errors);
     if (o.placeholders && errors.some((e) => e instanceof StaleWorkersLeftError)) {
       // A sandbox still running may be using them: left for the next start, after its end.
       errors.push(
@@ -3974,7 +3999,35 @@ function releaseMiniLock(path: string): void {
   releaseProcessLock(path);
 }
 
-/** Worker processes a crashed Mini-conductor left that SIGKILL did not end (#127). */
+/**
+ * Where a Worker session or `verify` command runs, for finding on macOS what it leaves running
+ * without a readable marker (#367): `dir` by its real path, only when it is a linked git worktree
+ * (`.git` a `gitdir:` file, as every Worker checkout is) and neither the root, HOME, the temp dir
+ * nor a directory holding one of them. Undefined otherwise, or when it cannot be resolved: then
+ * only marked processes and their trees are ended.
+ */
+function orphanScope(path: string, since = Date.now()): OrphanScope | undefined {
+  let dir: string;
+  try {
+    if (!isAbsolute(path)) return undefined;
+    dir = realpathSync(path);
+    if (!readFileSync(join(dir, '.git'), 'utf8').startsWith('gitdir:')) return undefined;
+  } catch {
+    return undefined;
+  }
+  for (const shared of ['/', homedir(), tmpdir()]) {
+    let at: string;
+    try {
+      at = realpathSync(shared);
+    } catch {
+      continue;
+    }
+    const rel = relative(dir, at);
+    if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) return undefined;
+  }
+  return { since, dir };
+}
+
 /** Write `file` whole or not at all (a temp file renamed over it), mode 0600; failures to `errors`. */
 function writeAtomic(file: string, text: string, errors: unknown[]): void {
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
@@ -3987,6 +4040,7 @@ function writeAtomic(file: string, text: string, errors: unknown[]): void {
   }
 }
 
+/** Worker processes a crashed Mini-conductor left that SIGKILL did not end (#127). */
 class StaleWorkersLeftError extends Error {
   override name = 'StaleWorkersLeftError';
   constructor(readonly pids: readonly number[]) {
@@ -4036,13 +4090,16 @@ async function endStaleWorkerProcesses(file: string, probe?: OrphanProbe): Promi
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') errors.push(err);
   }
   // Where and since when the recorded markers' sessions ran (#367); none before that was written.
+  // Only a scope that is still a Worker checkout as it was recorded: until the sandbox denies the
+  // state directory (#53) a Worker could write this file, and must not point it at HOME.
   const scopes: OrphanScope[] = [];
   try {
     const parsed: unknown = JSON.parse(readFileSync(`${file}.scopes`, 'utf8'));
     for (const m of markers) {
       const e = (parsed as Record<string, { dir?: unknown; since?: unknown }> | null)?.[m];
       if (typeof e?.dir === 'string' && typeof e.since === 'number' && Number.isFinite(e.since)) {
-        scopes.push({ dir: e.dir, since: e.since });
+        const again = orphanScope(e.dir, e.since);
+        if (again && again.dir === e.dir) scopes.push(again);
       }
     }
   } catch {

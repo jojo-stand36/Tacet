@@ -164,6 +164,11 @@ export interface OrphanCandidate {
   /** Its environment cannot be read (`ps -E` shows none). */
   envHidden: boolean;
   command: string;
+  /**
+   * Its start time as `ps -o lstart` prints it (the identity the sweep then follows it by); when
+   * given, it is taken only if it is still the same process when it is about to be signalled.
+   */
+  start?: string;
 }
 
 /** How `unreadableOrphans` looks at processes; replaced in tests. */
@@ -189,7 +194,7 @@ export interface OrphanProbe {
 export function unreadableOrphans(
   scopes: readonly OrphanScope[],
   probe: OrphanProbe = darwinProbe,
-): { pid: number; command: string }[] {
+): { pid: number; command: string; start?: string }[] {
   if (probe.platform !== 'darwin' || scopes.length === 0) return [];
   const earliest = Math.min(...scopes.map((s) => Math.floor(s.since / 1000) * 1000));
   const picked = probe
@@ -228,7 +233,9 @@ export function unreadableOrphans(
       const rel = relative(d.dir, at);
       return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
     });
-    return inside ? [{ pid: c.pid, command: c.command }] : [];
+    return inside
+      ? [{ pid: c.pid, command: c.command, ...(c.start !== undefined ? { start: c.start } : {}) }]
+      : [];
   });
 }
 
@@ -282,6 +289,7 @@ const darwinProbe: OrphanProbe = {
           pid: r.pid,
           ppid: r.ppid,
           startMs: parseLstart(r.lstart.split(/\s+/)),
+          start: r.lstart,
           // Seen in both, and `-E` added nothing: no environment shown.
           envHidden: env !== undefined && env.trimEnd() === r.rest.trimEnd(),
           command: r.rest.trimEnd(),
@@ -462,26 +470,44 @@ export async function endMarkedProcesses(
   const tracked = new Map<number, string>();
   const found: number[] = [];
   const orphans: { pid: number; command: string }[] = [];
+  /** An unmarked orphan's start time as it was found: a pid reused since is never taken. */
+  const orphanStart = new Map<number, string>();
   /** Orphans not found by a marker (those are ended as marked), not yet tracked. */
   const lookForOrphans = (marked: ReadonlySet<number>): number[] => {
     if (!opts.orphans?.length) return [];
     const fresh = unreadableOrphans(opts.orphans, opts.probe).filter(
       (o) => !tracked.has(o.pid) && !marked.has(o.pid),
     );
-    for (const o of fresh) if (!orphans.some((x) => x.pid === o.pid)) orphans.push(o);
+    for (const o of fresh) {
+      if (o.start !== undefined) orphanStart.set(o.pid, o.start);
+      if (!orphans.some((x) => x.pid === o.pid)) orphans.push({ pid: o.pid, command: o.command });
+    }
     return fresh.map((o) => o.pid);
   };
   /** Newly marked processes (and orphans), which are now tracked. */
   const scan = (): number[] => {
-    const marked = new Set([...find(markers).values()].flat());
-    const pids = [...new Set([...marked, ...lookForOrphans(marked)])].filter(
-      (pid) => !tracked.has(pid),
-    );
+    // A failed look (`ps` could not run) finds nothing this round, never ends the sweep: what it
+    // already ended, orphans included, is still returned for the caller to record (#367).
+    let marked = new Set<number>();
+    try {
+      marked = new Set([...find(markers).values()].flat());
+    } catch {
+      // Tried again next round.
+    }
+    let unmarked: number[] = [];
+    try {
+      unmarked = lookForOrphans(marked);
+    } catch {
+      // Tried again next round.
+    }
+    const pids = [...new Set([...marked, ...unmarked])].filter((pid) => !tracked.has(pid));
     const ids = identities(pids);
     const fresh: number[] = [];
     for (const pid of pids) {
       const id = ids.get(pid);
       if (!id || id.zombie) continue;
+      const was = orphanStart.get(pid);
+      if (was !== undefined && was.replace(/\s+/g, ' ') !== id.start.replace(/\s+/g, ' ')) continue;
       tracked.set(pid, id.start);
       found.push(pid);
       fresh.push(pid);

@@ -298,12 +298,81 @@ describe('unreadable orphans on macOS (#367)', () => {
     expect(none.asked).toEqual([]);
   });
 
+  it.runIf(process.platform === 'darwin')(
+    'finds, with the real ps and lsof, an orphan with no environment in its directory',
+    async () => {
+      // `env -i` empties the environment, so `ps -E` adds nothing, as for a platform binary under
+      // SIP; the short-lived parent leaves it orphaned (parent pid 1), each in its own directory.
+      const here = realpathSync(mkdtempSync(join(tmpdir(), 'orph-live-')));
+      const there = realpathSync(mkdtempSync(join(tmpdir(), 'orph-other-')));
+      const since = Date.now();
+      const orphanIn = (cwd: string): Promise<number> =>
+        new Promise((done) => {
+          const p = spawn(
+            process.execPath,
+            [
+              '-e',
+              "const c=require('node:child_process').spawn('/usr/bin/env',['-i','/bin/sleep','60'],{detached:true,stdio:'ignore'});console.log(c.pid);c.unref()",
+            ],
+            { cwd, stdio: ['ignore', 'pipe', 'ignore'] },
+          );
+          p.stdout?.once('data', (b: Buffer) => done(Number.parseInt(b.toString(), 10)));
+        });
+      const mine = await orphanIn(here);
+      const other = await orphanIn(there);
+      grandchildren.push(mine, other);
+      try {
+        await expect
+          .poll(() => unreadableOrphans([{ since, dir: here }]).map((o) => o.pid), {
+            timeout: 5000,
+          })
+          .toEqual([mine]);
+      } finally {
+        rmSync(here, { recursive: true, force: true });
+        rmSync(there, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('reads ps lstart in UTC', () => {
     expect(parseLstart('Tue Nov 17 10:48:32 2026'.split(' '))).toBe(
       Date.UTC(2026, 10, 17, 10, 48, 32),
     );
     expect(parseLstart(['Tue', 'Xyz', '1', '00:00:00', '2026'])).toBeNaN();
   });
+
+  it.runIf(process.platform !== 'win32')(
+    'takes no orphan whose pid now names another process, and still reports when ps fails',
+    async () => {
+      const a = spawn('/bin/sleep', ['60'], { stdio: 'ignore', detached: true });
+      a.unref();
+      grandchildren.push(a.pid as number);
+      const b = spawn('/bin/sleep', ['60'], { stdio: 'ignore', detached: true });
+      b.unref();
+      grandchildren.push(b.pid as number);
+      const p = probe(
+        [
+          // Found with a start time it no longer has: the pid was reused meanwhile.
+          ok({ pid: a.pid as number, startMs: Date.now(), start: 'Thu Jan  1 00:00:00 1970' }),
+          ok({ pid: b.pid as number, startMs: Date.now() }),
+        ],
+        { [a.pid as number]: real, [b.pid as number]: real },
+      );
+      const ended = await endMarkedProcesses([newWorkerMarker()], {
+        graceMs: 300,
+        orphans: [{ since: Date.now() - 5000, dir }],
+        probe: p,
+        // The marker scan failing every round does not lose what was ended.
+        find: () => {
+          throw new Error('ps failed');
+        },
+      });
+      expect(ended.found).toEqual([b.pid]);
+      expect(ended.orphans).toEqual([{ pid: b.pid, command: '/bin/sleep 600' }]);
+      await expect.poll(() => alive(b.pid as number)).toBe(false);
+      expect(alive(a.pid as number)).toBe(true);
+    },
+  );
 
   it.runIf(process.platform !== 'win32')(
     'never reports a process its marker found as an unmarked orphan',

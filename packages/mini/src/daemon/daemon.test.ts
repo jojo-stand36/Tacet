@@ -1,5 +1,13 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -1469,6 +1477,60 @@ describe('MiniConductor', () => {
     });
 
     it.skipIf(process.platform === 'win32')(
+      'records in the log, and reports, an unmarked orphan the cancel ended (#367)',
+      async () => {
+        const d1 = make({
+          planner: new FixedPlanner([{ key: 'a', goal: 'a [hold]', acceptanceCriteria: ['ok'] }]),
+        });
+        await d1.start();
+        const id = d1.submit({ goal: 'g', acceptanceCriteria: ['ok'] });
+        await expect.poll(() => fake.open, { timeout: 5000 }).toBe(1);
+        d1.crashForTest();
+        const marker = newWorkerMarker();
+        const wt = join(realpathSync(dir), 'wt-cancel');
+        mkdirSync(wt);
+        writeFileSync(join(wt, '.git'), 'gitdir: /nowhere\n');
+        writeFileSync(join(dir, 'mini.lock.workers'), `${JSON.stringify([marker])}\n`);
+        writeFileSync(
+          join(dir, 'mini.lock.workers.scopes'),
+          `${JSON.stringify({ [marker]: { since: Date.now() - 5000, dir: wt } })}\n`,
+        );
+        const orphan = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' });
+        orphan.unref();
+        const pid = orphan.pid as number;
+        const orphanProbe: OrphanProbe = {
+          platform: 'darwin',
+          candidates: () => [
+            { pid, ppid: 1, startMs: Date.now(), envHidden: true, command: '/bin/sleep 60' },
+          ],
+          cwdOf: () => new Map([[pid, wt]]),
+        };
+        try {
+          const r = await cancelStopped(id, {
+            store,
+            lockPath: join(dir, 'mini.lock'),
+            orphanProbe,
+          });
+          expect(r.errors.map((e) => (e as Error).message)).toEqual([
+            expect.stringMatching(new RegExp(`^ended pid ${pid} \\(/bin/sleep 60\\)`)),
+          ]);
+          await expect.poll(() => isProcessRunning(pid)).toBe(false);
+          expect(ofType('maintenance.problem').map((e) => (e.data as { op: string }).op)).toEqual([
+            'workers',
+          ]);
+          expect(readFileSync(join(dir, 'mini.lock.workers.scopes'), 'utf8')).toBe('{}\n');
+          expect(tasks()[id]?.state).toBe('canceled');
+        } finally {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // Gone.
+          }
+        }
+      },
+    );
+
+    it.skipIf(process.platform === 'win32')(
       'ends the Worker processes a crashed run left behind before recording the cancel',
       async () => {
         const d1 = make({
@@ -1662,8 +1724,10 @@ describe('MiniConductor', () => {
       // What a crashed run left: its marker and where its session ran, and an orphan there whose
       // environment shows no marker (`env -i`, as macOS hides a platform binary's).
       const marker = newWorkerMarker();
-      const wt = join(dir, 'wt-crashed');
+      // A Worker checkout: a linked worktree, whose `.git` is a `gitdir:` file.
+      const wt = join(realpathSync(dir), 'wt-crashed');
       mkdirSync(wt);
+      writeFileSync(join(wt, '.git'), `gitdir: ${join(dir, 'repo.git', 'worktrees', 'x')}\n`);
       const orphan = spawn('env', ['-i', '/bin/sleep', '60'], {
         cwd: wt,
         detached: true,
@@ -1716,6 +1780,57 @@ describe('MiniConductor', () => {
           } catch {
             // Gone.
           }
+        }
+      }
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'takes no orphan for a recorded scope that is not a Worker checkout (#367)',
+    async () => {
+      // As a Worker that wrote the file could (until #53): scopes on the temp dir itself, on a
+      // plain directory, and on a link to a checkout. None is used.
+      const plain = join(realpathSync(dir), 'plain');
+      mkdirSync(plain);
+      const wt = join(realpathSync(dir), 'wt-real');
+      mkdirSync(wt);
+      writeFileSync(join(wt, '.git'), 'gitdir: /nowhere\n');
+      const link = join(realpathSync(dir), 'wt-link');
+      symlinkSync(wt, link);
+      const markers = [newWorkerMarker(), newWorkerMarker(), newWorkerMarker()];
+      const since = Date.now() - 5000;
+      writeFileSync(join(dir, 'mini.lock.workers'), `${JSON.stringify(markers)}\n`);
+      writeFileSync(
+        join(dir, 'mini.lock.workers.scopes'),
+        `${JSON.stringify({
+          [markers[0] as string]: { since, dir: realpathSync(tmpdir()) },
+          [markers[1] as string]: { since, dir: plain },
+          [markers[2] as string]: { since, dir: link },
+        })}\n`,
+      );
+      const victim = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' });
+      victim.unref();
+      const pid = victim.pid as number;
+      let asked = 0;
+      const orphanProbe: OrphanProbe = {
+        platform: 'darwin',
+        candidates: () => {
+          asked++;
+          return [{ pid, ppid: 1, startMs: Date.now(), envHidden: true, command: '/bin/sleep 60' }];
+        },
+        cwdOf: () => new Map([[pid, wt]]),
+      };
+      try {
+        const d = make({ orphanProbe });
+        await d.start();
+        expect(asked).toBe(0);
+        expect(isProcessRunning(pid)).toBe(true);
+        expect(ofType('maintenance.problem')).toEqual([]);
+      } finally {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Gone.
         }
       }
     },
