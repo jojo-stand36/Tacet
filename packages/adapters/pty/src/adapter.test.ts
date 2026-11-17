@@ -445,6 +445,9 @@ describe('PtyAdapter (fake claude)', () => {
           t: 'usage',
           inputTokens: 5302,
           outputTokens: 80,
+          // Of the input, read from and written to the cache (#355).
+          cacheReadTokens: 5000,
+          cacheWriteTokens: 300,
           contextUsed: 5382,
           // Opus 4.6 has 1M in Claude Code only when launched with [1m].
           contextMax: 1_000_000,

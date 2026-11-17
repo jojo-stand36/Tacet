@@ -1776,6 +1776,18 @@
       "body": "Implement the handoff flow in ARCHITECTURE.md §2.3.\n\n### Tasks\n- [ ] warn/handoff/hard bands from config\n- [ ] Disable vendor auto-compaction where possible\n- [ ] Prompt worker for HandoffPacket; validate (reject if next_action missing)\n- [ ] Store in .tacet/handoffs/, start fresh session seeded with it\n- [ ] Optional model change on handoff\n- [ ] Borrow (ADR-001): Use Gas Town handoff mail (`Context / Status / Next` plus the work id) as evidence for the HandoffPacket fields; `nextAction` stays required (`docs/design/mail-protocol.md` §HANDOFF)\n- [ ] Borrow (ADR-001): Use compaction-boundary detection (Omnigent) as a fallback trigger\n- [ ] Borrow (ADR-001): Later (M3+, with #32): a new session can ask its predecessor a question when the packet is not enough (Gas Town `gt seance`)\n\n### Acceptance criteria\n- Handoff preserves task progress in ≥ 90% of eval runs\n\n_See docs/ARCHITECTURE.md and docs/RESEARCH.md for context._"
     },
     {
+      "title": "Cache rates in the user's `pricing:` config",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:config",
+        "area:cost",
+        "priority:p3",
+        "agent:either"
+      ],
+      "body": "The cost ledger prices prompt-cache tokens at their own rates since #355, from `BUILTIN_PRICES`. A user's `pricing:` entry (user layer only, #35) replaces a built-in price whole and can only set `input_per_mtok`, `output_per_mtok` and `long_context`, so re-pricing a model (a negotiated discount, say) drops its cache rates: every cache read is then charged at the full input rate, several times the bill for a cache-heavy agent loop.\n\n### Tasks\n- [ ] Add optional `cache_read_per_mtok` and `cache_write_per_mtok` to a `pricing:` entry and to its `long_context`, as an additive config change.\n- [ ] `pricingTable` maps them onto `ModelPrice`.\n- [ ] Config reference and ARCHITECTURE §4 (\"Prompt cache\").\n\n### Acceptance criteria\n- A `pricing:` entry with cache rates prices cache reads and writes at them (test).\n- An entry without them charges the cache at its input rate, as now (test).\n\n_See docs/ARCHITECTURE.md §4 (Budgets) and #355._\n"
+    },
+    {
       "title": "Conductor & mini-conductor self-handoff",
       "milestone": "M3 · Context handoff & cost tiering",
       "labels": [
@@ -1911,6 +1923,18 @@
         "agent:claude"
       ],
       "body": "Owner request (2026-11-09): Tacet should choose, for each Worker session, the model, the reasoning effort and the context size, instead of a fixed tier per repo. Today `tiers.*` in config sets `adapter`, `model` and `effort` statically. `SessionOptions` carries only `model`, and `send()` can switch the model mid-session where `capabilities().modelSwitch` allows it.\n\n### Tasks\n- [ ] Verify each vendor's controls from primary docs (`verify-vendor-facts`) and record them in the capability matrix:\n  - Claude SDK: `model`, effort or thinking options, `betas` for long context, `fallbackModel`\n  - Codex app-server: model and reasoning effort per turn\n  - OpenCode: model per message\n  - Gemini CLI: model at launch\n- [ ] Core: a `SessionProfile { model, effort?, contextWindow? }` type in `@tacet/core`, with `effort` as an `openEnum`. Add it to `SessionOptions` and `SendOptions`. Extend `AdapterCapabilities` with what each adapter can honour: `effortSwitch` (`per-turn` or `per-session`) and `contextSizes`.\n- [ ] Effort: set per turn wherever the vendor supports it (expected: Claude SDK per message, Codex per turn; confirm in the first task), otherwise per session. The adapter declares which through `effortSwitch`.\n- [ ] Policy: the Mini-conductor picks a profile from the task (kind, size, risk), budget headroom (the cost ledger) and observed outcomes. Config sets the bounds: allowed models per tier, maximum effort, and a context cap.\n- [ ] Context size is a cost lever, off by default. The policy prefers a handoff at the threshold. It opts into a 1M window only when config allows it and the task cannot be handed off cleanly (e.g. one indivisible long read), and logs that reason in the `worker.profile` event. Config sets the cap.\n- [ ] Every choice is recorded as an event (`worker.profile`) with its reason, so `tacet config explain` and the cost ledger can show why a session ran on what.\n- [ ] Adapters: Claude SDK first (this repo's #11 adapter), then Codex. Each adapter declares its support honestly and the conformance suite checks it with a new P1 probe.\n- [ ] Docs: the ARCHITECTURE §cost tiering section and the config reference.\n\n### Acceptance criteria\n- A task can run with a profile chosen by policy, the chosen profile is visible in the event log, and the adapter applies it (verified against the mock API by the model and effort sent).\n- A profile outside the configured bounds is refused before launch.\n- An adapter that cannot honour a field reports this through its capabilities instead of silently ignoring it.\n- With `effortSwitch: per-turn`, a turn-level effort change reaches the vendor on that turn (checked against the mock API); with `per-session`, it is refused or applied at the next session, as declared.\n- With default config, no session opts into a 1M window; a handoff happens at the threshold instead. When config allows it and the task is marked as not cleanly handoff-able, the 1M window is used and the `worker.profile` event records why.\n\n### Owner decisions (2026-11-09)\n- Effort is per turn wherever the vendor supports it, per session otherwise; adapters declare which (`effortSwitch`).\n- Context size is a cost lever, off by default: hand off at the threshold first; opt into a 1M window only when config allows it and the task cannot be handed off cleanly, with the reason logged in `worker.profile`. Config sets the cap.\n\n_See docs/ARCHITECTURE.md (tiers, budget), docs/adapters/capability-matrix.md §7, and #29–#32 (handoff)._\n"
+    },
+    {
+      "title": "Price 1-hour Anthropic cache writes at the 1-hour rate",
+      "milestone": "M3 · Context handoff & cost tiering",
+      "labels": [
+        "type:feature",
+        "area:adapters",
+        "area:cost",
+        "priority:p3",
+        "agent:either"
+      ],
+      "body": "Since #355 the cost ledger prices cache writes at the shortest cache lifetime the vendor prices: Anthropic's 5 minutes (1.25x input). A 1-hour write costs 2x input, so it is undercounted. Anthropic's usage says how many were which: `cache_creation` `{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}` (`@anthropic-ai/sdk` 1.6.0 `messages.d.ts`, capability matrix \"Cache token counts\").\n\n### Tasks\n- [ ] An optional count of 1-hour cache writes on `Usage` (within `cacheWriteTokens`), filled by claude-sdk and `pty:claude` from `cache_creation`.\n- [ ] A 1-hour write rate on `ModelPrice` (Anthropic rows: the matrix's second cache-write figure) used by `costOf`.\n- [ ] Check whether OpenAI's 12-hour writes can be told apart in Codex's usage; record it either way.\n\n### Acceptance criteria\n- A call with 1-hour cache writes is priced at the 1-hour rate (test).\n- Usage without the split is priced as now (test).\n\n_See docs/ARCHITECTURE.md §4 (Budgets), docs/adapters/capability-matrix.md and #355._\n"
     },
     {
       "title": "Threshold handoff for Workers without an MCP client",

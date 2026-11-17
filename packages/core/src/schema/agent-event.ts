@@ -72,8 +72,16 @@ export type ApprovalDecision = z.infer<typeof ApprovalDecision>;
  */
 export const Usage = z.object({
   t: z.literal('usage'),
-  inputTokens: TokenCount.describe('Input tokens for this call (delta)'),
+  inputTokens: TokenCount.describe(
+    'Input tokens for this call (delta), cache reads and writes included',
+  ),
   outputTokens: TokenCount.describe('Output tokens for this call (delta)'),
+  cacheReadTokens: TokenCount.optional().describe(
+    'Of inputTokens, those read from a prompt cache (delta, #355)',
+  ),
+  cacheWriteTokens: TokenCount.optional().describe(
+    'Of inputTokens, those written to a prompt cache (delta, #355)',
+  ),
   contextUsed: TokenCount.optional().describe('Tokens currently in context (gauge)'),
   contextMax: TokenCount.optional().describe('Context window size (gauge)'),
   costUsd: Usd.optional().describe('Cost of this call in US dollars (delta)'),

@@ -14,7 +14,7 @@ import {
   workerRefusal,
 } from '../daemon/ports.js';
 import { unfence } from '../daemon/reply.js';
-import { sessionTurns } from '../daemon/turns.js';
+import { cacheFields, sessionTurns, type TurnUsage } from '../daemon/turns.js';
 import { type ReviewDiffOptions, reviewDiff } from '../git/diff.js';
 
 const Reply = z.object({
@@ -224,10 +224,11 @@ export class AdapterReviewer implements Reviewer {
     } catch {
       return error('the reviewer session could not start');
     }
-    const usage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+    const usage: TurnUsage = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
     const usageOut = () => ({
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
+      ...cacheFields(usage),
       ...(usage.costUsd > 0 ? { costUsd: Math.round(usage.costUsd * 1e6) / 1e6 } : {}),
       ...(this.#o.model !== undefined ? { model: this.#o.model } : {}),
     });

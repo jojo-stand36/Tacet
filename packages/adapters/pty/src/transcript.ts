@@ -31,6 +31,9 @@ export interface TranscriptCall {
   /** Input tokens, cache writes and reads included (as the SDK adapter counts them). */
   inputTokens: number;
   outputTokens: number;
+  /** Of `inputTokens`, those read from and written to the prompt cache (#355). */
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   /** The call's whole input plus output so far: the conversation's context after it. */
   contextUsed: number;
   model: string | undefined;
@@ -134,6 +137,8 @@ const MAX_CALLS = 4096;
 interface Reported {
   input: number;
   output: number;
+  read: number;
+  write: number;
 }
 
 /**
@@ -261,9 +266,11 @@ export class TranscriptReader {
       const before = this.#reported.get(p.id);
       const input = Math.max(p.input, before?.input ?? 0);
       const output = Math.max(p.output, before?.output ?? 0);
+      const read = Math.max(p.read, before?.read ?? 0);
+      const write = Math.max(p.write, before?.write ?? 0);
       if (before && input === before.input && output === before.output) continue;
       this.#reported.delete(p.id);
-      this.#reported.set(p.id, { input, output });
+      this.#reported.set(p.id, { input, output, read, write });
       if (this.#reported.size > MAX_CALLS) {
         const oldest = this.#reported.keys().next().value;
         if (oldest !== undefined) this.#reported.delete(oldest);
@@ -273,6 +280,14 @@ export class TranscriptReader {
       out.push({
         inputTokens: input - (before?.input ?? 0),
         outputTokens: output - (before?.output ?? 0),
+        // Never more cache than the input this delta adds.
+        cacheReadTokens: Math.min(read - (before?.read ?? 0), input - (before?.input ?? 0)),
+        cacheWriteTokens: Math.min(
+          write - (before?.write ?? 0),
+          input -
+            (before?.input ?? 0) -
+            Math.min(read - (before?.read ?? 0), input - (before?.input ?? 0)),
+        ),
         contextUsed: input + output,
         model: p.model,
       });
@@ -293,6 +308,8 @@ interface Parsed {
   id: string;
   input: number;
   output: number;
+  read: number;
+  write: number;
   model: string | undefined;
   sidechain: boolean;
 }
@@ -324,6 +341,8 @@ function parseCall(line: string): Parsed | undefined {
       count(u.cache_creation_input_tokens) +
       count(u.cache_read_input_tokens),
     output: count(u.output_tokens),
+    read: count(u.cache_read_input_tokens),
+    write: count(u.cache_creation_input_tokens),
     model: typeof m.model === 'string' && m.model !== '' ? m.model : undefined,
     sidechain: o.isSidechain === true,
   };
