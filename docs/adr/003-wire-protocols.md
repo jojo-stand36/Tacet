@@ -371,7 +371,7 @@ Status of this addendum: **accepted** on 2026-11-16, approved by the owner on PR
    - `budget.exceeded` `{scope, key, capUsd, spentUsd, unpricedTokens?, escalationId?}`. `scope` is an open enum `task | day | month` with fallback `task`. `key` is the root task id, the UTC day (`YYYY-MM-DD`) or the month (`YYYY-MM`).
    - `budget.raised` `{scope, key, capUsd, escalationId?}`. Only the user's answer to a `budget.exceeded` question writes it.
    - `budget.threshold` `{scope, key, thresholdUsd, spentUsd}`. One per soft threshold (`budget.ask_thresholds_usd`) a task's spend passes.
-   - `budget.unpriced` `{model, escalationId?, allowed?}`. Written when a question about a model with no known cost is raised (`allowed` absent), and again with the answer.
+   - `budget.unpriced` `{model, escalationId?, allowed?}`. Written when a question about a model with no known cost is raised (`allowed` absent), and again with the answer. A withdrawn answer adds `withdrawn` (addendum on #361, below).
 2. **They stay local to the Mini-conductor**, because `budget` is not on §4's upward allowlist. The Conductor can rebuild spend from `agent.usage`, which is forwarded already, and the questions cross the link as `escalation.*`. Forwarding `budget.*` would widen the allowlist; that is left to the owner and needs its own line here.
 3. **A new `worker.ended` reason, `budget`.** The session was stopped because a hard cap was spent. It is not a failed attempt, and like `restart` it is resumed once the cap is raised: its vendor session is kept. A reader that does not know the reason reads it as `failed` (the enum's fallback) and counts an attempt. That is safe, but an older Conductor's view may over-count failures.
 4. **What a hard cap does.**
@@ -395,3 +395,13 @@ Status of this addendum: **accepted** on 2026-11-16, approved by the owner on PR
 4. **Older readers.** A reader that parses `source` as the open enum reads `canceled` as `mini` (its fallback, never `user`): safe for precedent, since only `user` Decisions are precedent. Older escalation stats read the raw string and count it as an answer of unknown source, so as sent to the user, which raises their rate until they update.
 
 Additive under §2: an open-enum value with a safe fallback. The upward allowlist is not widened (`escalation.*` is already on it).
+
+### Addendum (2026-11-18): withdrawing an answer about an unpriced model (#361)
+
+Status of this addendum: **proposed**, awaiting the owner's approval on the PR that adds it. The owner chose this design in chat on 2026-11-18 (all three recommendations), relayed by the coordinator.
+
+1. **`budget.unpriced` gains `withdrawn?`** (`true` only): `{model, withdrawn: true}`, with no `escalationId` and no `allowed`, and no `taskId` on the envelope (the answer holds for the repo). The user withdrew the answer recorded for that model, a refusal or an allowance. The cost ledger's fold removes its record, so the fold stays the only state, and the next task that needs the model raises the question again. A later answer stands as before.
+2. **Who writes it.** Only `tacet budget forget <model>`, and only while no Mini-conductor runs for the repo: it takes the repo's lock, as `tacet cancel` does with no run live, so the log keeps one writer. It refuses while a question about the model is open, or answered but not yet recorded (the next run records it first), and when nothing is recorded. Nothing writes an allowance without the question's answer code (#269): there is no `allow` command. A live-run version would need a control-port method (§4) and is not part of this addendum.
+3. **Older readers.** A reader without the field parses the event as a question with no answer and no escalation. Its Mini-conductor holds the work that needs the model and raises the question again, so nothing runs on the model unasked. An older `tacet logs` shows the event as a question being asked.
+
+Additive under §2: an optional field on an event type this ADR already lists.

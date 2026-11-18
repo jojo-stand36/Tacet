@@ -11,6 +11,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  BUILTIN_PRICES,
+  costLedgerProjection,
   type Decision,
   type EventEnvelope,
   escalationStats,
@@ -35,6 +37,7 @@ import { deterministicGate } from '../gate/gate.js';
 import { EventLogBackend } from '../mcp/backend.js';
 import {
   cancelStopped,
+  forgetUnpriced,
   isApproval,
   isOwnMcpTool,
   isYes,
@@ -3873,6 +3876,84 @@ describe('budgets (#35)', () => {
       await d.settled();
       expect(tasks()[`${b}/1`]?.state).toBe('failed');
       expect(ofType('escalation.raised')).toHaveLength(1);
+    });
+
+    it('asks again, and runs on a yes, after a refusal is forgotten (#361)', async () => {
+      const lockPath = join(dir, 'mini.lock');
+      const d1 = nocost({ budget: { per_day_usd: 10 } });
+      await d1.start();
+      const a = d1.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('escalation.raised').length, { timeout: 5000 }).toBe(1);
+      d1.answer(lastEscalation(`${a}/1`)?.id ?? '', 'no');
+      await d1.settled();
+      expect(tasks()[`${a}/1`]?.state).toBe('failed');
+      // Not while a run holds the lock.
+      expect(() => forgetUnpriced('cheap', { store, lockPath })).toThrow('already running');
+      await d1.stop();
+
+      const before = store.count();
+      expect(forgetUnpriced('cheap', { store, lockPath })).toEqual({ forgotten: 'refused' });
+      expect(miniLockHolder(lockPath)).toBeUndefined();
+      // One event, and the ledger's fold of it is the only state: no record is left.
+      expect(store.count()).toBe(before + 1);
+      const withdrawal = ofType('budget.unpriced').at(-1);
+      expect(withdrawal?.data).toEqual({ model: 'cheap', withdrawn: true });
+      expect(withdrawal?.taskId).toBeUndefined();
+      expect(store.replay(costLedgerProjection(BUILTIN_PRICES)).unpriced).toEqual({});
+      // Nothing more to forget.
+      expect(() => forgetUnpriced('cheap', { store, lockPath })).toThrow(
+        'no answer about cheap is recorded',
+      );
+
+      const d2 = nocost({ budget: { per_day_usd: 10 } });
+      await d2.start();
+      const b = d2.submit({ goal: 'b', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('escalation.raised').length, { timeout: 5000 }).toBe(2);
+      expect(lastEscalation(`${b}/1`)?.question).toMatch(
+        /run on cheap, whose cost Tacet cannot know/,
+      );
+      d2.answer(lastEscalation(`${b}/1`)?.id ?? '', 'yes');
+      await d2.settled();
+      expect(tasks()[`${b}/1`]?.state).toBe('completed');
+      expect(tasks()[`${a}/1`]?.state).toBe('failed');
+      await d2.stop();
+      // An allowance can be forgotten too.
+      expect(forgetUnpriced('cheap', { store, lockPath })).toEqual({ forgotten: 'allowed' });
+    });
+
+    it('refuses to forget while the question about the model is open (#361)', async () => {
+      const lockPath = join(dir, 'mini.lock');
+      const d = nocost({ budget: { per_day_usd: 10 } });
+      await d.start();
+      d.submit({ goal: 'a', acceptanceCriteria: ['ok'] });
+      await expect.poll(() => ofType('escalation.raised').length, { timeout: 5000 }).toBe(1);
+      await d.stop();
+      const before = store.count();
+      expect(() => forgetUnpriced('cheap', { store, lockPath })).toThrow(
+        /a question about cheap is open \(escalation \w+\): answer it/,
+      );
+      expect(() => forgetUnpriced('other', { store, lockPath })).toThrow(
+        'no answer about other is recorded',
+      );
+      expect(store.count()).toBe(before);
+      expect(miniLockHolder(lockPath)).toBeUndefined();
+      // Answered while no run was live: the next run records the answer, so it cannot be
+      // forgotten before then.
+      const x = ofType('escalation.raised').at(-1)?.data as { id: string; taskId: string };
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'test' },
+        taskId: x.taskId,
+        type: 'escalation.resolved',
+        data: { escalationId: x.id, answer: 'no', source: 'user' },
+      } as EventEnvelope);
+      const answered = store.count();
+      expect(() => forgetUnpriced('cheap', { store, lockPath })).toThrow(
+        /cheap was answered \(escalation \w+\) and the answer is recorded when a run next starts/,
+      );
+      expect(store.count()).toBe(answered);
     });
 
     it('asks again on a waiting task when the task it asked on was canceled', async () => {

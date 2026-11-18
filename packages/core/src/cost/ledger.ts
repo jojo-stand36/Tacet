@@ -313,6 +313,11 @@ export function costLedgerProjection(table: PricingTable): Projection<CostLedger
         case 'budget.unpriced': {
           const d = BudgetUnpriced.safeParse(e.data);
           if (!d.success) return state;
+          if (d.data.withdrawn) {
+            // The answer is forgotten (#361): nothing recorded, so the model is asked about again.
+            const { [d.data.model]: _gone, ...unpriced } = state.unpriced;
+            return { ...state, unpriced };
+          }
           return { ...state, unpriced: { ...state.unpriced, [d.data.model]: d.data } };
         }
         case 'budget.raised': {

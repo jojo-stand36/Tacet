@@ -422,6 +422,36 @@ describe('costLedgerProjection (#35)', () => {
     expect(raised.raised[k]).toBe(5);
   });
 
+  it('forgets an answer about an unpriced model when it is withdrawn (#361)', () => {
+    const asked = env('budget.unpriced', {
+      model: 'm',
+      escalationId: '01JZZZZZZZZZZZZZZZZZZZZZZ1',
+    });
+    const refused = env('budget.unpriced', {
+      model: 'm',
+      escalationId: '01JZZZZZZZZZZZZZZZZZZZZZZ1',
+      allowed: false,
+    });
+    const other = env('budget.unpriced', { model: 'n', allowed: true });
+    const withdrawn = env('budget.unpriced', { model: 'm', withdrawn: true });
+    expect(ledger([asked, refused, other]).unpriced.m).toMatchObject({ allowed: false });
+    const l = ledger([asked, refused, other, withdrawn]);
+    expect(l.unpriced.m).toBeUndefined();
+    expect(l.unpriced.n).toMatchObject({ allowed: true });
+    // Asked and answered again after it: the new answer stands.
+    const again = ledger([
+      asked,
+      refused,
+      withdrawn,
+      { ...refused, data: { model: 'm', allowed: true } },
+    ]);
+    expect(again.unpriced.m).toMatchObject({ allowed: true });
+    // `withdrawn` is only ever true.
+    expect(
+      ledger([refused, env('budget.unpriced', { model: 'm', withdrawn: false })]).unpriced.m,
+    ).toMatchObject({ allowed: false });
+  });
+
   it('ignores malformed events', () => {
     const l = ledger([
       env('agent.usage', { t: 'usage', inputTokens: -1 }, { taskId: 'T' }),
