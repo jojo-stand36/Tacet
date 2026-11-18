@@ -58,10 +58,13 @@ export type BudgetThreshold = z.infer<typeof BudgetThreshold>;
  * none and no price is known), so the user is asked first. `allowed` is absent while the question
  * is open and set by the answer; a refusal stands too, so the same model is not asked about again.
  * `model` is the id, or `default@<adapter>` when the session runs on the vendor's default.
+ * `withdrawn` (#361): the user withdrew the recorded answer (`tacet budget forget`), so the next
+ * task that needs the model asks again.
  */
 export const BudgetUnpriced = z.object({
   model: Id,
   escalationId: Ulid.optional(),
   allowed: z.boolean().optional(),
+  withdrawn: z.literal(true).optional(),
 });
 export type BudgetUnpriced = z.infer<typeof BudgetUnpriced>;

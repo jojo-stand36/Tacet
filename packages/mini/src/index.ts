@@ -21,6 +21,8 @@ export const packageName = '@tacet/mini' as const;
 export {
   type CancelStoppedOptions,
   cancelStopped,
+  type ForgetUnpricedOptions,
+  forgetUnpriced,
   isOwnMcpTool,
   MiniConductor,
   type MiniConductorOptions,

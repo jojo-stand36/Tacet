@@ -113,6 +113,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
             problems: [],
             escalations: { last7Days: NO_ESCALATIONS, total: NO_ESCALATIONS },
             costByProfile: {},
+            unpricedAnswers: {},
           }),
         );
       } else io.out(`no Tacet state for ${repoRoot}`);
@@ -130,7 +131,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
   const escalations = readEscalationStats(paths);
   // And what each Worker session profile cost (#356).
   const prices = pricesFor(repoRoot, o['user-dir']);
-  const profiles = readCostByProfile(paths, prices.table);
+  const { profiles, unpriced } = readLedger(paths, prices.table);
   if (o.json) {
     io.out(
       safeJson({
@@ -141,6 +142,7 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
         escalations,
         costByProfile: profiles,
         ...(prices.note ? { costByProfileNote: prices.note } : {}),
+        unpricedAnswers: unpriced,
       }),
     );
     return 0;
@@ -166,6 +168,12 @@ export async function status(io: Io, o: Where & { json?: boolean }): Promise<num
     io.out('cost by session profile, in all:');
     if (prices.note) io.out(`  ${terminalSafe(prices.note)}`);
     for (const l of lines) io.out(`  ${l}`);
+  }
+  const answered = Object.entries(unpriced);
+  if (answered.length > 0) {
+    // What `tacet budget forget <model>` would withdraw (#361).
+    io.out('models with no known price, as you answered (tacet budget forget <model> asks again):');
+    for (const [model, a] of answered) io.out(`  ${terminalSafe(model)}: ${a}`);
   }
   return 0;
 }
@@ -194,10 +202,26 @@ export function readCostByProfile(
   paths: Parameters<typeof openLog>[0],
   prices: PricingTable,
 ): Record<string, Spend> {
+  return readLedger(paths, prices).profiles;
+}
+
+/**
+ * From the log's cost ledger: spend per session profile (#356), and the answers recorded about
+ * models with no known cost (#361), which `tacet budget forget` withdraws.
+ */
+export function readLedger(
+  paths: Parameters<typeof openLog>[0],
+  prices: PricingTable,
+): { profiles: Record<string, Spend>; unpriced: Record<string, 'allowed' | 'refused'> } {
   const store = openLog(paths);
-  if (!store) return {};
+  if (!store) return { profiles: {}, unpriced: {} };
   try {
-    return store.replay(costLedgerProjection(prices)).profiles;
+    const ledger = store.replay(costLedgerProjection(prices));
+    const unpriced: Record<string, 'allowed' | 'refused'> = {};
+    for (const [model, rec] of Object.entries(ledger.unpriced)) {
+      if (rec.allowed !== undefined) unpriced[model] = rec.allowed ? 'allowed' : 'refused';
+    }
+    return { profiles: ledger.profiles, unpriced };
   } finally {
     store.close();
   }

@@ -168,6 +168,57 @@ describe('tacet standalone (#21)', () => {
     );
   });
 
+  it('forgets an answer about an unpriced model with no run live, and status shows it (#361)', async () => {
+    const paths = repoStatePaths(repo, state);
+    const store = openEventStore(paths.events);
+    const at = '2026-11-18T12:00:00.000Z';
+    store.append([
+      {
+        v: 1 as const,
+        id: newUlid(Date.parse(at)),
+        ts: at,
+        source: { kind: 'mini' as const, id: 'standalone' },
+        taskId: 'T/1',
+        type: 'budget.unpriced',
+        data: { model: 'cheap', allowed: false },
+      },
+    ]);
+    store.close();
+    const before = JSON.parse((await tacet(['status', ...user(), '--json'])).out);
+    expect(before.unpricedAnswers).toEqual({ cheap: 'refused' });
+    expect((await tacet(['status', ...user()])).out).toContain(
+      'models with no known price, as you answered (tacet budget forget <model> asks again):\n  cheap: refused',
+    );
+
+    // Refused while a run is live.
+    const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      writeFileSync(paths.lock, `${other.pid}\n`);
+      const live = await tacet(['budget', 'forget', ...user(), 'cheap']);
+      expect(live.code).toBe(1);
+      expect(live.err).toContain(
+        `a run is live for this repo (pid ${other.pid}): stop it (Ctrl-C), then tacet budget forget cheap`,
+      );
+    } finally {
+      other.kill('SIGKILL');
+      rmSync(paths.lock, { force: true });
+    }
+
+    const f = await tacet(['budget', 'forget', ...user(), '--json', 'cheap']);
+    expect(f.code).toBe(0);
+    expect(JSON.parse(f.out)).toEqual({ model: 'cheap', forgotten: 'refused' });
+    expect(JSON.parse((await tacet(['status', ...user(), '--json'])).out).unpricedAnswers).toEqual(
+      {},
+    );
+    const again = await tacet(['budget', 'forget', ...user(), 'cheap']);
+    expect(again.code).toBe(1);
+    expect(again.err).toContain('no answer about cheap is recorded: nothing to forget');
+    expect((await tacet(['budget', 'allow', ...user(), 'cheap'])).code).toBe(2);
+    expect((await tacet(['budget', 'forget', ...user()])).code).toBe(2);
+  });
+
   it('runs a task to a result branch, then status, logs and attach read it from the log', async () => {
     const r = await tacet(['run', ...user(), '--accept', 'work.txt exists', 'add work.txt']);
     expect(r.code).toBe(0);

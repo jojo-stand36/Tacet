@@ -54,6 +54,9 @@ describe('render (#21)', () => {
     expect(at('budget.unpriced', { model: 'm', allowed: false })).toMatch(
       /m has no known price: refused/,
     );
+    expect(at('budget.unpriced', { model: 'm', withdrawn: true })).toMatch(
+      /m has no known price: answer forgotten, asked again when next needed/,
+    );
     // A question withdrawn by a cancel is not an answer (#362).
     expect(
       at('escalation.resolved', {

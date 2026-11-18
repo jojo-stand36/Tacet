@@ -99,7 +99,7 @@ export function formatEvent(e: EventEnvelope): string {
       what = `budget: the ${str(d, 'scope') ?? '?'} cap raised to ${usd(d.capUsd)}`;
       break;
     case 'budget.unpriced':
-      what = `budget: ${str(d, 'model') ?? '?'} has no known price: ${d.allowed === true ? 'allowed' : d.allowed === false ? 'refused' : 'asking whether to run it'}`;
+      what = `budget: ${str(d, 'model') ?? '?'} has no known price: ${d.withdrawn === true ? 'answer forgotten, asked again when next needed' : d.allowed === true ? 'allowed' : d.allowed === false ? 'refused' : 'asking whether to run it'}`;
       break;
     case 'maintenance.problem':
       what = `problem (${[str(d, 'op') ?? '?', str(d, 'workspaceId')].filter(Boolean).join(' ')}): ${oneLine(str(d, 'message') ?? '', 300)}`;

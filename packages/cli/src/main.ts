@@ -2,6 +2,7 @@ import { parseArgs } from 'node:util';
 import { formatExplain } from '@tacet/core';
 import { ConfigError, loadConfig, StateDirError } from '@tacet/core/node';
 import { answer } from './commands/answer.js';
+import { budgetForget } from './commands/budget.js';
 import { cancel } from './commands/cancel.js';
 import { detach } from './commands/detach.js';
 import { init, uninstall } from './commands/init.js';
@@ -38,6 +39,10 @@ const USAGE = `usage:
                                  of yours can read that terminal); --repo-wide keeps the
                                  answer as precedent for the whole repo, not only the task
   tacet status [--json]          tasks, sub-tasks, open escalations; whether a run is live
+  tacet budget forget <model> [--json]
+                                 withdraw your answer about running a model with no known
+                                 price (yes or no), so the next task that needs it asks
+                                 again; only while no run is live
   tacet logs <task> [--transcript] [--json] [--follow]
                                  a task's events (--transcript adds the Workers' own)
   tacet attach <session | task/n> [--json]
@@ -93,6 +98,7 @@ const OPTIONS = {
   cancel: COMMON,
   answer: { ...COMMON, 'repo-wide': { type: 'boolean' } },
   status: COMMON,
+  budget: COMMON,
   logs: { ...COMMON, transcript: { type: 'boolean' }, follow: { type: 'boolean', short: 'f' } },
   attach: COMMON,
   config: COMMON,
@@ -168,6 +174,9 @@ export async function main(argv: string[], io: Io): Promise<number> {
       case 'status':
         if (positionals.length > 0) return usage(io);
         return await status(io, v);
+      case 'budget':
+        if (positionals.length !== 2 || positionals[0] !== 'forget') return usage(io);
+        return await budgetForget(io, positionals[1] as string, v);
       case 'logs':
         if (positionals.length !== 1) return usage(io);
         return await logs(io, positionals[0] as string, v);

@@ -15,6 +15,10 @@
     },
     "allowed": {
       "type": "boolean"
+    },
+    "withdrawn": {
+      "type": "boolean",
+      "const": true
     }
   },
   "required": [

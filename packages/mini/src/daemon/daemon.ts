@@ -18,6 +18,7 @@ import {
   BUILTIN_PRICES,
   type BudgetExceeded,
   type BudgetScope,
+  type BudgetUnpriced,
   budgetKey,
   type CostLedger,
   capOf,
@@ -3843,6 +3844,59 @@ export async function cancelStopped(
     const { events, canceled } = cancelEvents(readView(o.store), taskId, env);
     o.store.append(events);
     return { canceled, errors };
+  } finally {
+    releaseMiniLock(o.lockPath);
+  }
+}
+
+export interface ForgetUnpricedOptions {
+  store: EventStore;
+  /** The repo's Mini-conductor lock: taken for the change, so no Mini-conductor runs meanwhile. */
+  lockPath: string;
+  repo?: string;
+  miniId?: string;
+  now?: () => Date;
+}
+
+/**
+ * Withdraw the user's answer about a model with no known cost (`tacet budget forget`, #361, owner
+ * decision 2026-11-18): a refusal or an allowance. Only while no Mini-conductor runs: it takes the
+ * repo's lock (throws if a live one holds it) and writes `budget.unpriced` with `withdrawn`, which
+ * the ledger folds into no record, so the next task that needs the model asks again. Throws, and
+ * writes nothing, while a question about the model is open or when no answer is recorded.
+ */
+export function forgetUnpriced(
+  model: string,
+  o: ForgetUnpricedOptions,
+): { forgotten: 'allowed' | 'refused' } {
+  takeMiniLock(o.lockPath);
+  try {
+    const v = readView(o.store);
+    const rec = v.ledger.unpriced[model];
+    if (rec?.allowed === undefined) {
+      const x = rec?.escalationId ? v.escalations.get(rec.escalationId) : undefined;
+      const state = x ? v.tasks[x.taskId]?.state : undefined;
+      if (x?.resolved && !x.delivered) {
+        throw new Error(
+          `${model} was answered (escalation ${x.id}) and the answer is recorded when a run next starts: forget it after that`,
+        );
+      }
+      if (x && !x.resolved && (!state || !TERMINAL.has(state))) {
+        throw new Error(
+          `a question about ${model} is open (escalation ${x.id}): answer it with tacet run --resume --answer ${x.id}=<text>`,
+        );
+      }
+      throw new Error(`no answer about ${model} is recorded: nothing to forget`);
+    }
+    const env: MakeEnvelope = (t, type, data, sessionId) =>
+      envelope(o, o.now?.() ?? new Date(), t, type, data, sessionId);
+    // Not about a task: the answer holds for the repo. `envelope` needs one, so leave it out.
+    const { taskId: _none, ...event } = env('', 'budget.unpriced', {
+      model,
+      withdrawn: true,
+    } satisfies BudgetUnpriced);
+    o.store.append(event as EventEnvelope);
+    return { forgotten: rec.allowed ? 'allowed' : 'refused' };
   } finally {
     releaseMiniLock(o.lockPath);
   }
