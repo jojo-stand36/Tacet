@@ -197,14 +197,6 @@ export function pricesFor(
   }
 }
 
-/** Spend per Worker session profile, from the log (#356); none without a log. */
-export function readCostByProfile(
-  paths: Parameters<typeof openLog>[0],
-  prices: PricingTable,
-): Record<string, Spend> {
-  return readLedger(paths, prices).profiles;
-}
-
 /**
  * From the log's cost ledger: spend per session profile (#356), and the answers recorded about
  * models with no known cost (#361), which `tacet budget forget` withdraws.

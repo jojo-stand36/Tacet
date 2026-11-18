@@ -3872,7 +3872,8 @@ export function forgetUnpriced(
   takeMiniLock(o.lockPath);
   try {
     const v = readView(o.store);
-    const rec = v.ledger.unpriced[model];
+    // A model id the user typed: never a key of Object's prototype.
+    const rec = Object.hasOwn(v.ledger.unpriced, model) ? v.ledger.unpriced[model] : undefined;
     if (rec?.allowed === undefined) {
       const x = rec?.escalationId ? v.escalations.get(rec.escalationId) : undefined;
       const state = x ? v.tasks[x.taskId]?.state : undefined;
@@ -3888,14 +3889,17 @@ export function forgetUnpriced(
       }
       throw new Error(`no answer about ${model} is recorded: nothing to forget`);
     }
-    const env: MakeEnvelope = (t, type, data, sessionId) =>
-      envelope(o, o.now?.() ?? new Date(), t, type, data, sessionId);
-    // Not about a task: the answer holds for the repo. `envelope` needs one, so leave it out.
-    const { taskId: _none, ...event } = env('', 'budget.unpriced', {
-      model,
-      withdrawn: true,
-    } satisfies BudgetUnpriced);
-    o.store.append(event as EventEnvelope);
+    const now = o.now?.() ?? new Date();
+    // Not about a task: the answer holds for the repo, so the envelope names none.
+    o.store.append({
+      v: 1,
+      id: newUlid(now.getTime()),
+      ts: now.toISOString(),
+      source: { kind: 'mini', id: o.miniId ?? 'mini' },
+      ...(o.repo !== undefined ? { repo: o.repo } : {}),
+      type: 'budget.unpriced',
+      data: { model, withdrawn: true } satisfies BudgetUnpriced,
+    } as EventEnvelope);
     return { forgotten: rec.allowed ? 'allowed' : 'refused' };
   } finally {
     releaseMiniLock(o.lockPath);

@@ -3937,6 +3937,23 @@ describe('budgets (#35)', () => {
       );
       expect(store.count()).toBe(before);
       expect(miniLockHolder(lockPath)).toBeUndefined();
+      // Answered while no run was live: the next run records the answer, so it cannot be
+      // forgotten before then.
+      const x = ofType('escalation.raised').at(-1)?.data as { id: string; taskId: string };
+      store.append({
+        v: 1,
+        id: newUlid(),
+        ts: new Date().toISOString(),
+        source: { kind: 'mini', id: 'test' },
+        taskId: x.taskId,
+        type: 'escalation.resolved',
+        data: { escalationId: x.id, answer: 'no', source: 'user' },
+      } as EventEnvelope);
+      const answered = store.count();
+      expect(() => forgetUnpriced('cheap', { store, lockPath })).toThrow(
+        /cheap was answered \(escalation \w+\) and the answer is recorded when a run next starts/,
+      );
+      expect(store.count()).toBe(answered);
     });
 
     it('asks again on a waiting task when the task it asked on was canceled', async () => {
